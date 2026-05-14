@@ -116,3 +116,72 @@ def test_discontiguous_integer_with_drop_axis(store):
     np.testing.assert_array_equal(
         arr.get_orthogonal_selection((rows, 4)), data[rows, 4]
     )
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_unsorted_integer_selection_stays_in_rust(store):
+    """An integer ndarray that is not sorted ascending must still stay in
+    the Rust pipeline.
+
+    annbatch's sparse-integer row fetch produces unsorted indices coming
+    from CSR indptr ordering (arrival order, not sorted). Branch 1's
+    fragmenting path used to require sorted ascending and raised
+    DiscontiguousArrayError, which surfaced as a failure under
+    config.codec_pipeline.strict=True.
+    """
+    sp = StorePath(store, path="unsorted_int")
+    arr = zarr.create_array(
+        sp,
+        shape=(1000,),
+        chunks=(50,),
+        shards=(200,),
+        dtype=np.float32,
+        fill_value=0.0,
+    )
+    data = np.arange(1000, dtype=np.float32)
+    arr[:] = data
+
+    idx = np.array([7, 3, 12, 201, 199, 700, 999, 205], dtype=np.int64)
+    result = arr.get_orthogonal_selection((idx,))
+    np.testing.assert_array_equal(result, data[idx])
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_duplicate_integer_selection_stays_in_rust(store):
+    """An integer ndarray with duplicates must produce per-element output
+    rows (matching numpy semantics), not collapse the duplicates."""
+    sp = StorePath(store, path="dup_int")
+    arr = zarr.create_array(
+        sp,
+        shape=(1000,),
+        chunks=(50,),
+        shards=(200,),
+        dtype=np.float32,
+        fill_value=0.0,
+    )
+    data = np.arange(1000, dtype=np.float32)
+    arr[:] = data
+
+    idx = np.array([3, 3, 5, 7, 7, 7, 12], dtype=np.int64)
+    result = arr.get_orthogonal_selection((idx,))
+    np.testing.assert_array_equal(result, data[idx])
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_unsorted_integer_2d_stays_in_rust(store):
+    """2D orthogonal selection with an unsorted row dim and a contiguous
+    column dim. Mirrors the annbatch sparse-integer fetch shape."""
+    sp = StorePath(store, path="unsorted_int_2d")
+    arr = zarr.create_array(
+        sp,
+        shape=(100, 50),
+        chunks=(10, 50),
+        dtype=np.float32,
+        fill_value=0.0,
+    )
+    data = np.arange(5000, dtype=np.float32).reshape(100, 50)
+    arr[:] = data
+
+    rows = np.array([7, 3, 99, 50, 1], dtype=np.int64)
+    result = arr.get_orthogonal_selection((rows, slice(None)))
+    np.testing.assert_array_equal(result, data[rows])

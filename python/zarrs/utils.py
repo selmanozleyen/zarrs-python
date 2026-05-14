@@ -193,6 +193,17 @@ def _split_dim_jointly(
     Used when chunk_selection has a discontiguous ndarray and out_selection
     has either a slice (sub-divided into consecutive sub-slices) or an
     ndarray (sliced piecewise; each piece must itself be contiguous).
+
+    Three modes for an integer ndarray chunk_dim:
+
+    - sorted strictly ascending: merge into contiguous runs and pair each
+      run with a consecutive out sub-slice. Fewest fragments.
+    - has duplicates or is unsorted: fall through to per-element pairs --
+      each (chunk_idx, out_idx) is independent on the read path, so a
+      length-1 chunk_run paired with the corresponding length-1 out_run
+      is always correct. This is what zarr's OrthogonalIndexer produces
+      for, e.g., annbatch's sparse-integer row fetch where CSR-derived
+      indices arrive in arrival order rather than sorted.
     """
     # Compute chunk runs, tracking each run's length (number of elements
     # selected from the chunk axis).
@@ -209,14 +220,28 @@ def _split_dim_jointly(
         arr = chunk_dim.ravel()
         if arr.size == 0:
             return []
-        if (np.diff(arr) < 0).any() if arr.size > 1 else False:
-            raise DiscontiguousArrayError(
-                "ndarray chunk dim selector is not sorted ascending"
-            )
-        runs = _split_array_into_runs(arr)
-        # For a contiguous run [s, e), every integer in that range is in arr,
-        # so the count of selected entries equals the run width.
-        chunk_runs = [(slice(s, e), e - s) for (s, e) in runs]
+        if arr.size == 1:
+            v = int(arr[0])
+            chunk_runs = [(slice(v, v + 1), 1)]
+        else:
+            diff = np.diff(arr)
+            if (diff > 0).all():
+                # Sorted strictly ascending: merge into contiguous runs.
+                runs = _split_array_into_runs(arr)
+                # For a contiguous run [s, e), every integer in that range is
+                # in arr, so the count of selected entries equals the run
+                # width.
+                chunk_runs = [(slice(s, e), e - s) for (s, e) in runs]
+            else:
+                # Unsorted or has duplicates: emit one length-1 chunk_run per
+                # element, in the original order. The out side will be split
+                # into matching length-1 pieces below, preserving the
+                # element-to-output mapping. This bounds fanout at arr.size
+                # for this dim, gated by _MAX_FRAGMENTS_PER_ITEM in the
+                # caller.
+                chunk_runs = [
+                    (slice(int(v), int(v) + 1), 1) for v in arr
+                ]
     else:
         raise ValueError(f"unsupported chunk_dim type: {type(chunk_dim).__name__}")
 
