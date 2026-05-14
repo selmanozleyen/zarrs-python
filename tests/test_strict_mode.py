@@ -75,7 +75,10 @@ class TestStrictMode:
     ) -> None:
         """Test that advanced indexing raises or falls back based on strict mode.
 
-        Strided and fancy indexing are unsupported by zarrs-python.
+        Strided slicing and fancy (vectorized/coordinate) indexing are
+        unsupported by the Rust pipeline directly. In non-strict mode we
+        fall back to the python pipeline and the results must match numpy
+        bit-for-bit.
         """
         sp = StorePath(store, path="ellipsis_test")
         arr = zarr.create_array(
@@ -86,16 +89,39 @@ class TestStrictMode:
             fill_value=0.0,
         )
 
-        data = np.arange(100).reshape(10, 10)
+        data = np.arange(100).reshape(10, 10).astype(np.float64)
         arr[:] = data
 
-        with (
-            pytest.raises(DiscontiguousArrayError)
-            if codec_pipeline_strict
-            else nullcontext()
-        ):
-            arr[:, ::2] = data[:, ::2]
-            arr[[0, 2], [0, 1]] = data[[0, 2], [0, 1]]
+        if codec_pipeline_strict:
+            # The first unsupported write raises before the second runs.
+            with pytest.raises(DiscontiguousArrayError):
+                arr[:, ::2] = data[:, ::2]
+                arr[[0, 2], [0, 1]] = data[[0, 2], [0, 1]]
+            return
+
+        # Non-strict: writes go through the python fallback and produce
+        # the same content as numpy on an in-memory copy.
+        expected = data.copy()
+
+        modified = data + 1.0
+        arr[:, ::2] = modified[:, ::2]
+        expected[:, ::2] = modified[:, ::2]
+        np.testing.assert_array_equal(arr[:], expected)
+
+        new_values = np.array([-1.0, -2.0])
+        arr[[0, 2], [0, 1]] = new_values
+        expected[[0, 2], [0, 1]] = new_values
+        np.testing.assert_array_equal(arr[:], expected)
+
+        # Reads via fancy indexing should also match numpy bit-for-bit.
+        np.testing.assert_array_equal(
+            arr.get_orthogonal_selection(([0, 2], [0, 1])),
+            expected[np.ix_([0, 2], [0, 1])],
+        )
+        np.testing.assert_array_equal(
+            arr.vindex[[0, 2], [0, 1]],
+            expected[[0, 2], [0, 1]],
+        )
 
     @pytest.mark.parametrize("store", ["local"], indirect=["store"])
     def test_supported_operations_still_work(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import operator
 import os
 from dataclasses import dataclass
@@ -38,9 +39,114 @@ class FillValueNoneError(Exception):
     pass
 
 
+# Cap on the number of (chunk_subset, out_subset) fragments we will emit per
+# batch entry when splitting a discontiguous integer-array selection into
+# contiguous slice runs. If the cartesian product across dims exceeds this
+# limit we raise DiscontiguousArrayError so the existing python fallback
+# handles the pathological entry instead of allocating an unbounded number
+# of small ChunkItems.
+_MAX_FRAGMENTS_PER_ITEM = 256
+
+
+def _split_array_into_runs(arr: np.ndarray) -> list[tuple[int, int]]:
+    """Split a sorted ascending 1-D integer array into contiguous runs.
+
+    Returns a list of (start, stop) half-open ranges in the underlying axis
+    such that for each run every integer in [start, stop) is present in
+    ``arr``. ``arr`` must be sorted ascending and 1-D; otherwise ValueError
+    is raised. Empty arrays produce an empty list.
+    """
+    if arr.ndim != 1:
+        raise ValueError(f"_split_array_into_runs expects a 1-D array, got ndim={arr.ndim}")
+    if arr.size == 0:
+        return []
+    if arr.size == 1:
+        v = int(arr[0])
+        return [(v, v + 1)]
+    diff = np.diff(arr)
+    if (diff < 0).any():
+        raise ValueError("_split_array_into_runs expects a sorted ascending array")
+    boundaries = np.flatnonzero(diff != 1) + 1
+    if boundaries.size == 0:
+        return [(int(arr[0]), int(arr[-1]) + 1)]
+    starts = np.concatenate(([0], boundaries))
+    ends = np.concatenate((boundaries, [arr.size]))
+    return [(int(arr[s]), int(arr[e - 1]) + 1) for s, e in zip(starts, ends)]
+
+
+def _dim_to_slice_runs(dim_sel: Any) -> list[slice]:
+    """Convert a single dim selector to a list of contiguous slice runs.
+
+    - slice -> as-is (single run; step != 1 raises DiscontiguousArrayError).
+    - integer scalar -> [slice(v, v + 1)].
+    - 1-D ndarray length 1 -> single slice.
+    - 1-D ndarray contiguous -> single slice covering [arr[0], arr[-1] + 1).
+    - 1-D ndarray discontiguous (sorted ascending) -> N slices via
+      _split_array_into_runs.
+    """
+    if is_integer(dim_sel):
+        v = int(dim_sel)
+        return [slice(v, v + 1)]
+    if isinstance(dim_sel, slice):
+        if dim_sel.step is not None and dim_sel.step != 1:
+            raise DiscontiguousArrayError(
+                f"slice with step != 1 is not supported: {dim_sel}"
+            )
+        return [dim_sel]
+    if isinstance(dim_sel, np.ndarray):
+        arr = dim_sel.ravel()
+        if arr.size == 0:
+            return []
+        if arr.size == 1:
+            v = int(arr[0])
+            return [slice(v, v + 1)]
+        if (np.diff(arr) < 0).any():
+            raise DiscontiguousArrayError(
+                "ndarray dim selector is not sorted ascending"
+            )
+        runs = _split_array_into_runs(arr)
+        return [slice(s, e) for (s, e) in runs]
+    raise ValueError(f"unsupported dim selector type: {type(dim_sel).__name__}")
+
+
+def selector_tuple_to_slice_run_tuples(
+    selector_tuple: SelectorTuple,
+) -> list[tuple[slice, ...]]:
+    """Split a per-dim selector tuple into a list of slice-only tuples.
+
+    For each dim, slice/int selectors yield exactly one slice; a contiguous
+    integer ndarray yields one slice; a discontiguous integer ndarray
+    yields N slices, one per contiguous run. The returned list is the
+    cartesian product across dims, capped at ``_MAX_FRAGMENTS_PER_ITEM``.
+    Raises DiscontiguousArrayError if the cap is exceeded.
+    """
+    if isinstance(selector_tuple, slice):
+        return [(selector_tuple,)]
+    if isinstance(selector_tuple, np.ndarray):
+        runs = _dim_to_slice_runs(selector_tuple)
+        return [(s,) for s in runs]
+    per_dim_runs: list[list[slice]] = [_dim_to_slice_runs(s) for s in selector_tuple]
+    fanout = 1
+    for runs in per_dim_runs:
+        fanout *= max(1, len(runs))
+        if fanout > _MAX_FRAGMENTS_PER_ITEM:
+            raise DiscontiguousArrayError(
+                f"slice-run cartesian product exceeds cap "
+                f"_MAX_FRAGMENTS_PER_ITEM={_MAX_FRAGMENTS_PER_ITEM}"
+            )
+    return [tuple(combo) for combo in itertools.product(*per_dim_runs)]
+
+
 # This is a (mostly) copy of the function from zarr.core.indexing that fixes:
 #   DeprecationWarning: Conversion of an array with ndim > 0 to a scalar is deprecated
 # TODO: Upstream this fix
+#
+# This helper is intentionally distinct from selector_tuple_to_slice_run_tuples:
+# the latter splits a discontiguous integer ndarray into multiple slice runs,
+# while make_slice_selection keeps the legacy behavior of folding a fully
+# duplicated ndarray (e.g. [0, 0, 0] in coordinate indexing) into a single
+# length-1 slice. That fold is what allows the legacy single-ChunkItem path
+# to express vindex / coordinate indexing without fanout.
 def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
     ls: list[slice] = []
     for dim_selection in selection:
@@ -68,6 +174,182 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
     if all(isinstance(s, slice) for s in selector_tuple):
         return list(selector_tuple)
     return make_slice_selection(selector_tuple)
+
+
+def _slice_length(s: slice) -> int:
+    """Length of a slice with concrete non-negative start/stop and step==1."""
+    start = s.start if s.start is not None else 0
+    stop = s.stop
+    if stop is None:
+        raise ValueError(f"slice without concrete stop: {s}")
+    return max(0, int(stop) - int(start))
+
+
+def _split_dim_jointly(
+    chunk_dim: Any, out_dim: Any
+) -> list[tuple[slice, slice]]:
+    """Per-dim joint split: pair each chunk run with the corresponding out run.
+
+    Used when chunk_selection has a discontiguous ndarray and out_selection
+    has either a slice (sub-divided into consecutive sub-slices) or an
+    ndarray (sliced piecewise; each piece must itself be contiguous).
+    """
+    # Compute chunk runs, tracking each run's length (number of elements
+    # selected from the chunk axis).
+    if is_integer(chunk_dim):
+        v = int(chunk_dim)
+        chunk_runs: list[tuple[slice, int]] = [(slice(v, v + 1), 1)]
+    elif isinstance(chunk_dim, slice):
+        if chunk_dim.step is not None and chunk_dim.step != 1:
+            raise DiscontiguousArrayError(
+                f"slice with step != 1 is not supported: {chunk_dim}"
+            )
+        chunk_runs = [(chunk_dim, _slice_length(chunk_dim))]
+    elif isinstance(chunk_dim, np.ndarray):
+        arr = chunk_dim.ravel()
+        if arr.size == 0:
+            return []
+        if (np.diff(arr) < 0).any() if arr.size > 1 else False:
+            raise DiscontiguousArrayError(
+                "ndarray chunk dim selector is not sorted ascending"
+            )
+        runs = _split_array_into_runs(arr)
+        # For a contiguous run [s, e), every integer in that range is in arr,
+        # so the count of selected entries equals the run width.
+        chunk_runs = [(slice(s, e), e - s) for (s, e) in runs]
+    else:
+        raise ValueError(f"unsupported chunk_dim type: {type(chunk_dim).__name__}")
+
+    # Now split out_dim to align with the chunk runs.
+    if is_integer(out_dim):
+        if len(chunk_runs) != 1 or chunk_runs[0][1] != 1:
+            raise UnsupportedVIndexingError(
+                "integer out_dim cannot be paired with multi-run chunk_dim"
+            )
+        v = int(out_dim)
+        out_pieces: list[slice] = [slice(v, v + 1)]
+    elif isinstance(out_dim, slice):
+        if out_dim.step is not None and out_dim.step != 1:
+            raise DiscontiguousArrayError(
+                f"out slice with step != 1 is not supported: {out_dim}"
+            )
+        cur = out_dim.start if out_dim.start is not None else 0
+        out_pieces = []
+        for _, length in chunk_runs:
+            out_pieces.append(slice(cur, cur + length))
+            cur += length
+        if out_dim.stop is not None and cur != out_dim.stop:
+            # The chunk runs do not cover the full out slice. This should
+            # not happen for a well-formed orthogonal/basic indexer pair.
+            raise UnsupportedVIndexingError(
+                f"chunk runs cover {cur - (out_dim.start or 0)} elements but "
+                f"out slice is length {out_dim.stop - (out_dim.start or 0)}"
+            )
+    elif isinstance(out_dim, np.ndarray):
+        arr_out = out_dim.ravel()
+        cur = 0
+        out_pieces = []
+        for _, length in chunk_runs:
+            sub = arr_out[cur : cur + length]
+            if sub.size == 0:
+                raise UnsupportedVIndexingError(
+                    "out ndarray exhausted before chunk runs"
+                )
+            if sub.size == 1:
+                v = int(sub[0])
+                out_pieces.append(slice(v, v + 1))
+            else:
+                diff = np.diff(sub)
+                if (diff != 1).any():
+                    raise DiscontiguousArrayError(
+                        "out ndarray sub-piece is not contiguous"
+                    )
+                out_pieces.append(slice(int(sub[0]), int(sub[-1]) + 1))
+            cur += length
+        if cur != arr_out.size:
+            raise UnsupportedVIndexingError(
+                f"out ndarray has {arr_out.size} entries but chunk runs only "
+                f"cover {cur}"
+            )
+    else:
+        raise ValueError(f"unsupported out_dim type: {type(out_dim).__name__}")
+
+    return list(zip([c for c, _ in chunk_runs], out_pieces))
+
+
+def _paired_chunk_and_out_subsets(
+    chunk_selection: Any, out_selection: Any
+) -> list[tuple[list[slice], list[slice]]]:
+    """Jointly fragment chunk_selection and out_selection by contiguous runs.
+
+    Returns a list of (chunk_subset_slices, out_subset_slices) pairs. The
+    chunk side has one slice per dim of ``chunk_selection``; the out side
+    has one slice per dim of ``out_selection`` (which may have fewer dims
+    than chunk_selection when integer-valued chunk dims drop their out
+    counterpart, as in zarr-python's OrthogonalIndexer).
+
+    Raises DiscontiguousArrayError if the fanout exceeds
+    ``_MAX_FRAGMENTS_PER_ITEM`` or any dim cannot be expressed as
+    contiguous runs. Raises UnsupportedVIndexingError if chunk_selection
+    and out_selection structures cannot be aligned (e.g. coordinate /
+    mask indexing where out_selection is not a tuple).
+    """
+    if not isinstance(chunk_selection, tuple):
+        # Single-dim selectors arrive as a bare slice/ndarray for some
+        # indexers; normalize to a 1-tuple.
+        chunk_selection = (chunk_selection,)
+    if not isinstance(out_selection, tuple):
+        # Coordinate / mask indexers pass a single slice or ndarray here.
+        # The per-dim chunk slices and the single out slot do not
+        # correspond 1:1, so we cannot safely fragment.
+        raise UnsupportedVIndexingError(
+            "out_selection must be a tuple to support per-dim run splitting"
+        )
+
+    per_dim_pairs: list[list[tuple[slice, slice | None]]] = []
+    out_idx = 0
+    for c_dim in chunk_selection:
+        if is_integer(c_dim):
+            # Integer chunk dim: no corresponding out dim (zarr-python
+            # drops it). Produce a single fragment with a length-1 slice
+            # on the chunk side and None marker on the out side.
+            v = int(c_dim)
+            per_dim_pairs.append([(slice(v, v + 1), None)])
+            continue
+        if out_idx >= len(out_selection):
+            raise UnsupportedVIndexingError(
+                "chunk_selection has more non-integer dims than out_selection"
+            )
+        o_dim = out_selection[out_idx]
+        out_idx += 1
+        pairs = _split_dim_jointly(c_dim, o_dim)
+        if not pairs:
+            # Empty selection on this dim -> no fragments for the entry.
+            return []
+        per_dim_pairs.append(
+            [(c_slice, o_slice) for c_slice, o_slice in pairs]
+        )
+    if out_idx != len(out_selection):
+        raise UnsupportedVIndexingError(
+            f"out_selection has {len(out_selection)} dims but only {out_idx} "
+            "were consumed by non-integer chunk dims"
+        )
+
+    fanout = 1
+    for pairs in per_dim_pairs:
+        fanout *= len(pairs)
+        if fanout > _MAX_FRAGMENTS_PER_ITEM:
+            raise DiscontiguousArrayError(
+                f"chunk-fragment cartesian product exceeds cap "
+                f"_MAX_FRAGMENTS_PER_ITEM={_MAX_FRAGMENTS_PER_ITEM}"
+            )
+
+    fragments: list[tuple[list[slice], list[slice]]] = []
+    for combo in itertools.product(*per_dim_pairs):
+        chunk_slices = [c for c, _ in combo]
+        out_slices = [o for _, o in combo if o is not None]
+        fragments.append((chunk_slices, out_slices))
+    return fragments
 
 
 def resulting_shape_from_index(
@@ -153,13 +435,153 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
+def _detect_drop_axes_from_chunk_selection(
+    chunk_selection: Any,
+    chunk_spec_shape: tuple[int, ...],
+    drop_axes: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Mirror the existing shape-based drop_axes detection without needing
+    a single concrete slice version of chunk_selection.
+
+    Replicates the behavior of ``make_chunk_info_for_rust_with_indices``'s
+    drop_axes loop using a synthetic slice-version shape where each dim of
+    ``chunk_selection`` contributes the count of elements it would select
+    (length 1 for ints, slice length for slices, len(arr) for ndarrays).
+    """
+    if not isinstance(chunk_selection, tuple):
+        chunk_selection = (chunk_selection,)
+    shape_chunk_selection = get_shape_for_selector(
+        chunk_selection, chunk_spec_shape, pad=True, drop_axes=drop_axes
+    )
+    chunk_selection_padded_shape: list[int] = []
+    for idx, sel in enumerate(chunk_selection):
+        if is_integer(sel):
+            chunk_selection_padded_shape.append(1)
+        elif isinstance(sel, slice):
+            start, stop, _ = sel.indices(chunk_spec_shape[idx])
+            chunk_selection_padded_shape.append(max(0, stop - start))
+        elif isinstance(sel, np.ndarray):
+            chunk_selection_padded_shape.append(int(sel.size))
+        else:
+            chunk_selection_padded_shape.append(1)
+    scs_iter = iter(shape_chunk_selection)
+    scs_current = next(scs_iter, None)
+    local_drop_axes = drop_axes
+    for idx_shape, shape_chunk_from_slices in enumerate(chunk_selection_padded_shape):
+        if shape_chunk_from_slices == 1 and shape_chunk_from_slices != scs_current:
+            local_drop_axes = local_drop_axes + (idx_shape,)
+        else:
+            scs_current = next(scs_iter, None)
+    return local_drop_axes
+
+
+def _can_fragment_jointly(chunk_selection: Any, out_selection: Any) -> bool:
+    """Return True iff the selector pair has the per-dim alignment that
+    the joint run-splitter expects: both are tuples and chunk_selection
+    has at least one discontiguous integer ndarray dim.
+
+    Vectorized / coordinate indexing (where out_selection arrives as a
+    single slice or ndarray rather than a tuple) is intentionally routed
+    through the legacy single-ChunkItem path -- the per-dim chunk arrays
+    are paired coordinates, not independent runs, so a per-dim cartesian
+    fragmenting would produce wrong results.
+    """
+    if not isinstance(chunk_selection, tuple):
+        return False
+    if not isinstance(out_selection, tuple):
+        return False
+    for dim in chunk_selection:
+        if isinstance(dim, np.ndarray) and dim.size > 1:
+            arr = dim.ravel()
+            if (np.diff(arr) != 1).any():
+                return True
+    return False
+
+
+def _emit_legacy_single_chunk_item(
+    byte_getter: Any,
+    chunk_spec: Any,
+    chunk_selection: Any,
+    out_selection: Any,
+    drop_axes: tuple[int, ...],
+    shape: tuple[int, ...],
+    *,
+    is_constant: bool,
+) -> tuple[ChunkItem | None, tuple[int, ...]]:
+    """Build a single ChunkItem using the pre-Branch-1 logic.
+
+    Used as the fallback path for selectors that the joint splitter
+    cannot safely fragment (vindex / coordinate indexing) and for
+    selectors that do not actually need fragmenting.
+    """
+    out_selection_as_slices = selector_tuple_to_slice_selection(out_selection)
+    chunk_selection_as_slices = selector_tuple_to_slice_selection(chunk_selection)
+
+    shape_chunk_selection_slices = get_shape_for_selector(
+        tuple(chunk_selection_as_slices),
+        chunk_spec.shape,
+        pad=True,
+        drop_axes=drop_axes,
+    )
+    shape_chunk_selection = get_shape_for_selector(
+        chunk_selection, chunk_spec.shape, pad=True, drop_axes=drop_axes
+    )
+    chunk_size = prod_op(shape_chunk_selection)
+    if chunk_size != prod_op(shape_chunk_selection_slices):
+        raise UnsupportedVIndexingError(
+            f"{shape_chunk_selection} != {shape_chunk_selection_slices}"
+        )
+    if not is_constant and chunk_size > prod_op(shape):
+        raise IndexError(
+            f"the size of the chunk subset {shape_chunk_selection} and "
+            f"input/output subset {shape} are incompatible"
+        )
+
+    io_array_shape = list(shape)
+    out_selection_expanded = list(out_selection_as_slices)
+    scs_iter = iter(shape_chunk_selection)
+    scs_current = next(scs_iter, None)
+    for idx_shape, shape_chunk_from_slices in enumerate(shape_chunk_selection_slices):
+        if shape_chunk_from_slices == 1 and shape_chunk_from_slices != scs_current:
+            drop_axes = drop_axes + (idx_shape,)
+        else:
+            scs_current = next(scs_iter, None)
+    if drop_axes:
+        for axis in drop_axes:
+            io_array_shape.insert(axis, 1)
+            out_selection_expanded.insert(axis, slice(0, 1))
+
+    item = ChunkItem(
+        key=byte_getter.path,
+        chunk_subset=chunk_selection_as_slices,
+        chunk_shape=chunk_spec.shape,
+        subset=out_selection_expanded,
+        shape=io_array_shape,
+    )
+    return item, drop_axes
+
+
 def make_chunk_info_for_rust_with_indices(
     batch_info: Iterable[
         tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
     ],
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
+    *,
+    allow_fragmenting: bool = True,
 ) -> RustChunkInfo:
+    """Build ChunkItems for the Rust pipeline.
+
+    When ``allow_fragmenting`` is True, a discontiguous integer-array
+    selection in ``chunk_selection`` is split into multiple ChunkItems --
+    one per contiguous run -- all sharing the same ``key``. This is safe
+    on the read path because each ChunkItem writes to a disjoint region
+    of the output array. It is NOT safe on the write path: multiple
+    ChunkItems for the same shard each perform a read-modify-write of
+    that shard, which races. Callers on the write path should pass
+    ``allow_fragmenting=False`` so a discontiguous integer array still
+    raises DiscontiguousArrayError and falls back to the python pipeline.
+    """
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True
@@ -171,59 +593,67 @@ def make_chunk_info_for_rust_with_indices(
         _,
     ) in batch_info:
         write_empty_chunks = chunk_spec.config.write_empty_chunks
-        # Convert the selector tuples to ones that only have slices i.e., `i: int` replaced by slice(i, i+1)
-        out_selection_as_slices = selector_tuple_to_slice_selection(out_selection)
-        chunk_selection_as_slices = selector_tuple_to_slice_selection(chunk_selection)
-        # Because `chunk_selection_as_slices` contains only slices, certain types of vindex-ing are not going to be able to be processed by the zarrs pipeline.
-        # Thus we get the shapes of the input selector and the the converted-to-slices selector to check if they differ.
-        # If they differ, then the indexing operation is not supported because it is not describe-able as slices.
-        shape_chunk_selection_slices = get_shape_for_selector(
-            tuple(chunk_selection_as_slices),
-            chunk_spec.shape,
-            pad=True,
-            drop_axes=drop_axes,
-        )
-        shape_chunk_selection = get_shape_for_selector(
-            chunk_selection, chunk_spec.shape, pad=True, drop_axes=drop_axes
-        )
-        if (chunk_size := prod_op(shape_chunk_selection)) != prod_op(
-            shape_chunk_selection_slices
+
+        if not allow_fragmenting or not _can_fragment_jointly(
+            chunk_selection, out_selection
         ):
-            raise UnsupportedVIndexingError(
-                f"{shape_chunk_selection} != {shape_chunk_selection_slices}"
+            # Legacy single-ChunkItem path. This handles all cases that
+            # the pre-Branch-1 code handled, including vectorized /
+            # coordinate indexing where out_selection is a single slice
+            # or ndarray. If selector_tuple_to_slice_selection sees a
+            # discontiguous integer ndarray here it raises
+            # DiscontiguousArrayError, which the pipeline fallback
+            # catches.
+            item, drop_axes = _emit_legacy_single_chunk_item(
+                byte_getter,
+                chunk_spec,
+                chunk_selection,
+                out_selection,
+                drop_axes,
+                shape,
+                is_constant=is_constant,
             )
-        if not is_constant and chunk_size > prod_op(shape):
-            raise IndexError(
-                f"the size of the chunk subset {shape_chunk_selection} and input/output subset {shape} are incompatible"
-            )
-        io_array_shape = list(shape)
-        out_selection_expanded = out_selection_as_slices
-        # We need to have io_array_shape and out_selection_expanded with dimensionalities matching that of the underlying array.
-        # `drop_axes`` is only triggered via fancy outer-indexing because applying `chunk_selection_as_slices` to the chunk array would not drop a dimension that the out-array thinks should be dropped, thus that dimension needs to be indicated.
-        # However, other indexing operations can silently drop a dimension on input to match the output, like `z[1, ...]`.
-        # In other words, applying the `chunk_selection_as_slices` to a chunk array would drop a dimension, but `out_selection` already encodes this dropped dimension because zarr-python constructs the out-array missing the dimension.
-        # So if we detect that a dimension has been dropped silently like this after converting to slices, we update to handle the dropped dimension.
-        scs_iter = iter(shape_chunk_selection)
-        scs_current = next(scs_iter, None)
-        for idx_shape, shape_chunk_from_slices in enumerate(
-            shape_chunk_selection_slices
-        ):
-            # Detect if this dimension has been dropped on the io_array i.e., shape_chunk_selection has been exhausted so there is an extra 1-sized dimension at the end or has a mismatch with the "full" chunk shape `shape_chunk_selection_slices`.
-            if shape_chunk_from_slices == 1 != scs_current:
-                drop_axes += (idx_shape,)
-            else:
-                scs_current = next(scs_iter, None)
-        if drop_axes:
-            for axis in drop_axes:
-                io_array_shape.insert(axis, 1)
-                out_selection_expanded.insert(axis, slice(0, 1))
-        chunk_info_with_indices.append(
-            ChunkItem(
-                key=byte_getter.path,
-                chunk_subset=chunk_selection_as_slices,
-                chunk_shape=chunk_spec.shape,
-                subset=out_selection_expanded,
-                shape=io_array_shape,
-            )
+            chunk_info_with_indices.append(item)
+            continue
+
+        # Branch-1 fragmenting path: chunk_selection has at least one
+        # discontiguous integer ndarray dim and the joint splitter can
+        # align it with out_selection.
+        drop_axes = _detect_drop_axes_from_chunk_selection(
+            chunk_selection, chunk_spec.shape, drop_axes
         )
+        fragments = _paired_chunk_and_out_subsets(chunk_selection, out_selection)
+        if not fragments:
+            continue
+
+        for chunk_subset_as_slices, out_subset_as_slices in fragments:
+            shape_chunk_selection_slices = get_shape_for_selector(
+                tuple(chunk_subset_as_slices),
+                chunk_spec.shape,
+                pad=True,
+                drop_axes=drop_axes,
+            )
+            chunk_size = prod_op(shape_chunk_selection_slices)
+            if not is_constant and chunk_size > prod_op(shape):
+                raise IndexError(
+                    f"the size of the chunk subset {shape_chunk_selection_slices} "
+                    f"and input/output subset {shape} are incompatible"
+                )
+
+            io_array_shape = list(shape)
+            out_subset_expanded = list(out_subset_as_slices)
+            if drop_axes:
+                for axis in drop_axes:
+                    io_array_shape.insert(axis, 1)
+                    out_subset_expanded.insert(axis, slice(0, 1))
+
+            chunk_info_with_indices.append(
+                ChunkItem(
+                    key=byte_getter.path,
+                    chunk_subset=chunk_subset_as_slices,
+                    chunk_shape=chunk_spec.shape,
+                    subset=out_subset_expanded,
+                    shape=io_array_shape,
+                )
+            )
     return RustChunkInfo(chunk_info_with_indices, write_empty_chunks)
