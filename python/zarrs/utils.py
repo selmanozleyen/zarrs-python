@@ -39,15 +39,6 @@ class FillValueNoneError(Exception):
     pass
 
 
-# Cap on the number of (chunk_subset, out_subset) fragments we will emit per
-# batch entry when splitting a discontiguous integer-array selection into
-# contiguous slice runs. If the cartesian product across dims exceeds this
-# limit we raise DiscontiguousArrayError so the existing python fallback
-# handles the pathological entry instead of allocating an unbounded number
-# of small ChunkItems.
-_MAX_FRAGMENTS_PER_ITEM = 256
-
-
 def _split_array_into_runs(arr: np.ndarray) -> list[tuple[int, int]]:
     """Split a sorted ascending 1-D integer array into contiguous runs.
 
@@ -117,8 +108,7 @@ def selector_tuple_to_slice_run_tuples(
     For each dim, slice/int selectors yield exactly one slice; a contiguous
     integer ndarray yields one slice; a discontiguous integer ndarray
     yields N slices, one per contiguous run. The returned list is the
-    cartesian product across dims, capped at ``_MAX_FRAGMENTS_PER_ITEM``.
-    Raises DiscontiguousArrayError if the cap is exceeded.
+    cartesian product across dims.
     """
     if isinstance(selector_tuple, slice):
         return [(selector_tuple,)]
@@ -126,14 +116,6 @@ def selector_tuple_to_slice_run_tuples(
         runs = _dim_to_slice_runs(selector_tuple)
         return [(s,) for s in runs]
     per_dim_runs: list[list[slice]] = [_dim_to_slice_runs(s) for s in selector_tuple]
-    fanout = 1
-    for runs in per_dim_runs:
-        fanout *= max(1, len(runs))
-        if fanout > _MAX_FRAGMENTS_PER_ITEM:
-            raise DiscontiguousArrayError(
-                f"slice-run cartesian product exceeds cap "
-                f"_MAX_FRAGMENTS_PER_ITEM={_MAX_FRAGMENTS_PER_ITEM}"
-            )
     return [tuple(combo) for combo in itertools.product(*per_dim_runs)]
 
 
@@ -236,9 +218,12 @@ def _split_dim_jointly(
                 # Unsorted or has duplicates: emit one length-1 chunk_run per
                 # element, in the original order. The out side will be split
                 # into matching length-1 pieces below, preserving the
-                # element-to-output mapping. This bounds fanout at arr.size
-                # for this dim, gated by _MAX_FRAGMENTS_PER_ITEM in the
-                # caller.
+                # element-to-output mapping. Fanout is then arr.size for
+                # this dim. The caller does not cap fanout, so callers
+                # building selectors that multiply across many dims
+                # (orthogonal indexing with several large unsorted ndarrays)
+                # are responsible for keeping the resulting ChunkItem count
+                # within process memory.
                 chunk_runs = [
                     (slice(int(v), int(v) + 1), 1) for v in arr
                 ]
@@ -313,11 +298,11 @@ def _paired_chunk_and_out_subsets(
     than chunk_selection when integer-valued chunk dims drop their out
     counterpart, as in zarr-python's OrthogonalIndexer).
 
-    Raises DiscontiguousArrayError if the fanout exceeds
-    ``_MAX_FRAGMENTS_PER_ITEM`` or any dim cannot be expressed as
-    contiguous runs. Raises UnsupportedVIndexingError if chunk_selection
-    and out_selection structures cannot be aligned (e.g. coordinate /
-    mask indexing where out_selection is not a tuple).
+    Raises DiscontiguousArrayError if any dim cannot be expressed as
+    contiguous runs (e.g. a slice with step != 1). Raises
+    UnsupportedVIndexingError if chunk_selection and out_selection
+    structures cannot be aligned (e.g. coordinate / mask indexing where
+    out_selection is not a tuple).
     """
     if not isinstance(chunk_selection, tuple):
         # Single-dim selectors arrive as a bare slice/ndarray for some
@@ -359,15 +344,6 @@ def _paired_chunk_and_out_subsets(
             f"out_selection has {len(out_selection)} dims but only {out_idx} "
             "were consumed by non-integer chunk dims"
         )
-
-    fanout = 1
-    for pairs in per_dim_pairs:
-        fanout *= len(pairs)
-        if fanout > _MAX_FRAGMENTS_PER_ITEM:
-            raise DiscontiguousArrayError(
-                f"chunk-fragment cartesian product exceeds cap "
-                f"_MAX_FRAGMENTS_PER_ITEM={_MAX_FRAGMENTS_PER_ITEM}"
-            )
 
     fragments: list[tuple[list[slice], list[slice]]] = []
     for combo in itertools.product(*per_dim_pairs):

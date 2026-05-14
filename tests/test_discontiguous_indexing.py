@@ -54,14 +54,16 @@ def test_discontiguous_integer_2d(store):
 
 
 @pytest.mark.parametrize("store", ["local"], indirect=["store"])
-def test_fanout_cap_falls_back(store, monkeypatch):
-    """If a single batch entry would explode into > MAX_FRAGMENTS items,
-    we should fall back gracefully (or accept the explosion -- either is
-    OK, but no crash and the result must still match numpy)."""
-    from zarrs import utils
+def test_many_fragments_within_one_batch_entry(store):
+    """A discontiguous selection that produces many fragments within a
+    single batch entry must produce a correct result.
 
-    monkeypatch.setattr(utils, "_MAX_FRAGMENTS_PER_ITEM", 4, raising=True)
-    sp = StorePath(store, path="disc_cap")
+    The fragmenting path used to cap fanout at _MAX_FRAGMENTS_PER_ITEM
+    and trigger the python fallback above the cap; that cap has been
+    removed because the per-shard coalescing in src/lib.rs amortizes
+    the per-fragment cost. This test exists to document that the
+    no-cap path stays correct."""
+    sp = StorePath(store, path="disc_many_frags")
     arr = zarr.create_array(
         sp,
         shape=(1000,),
