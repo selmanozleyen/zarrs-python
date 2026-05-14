@@ -20,8 +20,8 @@ use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
-    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecOptions, DataType,
-    FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
+    ArrayPartialDecoderTraits, ArraySubset, ArrayToBytesCodecTraits, CodecChain, CodecOptions,
+    DataType, FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
@@ -39,6 +39,61 @@ mod utils;
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
+
+/// A unit of read work for `retrieve_chunks_and_apply_index`.
+///
+/// `Single` is one `ChunkItem` that is either a whole-chunk read or a
+/// solo partial-region read; it follows the original per-item code path.
+/// `Coalesced` is a set of partial-region `ChunkItem`s that share the
+/// same shard key and are read with one multi-region `partial_decode`
+/// call so the upstream sharding decoder can cache inner sub-chunk
+/// partial decoders across regions.
+enum WorkUnit {
+    Single(ChunkItem),
+    Coalesced { key: StoreKey, items: Vec<ChunkItem> },
+}
+
+/// Group `chunk_descriptions` into `WorkUnit`s.
+///
+/// Whole-chunk items always become `WorkUnit::Single`: they read the
+/// entire shard in one go and there is nothing for coalescing to share.
+/// Partial-region items are bucketed by store key in arrival order and
+/// emerge as `WorkUnit::Coalesced` if more than one item targets the
+/// same key, otherwise as `WorkUnit::Single`.
+fn group_chunk_items_into_work_units(
+    chunk_descriptions: Vec<ChunkItem>,
+) -> Vec<WorkUnit> {
+    let mut work_units: Vec<WorkUnit> = Vec::new();
+    let mut groups: HashMap<StoreKey, Vec<ChunkItem>> = HashMap::new();
+    let mut group_order: Vec<StoreKey> = Vec::new();
+
+    for item in chunk_descriptions {
+        if is_whole_chunk(&item) {
+            work_units.push(WorkUnit::Single(item));
+        } else {
+            let key = item.key.clone();
+            if !groups.contains_key(&key) {
+                group_order.push(key.clone());
+            }
+            groups.entry(key).or_default().push(item);
+        }
+    }
+
+    for key in group_order {
+        let mut items = groups
+            .remove(&key)
+            .expect("group must exist for each key in group_order");
+        if items.len() == 1 {
+            work_units.push(WorkUnit::Single(
+                items.pop().expect("len == 1 implies pop succeeds"),
+            ));
+        } else {
+            work_units.push(WorkUnit::Coalesced { key, items });
+        }
+    }
+
+    work_units
+}
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
 #[gen_stub_pyclass]
@@ -186,6 +241,123 @@ impl CodecPipelineImpl {
         Ok(slice)
     }
 
+    fn process_single_chunk_item(
+        &self,
+        item: &ChunkItem,
+        output: UnsafeCellSlice<'_, u8>,
+        data_type_size: usize,
+        partial_decoder_cache: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
+        codec_options: &CodecOptions,
+    ) -> PyResult<()> {
+        let mut output_view = unsafe {
+            // SAFETY: chunks represent disjoint array subsets
+            ArrayBytesFixedDisjointView::new(
+                output,
+                data_type_size,
+                bytemuck::must_cast_slice(&item.array_shape),
+                item.subset.clone(),
+            )
+            .map_py_err::<PyRuntimeError>()?
+        };
+        let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
+        if is_whole_chunk(item) {
+            // See zarrs::array::Array::retrieve_chunk_into
+            if let Some(chunk_encoded) =
+                self.store.get(&item.key).map_py_err::<PyRuntimeError>()?
+            {
+                let chunk_encoded: Vec<u8> = chunk_encoded.into();
+                self.codec_chain.decode_into(
+                    Cow::Owned(chunk_encoded),
+                    &item.shape,
+                    &self.data_type,
+                    &self.fill_value,
+                    target,
+                    codec_options,
+                )
+            } else {
+                copy_fill_value_into(&self.data_type, &self.fill_value, target)
+            }
+        } else {
+            let key = &item.key;
+            let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
+                PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
+            })?;
+            partial_decoder.partial_decode_into(&item.chunk_subset, target, codec_options)
+        }
+        .map_codec_err()
+    }
+
+    fn process_coalesced_group(
+        &self,
+        key: &StoreKey,
+        items: &[ChunkItem],
+        output: UnsafeCellSlice<'_, u8>,
+        data_type_size: usize,
+        partial_decoder_cache: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
+        codec_options: &CodecOptions,
+    ) -> PyResult<()> {
+        let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
+            PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
+        })?;
+
+        // Build a multi-region indexer covering every disjoint chunk_subset
+        // in this group. For a Vec<ArraySubset> indexer, the upstream
+        // partial_decode (sharding_partial_decoder_sync.rs::partial_decode)
+        // routes through partial_decode_fixed_indexer, which caches inner
+        // sub-chunk partial decoders so that a sub-chunk touched by multiple
+        // regions is decoded once. The returned ArrayBytes is laid out as
+        // concat(subset_0 elements in C-order, subset_1, ...), matching the
+        // order in which the items appear here.
+        let combined_indexer: Vec<ArraySubset> =
+            items.iter().map(|item| item.chunk_subset.clone()).collect();
+
+        let decoded = partial_decoder
+            .partial_decode(&combined_indexer, codec_options)
+            .map_codec_err()?;
+        let scratch = match decoded {
+            ArrayBytes::Fixed(bytes) => bytes,
+            ArrayBytes::Variable(..) => {
+                return Err(PyRuntimeError::new_err(
+                    "coalesced multi-region partial_decode returned variable-length bytes; \
+                     only fixed-length data types are supported on this path",
+                ));
+            }
+            ArrayBytes::Optional(..) => {
+                return Err(PyRuntimeError::new_err(
+                    "coalesced multi-region partial_decode returned optional bytes; \
+                     only fixed-length data types are supported on this path",
+                ));
+            }
+        };
+
+        // Scatter scratch into per-item output regions using the natural
+        // contiguous layout the indexer produced. Each item writes to a
+        // disjoint region of `output` (different subsets, possibly via
+        // dropped axes), so the per-item ArrayBytesFixedDisjointView
+        // creations are safe to do sequentially without aliasing.
+        let mut offset = 0usize;
+        for item in items {
+            let elements = item.chunk_subset.num_elements_usize();
+            let bytes_in_item = elements * data_type_size;
+            let mut output_view = unsafe {
+                // SAFETY: chunks represent disjoint array subsets
+                ArrayBytesFixedDisjointView::new(
+                    output,
+                    data_type_size,
+                    bytemuck::must_cast_slice(&item.array_shape),
+                    item.subset.clone(),
+                )
+                .map_py_err::<PyRuntimeError>()?
+            };
+            output_view
+                .copy_from_slice(&scratch[offset..offset + bytes_in_item])
+                .map_py_err::<PyRuntimeError>()?;
+            offset += bytes_in_item;
+        }
+        debug_assert_eq!(offset, scratch.len());
+        Ok(())
+    }
+
     fn nparray_to_unsafe_cell_slice<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
     ) -> Result<UnsafeCellSlice<'a, u8>, PyErr> {
@@ -326,63 +498,54 @@ impl CodecPipelineImpl {
             partial_decoder_cache.extend(key_decoder_pairs);
         }
 
+        // Group ChunkItems by key so that multiple disjoint regions inside
+        // the same shard (typically produced by the python-side
+        // discontiguous integer-array splitter, see
+        // python/zarrs/utils.py::selector_tuple_to_slice_run_tuples) can
+        // share a single multi-region partial_decode call. The upstream
+        // sharding partial decoder caches inner-chunk partial decoders
+        // within that call (moka::sync::Cache in
+        // zarrs::array::codec::array_to_bytes::sharding::sharding_partial_decoder_sync),
+        // so a sub-chunk that is touched by multiple disjoint output
+        // regions is only fetched and decompressed once per coalesced
+        // group instead of once per ChunkItem.
+        let work_units: Vec<WorkUnit> = group_chunk_items_into_work_units(chunk_descriptions);
+
+        let data_type_size = self
+            .data_type
+            .fixed_size()
+            .ok_or("variable length data type not supported")
+            .map_py_err::<PyTypeError>()?;
+
         py.detach(move || {
             // FIXME: the `decode_into` methods only support fixed length data types.
             // For variable length data types, need a codepath with non `_into` methods.
             // Collect all the subsets and copy into value on the Python side?
-            let update_chunk_subset = |item: ChunkItem| {
-                let mut output_view = unsafe {
-                    // TODO: Is the following correct?
-                    //       can we guarantee that when this function is called from Python with arbitrary arguments?
-                    // SAFETY: chunks represent disjoint array subsets
-                    ArrayBytesFixedDisjointView::new(
+            let process_work_unit = |unit: WorkUnit| -> PyResult<()> {
+                match unit {
+                    WorkUnit::Single(item) => self.process_single_chunk_item(
+                        &item,
                         output,
-                        // TODO: why is data_type in `item`, it should be derived from `output`, no?
-                        self.data_type
-                            .fixed_size()
-                            .ok_or("variable length data type not supported")
-                            .map_py_err::<PyTypeError>()?,
-                        bytemuck::must_cast_slice(&item.array_shape),
-                        item.subset.clone(),
-                    )
-                    .map_py_err::<PyRuntimeError>()?
-                };
-                let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
-                // See zarrs::array::Array::retrieve_chunk_subset_into
-                if is_whole_chunk(&item) {
-                    // See zarrs::array::Array::retrieve_chunk_into
-                    if let Some(chunk_encoded) =
-                        self.store.get(&item.key).map_py_err::<PyRuntimeError>()?
-                    {
-                        // Decode the encoded data into the output buffer
-                        let chunk_encoded: Vec<u8> = chunk_encoded.into();
-                        self.codec_chain.decode_into(
-                            Cow::Owned(chunk_encoded),
-                            &item.shape,
-                            &self.data_type,
-                            &self.fill_value,
-                            target,
-                            &codec_options,
-                        )
-                    } else {
-                        // The chunk is missing, write the fill value
-                        copy_fill_value_into(&self.data_type, &self.fill_value, target)
-                    }
-                } else {
-                    let key = &item.key;
-                    let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
-                        PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
-                    })?;
-                    partial_decoder.partial_decode_into(&item.chunk_subset, target, &codec_options)
+                        data_type_size,
+                        &partial_decoder_cache,
+                        &codec_options,
+                    ),
+                    WorkUnit::Coalesced { key, items } => self.process_coalesced_group(
+                        &key,
+                        &items,
+                        output,
+                        data_type_size,
+                        &partial_decoder_cache,
+                        &codec_options,
+                    ),
                 }
-                .map_codec_err()
             };
 
             iter_concurrent_limit!(
                 chunk_concurrent_limit,
-                chunk_descriptions,
+                work_units,
                 try_for_each,
-                update_chunk_subset
+                process_work_unit
             )?;
 
             Ok(())

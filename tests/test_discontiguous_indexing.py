@@ -187,3 +187,33 @@ def test_unsorted_integer_2d_stays_in_rust(store):
     rows = np.array([7, 3, 99, 50, 1], dtype=np.int64)
     result = arr.get_orthogonal_selection((rows, slice(None)))
     np.testing.assert_array_equal(result, data[rows])
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_coalescing_correctness(store):
+    """Many discontiguous-integer fragments per shard must produce
+    correct output.
+
+    This exercises the Branch 2 Rust-side coalescing path: with
+    shape=(2000,), chunks=(50,), shards=(500,) and 200 random indices,
+    each shard typically receives many ChunkItems whose chunk_subsets
+    overlap several inner chunks within the shard, so the per-key
+    coalesced partial_decode call (and the upstream sub-chunk decoder
+    cache) is the path under test.
+    """
+    sp = StorePath(store, path="coalesce")
+    arr = zarr.create_array(
+        sp,
+        shape=(2000,),
+        chunks=(50,),
+        shards=(500,),
+        dtype=np.float32,
+        fill_value=0.0,
+    )
+    data = np.arange(2000, dtype=np.float32)
+    arr[:] = data
+
+    rng = np.random.default_rng(0)
+    idx = np.sort(rng.choice(2000, size=200, replace=False))
+    result = arr.get_orthogonal_selection((idx,))
+    np.testing.assert_array_equal(result, data[idx])
