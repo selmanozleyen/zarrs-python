@@ -347,8 +347,24 @@ impl CodecPipelineImpl {
             let update_chunk_subset = |item: ChunkItem| -> PyResult<()> {
                 // 1-D scattered fast path (vindex / `arr[idx]`): group
                 // consecutive ascending indices into runs (annbatch's
-                // CSR shape gives one run per row), call partial_decode
-                // once with K << N regions, and scatter run-by-run.
+                // CSR shape gives one run per row).
+                //
+                // Default path: fan the runs out via rayon and call
+                // `partial_decode_into(single_run, output_view_for_run)`
+                // per run. Each call hits the sharding decoder's
+                // fast `partial_decode_fixed_array_subset_into`
+                // (parallel over inner subchunks, no scratch) and the
+                // runs themselves run in parallel. Scales well up to
+                // large per-row sizes -- this is what beats `slice`
+                // mode in zarrs-python.
+                //
+                // Opt-in path (ZARRS_VINDEX_DEDUP=1): one
+                // `partial_decode(Vec<ArraySubset>)` call so the
+                // sharding decoder's per-call moka cache dedups
+                // inner-subchunk decodes across runs. Wins when many
+                // tiny runs land in the same inner subchunk (small L,
+                // medium K) but stalls on `partial_decode_fixed_indexer`'s
+                // per-element iter for large total sizes.
                 if let Some(chunk_indices) = item.chunk_indices.as_ref() {
                     if chunk_indices.is_empty() {
                         return Ok(());
@@ -365,37 +381,80 @@ impl CodecPipelineImpl {
                         item.out_indices.as_deref(),
                         item.subset.start()[0],
                     );
-                    let combined: Vec<ArraySubset> = runs
-                        .iter()
-                        .map(|(c, _)| ArraySubset::new_with_ranges(&[c.clone()]))
-                        .collect();
-                    let decoded = partial_decoder
-                        .partial_decode(&combined, &codec_options)
-                        .map_codec_err()?;
-                    let scratch_cow = decoded.into_fixed().map_py_err::<PyTypeError>()?;
-                    let scratch: &[u8] = scratch_cow.as_ref();
                     let array_shape: &[u64] = bytemuck::must_cast_slice(&item.array_shape);
-                    let mut offset: usize = 0;
-                    for (chunk_run, out_run) in &runs {
-                        let len = (chunk_run.end - chunk_run.start) as usize;
-                        let bytes_in_run = len * data_type_size;
-                        let mut view = unsafe {
-                            // SAFETY: out_run is a contiguous range
-                            // within the output buffer; runs are
-                            // disjoint by construction.
-                            ArrayBytesFixedDisjointView::new(
-                                output,
-                                data_type_size,
-                                array_shape,
-                                ArraySubset::new_with_ranges(&[out_run.clone()]),
-                            )
-                            .map_py_err::<PyRuntimeError>()?
-                        };
-                        view.copy_from_slice(&scratch[offset..offset + bytes_in_run])
-                            .map_py_err::<PyRuntimeError>()?;
-                        offset += bytes_in_run;
+                    if use_subchunk_dedup() {
+                        let combined: Vec<ArraySubset> = runs
+                            .iter()
+                            .map(|(c, _)| ArraySubset::new_with_ranges(&[c.clone()]))
+                            .collect();
+                        let decoded = partial_decoder
+                            .partial_decode(&combined, &codec_options)
+                            .map_codec_err()?;
+                        let scratch_cow =
+                            decoded.into_fixed().map_py_err::<PyTypeError>()?;
+                        let scratch: &[u8] = scratch_cow.as_ref();
+                        let mut offset: usize = 0;
+                        for (chunk_run, out_run) in &runs {
+                            let len = (chunk_run.end - chunk_run.start) as usize;
+                            let bytes_in_run = len * data_type_size;
+                            let mut view = unsafe {
+                                // SAFETY: out_run is a contiguous range
+                                // within the output buffer; runs are
+                                // disjoint by construction.
+                                ArrayBytesFixedDisjointView::new(
+                                    output,
+                                    data_type_size,
+                                    array_shape,
+                                    ArraySubset::new_with_ranges(&[out_run.clone()]),
+                                )
+                                .map_py_err::<PyRuntimeError>()?
+                            };
+                            view.copy_from_slice(&scratch[offset..offset + bytes_in_run])
+                                .map_py_err::<PyRuntimeError>()?;
+                            offset += bytes_in_run;
+                        }
+                        debug_assert_eq!(offset, scratch.len());
+                    } else {
+                        // Default path: parallel partial_decode_into per
+                        // run via rayon's full thread pool. The outer
+                        // `chunk_concurrent_limit` is sized to
+                        // `num_chunks` (often 1 for vindex), so we
+                        // intentionally bypass it -- this inner loop is
+                        // exactly where the work lives. out_runs are
+                        // disjoint by construction (see
+                        // group_paired_runs), so each rayon worker
+                        // writes into a non-overlapping slice of
+                        // `output`.
+                        runs.into_par_iter().try_for_each(
+                            |(chunk_run, out_run): (
+                                std::ops::Range<u64>,
+                                std::ops::Range<u64>,
+                            )|
+                             -> PyResult<()> {
+                                let mut view = unsafe {
+                                    // SAFETY: out_run is a disjoint
+                                    // contiguous range within `output`.
+                                    ArrayBytesFixedDisjointView::new(
+                                        output,
+                                        data_type_size,
+                                        array_shape,
+                                        ArraySubset::new_with_ranges(&[out_run]),
+                                    )
+                                    .map_py_err::<PyRuntimeError>()?
+                                };
+                                let target =
+                                    ArrayBytesDecodeIntoTarget::Fixed(&mut view);
+                                partial_decoder
+                                    .partial_decode_into(
+                                        &ArraySubset::new_with_ranges(&[chunk_run]),
+                                        target,
+                                        &codec_options,
+                                    )
+                                    .map_codec_err()?;
+                                Ok(())
+                            },
+                        )?;
                     }
-                    debug_assert_eq!(offset, scratch.len());
                     return Ok(());
                 }
                 let mut output_view = unsafe {
@@ -525,6 +584,25 @@ impl CodecPipelineImpl {
             Ok(())
         })
     }
+}
+
+/// Should the scattered vindex fast path call
+/// `partial_decode(Vec<ArraySubset>)` so the sharding codec's per-call
+/// moka cache can dedup inner-subchunk decodes across runs?
+///
+/// Default is `false` -- we instead fan the runs out via rayon and
+/// call `partial_decode_into` per run, which hits the sharding decoder's
+/// vectorised `partial_decode_fixed_array_subset_into` path and
+/// parallelises across runs. The dedup path can be opted into for
+/// workloads with many tiny runs that cluster in the same inner
+/// subchunk by setting `ZARRS_VINDEX_DEDUP=1`.
+fn use_subchunk_dedup() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("ZARRS_VINDEX_DEDUP")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+    })
 }
 
 /// Group `chunk_indices` (and the matching output positions) into

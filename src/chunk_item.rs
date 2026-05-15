@@ -90,17 +90,18 @@ impl ChunkItem {
     }
 }
 
+/// Copy an i64 numpy array into a Vec<u64> in one bulk memcpy.
+///
+/// The `PyReadonlyArray1` is a GIL-bound borrow; its lifetime ends with
+/// the constructor, but the resulting ChunkItem is consumed inside
+/// `py.detach(...)` where the GIL is released, so the data must be
+/// owned by Rust. i64/u64 have identical size and alignment and zarr
+/// only ever emits non-negative chunk and output positions here, so a
+/// reinterpret + memcpy is bit-exact and avoids the per-element
+/// `try_from` check entirely.
 fn ndarray_to_u64_vec(arr: PyReadonlyArray1<i64>) -> PyResult<Vec<u64>> {
     let s = arr.as_slice().map_py_err::<PyValueError>()?;
-    s.iter()
-        .map(|&i| {
-            u64::try_from(i).map_err(|_| {
-                PyErr::new::<PyValueError, _>(format!(
-                    "negative index in scattered selector: {i}"
-                ))
-            })
-        })
-        .collect()
+    Ok(bytemuck::cast_slice::<i64, u64>(s).to_vec())
 }
 
 fn slice_to_range(slice: &Bound<'_, PySlice>, length: isize) -> PyResult<std::ops::Range<u64>> {
