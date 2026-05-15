@@ -38,6 +38,12 @@ impl<T> PyCodecErrExt<T> for Result<T, CodecError> {
 }
 
 pub fn is_whole_chunk(item: &ChunkItem) -> bool {
-    item.chunk_subset.start().iter().all(|&o| o == 0)
-        && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
+    let Some(chunk_subset) = item.chunk_subset_as_array_subset() else {
+        // Indices selectors are never whole-chunk reads in practice -- the
+        // python side only emits ndarray dim selectors when at least some
+        // entries within the chunk are skipped.
+        return false;
+    };
+    chunk_subset.start().iter().all(|&o| o == 0)
+        && chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
 }

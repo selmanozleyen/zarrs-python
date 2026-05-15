@@ -42,12 +42,14 @@ use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
 /// A unit of read work for `retrieve_chunks_and_apply_index`.
 ///
-/// `Single` is one `ChunkItem` that is either a whole-chunk read or a
-/// solo partial-region read; it follows the original per-item code path.
-/// `Coalesced` is a set of partial-region `ChunkItem`s that share the
-/// same shard key and are read with one multi-region `partial_decode`
-/// call so the upstream sharding decoder can cache inner sub-chunk
-/// partial decoders across regions.
+/// `Single` is one slice-only `ChunkItem` that is either a whole-chunk
+/// read or a solo partial-region read; it follows the original per-item
+/// code path with `partial_decode_into` writing directly into the
+/// output view. `Coalesced` is a set of `ChunkItem`s that share the
+/// same shard key (or a single ChunkItem with native ndarray dim
+/// selectors) and are read with one multi-region `partial_decode` call,
+/// so the upstream sharding decoder can cache inner sub-chunk partial
+/// decoders across regions.
 enum WorkUnit {
     Single(ChunkItem),
     Coalesced { key: StoreKey, items: Vec<ChunkItem> },
@@ -57,9 +59,14 @@ enum WorkUnit {
 ///
 /// Whole-chunk items always become `WorkUnit::Single`: they read the
 /// entire shard in one go and there is nothing for coalescing to share.
-/// Partial-region items are bucketed by store key in arrival order and
-/// emerge as `WorkUnit::Coalesced` if more than one item targets the
-/// same key, otherwise as `WorkUnit::Single`.
+/// Partial-region items are bucketed by store key in arrival order. A
+/// bucket emerges as `WorkUnit::Single` only when it has exactly one
+/// item AND that item is slice-only (no ndarray dim selectors), so the
+/// `partial_decode_into` direct-write fast path applies. Otherwise the
+/// bucket emerges as `WorkUnit::Coalesced`, which routes through the
+/// multi-region `partial_decode` + scatter path that natively handles
+/// both ndarray dim selectors (via `expand_to_subset_pairs`) and
+/// multiple slice-only items sharing a shard key.
 fn group_chunk_items_into_work_units(
     chunk_descriptions: Vec<ChunkItem>,
 ) -> Vec<WorkUnit> {
@@ -83,7 +90,7 @@ fn group_chunk_items_into_work_units(
         let mut items = groups
             .remove(&key)
             .expect("group must exist for each key in group_order");
-        if items.len() == 1 {
+        if items.len() == 1 && items[0].is_slice_only() {
             work_units.push(WorkUnit::Single(
                 items.pop().expect("len == 1 implies pop succeeds"),
             ));
@@ -175,7 +182,16 @@ impl CodecPipelineImpl {
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
         let array_shape = &item.shape;
-        let chunk_subset = &item.chunk_subset;
+        // The write path only accepts slice-only ChunkItems. The python
+        // side enforces this via allow_fragmenting=False, so any ndarray
+        // dim selector in chunk_subset would be a bug here.
+        let chunk_subset = item.chunk_subset_as_array_subset().ok_or_else(|| {
+            PyErr::new::<PyValueError, _>(
+                "store_chunks_with_indices does not support ndarray dim selectors; \
+                 write path must pass slice-only chunk_subsets"
+                    .to_string(),
+            )
+        })?;
         if !chunk_subset.inbounds_shape(bytemuck::must_cast_slice(array_shape)) {
             return Err(PyErr::new::<PyValueError, _>(format!(
                 "chunk subset ({chunk_subset}) is out of bounds for array shape ({array_shape:?})"
@@ -199,7 +215,7 @@ impl CodecPipelineImpl {
             let chunk_bytes_new = update_array_bytes(
                 chunk_bytes_old,
                 bytemuck::must_cast_slice(array_shape),
-                chunk_subset,
+                &chunk_subset,
                 &chunk_subset_bytes,
                 data_type_size,
             )
@@ -249,13 +265,30 @@ impl CodecPipelineImpl {
         partial_decoder_cache: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
+        // group_chunk_items_into_work_units only emits Single for items
+        // that are whole-chunk OR slice-only-and-alone-for-their-key, so
+        // the subset/chunk_subset are guaranteed convertible to a single
+        // ArraySubset here.
+        let chunk_subset = item.chunk_subset_as_array_subset().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "process_single_chunk_item received a ChunkItem with ndarray \
+                 dim selectors (this is a bug; such items must be routed through \
+                 process_coalesced_group)",
+            )
+        })?;
+        let subset = item.subset_as_array_subset().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "process_single_chunk_item received a ChunkItem with ndarray \
+                 output dim selectors",
+            )
+        })?;
         let mut output_view = unsafe {
             // SAFETY: chunks represent disjoint array subsets
             ArrayBytesFixedDisjointView::new(
                 output,
                 data_type_size,
                 bytemuck::must_cast_slice(&item.array_shape),
-                item.subset.clone(),
+                subset,
             )
             .map_py_err::<PyRuntimeError>()?
         };
@@ -282,7 +315,7 @@ impl CodecPipelineImpl {
             let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
                 PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
             })?;
-            partial_decoder.partial_decode_into(&item.chunk_subset, target, codec_options)
+            partial_decoder.partial_decode_into(&chunk_subset, target, codec_options)
         }
         .map_codec_err()
     }
@@ -300,16 +333,36 @@ impl CodecPipelineImpl {
             PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
         })?;
 
-        // Build a multi-region indexer covering every disjoint chunk_subset
-        // in this group. For a Vec<ArraySubset> indexer, the upstream
-        // partial_decode (sharding_partial_decoder_sync.rs::partial_decode)
-        // routes through partial_decode_fixed_indexer, which caches inner
-        // sub-chunk partial decoders so that a sub-chunk touched by multiple
-        // regions is decoded once. The returned ArrayBytes is laid out as
-        // concat(subset_0 elements in C-order, subset_1, ...), matching the
-        // order in which the items appear here.
+        // Expand each item into (chunk_subset, output_subset) ArraySubset
+        // pairs by cartesian product across its per-dim selectors. A
+        // slice-only item produces exactly one pair; an item with
+        // Indices dim selectors produces one pair per cartesian-product
+        // cell. For a (rows: ndarray[N], cols: slice) selection that's
+        // N pairs per item, all sharing the same shard key.
+        let flat_pairs: Vec<(usize, ArraySubset, ArraySubset)> = items
+            .iter()
+            .enumerate()
+            .flat_map(|(item_idx, item)| {
+                item.expand_to_subset_pairs()
+                    .into_iter()
+                    .map(move |(cs, os)| (item_idx, cs, os))
+            })
+            .collect();
+        if flat_pairs.is_empty() {
+            return Ok(());
+        }
+
+        // Build a multi-region indexer covering every disjoint
+        // chunk_subset cell in this group. For a Vec<ArraySubset>
+        // indexer, the upstream partial_decode
+        // (sharding_partial_decoder_sync.rs::partial_decode) routes
+        // through partial_decode_fixed_indexer, which caches inner
+        // sub-chunk partial decoders so that a sub-chunk touched by
+        // multiple regions is decoded once. The returned ArrayBytes is
+        // laid out as concat(cell_0 elements in C-order, cell_1, ...),
+        // matching the order produced by expand_to_subset_pairs.
         let combined_indexer: Vec<ArraySubset> =
-            items.iter().map(|item| item.chunk_subset.clone()).collect();
+            flat_pairs.iter().map(|(_, c, _)| c.clone()).collect();
 
         let decoded = partial_decoder
             .partial_decode(&combined_indexer, codec_options)
@@ -330,22 +383,22 @@ impl CodecPipelineImpl {
             }
         };
 
-        // Scatter scratch into per-item output regions using the natural
-        // contiguous layout the indexer produced. Each item writes to a
-        // disjoint region of `output` (different subsets, possibly via
-        // dropped axes), so the per-item ArrayBytesFixedDisjointView
+        // Scatter scratch into per-cell output regions. Each cell writes
+        // to a disjoint region of `output` (different subsets, possibly
+        // via dropped axes), so the per-cell ArrayBytesFixedDisjointView
         // creations are safe to do sequentially without aliasing.
         let mut offset = 0usize;
-        for item in items {
-            let elements = item.chunk_subset.num_elements_usize();
+        for (item_idx, _chunk_subset, output_subset) in &flat_pairs {
+            let item = &items[*item_idx];
+            let elements = output_subset.num_elements_usize();
             let bytes_in_item = elements * data_type_size;
             let mut output_view = unsafe {
-                // SAFETY: chunks represent disjoint array subsets
+                // SAFETY: cells represent disjoint array subsets
                 ArrayBytesFixedDisjointView::new(
                     output,
                     data_type_size,
                     bytemuck::must_cast_slice(&item.array_shape),
-                    item.subset.clone(),
+                    output_subset.clone(),
                 )
                 .map_py_err::<PyRuntimeError>()?
             };
@@ -584,9 +637,20 @@ impl CodecPipelineImpl {
         py.detach(move || {
             let store_chunk = |item: ChunkItem| match &input {
                 InputValue::Array(input) => {
+                    // The python side passes allow_fragmenting=False on the
+                    // write path so chunk_subset / subset are slice-only;
+                    // ndarray dim selectors raise DiscontiguousArrayError
+                    // up there and fall back to the python pipeline.
+                    let subset = item.subset_as_array_subset().ok_or_else(|| {
+                        PyErr::new::<PyValueError, _>(
+                            "store_chunks_with_indices does not support ndarray \
+                             output dim selectors"
+                                .to_string(),
+                        )
+                    })?;
                     let chunk_subset_bytes = input
                         .extract_array_subset(
-                            &item.subset,
+                            &subset,
                             bytemuck::must_cast_slice(&item.array_shape),
                             &self.data_type,
                         )
@@ -601,7 +665,7 @@ impl CodecPipelineImpl {
                 InputValue::Constant(constant_value) => {
                     let chunk_subset_bytes = ArrayBytes::new_fill_value(
                         &self.data_type,
-                        item.chunk_subset.num_elements(),
+                        item.chunk_subset_num_elements(),
                         constant_value,
                     )
                     .map_py_err::<PyRuntimeError>()?;
