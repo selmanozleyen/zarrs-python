@@ -38,6 +38,7 @@ impl<T> PyCodecErrExt<T> for Result<T, CodecError> {
 }
 
 pub fn is_whole_chunk(item: &ChunkItem) -> bool {
-    item.chunk_subset.start().iter().all(|&o| o == 0)
+    item.chunk_indices.is_none()
+        && item.chunk_subset.start().iter().all(|&o| o == 0)
         && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
 }

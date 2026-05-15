@@ -20,8 +20,8 @@ use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
-    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecOptions, DataType,
-    FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
+    ArrayPartialDecoderTraits, ArraySubset, ArrayToBytesCodecTraits, CodecChain, CodecOptions,
+    DataType, FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
@@ -119,6 +119,14 @@ impl CodecPipelineImpl {
         chunk_subset_bytes: ArrayBytes,
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
+        if item.chunk_indices.is_some() {
+            // The python side passes allow_fragmenting=False on the
+            // write path so this should not be reachable; reject
+            // explicitly to keep the contract enforced in Rust too.
+            return Err(PyErr::new::<PyValueError, _>(
+                "writing scattered ChunkItems is not supported".to_string(),
+            ));
+        }
         let array_shape = &item.shape;
         let chunk_subset = &item.chunk_subset;
         if !chunk_subset.inbounds_shape(bytemuck::must_cast_slice(array_shape)) {
@@ -326,22 +334,85 @@ impl CodecPipelineImpl {
             partial_decoder_cache.extend(key_decoder_pairs);
         }
 
+        let data_type_size = self
+            .data_type
+            .fixed_size()
+            .ok_or("variable length data type not supported")
+            .map_py_err::<PyTypeError>()?;
+
         py.detach(move || {
             // FIXME: the `decode_into` methods only support fixed length data types.
             // For variable length data types, need a codepath with non `_into` methods.
             // Collect all the subsets and copy into value on the Python side?
-            let update_chunk_subset = |item: ChunkItem| {
+            let update_chunk_subset = |item: ChunkItem| -> PyResult<()> {
+                // 1-D scattered fast path (vindex / `arr[idx]`): decode N
+                // length-1 positions in one partial_decode call (the
+                // sharding decoder dedups inner-chunk fetches across
+                // them) and scatter the bytes into the output buffer.
+                if let Some(chunk_indices) = item.chunk_indices.as_ref() {
+                    if chunk_indices.is_empty() {
+                        return Ok(());
+                    }
+                    let partial_decoder =
+                        partial_decoder_cache.get(&item.key).ok_or_else(|| {
+                            PyRuntimeError::new_err(format!(
+                                "Partial decoder not found for key: {}",
+                                item.key,
+                            ))
+                        })?;
+                    let combined: Vec<ArraySubset> = chunk_indices
+                        .iter()
+                        .map(|&i| ArraySubset::new_with_ranges(&[i..i + 1]))
+                        .collect();
+                    let decoded = partial_decoder
+                        .partial_decode(&combined, &codec_options)
+                        .map_codec_err()?;
+                    let scratch_cow = decoded.into_fixed().map_py_err::<PyTypeError>()?;
+                    let scratch: &[u8] = scratch_cow.as_ref();
+                    let array_shape: &[u64] = bytemuck::must_cast_slice(&item.array_shape);
+                    if let Some(out_indices) = item.out_indices.as_ref() {
+                        for (k, &pos) in out_indices.iter().enumerate() {
+                            let mut view = unsafe {
+                                // SAFETY: out_indices come from a single
+                                // 1-D output buffer and the python side
+                                // guarantees they are in-range and
+                                // disjoint across ChunkItems.
+                                ArrayBytesFixedDisjointView::new(
+                                    output,
+                                    data_type_size,
+                                    array_shape,
+                                    ArraySubset::new_with_ranges(&[pos..pos + 1]),
+                                )
+                                .map_py_err::<PyRuntimeError>()?
+                            };
+                            let src = &scratch
+                                [k * data_type_size..(k + 1) * data_type_size];
+                            view.copy_from_slice(src).map_py_err::<PyRuntimeError>()?;
+                        }
+                    } else {
+                        let mut view = unsafe {
+                            // SAFETY: contiguous output range; ChunkItems
+                            // for a given read use disjoint subsets.
+                            ArrayBytesFixedDisjointView::new(
+                                output,
+                                data_type_size,
+                                array_shape,
+                                item.subset.clone(),
+                            )
+                            .map_py_err::<PyRuntimeError>()?
+                        };
+                        view.copy_from_slice(scratch)
+                            .map_py_err::<PyRuntimeError>()?;
+                    }
+                    return Ok(());
+                }
                 let mut output_view = unsafe {
                     // TODO: Is the following correct?
                     //       can we guarantee that when this function is called from Python with arbitrary arguments?
                     // SAFETY: chunks represent disjoint array subsets
                     ArrayBytesFixedDisjointView::new(
                         output,
-                        // TODO: why is data_type in `item`, it should be derived from `output`, no?
-                        self.data_type
-                            .fixed_size()
-                            .ok_or("variable length data type not supported")
-                            .map_py_err::<PyTypeError>()?,
+                        data_type_size,
                         bytemuck::must_cast_slice(&item.array_shape),
                         item.subset.clone(),
                     )

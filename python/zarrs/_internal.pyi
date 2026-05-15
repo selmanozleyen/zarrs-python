@@ -16,6 +16,9 @@ class ChunkItem:
         chunk_shape: typing.Sequence[builtins.int],
         subset: typing.Sequence[slice],
         shape: typing.Sequence[builtins.int],
+        *,
+        chunk_indices: typing.Sequence[builtins.int] | None = None,
+        out_indices: typing.Sequence[builtins.int] | None = None,
     ) -> ChunkItem: ...
 
 @typing.final

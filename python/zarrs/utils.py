@@ -159,6 +159,8 @@ def make_chunk_info_for_rust_with_indices(
     ],
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
+    *,
+    allow_fragmenting: bool = True,
 ) -> RustChunkInfo:
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
@@ -171,6 +173,53 @@ def make_chunk_info_for_rust_with_indices(
         _,
     ) in batch_info:
         write_empty_chunks = chunk_spec.config.write_empty_chunks
+
+        # 1-D scattered fast path: zarr's CoordinateIndexer (vindex /
+        # plain `arr[idx]`) emits chunk_selection as a 1-tuple of ndarray
+        # and out_selection as a bare slice or 1-D ndarray. Route this
+        # straight to a scattered ChunkItem instead of letting the slice
+        # coercion below raise DiscontiguousArrayError -> python fallback.
+        # Disabled on the write path to avoid read-modify-write races in
+        # store_chunks_with_indices.
+        if (
+            allow_fragmenting
+            and not is_constant
+            and len(chunk_spec.shape) == 1
+            and len(shape) == 1
+            and isinstance(chunk_selection, tuple)
+            and len(chunk_selection) == 1
+            and isinstance(chunk_selection[0], np.ndarray)
+            and chunk_selection[0].ndim == 1
+            and chunk_selection[0].size > 0
+            and isinstance(out_selection, (slice, np.ndarray))
+            and (not isinstance(out_selection, np.ndarray) or out_selection.ndim == 1)
+        ):
+            chunk_arr = chunk_selection[0].ravel().astype(np.int64, copy=False)
+            n = chunk_arr.size
+            if isinstance(out_selection, slice):
+                out_indices = None
+                subset_slice = out_selection
+            else:
+                out_arr = out_selection.ravel().astype(np.int64, copy=False)
+                if out_arr.size == n:
+                    out_indices = [int(v) for v in out_arr.tolist()]
+                    subset_slice = slice(0, n)
+                else:
+                    out_indices = subset_slice = None
+            if subset_slice is not None:
+                chunk_info_with_indices.append(
+                    ChunkItem(
+                        key=byte_getter.path,
+                        chunk_subset=[slice(0, n)],
+                        chunk_shape=chunk_spec.shape,
+                        subset=[subset_slice],
+                        shape=shape,
+                        chunk_indices=[int(v) for v in chunk_arr.tolist()],
+                        out_indices=out_indices,
+                    )
+                )
+                continue
+
         # Convert the selector tuples to ones that only have slices i.e., `i: int` replaced by slice(i, i+1)
         out_selection_as_slices = selector_tuple_to_slice_selection(out_selection)
         chunk_selection_as_slices = selector_tuple_to_slice_selection(chunk_selection)
