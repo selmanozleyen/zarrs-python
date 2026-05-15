@@ -345,10 +345,10 @@ impl CodecPipelineImpl {
             // For variable length data types, need a codepath with non `_into` methods.
             // Collect all the subsets and copy into value on the Python side?
             let update_chunk_subset = |item: ChunkItem| -> PyResult<()> {
-                // 1-D scattered fast path (vindex / `arr[idx]`): decode N
-                // length-1 positions in one partial_decode call (the
-                // sharding decoder dedups inner-chunk fetches across
-                // them) and scatter the bytes into the output buffer.
+                // 1-D scattered fast path (vindex / `arr[idx]`): group
+                // consecutive ascending indices into runs (annbatch's
+                // CSR shape gives one run per row), call partial_decode
+                // once with K << N regions, and scatter run-by-run.
                 if let Some(chunk_indices) = item.chunk_indices.as_ref() {
                     if chunk_indices.is_empty() {
                         return Ok(());
@@ -360,9 +360,14 @@ impl CodecPipelineImpl {
                                 item.key,
                             ))
                         })?;
-                    let combined: Vec<ArraySubset> = chunk_indices
+                    let runs = group_paired_runs(
+                        chunk_indices,
+                        item.out_indices.as_deref(),
+                        item.subset.start()[0],
+                    );
+                    let combined: Vec<ArraySubset> = runs
                         .iter()
-                        .map(|&i| ArraySubset::new_with_ranges(&[i..i + 1]))
+                        .map(|(c, _)| ArraySubset::new_with_ranges(&[c.clone()]))
                         .collect();
                     let decoded = partial_decoder
                         .partial_decode(&combined, &codec_options)
@@ -370,40 +375,27 @@ impl CodecPipelineImpl {
                     let scratch_cow = decoded.into_fixed().map_py_err::<PyTypeError>()?;
                     let scratch: &[u8] = scratch_cow.as_ref();
                     let array_shape: &[u64] = bytemuck::must_cast_slice(&item.array_shape);
-                    if let Some(out_indices) = item.out_indices.as_ref() {
-                        for (k, &pos) in out_indices.iter().enumerate() {
-                            let mut view = unsafe {
-                                // SAFETY: out_indices come from a single
-                                // 1-D output buffer and the python side
-                                // guarantees they are in-range and
-                                // disjoint across ChunkItems.
-                                ArrayBytesFixedDisjointView::new(
-                                    output,
-                                    data_type_size,
-                                    array_shape,
-                                    ArraySubset::new_with_ranges(&[pos..pos + 1]),
-                                )
-                                .map_py_err::<PyRuntimeError>()?
-                            };
-                            let src = &scratch
-                                [k * data_type_size..(k + 1) * data_type_size];
-                            view.copy_from_slice(src).map_py_err::<PyRuntimeError>()?;
-                        }
-                    } else {
+                    let mut offset: usize = 0;
+                    for (chunk_run, out_run) in &runs {
+                        let len = (chunk_run.end - chunk_run.start) as usize;
+                        let bytes_in_run = len * data_type_size;
                         let mut view = unsafe {
-                            // SAFETY: contiguous output range; ChunkItems
-                            // for a given read use disjoint subsets.
+                            // SAFETY: out_run is a contiguous range
+                            // within the output buffer; runs are
+                            // disjoint by construction.
                             ArrayBytesFixedDisjointView::new(
                                 output,
                                 data_type_size,
                                 array_shape,
-                                item.subset.clone(),
+                                ArraySubset::new_with_ranges(&[out_run.clone()]),
                             )
                             .map_py_err::<PyRuntimeError>()?
                         };
-                        view.copy_from_slice(scratch)
+                        view.copy_from_slice(&scratch[offset..offset + bytes_in_run])
                             .map_py_err::<PyRuntimeError>()?;
+                        offset += bytes_in_run;
                     }
+                    debug_assert_eq!(offset, scratch.len());
                     return Ok(());
                 }
                 let mut output_view = unsafe {
@@ -533,6 +525,54 @@ impl CodecPipelineImpl {
             Ok(())
         })
     }
+}
+
+/// Group `chunk_indices` (and the matching output positions) into
+/// paired contiguous runs. A run continues as long as the next chunk
+/// position is `prev + 1` and the next output position is `prev + 1`;
+/// otherwise a new run starts.
+///
+/// `out_indices` is `Some` for the permuted-output case (zarr's
+/// `sel_sort` path); when `None` the output positions are
+/// `out_start, out_start + 1, ...` (the ChunkItem's `subset` start).
+///
+/// For annbatch's CSR-component shape, where the indices passed to a
+/// single `arr[idx]` are concatenated runs of length `L_i` (one per
+/// selected row), this collapses N length-1 subsets into K = number of
+/// runs subsets, where K is on the order of the row count rather than
+/// the total element count. That eliminates the per-index overhead
+/// inside `partial_decode` (decoder dispatch, bounds checks per region).
+fn group_paired_runs(
+    chunk_indices: &[u64],
+    out_indices: Option<&[u64]>,
+    out_start: u64,
+) -> Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> {
+    let n = chunk_indices.len();
+    let mut runs: Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> = Vec::new();
+    if n == 0 {
+        return runs;
+    }
+    let out_at = |k: usize| match out_indices {
+        Some(oi) => oi[k],
+        None => out_start + k as u64,
+    };
+    let mut run_start = 0usize;
+    for k in 1..n {
+        let chunk_breaks = chunk_indices[k] != chunk_indices[k - 1] + 1;
+        let out_breaks = out_at(k) != out_at(k - 1) + 1;
+        if chunk_breaks || out_breaks {
+            let cs = chunk_indices[run_start];
+            let os = out_at(run_start);
+            let len = (k - run_start) as u64;
+            runs.push((cs..cs + len, os..os + len));
+            run_start = k;
+        }
+    }
+    let cs = chunk_indices[run_start];
+    let os = out_at(run_start);
+    let len = (n - run_start) as u64;
+    runs.push((cs..cs + len, os..os + len));
+    runs
 }
 
 /// A Python module implemented in Rust.

@@ -1,5 +1,6 @@
 use std::num::NonZeroU64;
 
+use numpy::PyReadonlyArray1;
 use pyo3::{
     Bound, PyErr, PyResult,
     exceptions::{PyIndexError, PyValueError},
@@ -53,14 +54,18 @@ impl ChunkItem {
         chunk_shape: Vec<u64>,
         subset: Vec<Bound<'_, PySlice>>,
         shape: Vec<u64>,
-        chunk_indices: Option<Vec<u64>>,
-        out_indices: Option<Vec<u64>>,
+        chunk_indices: Option<PyReadonlyArray1<i64>>,
+        out_indices: Option<PyReadonlyArray1<i64>>,
     ) -> PyResult<Self> {
         let num_elements = chunk_shape.iter().product();
         let shape_nonzero_u64 = to_nonzero_u64_vec(shape)?;
         let chunk_shape_nonzero_u64 = to_nonzero_u64_vec(chunk_shape)?;
         let chunk_subset = selection_to_array_subset(&chunk_subset, &chunk_shape_nonzero_u64)?;
         let subset = selection_to_array_subset(&subset, &shape_nonzero_u64)?;
+        // Numpy ndarrays are taken directly here (no python list -> PyInt
+        // -> u64 round-trip on the hot path).
+        let chunk_indices = chunk_indices.map(ndarray_to_u64_vec).transpose()?;
+        let out_indices = out_indices.map(ndarray_to_u64_vec).transpose()?;
         // Check that subset and chunk_subset have the same number of elements.
         // This permits broadcasting of a constant input.
         if chunk_indices.is_none()
@@ -83,6 +88,19 @@ impl ChunkItem {
             out_indices,
         })
     }
+}
+
+fn ndarray_to_u64_vec(arr: PyReadonlyArray1<i64>) -> PyResult<Vec<u64>> {
+    let s = arr.as_slice().map_py_err::<PyValueError>()?;
+    s.iter()
+        .map(|&i| {
+            u64::try_from(i).map_err(|_| {
+                PyErr::new::<PyValueError, _>(format!(
+                    "negative index in scattered selector: {i}"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn slice_to_range(slice: &Bound<'_, PySlice>, length: isize) -> PyResult<std::ops::Range<u64>> {

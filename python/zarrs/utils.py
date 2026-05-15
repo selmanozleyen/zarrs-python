@@ -194,18 +194,20 @@ def make_chunk_info_for_rust_with_indices(
             and isinstance(out_selection, (slice, np.ndarray))
             and (not isinstance(out_selection, np.ndarray) or out_selection.ndim == 1)
         ):
-            chunk_arr = chunk_selection[0].ravel().astype(np.int64, copy=False)
+            chunk_arr = np.ascontiguousarray(
+                chunk_selection[0].ravel().astype(np.int64, copy=False)
+            )
             n = chunk_arr.size
             if isinstance(out_selection, slice):
-                out_indices = None
+                out_arr = None
                 subset_slice = out_selection
             else:
-                out_arr = out_selection.ravel().astype(np.int64, copy=False)
-                if out_arr.size == n:
-                    out_indices = [int(v) for v in out_arr.tolist()]
+                out_arr_raw = out_selection.ravel().astype(np.int64, copy=False)
+                if out_arr_raw.size == n:
+                    out_arr = np.ascontiguousarray(out_arr_raw)
                     subset_slice = slice(0, n)
                 else:
-                    out_indices = subset_slice = None
+                    out_arr = subset_slice = None
             if subset_slice is not None:
                 chunk_info_with_indices.append(
                     ChunkItem(
@@ -214,8 +216,8 @@ def make_chunk_info_for_rust_with_indices(
                         chunk_shape=chunk_spec.shape,
                         subset=[subset_slice],
                         shape=shape,
-                        chunk_indices=[int(v) for v in chunk_arr.tolist()],
-                        out_indices=out_indices,
+                        chunk_indices=chunk_arr,
+                        out_indices=out_arr,
                     )
                 )
                 continue

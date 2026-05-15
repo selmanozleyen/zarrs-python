@@ -17,8 +17,8 @@ class ChunkItem:
         subset: typing.Sequence[slice],
         shape: typing.Sequence[builtins.int],
         *,
-        chunk_indices: typing.Sequence[builtins.int] | None = None,
-        out_indices: typing.Sequence[builtins.int] | None = None,
+        chunk_indices: numpy.typing.NDArray[numpy.int64] | None = None,
+        out_indices: numpy.typing.NDArray[numpy.int64] | None = None,
     ) -> ChunkItem: ...
 
 @typing.final
