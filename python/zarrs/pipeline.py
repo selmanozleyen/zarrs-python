@@ -214,8 +214,12 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
+            # allow_fragmenting=False: emitting a scattered ChunkItem
+            # would trigger a read-modify-write race in
+            # store_chunks_with_indices. Discontiguous integer-array
+            # writes keep falling back to the python pipeline.
             chunks_desc = make_chunk_info_for_rust_with_indices(
-                batch_info, drop_axes, value.shape
+                batch_info, drop_axes, value.shape, allow_fragmenting=False
             )
         except (
             UnsupportedMetadataError,

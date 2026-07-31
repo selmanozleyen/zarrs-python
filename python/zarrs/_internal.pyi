@@ -4,6 +4,7 @@
 import builtins
 import typing
 
+import numpy
 import numpy.typing
 import zarr.abc.store
 
@@ -16,6 +17,9 @@ class ChunkItem:
         chunk_shape: typing.Sequence[builtins.int],
         subset: typing.Sequence[slice],
         shape: typing.Sequence[builtins.int],
+        *,
+        chunk_indices: numpy.typing.NDArray[numpy.int64] | None = None,
+        out_indices: numpy.typing.NDArray[numpy.int64] | None = None,
     ) -> ChunkItem: ...
 
 @typing.final

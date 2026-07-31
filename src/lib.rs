@@ -20,8 +20,8 @@ use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
-    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecOptions, DataType,
-    FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
+    ArrayPartialDecoderTraits, ArraySubset, ArrayToBytesCodecTraits, CodecChain, CodecOptions,
+    DataType, FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
@@ -119,6 +119,14 @@ impl CodecPipelineImpl {
         chunk_subset_bytes: ArrayBytes,
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
+        if item.chunk_indices.is_some() {
+            // The python side passes allow_fragmenting=False on the
+            // write path so this should not be reachable; reject
+            // explicitly to keep the contract enforced in Rust too.
+            return Err(PyErr::new::<PyValueError, _>(
+                "writing scattered ChunkItems is not supported".to_string(),
+            ));
+        }
         let array_shape = &item.shape;
         let chunk_subset = &item.chunk_subset;
         if !chunk_subset.inbounds_shape(bytemuck::must_cast_slice(array_shape)) {
@@ -326,22 +334,86 @@ impl CodecPipelineImpl {
             partial_decoder_cache.extend(key_decoder_pairs);
         }
 
+        let data_type_size = self
+            .data_type
+            .fixed_size()
+            .ok_or("variable length data type not supported")
+            .map_py_err::<PyTypeError>()?;
+
         py.detach(move || {
             // FIXME: the `decode_into` methods only support fixed length data types.
             // For variable length data types, need a codepath with non `_into` methods.
             // Collect all the subsets and copy into value on the Python side?
-            let update_chunk_subset = |item: ChunkItem| {
+            let update_chunk_subset = |item: ChunkItem| -> PyResult<()> {
+                // 1-D scattered fast path (vindex / `arr[idx]`): group
+                // consecutive ascending indices into runs (annbatch's
+                // CSR shape gives one run per row), then fan the runs out
+                // via rayon and call
+                // `partial_decode_into(single_run, output_view_for_run)`
+                // per run. Each call hits the sharding decoder's fast
+                // `partial_decode_fixed_array_subset_into` (parallel over
+                // inner subchunks, no scratch) and the runs themselves run
+                // in parallel.
+                if let Some(chunk_indices) = item.chunk_indices.as_ref() {
+                    if chunk_indices.is_empty() {
+                        return Ok(());
+                    }
+                    let partial_decoder =
+                        partial_decoder_cache.get(&item.key).ok_or_else(|| {
+                            PyRuntimeError::new_err(format!(
+                                "Partial decoder not found for key: {}",
+                                item.key,
+                            ))
+                        })?;
+                    let runs = group_paired_runs(
+                        chunk_indices,
+                        item.out_indices.as_deref(),
+                        item.subset.start()[0],
+                    );
+                    let array_shape: &[u64] = bytemuck::must_cast_slice(&item.array_shape);
+                    // The outer `chunk_concurrent_limit` is sized to
+                    // `num_chunks` (often 1 for vindex), so we intentionally
+                    // bypass it -- this inner loop is exactly where the work
+                    // lives. out_runs are disjoint by construction (see
+                    // group_paired_runs), so each rayon worker writes into a
+                    // non-overlapping slice of `output`.
+                    runs.into_par_iter().try_for_each(
+                        |(chunk_run, out_run): (
+                            std::ops::Range<u64>,
+                            std::ops::Range<u64>,
+                        )|
+                         -> PyResult<()> {
+                            let mut view = unsafe {
+                                // SAFETY: out_run is a disjoint contiguous
+                                // range within `output`.
+                                ArrayBytesFixedDisjointView::new(
+                                    output,
+                                    data_type_size,
+                                    array_shape,
+                                    ArraySubset::new_with_ranges(&[out_run]),
+                                )
+                                .map_py_err::<PyRuntimeError>()?
+                            };
+                            let target = ArrayBytesDecodeIntoTarget::Fixed(&mut view);
+                            partial_decoder
+                                .partial_decode_into(
+                                    &ArraySubset::new_with_ranges(&[chunk_run]),
+                                    target,
+                                    &codec_options,
+                                )
+                                .map_codec_err()?;
+                            Ok(())
+                        },
+                    )?;
+                    return Ok(());
+                }
                 let mut output_view = unsafe {
                     // TODO: Is the following correct?
                     //       can we guarantee that when this function is called from Python with arbitrary arguments?
                     // SAFETY: chunks represent disjoint array subsets
                     ArrayBytesFixedDisjointView::new(
                         output,
-                        // TODO: why is data_type in `item`, it should be derived from `output`, no?
-                        self.data_type
-                            .fixed_size()
-                            .ok_or("variable length data type not supported")
-                            .map_py_err::<PyTypeError>()?,
+                        data_type_size,
                         bytemuck::must_cast_slice(&item.array_shape),
                         item.subset.clone(),
                     )
@@ -462,6 +534,54 @@ impl CodecPipelineImpl {
             Ok(())
         })
     }
+}
+
+/// Group `chunk_indices` (and the matching output positions) into
+/// paired contiguous runs. A run continues as long as the next chunk
+/// position is `prev + 1` and the next output position is `prev + 1`;
+/// otherwise a new run starts.
+///
+/// `out_indices` is `Some` for the permuted-output case (zarr's
+/// `sel_sort` path); when `None` the output positions are
+/// `out_start, out_start + 1, ...` (the `ChunkItem`'s `subset` start).
+///
+/// For annbatch's CSR-component shape, where the indices passed to a
+/// single `arr[idx]` are concatenated runs of length `L_i` (one per
+/// selected row), this collapses N length-1 subsets into K = number of
+/// runs subsets, where K is on the order of the row count rather than
+/// the total element count. That eliminates the per-index overhead
+/// inside `partial_decode` (decoder dispatch, bounds checks per region).
+fn group_paired_runs(
+    chunk_indices: &[u64],
+    out_indices: Option<&[u64]>,
+    out_start: u64,
+) -> Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> {
+    let n = chunk_indices.len();
+    let mut runs: Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> = Vec::new();
+    if n == 0 {
+        return runs;
+    }
+    let out_at = |k: usize| match out_indices {
+        Some(oi) => oi[k],
+        None => out_start + k as u64,
+    };
+    let mut run_start = 0usize;
+    for k in 1..n {
+        let chunk_breaks = chunk_indices[k] != chunk_indices[k - 1] + 1;
+        let out_breaks = out_at(k) != out_at(k - 1) + 1;
+        if chunk_breaks || out_breaks {
+            let cs = chunk_indices[run_start];
+            let os = out_at(run_start);
+            let len = (k - run_start) as u64;
+            runs.push((cs..cs + len, os..os + len));
+            run_start = k;
+        }
+    }
+    let cs = chunk_indices[run_start];
+    let os = out_at(run_start);
+    let len = (n - run_start) as u64;
+    runs.push((cs..cs + len, os..os + len));
+    runs
 }
 
 /// A Python module implemented in Rust.
