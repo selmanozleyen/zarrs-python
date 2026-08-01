@@ -72,9 +72,17 @@ impl<'py> FromPyObject<'_, 'py> for StoreConfig {
 }
 
 impl StoreConfig {
-    pub fn direct_io(&mut self, flag: bool) -> () {
+    pub fn direct_io(&mut self, flag: bool) {
         match self {
             StoreConfig::Filesystem(config) => config.direct_io(flag),
+            StoreConfig::Http(_config) => (),
+            StoreConfig::ObStore(_config) => (),
+        }
+    }
+
+    pub fn file_handle_cache_size(&mut self, size: usize) {
+        match self {
+            StoreConfig::Filesystem(config) => config.file_handle_cache_size(size),
             StoreConfig::Http(_config) => (),
             StoreConfig::ObStore(_config) => (),
         }
