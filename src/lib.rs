@@ -163,6 +163,97 @@ impl CodecPipelineImpl {
         }
     }
 
+    /// Decode a scattered (1-D vindex / `arr[idx]`) chunk item into `output`.
+    ///
+    /// The coordinates are grouped into contiguous runs -- annbatch's CSR shape
+    /// gives one run per selected row -- and every run is handed to the decoder
+    /// in ONE `partial_decode` call.
+    ///
+    /// Decoding runs one at a time (previously via rayon) leaves the sharding
+    /// decoder nothing to work with: a run is typically a single inner chunk, so
+    /// N separate calls each re-plan the read from scratch (shard index lookup,
+    /// byte range assembly) and cannot share an inner-chunk decode with one
+    /// another. With N large that dominates -- a 1.5k-element run inside a ~97k
+    /// element inner chunk decodes the whole inner chunk, once per call.
+    /// Measured on a shuffled CSR minibatch, per-run decoding was 18x slower
+    /// than the slice path. Handing every subset over at once lets the decoder
+    /// plan them together and dedup inner-chunk decodes via its per-call cache.
+    ///
+    /// The parallelism itself comes from processing several items at once; see
+    /// `recommended_outer_concurrency`.
+    fn decode_scattered_into(
+        item: &ChunkItem,
+        partial_decoder: &dyn ArrayPartialDecoderTraits,
+        output: UnsafeCellSlice<u8>,
+        data_type_size: usize,
+        codec_options: &CodecOptions,
+    ) -> PyResult<()> {
+        let Some(chunk_indices) = item.chunk_indices.as_ref() else {
+            return Ok(());
+        };
+        if chunk_indices.is_empty() {
+            return Ok(());
+        }
+        let out_indices = item.out_indices.as_deref();
+        let out_start = item.subset.start()[0];
+        let (runs, order) = group_chunk_runs(chunk_indices, out_indices, out_start);
+        let array_shape: &[u64] = bytemuck::must_cast_slice(&item.array_shape);
+
+        let subsets: Vec<ArraySubset> = runs
+            .iter()
+            .map(|r| ArraySubset::new_with_ranges(std::slice::from_ref(&r.chunk)))
+            .collect();
+        let decoded = partial_decoder
+            .partial_decode(&subsets, codec_options)
+            .map_codec_err()?;
+        let scratch = decoded.into_fixed().map_py_err::<PyTypeError>()?;
+        let scratch: &[u8] = scratch.as_ref();
+
+        // `partial_decode` returns the subsets concatenated in request order,
+        // so walk them in lockstep with `runs`.
+        let mut offset: usize = 0;
+        for run in &runs {
+            let len = usize::try_from(run.chunk.end - run.chunk.start).map_py_err::<PyValueError>()?;
+            let nbytes = len * data_type_size;
+            if let Some(out_run) = run.out_contiguous.clone() {
+                let mut view = unsafe {
+                    // SAFETY: out_run is a disjoint contiguous range within `output`.
+                    ArrayBytesFixedDisjointView::new(
+                        output,
+                        data_type_size,
+                        array_shape,
+                        ArraySubset::new_with_ranges(&[out_run]),
+                    )
+                    .map_py_err::<PyRuntimeError>()?
+                };
+                view.copy_from_slice(&scratch[offset..offset + nbytes])
+                    .map_py_err::<PyRuntimeError>()?;
+            } else {
+                // Permuted output: place each element individually.
+                for j in 0..len {
+                    let k = order[run.start_idx + j];
+                    let out_index = match out_indices {
+                        Some(oi) => oi[k as usize],
+                        None => out_start + u64::from(k),
+                    };
+                    let pos =
+                        usize::try_from(out_index).map_py_err::<PyValueError>()? * data_type_size;
+                    let src = offset + j * data_type_size;
+                    unsafe {
+                        // SAFETY: each output position occurs exactly once
+                        // across all runs.
+                        output
+                            .index_mut(pos..pos + data_type_size)
+                            .copy_from_slice(&scratch[src..src + data_type_size]);
+                    }
+                }
+            }
+            offset += nbytes;
+        }
+        debug_assert_eq!(offset, scratch.len());
+        Ok(())
+    }
+
     fn py_untyped_array_to_array_object<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
     ) -> &'a PyArrayObject {
@@ -345,19 +436,8 @@ impl CodecPipelineImpl {
             // For variable length data types, need a codepath with non `_into` methods.
             // Collect all the subsets and copy into value on the Python side?
             let update_chunk_subset = |item: ChunkItem| -> PyResult<()> {
-                // 1-D scattered fast path (vindex / `arr[idx]`): group
-                // consecutive ascending indices into runs (annbatch's
-                // CSR shape gives one run per row), then fan the runs out
-                // via rayon and call
-                // `partial_decode_into(single_run, output_view_for_run)`
-                // per run. Each call hits the sharding decoder's fast
-                // `partial_decode_fixed_array_subset_into` (parallel over
-                // inner subchunks, no scratch) and the runs themselves run
-                // in parallel.
-                if let Some(chunk_indices) = item.chunk_indices.as_ref() {
-                    if chunk_indices.is_empty() {
-                        return Ok(());
-                    }
+                // 1-D scattered fast path (vindex / `arr[idx]`).
+                if item.chunk_indices.is_some() {
                     let partial_decoder =
                         partial_decoder_cache.get(&item.key).ok_or_else(|| {
                             PyRuntimeError::new_err(format!(
@@ -365,47 +445,13 @@ impl CodecPipelineImpl {
                                 item.key,
                             ))
                         })?;
-                    let runs = group_paired_runs(
-                        chunk_indices,
-                        item.out_indices.as_deref(),
-                        item.subset.start()[0],
+                    return Self::decode_scattered_into(
+                        &item,
+                        partial_decoder.as_ref(),
+                        output,
+                        data_type_size,
+                        &codec_options,
                     );
-                    let array_shape: &[u64] = bytemuck::must_cast_slice(&item.array_shape);
-                    // The outer `chunk_concurrent_limit` is sized to
-                    // `num_chunks` (often 1 for vindex), so we intentionally
-                    // bypass it -- this inner loop is exactly where the work
-                    // lives. out_runs are disjoint by construction (see
-                    // group_paired_runs), so each rayon worker writes into a
-                    // non-overlapping slice of `output`.
-                    runs.into_par_iter().try_for_each(
-                        |(chunk_run, out_run): (
-                            std::ops::Range<u64>,
-                            std::ops::Range<u64>,
-                        )|
-                         -> PyResult<()> {
-                            let mut view = unsafe {
-                                // SAFETY: out_run is a disjoint contiguous
-                                // range within `output`.
-                                ArrayBytesFixedDisjointView::new(
-                                    output,
-                                    data_type_size,
-                                    array_shape,
-                                    ArraySubset::new_with_ranges(&[out_run]),
-                                )
-                                .map_py_err::<PyRuntimeError>()?
-                            };
-                            let target = ArrayBytesDecodeIntoTarget::Fixed(&mut view);
-                            partial_decoder
-                                .partial_decode_into(
-                                    &ArraySubset::new_with_ranges(&[chunk_run]),
-                                    target,
-                                    &codec_options,
-                                )
-                                .map_codec_err()?;
-                            Ok(())
-                        },
-                    )?;
-                    return Ok(());
                 }
                 let mut output_view = unsafe {
                     // TODO: Is the following correct?
@@ -536,52 +582,86 @@ impl CodecPipelineImpl {
     }
 }
 
-/// Group `chunk_indices` (and the matching output positions) into
-/// paired contiguous runs. A run continues as long as the next chunk
-/// position is `prev + 1` and the next output position is `prev + 1`;
-/// otherwise a new run starts.
+/// One contiguous run of chunk positions, plus where its elements go.
+pub(crate) struct Run {
+    /// Contiguous positions within the chunk.
+    pub chunk: std::ops::Range<u64>,
+    /// Index into the `ChunkItem`'s coordinate arrays at which this run starts,
+    /// so the scatter path can look up each element's output position.
+    pub start_idx: usize,
+    /// `Some(range)` when the output positions are contiguous too, which lets
+    /// the run decode straight into the output with no scratch buffer.
+    pub out_contiguous: Option<std::ops::Range<u64>>,
+}
+
+/// Group `chunk_indices` into contiguous runs.
 ///
-/// `out_indices` is `Some` for the permuted-output case (zarr's
-/// `sel_sort` path); when `None` the output positions are
-/// `out_start, out_start + 1, ...` (the `ChunkItem`'s `subset` start).
+/// Runs break on chunk-position discontinuity ONLY. An earlier version also
+/// broke on output-position discontinuity, which quietly destroyed the grouping
+/// whenever the caller's selection was not already sorted: zarr's
+/// `CoordinateIndexer` sorts the coordinates and returns a permuted output
+/// mapping, so on a shuffled selection almost every element became its own run
+/// (measured: 1.88M runs for 2.96M coordinates, i.e. 1.6 elements per run,
+/// against the ~1519 expected for CSR rows). The decode call count then tracks
+/// element count rather than run count, which is catastrophic.
 ///
-/// For annbatch's CSR-component shape, where the indices passed to a
-/// single `arr[idx]` are concatenated runs of length `L_i` (one per
-/// selected row), this collapses N length-1 subsets into K = number of
-/// runs subsets, where K is on the order of the row count rather than
-/// the total element count. That eliminates the per-index overhead
-/// inside `partial_decode` (decoder dispatch, bounds checks per region).
-fn group_paired_runs(
+/// Output contiguity is recorded per run instead of forcing a split, so the
+/// zero-copy decode is still used whenever it applies.
+///
+/// For annbatch's CSR shape -- one contiguous element range per selected row --
+/// this yields one run per row regardless of the order the rows arrive in.
+fn group_chunk_runs(
     chunk_indices: &[u64],
     out_indices: Option<&[u64]>,
     out_start: u64,
-) -> Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> {
+) -> (Vec<Run>, Vec<u32>) {
     let n = chunk_indices.len();
-    let mut runs: Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
+    // zarr's `CoordinateIndexer` groups an unsorted selection by chunk with
+    // `np.argsort(chunks_raveled_indices)`, which defaults to an UNSTABLE
+    // quicksort. The key has only one distinct value per chunk, so the sort is
+    // free to permute arbitrarily within a chunk -- and it does, destroying
+    // whatever order the caller had. Measured on a CSR minibatch whose
+    // coordinate array contained exactly one contiguous run per row: 256 runs
+    // going in, 203,661 as delivered, 256 again after re-sorting here. So sort
+    // by chunk position before grouping.
+    //
+    // A caller that pre-sorts avoids this entirely: zarr then takes its
+    // `searchsorted` fast path, leaves `sel_sort` unset, and hands back a plain
+    // slice for `out_selection`, which reaches the zero-copy branch below.
+    let mut order: Vec<u32> = (0..u32::try_from(n).unwrap_or(u32::MAX)).collect();
+    order.sort_unstable_by_key(|&k| chunk_indices[k as usize]);
     if n == 0 {
-        return runs;
+        return (runs, order);
     }
+    let chunk_at = |k: usize| chunk_indices[order[k] as usize];
     let out_at = |k: usize| match out_indices {
-        Some(oi) => oi[k],
-        None => out_start + k as u64,
+        Some(oi) => oi[order[k] as usize],
+        None => out_start + u64::from(order[k]),
+    };
+    // Output positions are contiguous over `[a, b)` iff they never break.
+    let push = |start: usize, end: usize, runs: &mut Vec<Run>| {
+        let len = (end - start) as u64;
+        let cs = chunk_at(start);
+        let os = out_at(start);
+        let out_contiguous = (start..end)
+            .all(|k| out_at(k) == os + (k - start) as u64)
+            .then(|| os..os + len);
+        runs.push(Run {
+            chunk: cs..cs + len,
+            start_idx: start,
+            out_contiguous,
+        });
     };
     let mut run_start = 0usize;
     for k in 1..n {
-        let chunk_breaks = chunk_indices[k] != chunk_indices[k - 1] + 1;
-        let out_breaks = out_at(k) != out_at(k - 1) + 1;
-        if chunk_breaks || out_breaks {
-            let cs = chunk_indices[run_start];
-            let os = out_at(run_start);
-            let len = (k - run_start) as u64;
-            runs.push((cs..cs + len, os..os + len));
+        if chunk_at(k) != chunk_at(k - 1) + 1 {
+            push(run_start, k, &mut runs);
             run_start = k;
         }
     }
-    let cs = chunk_indices[run_start];
-    let os = out_at(run_start);
-    let len = (n - run_start) as u64;
-    runs.push((cs..cs + len, os..os + len));
-    runs
+    push(run_start, n, &mut runs);
+    (runs, order)
 }
 
 /// A Python module implemented in Rust.

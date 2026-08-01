@@ -137,3 +137,53 @@ def test_vindex_1d_write_falls_back(store):
     expected = np.zeros(100, dtype=np.float32)
     expected[idx] = values
     np.testing.assert_array_equal(arr[:], expected)
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_vindex_1d_shuffled_contiguous_runs(store):
+    """Contiguous element ranges requested in shuffled order.
+
+    This is the CSR shape a shuffling minibatch loader produces: each row is a
+    contiguous range, but the rows arrive permuted. zarr sorts the coordinates
+    and returns a permuted output mapping, so run grouping must key on chunk
+    position alone -- keying on output position too collapses this to one run
+    per element.
+    """
+    sp = StorePath(store, path="vindex_1d_shuffled_runs")
+    n, row = 40_000, 97
+    arr = zarr.create_array(
+        sp, shape=(n,), chunks=(512,), shards=(4096,), dtype=np.float32, fill_value=0.0
+    )
+    data = np.arange(n, dtype=np.float32)
+    arr[:] = data
+    rng = np.random.default_rng(0)
+    rows = rng.permutation(n // row)[:120]
+    idx = np.concatenate(
+        [np.arange(r * row, (r + 1) * row, dtype=np.int64) for r in rows]
+    )
+    np.testing.assert_array_equal(arr[idx], data[idx])
+    np.testing.assert_array_equal(arr[idx[::-1]], data[idx[::-1]])
+    np.testing.assert_array_equal(arr[np.sort(idx)], data[np.sort(idx)])
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_vindex_1d_run_longer_than_scatter_slab(store):
+    """A permuted run longer than one scratch slab must be decoded in pieces."""
+    sp = StorePath(store, path="vindex_1d_long_run")
+    n = 300_000
+    arr = zarr.create_array(
+        sp,
+        shape=(n,),
+        chunks=(8192,),
+        shards=(65536,),
+        dtype=np.float32,
+        fill_value=0.0,
+    )
+    data = np.arange(n, dtype=np.float32)
+    arr[:] = data
+    # two long contiguous ranges, requested second-then-first so the output
+    # positions are permuted and the scatter path is taken
+    a = np.arange(10_000, 150_000, dtype=np.int64)
+    b = np.arange(150_000, 290_000, dtype=np.int64)
+    idx = np.concatenate([b, a])
+    np.testing.assert_array_equal(arr[idx], data[idx])
