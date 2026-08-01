@@ -61,7 +61,19 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.chunk_concurrent_maximum", None
             ),
             num_threads=config.get("threading.max_workers", None),
+            vindex_io_concurrent_target=config.get(
+                "codec_pipeline.vindex_io_concurrent_target", None
+            ),
+            vindex_decode_concurrent_target=config.get(
+                "codec_pipeline.vindex_decode_concurrent_target", None
+            ),
+            vindex_shard_index_cache_size=config.get(
+                "codec_pipeline.vindex_shard_index_cache_size", 0
+            ),
             direct_io=config.get("codec_pipeline.direct_io", False),
+            file_handle_cache_size=config.get(
+                "codec_pipeline.file_handle_cache_size", 0
+            ),
         )
     except TypeError as e:
         if strict:

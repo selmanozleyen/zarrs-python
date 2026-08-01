@@ -21,18 +21,19 @@ pub trait ChunkConcurrentLimitAndCodecOptions {
 /// is the right split for a subset that spans many inner chunks: the sharding
 /// decoder parallelises across them and uses the budget.
 ///
-/// A scattered item does not. It decodes a couple of short runs that each sit
-/// inside a single inner chunk, so a codec target above 1 buys nothing and the
-/// threads it was given sit idle. Measured on a shuffled CSR minibatch (16
-/// threads, ~126 items): 2.5 runnable threads on the scattered path against
-/// 9-10 on the slice path, with neither blocked on I/O.
+/// A scattered item instead exposes explicit decode-granule groups (inner
+/// chunks for sharding). Measured on a shuffled CSR minibatch (16 threads,
+/// ~126 items), the old 4-item/4-codec split reached only 2.5 runnable threads
+/// because most items had too few groups to spend four threads effectively.
 ///
 /// So for scattered items ask for the items themselves to run concurrently and
 /// pin the recommendation to that one value. When there are at least as many
 /// items as threads this leaves the codec a target of 1, which is what a
 /// single-inner-chunk decode wants. When there are fewer items than threads the
-/// leftover flows back to the codec, so a batch of two items on sixteen threads
-/// still gets eight-way codec concurrency each.
+/// leftover is spent across the item's decode-granule groups first, then passed
+/// into the codec if there are still too few groups. Thus two items with four
+/// groups each can still expose eight independent decodes without hard-coding
+/// either the shard or inner-chunk level as the only source of parallelism.
 fn recommended_outer_concurrency(
     scattered: bool,
     num_chunks: usize,

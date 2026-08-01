@@ -128,3 +128,20 @@ def test_direct_io(tmp_path: Path) -> None:
     ground_truth_arr = np.random.random(z.shape)
     z[...] = ground_truth_arr
     np.testing.assert_array_equal(z[...], ground_truth_arr)
+
+
+def test_file_handle_cache(tmp_path: Path) -> None:
+    zarr.config.set({"codec_pipeline.file_handle_cache_size": 8})
+    try:
+        z = zarr.create_array(
+            tmp_path / "cached.zarr",
+            dtype=np.float64,
+            shape=(80, 100),
+            chunks=(10, 10),
+            shards=(20, 20),
+        )
+        ground_truth_arr = np.random.random(z.shape)
+        z[...] = ground_truth_arr
+        np.testing.assert_array_equal(z[...], ground_truth_arr)
+    finally:
+        zarr.config.set({"codec_pipeline.file_handle_cache_size": 0})

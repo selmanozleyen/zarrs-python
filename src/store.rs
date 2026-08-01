@@ -13,10 +13,12 @@ use zarrs::storage::{
 
 use crate::{runtime::tokio_block_on, utils::PyErrExt};
 
+mod concurrent_partial;
 mod filesystem;
 mod http;
 mod obstore;
 
+pub use self::concurrent_partial::{partial_read_max_active, with_io_measurement};
 pub use self::filesystem::FilesystemStoreConfig;
 pub use self::http::HttpStoreConfig;
 pub use self::obstore::ObStoreConfig;
@@ -72,9 +74,17 @@ impl<'py> FromPyObject<'_, 'py> for StoreConfig {
 }
 
 impl StoreConfig {
-    pub fn direct_io(&mut self, flag: bool) -> () {
+    pub fn direct_io(&mut self, flag: bool) {
         match self {
             StoreConfig::Filesystem(config) => config.direct_io(flag),
+            StoreConfig::Http(_config) => (),
+            StoreConfig::ObStore(_config) => (),
+        }
+    }
+
+    pub fn file_handle_cache_size(&mut self, size: usize) {
+        match self {
+            StoreConfig::Filesystem(config) => config.file_handle_cache_size(size),
             StoreConfig::Http(_config) => (),
             StoreConfig::ObStore(_config) => (),
         }

@@ -140,6 +140,27 @@ def test_vindex_1d_write_falls_back(store):
 
 
 @pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_vindex_1d_cached_shard_index_is_invalidated_after_write(store):
+    """A write must invalidate persistent shard decoders and their indexes."""
+    with zarr.config.set({"codec_pipeline.vindex_shard_index_cache_size": 16}):
+        sp = StorePath(store, path="vindex_1d_cache_invalidation")
+        arr = zarr.create_array(
+            sp,
+            shape=(4096,),
+            chunks=(128,),
+            shards=(1024,),
+            dtype=np.int64,
+            fill_value=0,
+        )
+        arr[:] = np.arange(arr.size, dtype=np.int64)
+        idx = np.array([3, 127, 128, 900, 1023, 1024, 2050], dtype=np.int64)
+        np.testing.assert_array_equal(arr[idx], idx)
+
+        arr[0:2300] = np.arange(0, 2300, dtype=np.int64) + 10_000
+        np.testing.assert_array_equal(arr[idx], idx + 10_000)
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
 def test_vindex_1d_shuffled_contiguous_runs(store):
     """Contiguous element ranges requested in shuffled order.
 
@@ -187,3 +208,58 @@ def test_vindex_1d_run_longer_than_scatter_slab(store):
     b = np.arange(150_000, 290_000, dtype=np.int64)
     idx = np.concatenate([b, a])
     np.testing.assert_array_equal(arr[idx], data[idx])
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_vindex_1d_separate_io_and_decode_targets(store):
+    """The sparse path accepts independent outer-I/O and codec budgets."""
+    with zarr.config.set(
+        {
+            "codec_pipeline.vindex_io_concurrent_target": 3,
+            "codec_pipeline.vindex_decode_concurrent_target": 2,
+            "codec_pipeline.vindex_shard_index_cache_size": 4,
+        }
+    ):
+        sp = StorePath(store, path="vindex_1d_separate_targets")
+        arr = zarr.create_array(
+            sp,
+            shape=(4096,),
+            chunks=(128,),
+            shards=(1024,),
+            dtype=np.int64,
+            fill_value=0,
+        )
+        data = np.arange(arr.size, dtype=np.int64)
+        arr[:] = data
+        idx = np.concatenate(
+            [
+                np.arange(900, 940, dtype=np.int64),
+                np.arange(10, 30, dtype=np.int64),
+                np.arange(2050, 2090, dtype=np.int64),
+            ]
+        )
+    np.testing.assert_array_equal(arr[idx], data[idx])
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_vindex_1d_sharded_blosc_partial_decode(store):
+    """Sparse subsets remain correct through Blosc's partial decoder."""
+    from zarr.codecs import BloscCodec
+
+    with zarr.config.set({"codec_pipeline.vindex_shard_index_cache_size": 16}):
+        sp = StorePath(store, path="vindex_1d_sharded_blosc")
+        arr = zarr.create_array(
+            sp,
+            shape=(20_000,),
+            chunks=(512,),
+            shards=(4096,),
+            dtype=np.int64,
+            fill_value=0,
+            compressors=[BloscCodec()],
+        )
+        data = np.arange(arr.size, dtype=np.int64)
+        arr[:] = data
+        rng = np.random.default_rng(42)
+        idx = rng.choice(arr.size, size=1000, replace=False)
+        np.testing.assert_array_equal(arr[idx], data[idx])
+        np.testing.assert_array_equal(arr[np.sort(idx)], data[np.sort(idx)])

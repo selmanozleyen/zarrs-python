@@ -4,7 +4,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Instant;
 
 use chunk_item::ChunkItem;
 use itertools::Itertools;
@@ -14,14 +16,16 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use rayon::ThreadPool;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::{
-    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
-    ArrayPartialDecoderTraits, ArraySubset, ArrayToBytesCodecTraits, CodecChain, CodecOptions,
-    DataType, FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
+    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayCodecTraits,
+    ArrayMetadata, ArrayPartialDecoderTraits, ArraySubset, ArrayToBytesCodecTraits, CodecChain,
+    CodecOptions, DataType, FillValue, StoragePartialDecoder, copy_fill_value_into,
+    update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
@@ -35,21 +39,51 @@ mod store;
 #[cfg(test)]
 mod tests;
 mod utils;
+mod vindex_stats;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
-use crate::store::StoreConfig;
+use crate::store::{StoreConfig, partial_read_max_active, with_io_measurement};
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
+use crate::vindex_stats::{Phase, VindexStats};
+
+static VINDEX_DECODE_POOLS: LazyLock<Mutex<HashMap<usize, Weak<ThreadPool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn shared_vindex_decode_pool(num_threads: usize) -> PyResult<Arc<ThreadPool>> {
+    let mut pools = VINDEX_DECODE_POOLS.lock().unwrap();
+    if let Some(pool) = pools.get(&num_threads).and_then(Weak::upgrade) {
+        return Ok(pool);
+    }
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(|index| format!("zarrs-decode-{index}"))
+            .build()
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+    );
+    pools.insert(num_threads, Arc::downgrade(&pool));
+    Ok(pool)
+}
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct CodecPipelineImpl {
     pub(crate) store: ReadableWritableListableStorage,
+    /// `store` wrapped so each logical multi-range read is dispatched onto the
+    /// shared I/O pool. Used only by the scattered path, which batches a
+    /// shard's ranges into one operation; see the constructor.
+    pub(crate) vindex_store: ReadableWritableListableStorage,
     pub(crate) codec_chain: Arc<CodecChain>,
     pub(crate) codec_options: CodecOptions,
     pub(crate) chunk_concurrent_minimum: usize,
     pub(crate) chunk_concurrent_maximum: usize,
     pub(crate) num_threads: usize,
+    pub(crate) vindex_io_concurrent_target: usize,
+    pub(crate) vindex_decode_concurrent_target: usize,
+    vindex_decode_pool: Arc<ThreadPool>,
+    vindex_shard_index_cache_size: usize,
+    partial_decoder_cache: Mutex<HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>>,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
 }
@@ -166,26 +200,21 @@ impl CodecPipelineImpl {
     /// Decode a scattered (1-D vindex / `arr[idx]`) chunk item into `output`.
     ///
     /// The coordinates are grouped into contiguous runs -- annbatch's CSR shape
-    /// gives one run per selected row -- and every run is handed to the decoder
-    /// in ONE `partial_decode` call.
+    /// gives one run per selected row -- then grouped again by the codec's
+    /// efficient partial-decode granularity (an inner chunk for sharding).
     ///
-    /// Decoding runs one at a time (previously via rayon) leaves the sharding
-    /// decoder nothing to work with: a run is typically a single inner chunk, so
-    /// N separate calls each re-plan the read from scratch (shard index lookup,
-    /// byte range assembly) and cannot share an inner-chunk decode with one
-    /// another. With N large that dominates -- a 1.5k-element run inside a ~97k
-    /// element inner chunk decodes the whole inner chunk, once per call.
-    /// Measured on a shuffled CSR minibatch, per-run decoding was 18x slower
-    /// than the slice path. Handing every subset over at once lets the decoder
-    /// plan them together and dedup inner-chunk decodes via its per-call cache.
-    ///
-    /// The parallelism itself comes from processing several items at once; see
-    /// `recommended_outer_concurrency`.
+    /// One ordinary subset decode is issued per distinct granule. This avoids
+    /// both bad earlier extremes: one decode per run could decompress the same
+    /// inner chunk repeatedly, while passing all runs as a generic `Indexer`
+    /// made zarrs iterate and dispatch once per selected element. Groups share
+    /// the item's codec budget; any budget left when there are few groups flows
+    /// down into the codec.
     fn decode_scattered_into(
         item: &ChunkItem,
         partial_decoder: &dyn ArrayPartialDecoderTraits,
         output: UnsafeCellSlice<u8>,
         data_type_size: usize,
+        decode_granularity: u64,
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
         let Some(chunk_indices) = item.chunk_indices.as_ref() else {
@@ -197,27 +226,209 @@ impl CodecPipelineImpl {
         let out_indices = item.out_indices.as_deref();
         let out_start = item.subset.start()[0];
         let (runs, order) = group_chunk_runs(chunk_indices, out_indices, out_start);
+        let (runs, decode_groups) = group_runs_by_decode_granule(runs, decode_granularity);
         let array_shape: &[u64] = bytemuck::must_cast_slice(&item.array_shape);
 
-        let subsets: Vec<ArraySubset> = runs
-            .iter()
-            .map(|r| ArraySubset::new_with_ranges(std::slice::from_ref(&r.chunk)))
-            .collect();
+        // A list of ArraySubsets is a generic zarrs `Indexer`. The sharding
+        // decoder handles that by iterating every selected coordinate, which
+        // turned this 2.96M-element workload into 2.96M tiny inner-decoder
+        // calls. Instead, issue one ordinary ArraySubset per distinct decode
+        // granule (an inner chunk for sharding). Each call takes the fast
+        // subset path, decompresses the granule once, and copies all runs that
+        // hit it from one bounded scratch buffer.
+        let (group_concurrent_limit, group_codec_target) =
+            split_decode_concurrency(codec_options.concurrent_target(), decode_groups.len());
+        let group_codec_options = (*codec_options).with_concurrent_target(group_codec_target);
+        let decode_group = |group: DecodeGroup| -> PyResult<()> {
+            let decoded = partial_decoder
+                .partial_decode(
+                    &ArraySubset::new_with_ranges(std::slice::from_ref(&group.chunk)),
+                    &group_codec_options,
+                )
+                .map_codec_err()?;
+            let scratch = decoded.into_fixed().map_py_err::<PyTypeError>()?;
+            let scratch: &[u8] = scratch.as_ref();
+
+            for run in &runs[group.runs] {
+                let len = usize::try_from(run.chunk.end - run.chunk.start)
+                    .map_py_err::<PyValueError>()?;
+                let nbytes = len * data_type_size;
+                let src = usize::try_from(run.chunk.start - group.chunk.start)
+                    .map_py_err::<PyValueError>()?
+                    * data_type_size;
+                if let Some(out_run) = run.out_contiguous.clone() {
+                    let mut view = unsafe {
+                        // SAFETY: out_run is a disjoint contiguous range within `output`.
+                        ArrayBytesFixedDisjointView::new(
+                            output,
+                            data_type_size,
+                            array_shape,
+                            ArraySubset::new_with_ranges(&[out_run]),
+                        )
+                        .map_py_err::<PyRuntimeError>()?
+                    };
+                    view.copy_from_slice(&scratch[src..src + nbytes])
+                        .map_py_err::<PyRuntimeError>()?;
+                } else {
+                    // Permuted output: place each element individually.
+                    for j in 0..len {
+                        let k = order[run.start_idx + j];
+                        let out_index = match out_indices {
+                            Some(oi) => oi[k as usize],
+                            None => out_start + u64::from(k),
+                        };
+                        let pos = usize::try_from(out_index).map_py_err::<PyValueError>()?
+                            * data_type_size;
+                        let element_src = src + j * data_type_size;
+                        unsafe {
+                            // SAFETY: each output position occurs exactly once
+                            // across all runs.
+                            output.index_mut(pos..pos + data_type_size).copy_from_slice(
+                                &scratch[element_src..element_src + data_type_size],
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
+        iter_concurrent_limit!(
+            group_concurrent_limit,
+            decode_groups,
+            try_for_each,
+            decode_group
+        )?;
+        Ok(())
+    }
+
+    fn decode_scattered_item(
+        &self,
+        item: &ChunkItem,
+        partial_decoder_cache: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
+        output: UnsafeCellSlice<u8>,
+        data_type_size: usize,
+        codec_options: &CodecOptions,
+    ) -> PyResult<()> {
+        let partial_decoder = partial_decoder_cache.get(&item.key).ok_or_else(|| {
+            PyRuntimeError::new_err(format!("Partial decoder not found for key: {}", item.key))
+        })?;
+        let decode_granularity = self
+            .codec_chain
+            .partial_decode_granularity(&item.shape)
+            .first()
+            .ok_or_else(|| PyRuntimeError::new_err("missing 1-D decode granularity"))?
+            .get();
+        Self::decode_scattered_into(
+            item,
+            partial_decoder.as_ref(),
+            output,
+            data_type_size,
+            decode_granularity,
+            codec_options,
+        )
+    }
+
+    /// Build one sparse multi-subset task per store key (one sharded chunk).
+    ///
+    /// Runs stay separate in the task. The zarrs sharding decoder groups them
+    /// by inner chunk without expanding them to element coordinates, so each
+    /// inner chunk is fetched once and the gaps are never requested.
+    fn plan_scattered_decode_tasks(
+        &self,
+        items: Vec<ChunkItem>,
+    ) -> PyResult<Vec<ScatteredDecodeTask>> {
+        let mut tasks: Vec<ScatteredDecodeTask> = Vec::new();
+        let mut task_indices: HashMap<StoreKey, usize> = HashMap::new();
+
+        for item in items {
+            let Some(chunk_indices) = item.chunk_indices.as_deref() else {
+                return Err(PyRuntimeError::new_err(
+                    "mixed scattered/basic batch cannot use the global decode planner",
+                ));
+            };
+            if chunk_indices.is_empty() {
+                continue;
+            }
+            let granularity = self
+                .codec_chain
+                .partial_decode_granularity(&item.shape)
+                .first()
+                .ok_or_else(|| PyRuntimeError::new_err("missing 1-D decode granularity"))?
+                .get();
+            let out_start = item.subset.start()[0];
+            let (runs, order) =
+                group_chunk_runs(chunk_indices, item.out_indices.as_deref(), out_start);
+            let (runs, _groups) = group_runs_by_decode_granule(runs, granularity);
+            let plan = Arc::new(ScatteredItemPlan {
+                runs,
+                order,
+                out_indices: item.out_indices,
+                out_start,
+                array_shape: item.array_shape,
+            });
+
+            let task_index = *task_indices.entry(item.key.clone()).or_insert_with(|| {
+                let task_index = tasks.len();
+                tasks.push(ScatteredDecodeTask {
+                    key: item.key.clone(),
+                    subsets: Vec::new(),
+                    pieces: Vec::new(),
+                });
+                task_index
+            });
+            let task = &mut tasks[task_index];
+            for (run_index, run) in plan.runs.iter().enumerate() {
+                task.subsets
+                    .push(ArraySubset::new_with_ranges(std::slice::from_ref(
+                        &run.chunk,
+                    )));
+                task.pieces.push(ScatteredDecodePiece {
+                    plan: plan.clone(),
+                    run_index,
+                });
+            }
+        }
+        Ok(tasks)
+    }
+
+    fn decode_scattered_task(
+        task: ScatteredDecodeTask,
+        partial_decoder_cache: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
+        output: UnsafeCellSlice<u8>,
+        data_type_size: usize,
+        codec_options: &CodecOptions,
+        stats: Option<&Arc<VindexStats>>,
+    ) -> PyResult<()> {
+        let partial_decoder = partial_decoder_cache.get(&task.key).ok_or_else(|| {
+            PyRuntimeError::new_err(format!("Partial decoder not found for key: {}", task.key))
+        })?;
+        // Payload reads issued below are attributed to this thread, so the
+        // storage wait can be subtracted from the decode time to estimate
+        // codec CPU.
+        let _scope = stats.map(|stats| vindex_stats::scope(stats, Phase::Payload));
+        let decode_started = stats.map(|_| Instant::now());
         let decoded = partial_decoder
-            .partial_decode(&subsets, codec_options)
+            .partial_decode_subsets(&task.subsets, codec_options)
             .map_codec_err()?;
         let scratch = decoded.into_fixed().map_py_err::<PyTypeError>()?;
         let scratch: &[u8] = scratch.as_ref();
+        if let (Some(stats), Some(started)) = (stats, decode_started) {
+            stats.record_partial_decode(started.elapsed());
+        }
 
-        // `partial_decode` returns the subsets concatenated in request order,
-        // so walk them in lockstep with `runs`.
-        let mut offset: usize = 0;
-        for run in &runs {
-            let len = usize::try_from(run.chunk.end - run.chunk.start).map_py_err::<PyValueError>()?;
+        let scatter_started = stats.map(|_| Instant::now());
+        let mut scratch_offset = 0;
+        for piece in task.pieces {
+            let plan = piece.plan;
+            let array_shape: &[u64] = bytemuck::must_cast_slice(&plan.array_shape);
+            let run = &plan.runs[piece.run_index];
+            let len =
+                usize::try_from(run.chunk.end - run.chunk.start).map_py_err::<PyValueError>()?;
             let nbytes = len * data_type_size;
             if let Some(out_run) = run.out_contiguous.clone() {
                 let mut view = unsafe {
-                    // SAFETY: out_run is a disjoint contiguous range within `output`.
+                    // SAFETY: zarr's projections are disjoint in output
+                    // space, including across distinct ChunkItems.
                     ArrayBytesFixedDisjointView::new(
                         output,
                         data_type_size,
@@ -226,31 +437,97 @@ impl CodecPipelineImpl {
                     )
                     .map_py_err::<PyRuntimeError>()?
                 };
-                view.copy_from_slice(&scratch[offset..offset + nbytes])
+                view.copy_from_slice(&scratch[scratch_offset..scratch_offset + nbytes])
                     .map_py_err::<PyRuntimeError>()?;
             } else {
-                // Permuted output: place each element individually.
                 for j in 0..len {
-                    let k = order[run.start_idx + j];
-                    let out_index = match out_indices {
-                        Some(oi) => oi[k as usize],
-                        None => out_start + u64::from(k),
+                    let k = plan.order[run.start_idx + j];
+                    let out_index = match plan.out_indices.as_deref() {
+                        Some(indices) => indices[k as usize],
+                        None => plan.out_start + u64::from(k),
                     };
                     let pos =
                         usize::try_from(out_index).map_py_err::<PyValueError>()? * data_type_size;
-                    let src = offset + j * data_type_size;
+                    let element_src = scratch_offset + j * data_type_size;
                     unsafe {
-                        // SAFETY: each output position occurs exactly once
-                        // across all runs.
+                        // SAFETY: every projected output position occurs
+                        // exactly once across the complete task queue.
                         output
                             .index_mut(pos..pos + data_type_size)
-                            .copy_from_slice(&scratch[src..src + data_type_size]);
+                            .copy_from_slice(&scratch[element_src..element_src + data_type_size]);
                     }
                 }
             }
-            offset += nbytes;
+            scratch_offset += nbytes;
         }
-        debug_assert_eq!(offset, scratch.len());
+        debug_assert_eq!(scratch_offset, scratch.len());
+        if let (Some(stats), Some(started)) = (stats, scatter_started) {
+            stats.record_scatter(started.elapsed());
+            stats
+                .scatter_bytes
+                .fetch_add(scratch_offset as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn decode_scattered_batch(
+        &self,
+        items: Vec<ChunkItem>,
+        partial_decoder_cache: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
+        output: UnsafeCellSlice<u8>,
+        data_type_size: usize,
+        codec_options: CodecOptions,
+        stats: Option<&Arc<VindexStats>>,
+    ) -> PyResult<()> {
+        let num_items = items.len();
+        let plan_started = stats.map(|_| Instant::now());
+        let tasks = self.plan_scattered_decode_tasks(items)?;
+        if let (Some(stats), Some(started)) = (stats, plan_started) {
+            stats.record_plan(started.elapsed());
+            let subsets = tasks.iter().map(|task| task.subsets.len()).sum::<usize>();
+            let subsets_max = tasks.iter().map(|task| task.subsets.len()).max().unwrap_or(0);
+            stats.chunk_items.fetch_add(num_items as u64, Ordering::Relaxed);
+            stats
+                .sparse_subsets
+                .fetch_add(subsets as u64, Ordering::Relaxed);
+            stats
+                .shard_tasks
+                .fetch_add(tasks.len() as u64, Ordering::Relaxed);
+            stats
+                .subsets_per_task_max
+                .fetch_max(subsets_max as u64, Ordering::Relaxed);
+        }
+        // Shard tasks run concurrently up to the pool size; the decode target
+        // is the total codec-thread budget spread across whatever is running.
+        let active_decode_tasks =
+            std::cmp::min(self.vindex_io_concurrent_target, tasks.len()).max(1);
+        let task_codec_target = std::cmp::max(
+            1,
+            self.vindex_decode_concurrent_target / active_decode_tasks,
+        );
+        if stats.is_some() {
+            eprintln!(
+                "zarrs vindex concurrency: io_target={} decode_target={} active_decode_workers={active_decode_tasks} codec_target_per_shard={task_codec_target}",
+                self.vindex_io_concurrent_target, self.vindex_decode_concurrent_target,
+            );
+        }
+        let task_codec_options = codec_options.with_concurrent_target(task_codec_target);
+        let execute_started = stats.map(|_| Instant::now());
+        self.vindex_decode_pool.install(|| {
+            tasks.into_par_iter().try_for_each(|task| {
+                Self::decode_scattered_task(
+                    task,
+                    partial_decoder_cache,
+                    output,
+                    data_type_size,
+                    &task_codec_options,
+                    stats,
+                )
+            })
+        })?;
+        if let (Some(stats), Some(started)) = (stats, execute_started) {
+            stats.record_execute(started.elapsed());
+        }
         Ok(())
     }
 
@@ -316,9 +593,14 @@ impl CodecPipelineImpl {
         chunk_concurrent_minimum=None,
         chunk_concurrent_maximum=None,
         num_threads=None,
+        vindex_io_concurrent_target=None,
+        vindex_decode_concurrent_target=None,
+        vindex_shard_index_cache_size=0,
         direct_io=false,
+        file_handle_cache_size=0,
     ))]
     #[new]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         array_metadata: &str,
         mut store_config: StoreConfig,
@@ -326,9 +608,14 @@ impl CodecPipelineImpl {
         chunk_concurrent_minimum: Option<usize>,
         chunk_concurrent_maximum: Option<usize>,
         num_threads: Option<usize>,
+        vindex_io_concurrent_target: Option<usize>,
+        vindex_decode_concurrent_target: Option<usize>,
+        vindex_shard_index_cache_size: usize,
         direct_io: bool,
+        file_handle_cache_size: usize,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
+        store_config.file_handle_cache_size(file_handle_cache_size);
         let metadata = serde_json::from_str(array_metadata).map_py_err::<PyTypeError>()?;
         let metadata_v3 = match &metadata {
             ArrayMetadata::V2(v2) => {
@@ -345,9 +632,22 @@ impl CodecPipelineImpl {
         let chunk_concurrent_maximum =
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
+        let vindex_io_concurrent_target = vindex_io_concurrent_target.unwrap_or(num_threads).max(1);
+        let vindex_decode_concurrent_target = vindex_decode_concurrent_target
+            .unwrap_or(num_threads)
+            .max(1);
+        // One pool runs each shard task end to end: its own read, then its own
+        // decode. Its size is therefore the outstanding-read depth, which is
+        // what this latency-bound workload actually rewards, so it is sized
+        // from the I/O target rather than the decode target. Threads waiting
+        // in `pread` are cheap; codec CPU is a small share of the batch.
+        let vindex_decode_pool = shared_vindex_decode_pool(vindex_io_concurrent_target)?;
 
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
+        // Only the scattered path is instrumented; the basic slice path keeps
+        // the raw store so it pays nothing for counters it does not report.
+        let vindex_store = with_io_measurement(store.clone());
 
         let data_type =
             DataType::from_metadata(&metadata_v3.data_type).map_py_err::<PyTypeError>()?;
@@ -369,16 +669,23 @@ impl CodecPipelineImpl {
 
         Ok(Self {
             store,
+            vindex_store,
             codec_chain,
             codec_options,
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
+            vindex_io_concurrent_target,
+            vindex_decode_concurrent_target,
+            vindex_decode_pool,
+            vindex_shard_index_cache_size,
+            partial_decoder_cache: Mutex::new(HashMap::new()),
             fill_value,
             data_type,
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn retrieve_chunks_and_apply_index(
         &self,
         py: Python,
@@ -387,67 +694,151 @@ impl CodecPipelineImpl {
     ) -> PyResult<()> {
         // Get input array
         let output = Self::nparray_to_unsafe_cell_slice(value)?;
-
-        // Adjust the concurrency based on the codec chain and the first chunk description
-        let Some((chunk_concurrent_limit, codec_options)) =
-            chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
-        else {
-            return Ok(());
-        };
-
-        // Assemble partial decoders ahead of time and in parallel
-        let partial_chunk_items = chunk_descriptions
-            .iter()
-            .filter(|item| !(is_whole_chunk(item)))
-            .unique_by(|item| item.key.clone())
-            .collect::<Vec<_>>();
-        let mut partial_decoder_cache: HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>> =
-            HashMap::new();
-        if !partial_chunk_items.is_empty() {
-            let key_decoder_pairs =
-                iter_concurrent_limit!(chunk_concurrent_limit, partial_chunk_items, map, |item| {
-                    let storage_handle = Arc::new(StorageHandle::new(self.store.clone()));
-                    let input_handle = StoragePartialDecoder::new(storage_handle, item.key.clone());
-                    let partial_decoder = self
-                        .codec_chain
-                        .clone()
-                        .partial_decoder(
-                            Arc::new(input_handle),
-                            &item.shape,
-                            &self.data_type,
-                            &self.fill_value,
-                            &codec_options,
-                        )
-                        .map_codec_err()?;
-                    Ok((item.key.clone(), partial_decoder))
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            partial_decoder_cache.extend(key_decoder_pairs);
-        }
-
-        let data_type_size = self
-            .data_type
-            .fixed_size()
-            .ok_or("variable length data type not supported")
-            .map_py_err::<PyTypeError>()?;
-
         py.detach(move || {
+            // One stats object per read, shared by every worker it fans out
+            // to, so concurrently reading arrays do not pool their counters.
+            let stats = vindex_stats::enabled().then(|| Arc::new(VindexStats::default()));
+
+            // Decoder construction reads sharding indexes, so it must be
+            // outside the GIL along with payload I/O and codec work.
+            let Some((chunk_concurrent_limit, codec_options)) =
+                chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
+            else {
+                return Ok(());
+            };
+
+            // Decided up front because it selects the store the partial
+            // decoders are built from: only the scattered path amortises the
+            // I/O pool's cross-pool handoff.
+            let scattered = chunk_descriptions
+                .iter()
+                .all(|item| item.chunk_indices.is_some());
+            let read_store = if scattered {
+                &self.vindex_store
+            } else {
+                &self.store
+            };
+
+            let partial_chunk_items = chunk_descriptions
+                .iter()
+                .filter(|item| !(is_whole_chunk(item)))
+                .unique_by(|item| item.key.clone())
+                .collect::<Vec<_>>();
+            let cache_enabled = self.vindex_shard_index_cache_size > 0;
+            let missing_partial_chunk_items = if cache_enabled {
+                let cache = self.partial_decoder_cache.lock().unwrap();
+                partial_chunk_items
+                    .iter()
+                    .copied()
+                    .filter(|item| !cache.contains_key(&item.key))
+                    .collect::<Vec<_>>()
+            } else {
+                partial_chunk_items.clone()
+            };
+            let num_cache_misses = missing_partial_chunk_items.len();
+            let build_started = stats.as_ref().map(|_| Instant::now());
+            let key_decoder_pairs = if num_cache_misses > 0 {
+                self.vindex_decode_pool.install(|| {
+                    missing_partial_chunk_items
+                        .into_par_iter()
+                        .map(|item| {
+                            // Constructing a sharding partial decoder reads and
+                            // decodes the shard index, so this scope isolates
+                            // index I/O from payload I/O.
+                            let _scope = stats
+                                .as_ref()
+                                .map(|stats| vindex_stats::scope(stats, Phase::Index));
+                            let storage_handle = Arc::new(StorageHandle::new(read_store.clone()));
+                            let input_handle =
+                                StoragePartialDecoder::new(storage_handle, item.key.clone());
+                            let partial_decoder = self
+                                .codec_chain
+                                .clone()
+                                .partial_decoder(
+                                    Arc::new(input_handle),
+                                    &item.shape,
+                                    &self.data_type,
+                                    &self.fill_value,
+                                    &codec_options,
+                                )
+                                .map_codec_err()?;
+                            Ok((item.key.clone(), partial_decoder))
+                        })
+                        .collect::<PyResult<Vec<_>>>()
+                })?
+            } else {
+                Vec::new()
+            };
+            let partial_decoder_cache = if cache_enabled {
+                let mut cache = self.partial_decoder_cache.lock().unwrap();
+                let mut local_cache = partial_chunk_items
+                    .iter()
+                    .filter_map(|item| {
+                        cache
+                            .get(&item.key)
+                            .map(|decoder| (item.key.clone(), decoder.clone()))
+                    })
+                    .collect::<HashMap<_, _>>();
+                for (key, decoder) in key_decoder_pairs {
+                    local_cache.insert(key.clone(), decoder.clone());
+                    if !cache.contains_key(&key)
+                        && cache.len() >= self.vindex_shard_index_cache_size
+                        && let Some(evicted) = cache.keys().next().cloned()
+                    {
+                        cache.remove(&evicted);
+                    }
+                    cache.entry(key).or_insert(decoder);
+                }
+                debug_assert_eq!(local_cache.len(), partial_chunk_items.len());
+                local_cache
+            } else {
+                key_decoder_pairs.into_iter().collect::<HashMap<_, _>>()
+            };
+            if let (Some(stats), Some(started)) = (stats.as_ref(), build_started) {
+                stats.record_decoder_build(started.elapsed());
+                stats.decoder_cache_hits.fetch_add(
+                    (partial_chunk_items.len() - num_cache_misses) as u64,
+                    Ordering::Relaxed,
+                );
+                stats
+                    .decoder_cache_misses
+                    .fetch_add(num_cache_misses as u64, Ordering::Relaxed);
+            }
+
+            let data_type_size = self
+                .data_type
+                .fixed_size()
+                .ok_or("variable length data type not supported")
+                .map_py_err::<PyTypeError>()?;
+
+            if scattered {
+                let result = self.decode_scattered_batch(
+                    chunk_descriptions,
+                    &partial_decoder_cache,
+                    output,
+                    data_type_size,
+                    codec_options,
+                    stats.as_ref(),
+                );
+                if let Some(stats) = stats.as_ref() {
+                    stats.report("scattered");
+                    eprintln!(
+                        "zarrs vindex process-global: max_active_partial_reads={}",
+                        partial_read_max_active(),
+                    );
+                }
+                return result;
+            }
+
             // FIXME: the `decode_into` methods only support fixed length data types.
             // For variable length data types, need a codepath with non `_into` methods.
             // Collect all the subsets and copy into value on the Python side?
             let update_chunk_subset = |item: ChunkItem| -> PyResult<()> {
                 // 1-D scattered fast path (vindex / `arr[idx]`).
                 if item.chunk_indices.is_some() {
-                    let partial_decoder =
-                        partial_decoder_cache.get(&item.key).ok_or_else(|| {
-                            PyRuntimeError::new_err(format!(
-                                "Partial decoder not found for key: {}",
-                                item.key,
-                            ))
-                        })?;
-                    return Self::decode_scattered_into(
+                    return self.decode_scattered_item(
                         &item,
-                        partial_decoder.as_ref(),
+                        &partial_decoder_cache,
                         output,
                         data_type_size,
                         &codec_options,
@@ -496,12 +887,16 @@ impl CodecPipelineImpl {
                 .map_codec_err()
             };
 
-            iter_concurrent_limit!(
+            let result = iter_concurrent_limit!(
                 chunk_concurrent_limit,
                 chunk_descriptions,
                 try_for_each,
                 update_chunk_subset
-            )?;
+            );
+            if let Some(stats) = stats.as_ref() {
+                stats.report("basic");
+            }
+            result?;
 
             Ok(())
         })
@@ -537,6 +932,7 @@ impl CodecPipelineImpl {
         codec_options.set_store_empty_chunks(write_empty_chunks);
 
         py.detach(move || {
+            self.partial_decoder_cache.lock().unwrap().clear();
             let store_chunk = |item: ChunkItem| match &input {
                 InputValue::Array(input) => {
                     let chunk_subset_bytes = input
@@ -592,6 +988,157 @@ pub(crate) struct Run {
     /// `Some(range)` when the output positions are contiguous too, which lets
     /// the run decode straight into the output with no scratch buffer.
     pub out_contiguous: Option<std::ops::Range<u64>>,
+}
+
+/// Runs that can be served by one subset decode of a single codec granule.
+struct DecodeGroup {
+    /// Minimal contiguous span covering the selected runs in this granule.
+    chunk: std::ops::Range<u64>,
+    /// Range of entries in the split `Run` vector belonging to this granule.
+    runs: std::ops::Range<usize>,
+}
+
+/// Immutable output-placement information shared by all global tasks that
+/// originated from one `ChunkItem`.
+struct ScatteredItemPlan {
+    runs: Vec<Run>,
+    order: Vec<u32>,
+    out_indices: Option<Vec<u64>>,
+    out_start: u64,
+    array_shape: Vec<std::num::NonZeroU64>,
+}
+
+/// One sparse subset and its output-placement plan.
+struct ScatteredDecodePiece {
+    plan: Arc<ScatteredItemPlan>,
+    run_index: usize,
+}
+
+/// One globally scheduled sparse multi-range read/decode per store key.
+struct ScatteredDecodeTask {
+    key: StoreKey,
+    subsets: Vec<ArraySubset>,
+    pieces: Vec<ScatteredDecodePiece>,
+}
+
+/// Spend an item's thread budget on independent decode groups first, then
+/// return any unspent capacity to the codec inside each group.
+fn split_decode_concurrency(thread_budget: usize, num_groups: usize) -> (usize, usize) {
+    let group_concurrent_limit = std::cmp::min(thread_budget, num_groups).max(1);
+    let codec_target = std::cmp::max(1, thread_budget / group_concurrent_limit);
+    (group_concurrent_limit, codec_target)
+}
+
+/// Split runs at codec decode-granule boundaries and group them by granule.
+///
+/// For a sharding codec the granule is an inner chunk. The input runs are
+/// sorted by chunk position, so all pieces for a granule remain adjacent. A
+/// group decodes the minimal span from its first selected position to its last;
+/// compressed codecs still decode the inner chunk once, while gaps are copied
+/// only into scratch and never into the caller's output.
+fn group_runs_by_decode_granule(runs: Vec<Run>, granule: u64) -> (Vec<Run>, Vec<DecodeGroup>) {
+    debug_assert!(granule > 0);
+    let mut split = Vec::with_capacity(runs.len());
+    for run in runs {
+        let mut start = run.chunk.start;
+        while start < run.chunk.end {
+            let next_boundary = start.saturating_add(granule - start % granule);
+            let end = std::cmp::min(run.chunk.end, next_boundary);
+            let offset = start - run.chunk.start;
+            let len = end - start;
+            let out_contiguous = run
+                .out_contiguous
+                .as_ref()
+                .map(|out| out.start + offset..out.start + offset + len);
+            split.push(Run {
+                chunk: start..end,
+                start_idx: run.start_idx + usize::try_from(offset).unwrap(),
+                out_contiguous,
+            });
+            start = end;
+        }
+    }
+
+    let mut groups = Vec::new();
+    let mut group_start = 0;
+    while group_start < split.len() {
+        let granule_index = split[group_start].chunk.start / granule;
+        let mut group_end = group_start + 1;
+        while group_end < split.len() && split[group_end].chunk.start / granule == granule_index {
+            group_end += 1;
+        }
+        groups.push(DecodeGroup {
+            chunk: split[group_start].chunk.start..split[group_end - 1].chunk.end,
+            runs: group_start..group_end,
+        });
+        group_start = group_end;
+    }
+    (split, groups)
+}
+
+#[cfg(test)]
+mod scattered_decode_plan_tests {
+    use super::*;
+
+    #[test]
+    fn groups_runs_once_per_decode_granule() {
+        let runs = vec![
+            Run {
+                chunk: 10..20,
+                start_idx: 0,
+                out_contiguous: Some(100..110),
+            },
+            Run {
+                chunk: 30..40,
+                start_idx: 10,
+                out_contiguous: Some(200..210),
+            },
+            // This run crosses the 100-element granule boundary.
+            Run {
+                chunk: 95..115,
+                start_idx: 20,
+                out_contiguous: Some(300..320),
+            },
+            Run {
+                chunk: 210..220,
+                start_idx: 40,
+                out_contiguous: None,
+            },
+        ];
+
+        let (split, groups) = group_runs_by_decode_granule(runs, 100);
+
+        // Five split runs, but only three distinct compressed inner chunks.
+        assert_eq!(split.len(), 5);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].chunk, 10..100);
+        assert_eq!(groups[0].runs, 0..3);
+        assert_eq!(groups[1].chunk, 100..115);
+        assert_eq!(groups[1].runs, 3..4);
+        assert_eq!(groups[2].chunk, 210..220);
+        assert_eq!(groups[2].runs, 4..5);
+
+        // Splitting preserves both source-order and contiguous-output offsets.
+        assert_eq!(split[2].start_idx, 20);
+        assert_eq!(split[2].out_contiguous, Some(300..305));
+        assert_eq!(split[3].start_idx, 25);
+        assert_eq!(split[3].out_contiguous, Some(305..320));
+    }
+
+    #[test]
+    fn empty_plan_has_no_decode_groups() {
+        let (runs, groups) = group_runs_by_decode_granule(Vec::new(), 100);
+        assert!(runs.is_empty());
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn decode_groups_get_budget_before_the_codec() {
+        assert_eq!(split_decode_concurrency(16, 126), (16, 1));
+        assert_eq!(split_decode_concurrency(16, 8), (8, 2));
+        assert_eq!(split_decode_concurrency(16, 2), (2, 8));
+        assert_eq!(split_decode_concurrency(16, 1), (1, 16));
+    }
 }
 
 /// Group `chunk_indices` into contiguous runs.

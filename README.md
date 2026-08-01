@@ -45,8 +45,17 @@ The `ZarrsCodecPipeline` specific options are:
   - Defaults to the number of logical CPUs if `None`. It is constrained by `threading.max_workers` as well.
 - `codec_pipeline.chunk_concurrent_minimum`: the minimum number of chunks retrieved/stored concurrently when balancing chunk/codec concurrency.
   - Defaults to 4 if `None`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#chunk-concurrent-minimum) for more info.
+- `codec_pipeline.vindex_io_concurrent_target`: the shared dedicated worker count for logical multi-range shard reads used by sparse 1-D integer indexing. Ranges belonging to one shard stay batched so filesystem stores can reuse one file handle and issue them efficiently.
+  - Defaults to `threading.max_workers` if `None`.
+- `codec_pipeline.vindex_decode_concurrent_target`: the shared dedicated codec worker count for sparse 1-D reads.
+  - Defaults to `threading.max_workers` if `None`.
+
+- `codec_pipeline.vindex_shard_index_cache_size`: retain this many decoded shard indexes for sparse reads. This is disabled by default because mutations outside the Rust pipeline cannot be detected; enable it for read-only arrays.
+  - Defaults to `0` (disabled).
 - `codec_pipeline.validate_checksums`: enable checksum validation (e.g. with the CRC32C codec).
   - Defaults to `True`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#validate-checksums) for more info.
+- `codec_pipeline.file_handle_cache_size`: the number of filesystem handles retained by the zarrs filesystem store.
+  - Defaults to `0` (disabled).
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -62,6 +71,10 @@ zarr.config.set({
         "validate_checksums": True,
         "chunk_concurrent_maximum": None,
         "chunk_concurrent_minimum": 4,
+        "vindex_io_concurrent_target": None,
+        "vindex_decode_concurrent_target": None,
+        "vindex_shard_index_cache_size": 0,
+        "file_handle_cache_size": 0,
         "direct_io": False,
         "strict": False
     }
