@@ -47,6 +47,10 @@ The `ZarrsCodecPipeline` specific options are:
   - Defaults to 4 if `None`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#chunk-concurrent-minimum) for more info.
 - `codec_pipeline.validate_checksums`: enable checksum validation (e.g. with the CRC32C codec).
   - Defaults to `True`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#validate-checksums) for more info.
+- `codec_pipeline.file_handle_cache_size`: the capacity of the filesystem store's file handle cache. If nonzero, files are kept open in a least-recently-used cache and reused across partial reads instead of being reopened per read, which cuts `open`/`stat`/`close` operations when many byte ranges are read from the same files, such as partial reads of sharded arrays. This is particularly beneficial on network filesystems (e.g. Lustre, NFS), where each metadata operation is a server round trip.
+  - Defaults to `0` (disabled). Only applies to filesystem stores, and has no effect when `direct_io` is enabled.
+  - **Only enable this for arrays that are not modified outside this codec pipeline.** Writes made *through* the pipeline invalidate the affected handles, but the cache cannot see changes made through any other handle on the same files. In particular `zarr-python` performs `resize`, `delete_dir` and metadata writes through its own store, so a cached handle can keep serving bytes from a chunk file that has already been deleted. Shrinking and regrowing an array, for example, can then read back stale data instead of the fill value. Read-mostly workloads — training, analysis, repeated partial reads of a finished array — are the intended use.
+  - The cache is **per codec pipeline instance**, which means one per `Array` object rather than one per process: opening the same array twice gives two independent caches. Keep `file_handle_cache_size` multiplied by the number of open arrays comfortably below the process open-file limit (e.g. `ulimit -n`). See [here](https://docs.rs/zarrs_filesystem/latest/zarrs_filesystem/struct.FilesystemStoreOptions.html#method.file_handle_cache_size) for more info.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -62,6 +66,7 @@ zarr.config.set({
         "validate_checksums": True,
         "chunk_concurrent_maximum": None,
         "chunk_concurrent_minimum": 4,
+        "file_handle_cache_size": 0,
         "direct_io": False,
         "strict": False
     }
