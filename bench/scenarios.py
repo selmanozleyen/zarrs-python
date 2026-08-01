@@ -98,18 +98,26 @@ REQUIRED_VERSIONS: dict[str, str] = {
 
 
 # --------------------------------------------------------------------------
-# Baseline. annbatch's NATIVE path: MultiBasicIndexer wrapping one
-# BasicIndexer(slice) per row-run (utils.py:86, loader.py:855). At
-# chunk_size=1 that is 1024 one-row slices per array. It never constructs a
-# CoordinateIndexer.
+# Baseline: latest zarr-python + annbatch's NATIVE path (MultiBasicIndexer
+# wrapping one BasicIndexer(slice) per row-run, utils.py:86, loader.py:855)
+# + a pure-Python FD-cached store. At chunk_size=1 that is 1024 one-row
+# slices per array, and it never constructs a CoordinateIndexer.
 #
-# The zarrs pipeline appears here ONLY because file_handle_cache_size is a
-# zarrs-python feature. There is NO vindex configuration in the baseline.
+# NO zarrs wheel in the baseline. zarrs is an ablation on top of it.
 # --------------------------------------------------------------------------
 
 BASELINE: dict = {
-    "codec_pipeline": "zarrs.ZarrsCodecPipeline",
-    "file_handle_cache_size": 512,
+    # Pure-Python FD cache: an LRU of open fds served with os.pread. NO zarrs
+    # wheel, no Rust build, no Cargo path dependency, no sibling checkout.
+    #
+    # Justification: zarr's LocalStore._get (zarr/storage/_local.py:30) does
+    # `with path.open("rb") as f: size = f.seek(0, SEEK_END); f.seek(start);
+    # f.read(...)` -- an open, a size probe, a read and a close on EVERY read,
+    # and the size probe is not even needed for a RangeByteRequest. At ~16,600
+    # reads/fetch that is ~50k metadata syscalls per fetch, and metadata ops
+    # are the expensive kind on Lustre. os.pread(fd, length, offset) collapses
+    # it to one syscall per read.
+    "fd_cache": True,
 }
 BASELINE_ANNBATCH_INTEGER_PATH = False
 
@@ -139,6 +147,23 @@ class Ablation:
         )
 
 
+ZARRS = Ablation(
+    "zarrs",
+    where="zarrs-python",
+    change="Swap zarr's codec pipeline for the zarrs one, with its native "
+    "Rust FD cache instead of the Python one. Requires building the wheel. "
+    "On annbatch's native slice path this previously measured SLOWER than "
+    "the stock pipeline, because the concurrent-read adapter was applied in "
+    "the constructor and so wrapped every path: the slice path paid a "
+    "cross-pool rayon handoff per read while never reaching the batching "
+    "that amortises it. Fixed by the store split; unverified since.",
+    config={
+        "codec_pipeline": "zarrs.ZarrsCodecPipeline",
+        "file_handle_cache_size": 512,
+        "fd_cache": False,  # zarrs has its own
+    },
+)
+
 # The vindex config is ONE TICK, not two knobs. It is an annbatch change and a
 # zarrs-python change that only do anything together: the annbatch integer
 # path produces a CoordinateIndexer, and the zarrs-python config is what acts
@@ -165,6 +190,7 @@ VINDEX = Ablation(
         "vindex_decode_concurrent_target": 48,
     },
     integer_path=True,
+    requires=("zarrs",),
 )
 
 
@@ -172,10 +198,11 @@ ABLATIONS: list[Ablation] = [
     Ablation(
         "baseline",
         where="-",
-        change="annbatch native MultiBasicIndexer (slices) + zarrs pipeline "
-        "for the FD cache + file_handle_cache_size=512 + latest zarr-python. "
-        "No vindex config. #4172 is inert here.",
+        change="latest zarr-python + annbatch native MultiBasicIndexer "
+        "(slices) + pure-Python FD-cached store. No zarrs wheel, no vindex "
+        "config. #4172 is inert here (no CoordinateIndexer is ever built).",
     ),
+    ZARRS,
     VINDEX,
     # ---- depth sweep, all on top of the vindex tick -----------------------
     Ablation(
@@ -183,7 +210,7 @@ ABLATIONS: list[Ablation] = [
         where="zarrs-python",
         change="vindex_io_concurrent_target 96 -> 32.",
         config={"vindex_io_concurrent_target": 32},
-        requires=("vindex",),
+        requires=("zarrs", "vindex"),
     ),
     Ablation(
         "vindex_io192",
@@ -193,7 +220,7 @@ ABLATIONS: list[Ablation] = [
         "96, so expect a turnover. More relevant at preload 8192, which makes "
         "~16,600 reads available at once.",
         config={"vindex_io_concurrent_target": 192},
-        requires=("vindex",),
+        requires=("zarrs", "vindex"),
     ),
     Ablation(
         "vindex_io384",
@@ -201,7 +228,7 @@ ABLATIONS: list[Ablation] = [
         change="vindex_io_concurrent_target 96 -> 384. Lustre allows 16 rpcs "
         "x 50 OSTs; finds whether the client or the server binds.",
         config={"vindex_io_concurrent_target": 384},
-        requires=("vindex",),
+        requires=("zarrs", "vindex"),
     ),
     Ablation(
         "vindex_no_index_cache",
@@ -209,15 +236,16 @@ ABLATIONS: list[Ablation] = [
         change="vindex_shard_index_cache_size 4096 -> 0. Isolates what 48.4 "
         "MiB of cached shard indexes is worth.",
         config={"vindex_shard_index_cache_size": 0},
-        requires=("vindex",),
+        requires=("zarrs", "vindex"),
     ),
     # ---- applies to baseline and vindex alike -----------------------------
     Ablation(
         "no_fd_cache",
         where="zarrs-python",
-        change="file_handle_cache_size 512 -> 0. At ~16,600 reads/fetch that "
-        "is that many Lustre open() metadata ops saved or paid.",
-        config={"file_handle_cache_size": 0},
+        change="Disable the FD cache and fall back to zarr's stock "
+        "open/stat/read/close per read. Isolates what ~50k metadata syscalls "
+        "per fetch actually cost on Lustre.",
+        config={"fd_cache": False},
     ),
     Ablation(
         "direct_io",
@@ -225,6 +253,7 @@ ABLATIONS: list[Ablation] = [
         change="O_DIRECT on. Measured NEGATIVE at 96-way (1024 vs 953 ms) but "
         "4.7x at low concurrency, so it may return if depth drops.",
         config={"direct_io": True},
+        requires=("zarrs",),
     ),
     # ---- not yet implemented; declared so the matrix shows the gap --------
     Ablation(
