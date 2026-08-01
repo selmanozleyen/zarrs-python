@@ -16,6 +16,42 @@ Nothing committed, nothing pushed. Preserve all dirty files in both trees.
 | `~/projects/annbatch` | — | — | clean |
 | cluster `~/projects/sparse-read-bench` | — | `3d3720c` | benchmark harness + skill, committed locally only |
 
+## Benchmark definitions (corrected)
+
+**Baseline** is annbatch's *native* path: `MultiBasicIndexer` wrapping one
+`BasicIndexer(slice)` per row-run, plus the FD cache, plus latest zarr-python.
+The zarrs pipeline is present **only** because `file_handle_cache_size` is a
+zarrs-python feature. There is **no vindex configuration in the baseline**.
+
+Because the baseline never builds a `CoordinateIndexer`, **zarr-python#4172 is
+inert in it** — #4172 only optimises `CoordinateIndexer`. Latest zarr is
+version hygiene in the baseline, not a lever.
+
+**The vindex change is ONE TICK, not two knobs.** It is an annbatch change and
+a zarrs-python change that only do anything together:
+
+- *annbatch*: at `chunk_size=1`, emit an integer row array instead of 1-row
+  slices, so zarr builds a `CoordinateIndexer` (this also makes #4172 live).
+- *zarrs-python*: `vindex_shard_index_cache_size=4096`,
+  `vindex_io_concurrent_target=96`, `vindex_decode_concurrent_target=48`.
+
+Measured separately, the zarrs-python half alone was **7946 ms against a 7931
+ms baseline — i.e. nothing**. Any matrix that varies them independently will
+report the vindex work as worthless, which is a measurement artefact rather
+than a result.
+
+**Fixed sampling regime** (asserted by the runner, not swept):
+`chunk_size=1`, `preload_nchunks=8192`, `batch_size=1024` → 8192 rows/fetch,
+8 batches/fetch, ~16,600 reads/fetch.
+
+Earlier runs used roughly **one fetch per batch**, which issues ~2,080 reads at
+a time instead of ~16,600. This workload is depth-limited, so those are *not
+comparable* to runs at the fixed regime.
+
+Consequence: **do not report a per-batch median.** Only 1 batch in 8 performs
+I/O; the rest slice an in-memory buffer, so a median lands on a cheap batch and
+understates cost ~8x. Report **samples per second over the whole run**.
+
 ## Headline result — all 14 plates, one exclusive `cpu_96` node per arm
 
 | arm | what | cold ms | later median | avg cores | peak RSS | max FDs |
@@ -27,10 +63,29 @@ Nothing committed, nothing pushed. Preserve all dirty files in both trees.
 | D | C + `ZARRS_VINDEX_STATS=1` | 1237 | 930 | 3.83 | 3.2 GiB | 3240 |
 | E | C + `direct_io=True` | 1462 | 1024 | 5.79 | 3.2 GiB | 104 |
 
-**C is 6.5x faster than baseline** on the later median and uses 5x less RSS.
+Mapping onto the corrected definitions above: **arm B is the baseline**
+(annbatch native slices + zarrs-for-FD + FD 512). Arm C0 is the zarrs-python
+half of the vindex tick *without* the annbatch half, which is why it equals B.
+Arm C is the full vindex tick.
 
-Caveat: 8 batches per arm, entropy seeds, visible spread. Treat B vs C0 as a
-tie and C/D/E as within ~10%. The A→C gap is far outside that noise.
+As samples/second (1024 rows per batch), the numbers that matter:
+
+| config | ms | **samples/s** |
+|---|---:|---:|
+| baseline (arm B) | 7931 | **129** |
+| full vindex tick (arm C) | 953 | **1074** |
+| reference: no zarrs at all (arm A) | 6161 | 166 |
+
+Caveats, all load-bearing:
+
+- 8 batches per arm, entropy seeds, visible spread. Treat B vs C0 as a tie.
+- **Every zarrs arm is stale.** The store-split and scheduler fixes landed
+  after these runs. Arm B in particular was *inflated by the store-wrap bug* —
+  that is precisely why the baseline measured slower than using no zarrs at
+  all. Post-fix it should be at or above 166 samples/s.
+- **None of these used the fixed sampling regime.** They were ~one fetch per
+  batch, not `preload_nchunks=8192`. They must be re-run before being compared
+  against anything produced at the fixed regime.
 
 ## The B/C0 regression — root-caused, fixed
 
