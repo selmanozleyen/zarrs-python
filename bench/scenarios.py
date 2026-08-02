@@ -56,6 +56,31 @@ anything alone:
 Without the annbatch half there is no ``CoordinateIndexer`` and the whole
 path is dead code -- measured at 7946 ms against a 7931 ms baseline.
 
+Depth, and its ceiling
+----------------------
+Shard **indices** are cached (48.4 MiB, all resident). Shard **payload** is
+312 GiB and never can be: every batch still pulls ~205 MiB of compressed
+inner chunks off Lustre. ``vindex_io_concurrent_target`` governs PAYLOAD
+reads in flight; caching indices does not touch that.
+
+Ranges *within* one shard are issued as a single ``get_partial_many`` and
+looped sequentially by the store. So outstanding reads equal concurrent
+SHARD tasks, not concurrent ranges::
+
+    1024 rows x 2 arrays = 2048 runs -> ~234 shard tasks x ~9 ranges each
+    outstanding reads ~= 234 (max), NOT ~2,080
+
+That is the ceiling: past ~234 there is nothing left to schedule, so
+``io384`` cannot help by construction.
+
+Getting to ~2,080 outstanding means parallelising ranges within a shard.
+Thread-per-range WAS tried and lost badly -- ~340 threads, 50k+ voluntary
+context switches, slower than the batched control at every target up to 96.
+But that was measured under the cross-pool rayon scheduler since shown to be
+pathological (nesting 31 deep, no target bounding anything), so the verdict
+is not safe and deserves a re-test. The principled version is io_uring:
+2,080 outstanding reads without 2,080 threads.
+
 ``vindex_io32`` / ``io192`` / ``io384`` vary ``vindex_io_concurrent_target``.
 Since the scheduler rework this sizes the SINGLE shared pool, and each shard
 task performs its own read inline on its own thread, so this value **is the
@@ -217,19 +242,34 @@ class Ablation:
 # on it. Measured separately, the zarrs-python half alone was 7946 ms against
 # a 7931 ms baseline -- i.e. nothing. Splitting them in a matrix reports the
 # vindex work as worthless, which is a measurement artefact, not a result.
+VINDEX_NAME = "vindex (sorted+shard-grouped, shard-indices cached, fd cached)"
 VINDEX = Ablation(
-    "vindex",
+    VINDEX_NAME,
     where="annbatch + zarrs-python",
     change=(
-        "TWO CHANGES AS ONE TICK. "
-        "(annbatch) at chunk_size=1 emit an integer row array instead of "
-        "1-row slices, so zarr builds a CoordinateIndexer -- this also makes "
-        "zarr-python#4172 live. "
-        "(zarrs-python) vindex_shard_index_cache_size=4096 (3,292 shards "
-        "exist; the 256 default holds 8% and evicts in arbitrary hash order), "
-        "vindex_io_concurrent_target=96 (= outstanding-read depth), "
-        "vindex_decode_concurrent_target=48 (= codec thread budget). "
-        "Neither half does anything without the other."
+        "EVERY TRICK ON. One tick spanning two codebases; neither half does "
+        "anything alone. "
+        "(annbatch) emit an integer row array at chunk_size=1 instead of 1024 "
+        "one-row slices, so zarr builds a CoordinateIndexer -- this is also "
+        "what makes zarr-python#4172 live. "
+        "(zarrs-python) sort and group-run the coordinates; group every "
+        "sparse subset by StoreKey, i.e. by physical shard; one task per "
+        "shard; ONE logical multi-range read per shard via get_partial_many; "
+        "map subsets to inner chunks and group byte ranges per inner chunk; "
+        "decode and scatter straight into a single contiguous output arena, "
+        "avoiding one Vec per subset plus a final flattening copy; retain the "
+        "output permutation so results land in caller order. "
+        "(caches) shard-index/partial-decoder cache 4096 = every index "
+        "resident (~117 shards per array, 48.4 MiB for all 3,292); file "
+        "handle cache 512 inherited from the baseline. "
+        "(scheduling) reads run inline on one shared pool sized by "
+        "vindex_io_concurrent_target, after the cross-pool rayon install was "
+        "removed. "
+        "(codec) Blosc partial decode via blosc_getitem. "
+        "NOTE the depth ceiling: ranges WITHIN a shard are issued as one "
+        "get_partial_many and looped sequentially by the store, so "
+        "outstanding reads equal concurrent SHARD tasks (~234 here), not "
+        "concurrent ranges (~2,080)."
     ),
     config={
         "vindex_shard_index_cache_size": 4096,
@@ -268,7 +308,7 @@ ABLATIONS: list[Ablation] = [
         where="zarrs-python",
         change="vindex_io_concurrent_target 96 -> 32.",
         config={"vindex_io_concurrent_target": 32},
-        requires=("vindex",),
+        requires=(VINDEX_NAME,),
     ),
     Ablation(
         "vindex_io192",
@@ -278,7 +318,7 @@ ABLATIONS: list[Ablation] = [
         "96, so expect a turnover. More relevant at preload 8192, which makes "
         "~16,600 reads available at once.",
         config={"vindex_io_concurrent_target": 192},
-        requires=("vindex",),
+        requires=(VINDEX_NAME,),
     ),
     Ablation(
         "vindex_io384",
@@ -286,7 +326,7 @@ ABLATIONS: list[Ablation] = [
         change="vindex_io_concurrent_target 96 -> 384. Lustre allows 16 rpcs "
         "x 50 OSTs; finds whether the client or the server binds.",
         config={"vindex_io_concurrent_target": 384},
-        requires=("vindex",),
+        requires=(VINDEX_NAME,),
     ),
     # ---- not yet implemented; declared so the matrix shows the gap --------
     Ablation(
@@ -298,7 +338,7 @@ ABLATIONS: list[Ablation] = [
         "batch specifically: measured 2,108-5,259 ms cold against 1,986-2,440 "
         "ms steady. NOT IMPLEMENTED -- needs a new zarrs-python option.",
         config={"vindex_shard_index_cache_size": 4096},
-        requires=("vindex",),
+        requires=(VINDEX_NAME,),
         landed=False,
     ),
     Ablation(
@@ -313,7 +353,7 @@ ABLATIONS: list[Ablation] = [
         "runs and tighter per-shard grouping. Today the stable argsort at "
         "loader.py:572 preserves shuffled chunk order, so what reaches zarr "
         "is unsorted and neither fires.",
-        requires=("vindex",),
+        requires=(VINDEX_NAME,),
         landed=False,
     ),
     Ablation(
@@ -325,7 +365,7 @@ ABLATIONS: list[Ablation] = [
         "which only pay off once the vindex path is working and measured, so "
         "this is downstream of having vindex_* numbers -- not a parallel "
         "experiment. Risk: may not support the direct out= buffer write.",
-        requires=("vindex",),
+        requires=(VINDEX_NAME,),
         landed=False,
     ),
     Ablation(
