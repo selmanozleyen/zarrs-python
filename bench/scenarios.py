@@ -31,12 +31,13 @@ the headline metric even now that per-batch numbers mean something.
 Read count at this regime (measured geometry: inner chunk 91,549 elements,
 ~1450 nnz/row, so a 1-row run spans 1 + 1450/91549 = 1.016 inner chunks)::
 
-    per fetch = per batch:  1024 rows * 2 arrays * 1.016 = ~2,080 reads
+    per fetch:  4096 rows * 2 arrays * 1.016 = ~8,320 reads
+    per batch:  ~2,080 reads (amortised over the 4 batches a fetch feeds)
 
-Depth note: 2,080 reads are available at once, against a baseline measured
-to be concurrency-limited at ~16 and a Lustre ceiling near 2,455 preads/s.
-So this regime still offers far more outstanding work than any arm can
-currently consume, and the reduction from ~16,600 should not itself bind.
+Depth note: the vindex path measured ~2,460 reads/s, which is essentially the
+~2,455 preads/s ceiling measured on this filesystem. Submitting ~8,320 at once
+rather than ~2,080 tests whether more outstanding work still buys anything, or
+whether the storage is already saturated.
 
 Pure random is the most read-expensive regime possible: ~1 read per row per
 array, and no coalescing is available because 1024 random rows out of 100.6M
@@ -511,7 +512,7 @@ if __name__ == "__main__":
         f"  -> {ROWS_PER_FETCH} rows/fetch, {BATCHES_PER_FETCH} batches/fetch, "
         f"~{reads_per_fetch():,} reads/fetch"
     )
-    print("  -> 1 fetch = 1 batch; per-batch numbers are meaningful\n")
+    print("  -> report SAMPLES/SECOND; only 1 batch in 4 does I/O\n")
     print(f"{'ablation':<24} {'where':<24} {'int-path':<9} landed")
     for a in ABLATIONS:
         print(
