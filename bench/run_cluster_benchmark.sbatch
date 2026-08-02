@@ -18,7 +18,7 @@ echo "Running on node: $(hostname)"
 echo "Start time: $(date)"
 
 # Record provenance before run
-python bench/check_provenance.py
+uv run python bench/check_provenance.py
 
 DATASETS=(
   "/ictstr01/groups/ml01/datasets/selman.ozleyen/tahoe100_collection.zarr/dataset_0"
@@ -29,14 +29,14 @@ DATASETS=(
 
 # Run Arms B and D (alternating order to remove fixed-order bias)
 echo "=== Phase 1: Comparing Arm B vs Arm D ==="
-python bench/run_cluster_benchmark.py \
+uv run python bench/run_cluster_benchmark.py \
   --arms B D \
   --dataset-paths "${DATASETS[@]}" \
   --num-batches 12 \
   --output-json "results_bd_${SLURM_JOB_ID}.json"
 
 echo "=== Phase 2: Full A/B/C/D Matrix ==="
-python bench/run_cluster_benchmark.py \
+uv run python bench/run_cluster_benchmark.py \
   --arms A B C D \
   --dataset-paths "${DATASETS[@]}" \
   --num-batches 12 \
