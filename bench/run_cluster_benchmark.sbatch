@@ -11,6 +11,8 @@
 
 set -euo pipefail
 
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+
 mkdir -p logs
 
 echo "Job ID: ${SLURM_JOB_ID}"
