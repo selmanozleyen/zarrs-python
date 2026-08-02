@@ -47,6 +47,8 @@ The `ZarrsCodecPipeline` specific options are:
   - Defaults to 4 if `None`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#chunk-concurrent-minimum) for more info.
 - `codec_pipeline.validate_checksums`: enable checksum validation (e.g. with the CRC32C codec).
   - Defaults to `True`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#validate-checksums) for more info.
+- `codec_pipeline.shard_index_cache_size`: the number of chunks whose partial decoder is retained between reads. Building one reads and decodes the chunk's index, so for a sharded array repeatedly read in pieces — a training loop over random rows, say — caching them removes an index read and decode per shard per batch.
+  - Defaults to `0` (disabled). Cleared on any write through this pipeline, but a cached index does not observe modification from anywhere else, including `zarr-python`'s own `resize` and `delete_dir`. Only enable this while nothing is modifying the array.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -62,6 +64,7 @@ zarr.config.set({
         "validate_checksums": True,
         "chunk_concurrent_maximum": None,
         "chunk_concurrent_minimum": 4,
+        "shard_index_cache_size": 0,
         "direct_io": False,
         "strict": False
     }

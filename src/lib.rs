@@ -3,11 +3,13 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chunk_item::ChunkItem;
 use itertools::Itertools;
+use lru::LruCache;
 use numpy::npyffi::PyArrayObject;
 use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -50,6 +52,10 @@ pub struct CodecPipelineImpl {
     pub(crate) chunk_concurrent_minimum: usize,
     pub(crate) chunk_concurrent_maximum: usize,
     pub(crate) num_threads: usize,
+    /// Partial decoders keyed by chunk, retained across calls. Building one
+    /// reads and decodes the shard index, so reusing it across reads of the
+    /// same shards removes that work. `None` when disabled.
+    shard_index_cache: Option<Mutex<LruCache<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>>>,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
 }
@@ -218,6 +224,7 @@ impl CodecPipelineImpl {
         chunk_concurrent_maximum=None,
         num_threads=None,
         direct_io=false,
+        shard_index_cache_size=0,
     ))]
     #[new]
     fn new(
@@ -228,6 +235,7 @@ impl CodecPipelineImpl {
         chunk_concurrent_maximum: Option<usize>,
         num_threads: Option<usize>,
         direct_io: bool,
+        shard_index_cache_size: usize,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
         let metadata = serde_json::from_str(array_metadata).map_py_err::<PyTypeError>()?;
@@ -275,6 +283,8 @@ impl CodecPipelineImpl {
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
+            shard_index_cache: NonZeroUsize::new(shard_index_cache_size)
+                .map(|size| Mutex::new(LruCache::new(size))),
             fill_value,
             data_type,
         })
@@ -304,6 +314,24 @@ impl CodecPipelineImpl {
             .collect::<Vec<_>>();
         let mut partial_decoder_cache: HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>> =
             HashMap::new();
+        // Serve whatever the shard index cache already holds, and only build
+        // decoders for the rest.
+        let partial_chunk_items = match &self.shard_index_cache {
+            None => partial_chunk_items,
+            Some(cache) => {
+                let mut cache = cache.lock().unwrap();
+                partial_chunk_items
+                    .into_iter()
+                    .filter(|item| match cache.get(&item.key) {
+                        Some(decoder) => {
+                            partial_decoder_cache.insert(item.key.clone(), decoder.clone());
+                            false
+                        }
+                        None => true,
+                    })
+                    .collect()
+            }
+        };
         if !partial_chunk_items.is_empty() {
             let key_decoder_pairs =
                 iter_concurrent_limit!(chunk_concurrent_limit, partial_chunk_items, map, |item| {
@@ -323,6 +351,12 @@ impl CodecPipelineImpl {
                     Ok((item.key.clone(), partial_decoder))
                 })
                 .collect::<PyResult<Vec<_>>>()?;
+            if let Some(cache) = &self.shard_index_cache {
+                let mut cache = cache.lock().unwrap();
+                for (key, decoder) in &key_decoder_pairs {
+                    cache.put(key.clone(), decoder.clone());
+                }
+            }
             partial_decoder_cache.extend(key_decoder_pairs);
         }
 
@@ -399,6 +433,12 @@ impl CodecPipelineImpl {
         enum InputValue<'a> {
             Array(ArrayBytes<'a>),
             Constant(FillValue),
+        }
+
+        // A cached decoder holds the shard index read when it was built, so it
+        // does not survive a write to that shard.
+        if let Some(cache) = &self.shard_index_cache {
+            cache.lock().unwrap().clear();
         }
 
         // Get input array

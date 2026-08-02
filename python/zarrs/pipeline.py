@@ -62,6 +62,9 @@ def get_codec_pipeline_impl(
             ),
             num_threads=config.get("threading.max_workers", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
+            shard_index_cache_size=config.get(
+                "codec_pipeline.shard_index_cache_size", 0
+            ),
         )
     except TypeError as e:
         if strict:

@@ -128,3 +128,30 @@ def test_direct_io(tmp_path: Path) -> None:
     ground_truth_arr = np.random.random(z.shape)
     z[...] = ground_truth_arr
     np.testing.assert_array_equal(z[...], ground_truth_arr)
+
+
+@pytest.mark.parametrize("cache_size", [0, 8])
+def test_shard_index_cache(tmp_path: Path, cache_size: int) -> None:
+    with zarr.config.set(
+        {
+            "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
+            "codec_pipeline.shard_index_cache_size": cache_size,
+        }
+    ):
+        z = zarr.create_array(
+            tmp_path / "foo.zarr",
+            dtype=np.float64,
+            shape=(80, 100),
+            chunks=(10, 10),
+            shards=(20, 20),
+        )
+        ground_truth_arr = np.random.random(z.shape)
+        z[...] = ground_truth_arr
+        # Repeated partial reads are what the cache serves.
+        for _ in range(3):
+            np.testing.assert_array_equal(z[10:30, :], ground_truth_arr[10:30, :])
+
+        # A cached decoder holds a stale index after a write, so it must be dropped.
+        ground_truth_arr = np.random.random(z.shape)
+        z[...] = ground_truth_arr
+        np.testing.assert_array_equal(z[10:30, :], ground_truth_arr[10:30, :])
