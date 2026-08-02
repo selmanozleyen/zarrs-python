@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -43,31 +44,28 @@ pub fn partial_read_max_active() -> usize {
 
 /// A storage adapter that measures logical multi-range reads.
 ///
-/// # Why this no longer dispatches to a separate I/O pool
+/// Measurement only: it records how many reads are in flight and how long they
+/// take, and dispatches nothing. Reads are handed to [`VindexFetchPool`]
+/// explicitly at the call site.
 ///
-/// It previously ran each read on a shared rayon I/O pool via
-/// `ThreadPool::install`, called from a rayon decode worker. That is
-/// documented rayon behaviour to *not* park the caller: it "will try to keep
-/// busy while the op completes in its target pool ... it may potentially
-/// schedule other tasks to run on the current thread in the meantime". The
-/// waiting decode worker therefore stole further shard tasks, which blocked on
-/// their own reads and stole more. Measured with `ZARRS_VINDEX_STATS`: nesting
-/// 31 deep on a *single* decode thread, with 31 concurrent reads even when the
-/// decode target was 1.
+/// # Why dispatch does not happen here
 ///
-/// Consequences were that no configured target bounded concurrency, summed
-/// task timings double-counted nested work, and stack depth grew without limit.
+/// An earlier design ran each read on a shared *rayon* I/O pool via
+/// `ThreadPool::install`, called from a rayon decode worker. Rayon documents
+/// that as explicitly *not* parking the caller: it "will try to keep busy
+/// while the op completes in its target pool ... it may potentially schedule
+/// other tasks to run on the current thread in the meantime". The waiting
+/// decode worker therefore stole further shard tasks, which blocked on their
+/// own reads and stole more. Measured with `ZARRS_VINDEX_STATS`: nesting 31
+/// deep on a *single* decode thread, with 31 concurrent reads even when the
+/// decode target was 1. No configured target bounded concurrency, summed task
+/// timings double-counted nested work, and stack depth grew without limit.
 ///
-/// A two-pool split cannot fix this, because a worker waiting on a read still
-/// occupies a thread either way: outstanding reads are capped by the number of
-/// waiting workers regardless. Splitting only pays once a read can be
-/// outstanding *without* holding a thread, which needs completion-based I/O
-/// (`io_uring`), not a second pool.
-///
-/// So reads now run inline on the calling shard-task thread, and concurrency
-/// comes from the size of the single shared pool. Getting more outstanding
-/// reads means more threads in that pool, which is cheap: they are parked in
-/// `pread`, and codec CPU is a small fraction of this workload.
+/// The fix was not a second *rayon* pool, which has the same defect for the
+/// same reason -- `install` never parks. It was dedicated non-rayon threads
+/// that block in `pread` and return bytes over a channel, so a waiting read
+/// occupies one cheap 256 KiB thread and steals nothing. See
+/// [`VindexFetchPool`].
 struct MeasuredStorage {
     storage: ReadableWritableListableStorage,
 }
@@ -197,22 +195,21 @@ pub fn with_io_measurement(
 /// the opposite of work stealing -- a thread that parks in `pread` and costs
 /// nothing until its bytes arrive.
 ///
-/// Spawned once, so a batch never pays thread creation. Sized by
-/// `ZARRS_VINDEX_IO_THREADS`. The bound is about bytes in flight and the
+/// Spawned once per distinct size, so a batch never pays thread creation.
+/// Sized by `vindex_fetch_threads`. The bound is about bytes in flight and the
 /// storage service rate, not cores, because these threads are almost always
-/// parked.
-pub struct VindexIoPool {
+/// parked -- so it wants to be far larger than the core count.
+pub struct VindexFetchPool {
     tx: crossbeam_channel::Sender<Box<dyn FnOnce() + Send + 'static>>,
 }
 
-impl VindexIoPool {
+impl VindexFetchPool {
     fn new(threads: usize) -> Self {
-        let (tx, rx) =
-            crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send + 'static>>();
+        let (tx, rx) = crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send + 'static>>();
         for index in 0..threads {
             let rx = rx.clone();
             std::thread::Builder::new()
-                .name(format!("zarrs-vindex-io-{index}"))
+                .name(format!("zarrs-vindex-fetch-{index}"))
                 // They only wait and move bytes; no codec recursion.
                 .stack_size(256 * 1024)
                 .spawn(move || {
@@ -220,26 +217,38 @@ impl VindexIoPool {
                         job();
                     }
                 })
-                .expect("failed to spawn vindex io thread");
+                .expect("failed to spawn vindex fetch thread");
         }
         Self { tx }
     }
 
     pub fn submit(&self, job: impl FnOnce() + Send + 'static) {
-        // Receivers live for the process, so this cannot fail.
+        // The workers hold `rx` for as long as this pool is alive, so a send
+        // can only fail once every worker is gone, i.e. after the last `Arc`
+        // to the pool has dropped -- which cannot happen while `self` exists.
         let _ = self.tx.send(Box::new(job));
     }
 }
 
-pub fn vindex_io_pool() -> &'static VindexIoPool {
-    static POOL: LazyLock<VindexIoPool> = LazyLock::new(|| {
-        let threads = std::env::var("ZARRS_VINDEX_IO_THREADS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism().map_or(64, |n| (n.get() * 8).clamp(64, 1024))
-            });
-        VindexIoPool::new(threads)
-    });
-    &POOL
+/// Default fetch depth when unset: these threads park in `pread`, so this is a
+/// bytes-in-flight bound rather than a CPU one, and it is deliberately a large
+/// multiple of the core count.
+pub fn default_vindex_fetch_threads() -> usize {
+    std::thread::available_parallelism().map_or(64, |n| (n.get() * 8).clamp(64, 1024))
+}
+
+static VINDEX_FETCH_POOLS: LazyLock<Mutex<HashMap<usize, Weak<VindexFetchPool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Share one fetch pool per distinct size, so many pipelines over the same
+/// config do not each spawn their own hundreds of threads. Dropping the last
+/// pipeline drops the sender, which lets the workers exit.
+pub fn shared_vindex_fetch_pool(threads: usize) -> Arc<VindexFetchPool> {
+    let mut pools = VINDEX_FETCH_POOLS.lock().unwrap();
+    if let Some(pool) = pools.get(&threads).and_then(Weak::upgrade) {
+        return pool;
+    }
+    let pool = Arc::new(VindexFetchPool::new(threads));
+    pools.insert(threads, Arc::downgrade(&pool));
+    pool
 }

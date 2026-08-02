@@ -43,7 +43,10 @@ mod utils;
 mod vindex_stats;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
-use crate::store::{StoreConfig, partial_read_max_active, vindex_io_pool, with_io_measurement};
+use crate::store::{
+    StoreConfig, VindexFetchPool, default_vindex_fetch_threads, partial_read_max_active,
+    shared_vindex_fetch_pool, with_io_measurement,
+};
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 use crate::vindex_stats::{Phase, VindexStats};
 
@@ -71,17 +74,17 @@ fn shared_vindex_decode_pool(num_threads: usize) -> PyResult<Arc<ThreadPool>> {
 #[pyclass]
 pub struct CodecPipelineImpl {
     pub(crate) store: ReadableWritableListableStorage,
-    /// `store` wrapped so each logical multi-range read is dispatched onto the
-    /// shared I/O pool. Used only by the scattered path, which batches a
-    /// shard's ranges into one operation; see the constructor.
+    /// `store` wrapped so each read is measured. Dispatch is explicit: the
+    /// scattered path submits one job per byte range to `vindex_fetch_pool`.
     pub(crate) vindex_store: ReadableWritableListableStorage,
     pub(crate) codec_chain: Arc<CodecChain>,
     pub(crate) codec_options: CodecOptions,
     pub(crate) chunk_concurrent_minimum: usize,
     pub(crate) chunk_concurrent_maximum: usize,
     pub(crate) num_threads: usize,
-    pub(crate) vindex_io_concurrent_target: usize,
-    pub(crate) vindex_decode_concurrent_target: usize,
+    pub(crate) vindex_fetch_threads: usize,
+    pub(crate) vindex_decode_threads: usize,
+    vindex_fetch_pool: Arc<VindexFetchPool>,
     vindex_decode_pool: Arc<ThreadPool>,
     vindex_shard_index_cache_size: usize,
     partial_decoder_cache: Mutex<HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>>,
@@ -89,10 +92,11 @@ pub struct CodecPipelineImpl {
     pub(crate) data_type: DataType,
 }
 
-/// Shard tasks allowed in flight when unset. A safety valve, not a tuning
-/// knob: it only needs to exceed the shards a batch touches, and its threads
-/// park on completions rather than spinning.
-const VINDEX_SHARD_TASKS_DEFAULT: usize = 512;
+/// Decode work is CPU-bound, so each shard decodes on exactly one thread and
+/// parallelism comes only from the pool. Nesting a per-shard codec target on
+/// top of the pool is what previously multiplied two settings into an
+/// effective concurrency nobody chose.
+const VINDEX_SHARD_CODEC_TARGET: usize = 1;
 
 impl CodecPipelineImpl {
     fn retrieve_chunk_bytes<'a>(
@@ -511,36 +515,29 @@ impl CodecPipelineImpl {
                 .subsets_per_task_max
                 .fetch_max(subsets_max as u64, Ordering::Relaxed);
         }
-        // ONE knob: `vindex_io_concurrent_target` is the maximum number of
-        // reads allowed to be outstanding, and nothing else throttles them.
+        // Two levers, two axes, neither derived from the other:
+        //   vindex_fetch_threads  -> how many reads may be outstanding, i.e.
+        //                            the size of the fetch pool
+        //   vindex_decode_threads -> how many shards may decompress at once,
+        //                            i.e. the size of the decode pool
         //
-        // The inner per-inner-chunk fan-out is deliberately NOT divided down
-        // by how many shard tasks are running. Dividing made the two settings
-        // multiply into an effective concurrency nobody chose: at
-        // io=96/decode=48 it yielded `max(1, 48/96) = 1`, so each shard task
-        // fetched its inner chunks one at a time and per-chunk fetching was
-        // inert. Measured on a 1024-row CSR minibatch, raising the effective
-        // figure moved throughput 1903 -> 2348 -> 2600 samples/s.
+        // Each shard then decodes on a single thread (VINDEX_SHARD_CODEC_TARGET),
+        // so there is no nested fan-out for the two to multiply through. An
+        // earlier shape divided one by the other and yielded `max(1, 48/96) = 1`,
+        // making per-chunk fetching inert; on a 1024-row CSR minibatch, undoing
+        // that moved throughput 1903 -> 2348 -> 2600 samples/s.
         //
-        // A thread parked in `pread` costs no CPU, so this bound is not about
-        // core count. It is about bytes in flight (~100 KiB of compressed
-        // chunk per outstanding read) and about the storage service rate,
-        // beyond which extra concurrency only queues: the same measurements
-        // show 4x concurrency buying +23% and a further 2.25x buying +11%.
-        // The two knobs now mean genuinely different things, and neither
-        // divides the other:
-        //   vindex_io_concurrent_target     -> pool size, i.e. how many reads
-        //                                      may be outstanding at once
-        //   vindex_decode_concurrent_target -> decode admission in the codec,
-        //                                      i.e. how many completed reads
-        //                                      may decompress concurrently
-        let active_decode_tasks =
-            std::cmp::min(self.vindex_io_concurrent_target, tasks.len()).max(1);
-        let task_codec_target = self.vindex_decode_concurrent_target;
+        // The two bounds are unlike each other. A fetch thread parks in `pread`
+        // and costs no CPU, so its bound is bytes in flight (~100 KiB of
+        // compressed chunk apiece), 256 KiB of stack, and the storage service
+        // rate beyond which extra depth only queues -- measurements show 4x
+        // depth buying +23% and a further 2.25x buying +11%. A decode thread
+        // is CPU-bound, so its bound is core count.
+        let task_codec_target = VINDEX_SHARD_CODEC_TARGET;
         if stats.is_some() {
             eprintln!(
-                "zarrs vindex concurrency: io_target={} decode_target={} active_decode_workers={active_decode_tasks} codec_target_per_shard={task_codec_target}",
-                self.vindex_io_concurrent_target, self.vindex_decode_concurrent_target,
+                "zarrs vindex concurrency: fetch_threads={} decode_threads={} codec_target_per_shard={task_codec_target}",
+                self.vindex_fetch_threads, self.vindex_decode_threads,
             );
         }
         let task_codec_options = codec_options.with_concurrent_target(task_codec_target);
@@ -566,8 +563,8 @@ impl CodecPipelineImpl {
             .collect::<PyResult<Vec<Option<Vec<Option<ByteRange>>>>>>()?;
 
         // Submit every read across every shard at once. Nothing throttles
-        // them here: depth is bounded by the I/O pool, and decompression by
-        // the codec's own gate. No thread is parked per shard.
+        // them here: depth is bounded by the fetch pool, and decompression by
+        // the decode pool. No thread is parked per shard.
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut outstanding = vec![0usize; tasks.len()];
         for (task_index, plan) in plans.iter().enumerate() {
@@ -581,7 +578,7 @@ impl CodecPipelineImpl {
                         let key = tasks[task_index].key.clone();
                         let byte_range = *byte_range;
                         let stats = stats.cloned();
-                        vindex_io_pool().submit(move || {
+                        self.vindex_fetch_pool.submit(move || {
                             let started = stats.as_ref().map(|_| Instant::now());
                             let fetched = store.get_partial(&key, byte_range);
                             if let (Some(stats), Some(started)) = (stats, started) {
@@ -746,8 +743,8 @@ impl CodecPipelineImpl {
         chunk_concurrent_minimum=None,
         chunk_concurrent_maximum=None,
         num_threads=None,
-        vindex_io_concurrent_target=None,
-        vindex_decode_concurrent_target=None,
+        vindex_fetch_threads=None,
+        vindex_decode_threads=None,
         vindex_shard_index_cache_size=0,
         direct_io=false,
         file_handle_cache_size=0,
@@ -761,8 +758,8 @@ impl CodecPipelineImpl {
         chunk_concurrent_minimum: Option<usize>,
         chunk_concurrent_maximum: Option<usize>,
         num_threads: Option<usize>,
-        vindex_io_concurrent_target: Option<usize>,
-        vindex_decode_concurrent_target: Option<usize>,
+        vindex_fetch_threads: Option<usize>,
+        vindex_decode_threads: Option<usize>,
         vindex_shard_index_cache_size: usize,
         direct_io: bool,
         file_handle_cache_size: usize,
@@ -785,31 +782,15 @@ impl CodecPipelineImpl {
         let chunk_concurrent_maximum =
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
-        // Not a tuning knob: a safety valve that should never bind.
-        //
-        // This sizes the pool running shard tasks. A shard task now only
-        // submits its inner-chunk reads to the codec's dedicated I/O threads
-        // and waits, so capping it caps how many shards can have reads in
-        // flight at all. Defaulting it to the rayon thread count meant 16 on
-        // a `-c16` allocation, throttling a ~234-shard batch to 16 shards'
-        // worth of reads however many I/O threads existed.
-        //
-        // The bounds that matter live elsewhere: `ZARRS_IO_THREADS` limits
-        // outstanding reads, and the codec's decode gate limits CPU. So this
-        // just needs to exceed the number of shards a batch touches. The
-        // threads are parked waiting on completions, not spinning.
-        let vindex_io_concurrent_target = vindex_io_concurrent_target
-            .unwrap_or(VINDEX_SHARD_TASKS_DEFAULT)
+        // Fetch depth is a bytes-in-flight bound, not a CPU one, so it wants
+        // to be a large multiple of the core count and must comfortably exceed
+        // the reads a batch plans. Decode is CPU-bound, so it tracks cores.
+        let vindex_fetch_threads = vindex_fetch_threads
+            .unwrap_or_else(default_vindex_fetch_threads)
             .max(1);
-        let vindex_decode_concurrent_target = vindex_decode_concurrent_target
-            .unwrap_or(num_threads)
-            .max(1);
-        // One pool runs each shard task end to end: its own read, then its own
-        // decode. Its size is therefore the outstanding-read depth, which is
-        // what this latency-bound workload actually rewards, so it is sized
-        // from the I/O target rather than the decode target. Threads waiting
-        // in `pread` are cheap; codec CPU is a small share of the batch.
-        let vindex_decode_pool = shared_vindex_decode_pool(vindex_io_concurrent_target)?;
+        let vindex_decode_threads = vindex_decode_threads.unwrap_or(num_threads).max(1);
+        let vindex_fetch_pool = shared_vindex_fetch_pool(vindex_fetch_threads);
+        let vindex_decode_pool = shared_vindex_decode_pool(vindex_decode_threads)?;
 
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
@@ -843,8 +824,9 @@ impl CodecPipelineImpl {
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
-            vindex_io_concurrent_target,
-            vindex_decode_concurrent_target,
+            vindex_fetch_threads,
+            vindex_decode_threads,
+            vindex_fetch_pool,
             vindex_decode_pool,
             vindex_shard_index_cache_size,
             partial_decoder_cache: Mutex::new(HashMap::new()),

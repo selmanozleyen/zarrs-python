@@ -65,7 +65,7 @@ Depth, and its ceiling
 ----------------------
 Shard **indices** are cached (48.4 MiB, all resident). Shard **payload** is
 312 GiB and never can be: every batch still pulls ~205 MiB of compressed
-inner chunks off Lustre. ``vindex_io_concurrent_target`` governs PAYLOAD
+inner chunks off Lustre. ``vindex_fetch_threads`` governs PAYLOAD
 reads in flight; caching indices does not touch that.
 
 Ranges *within* one shard are issued as a single ``get_partial_many`` and
@@ -115,7 +115,7 @@ pathological (nesting 31 deep, no target bounding anything), so the verdict
 is not safe and deserves a re-test. The principled version is io_uring:
 2,080 outstanding reads without 2,080 threads.
 
-``vindex_io32`` / ``io192`` / ``io384`` vary ``vindex_io_concurrent_target``.
+``vindex_io32`` / ``io192`` / ``io384`` vary ``vindex_fetch_threads``.
 Since the scheduler rework this sizes the SINGLE shared pool, and each shard
 task performs its own read inline on its own thread, so this value **is the
 outstanding-read depth** -- how many shard reads are in flight at once. The
@@ -293,7 +293,9 @@ VINDEX = Ablation(
         "what makes zarr-python#4172 live. "
         "(zarrs-python) sort and group-run the coordinates; group every "
         "sparse subset by StoreKey, i.e. by physical shard; one task per "
-        "shard; ONE logical multi-range read per shard via get_partial_many; "
+        "shard; plan every byte range up front, then submit each range "
+        "individually to a pool of dedicated parked I/O threads and decode "
+        "each shard the moment its last range lands; "
         "map subsets to inner chunks and group byte ranges per inner chunk; "
         "decode and scatter straight into a single contiguous output arena, "
         "avoiding one Vec per subset plus a final flattening copy; retain the "
@@ -302,18 +304,20 @@ VINDEX = Ablation(
         "resident (~117 shards per array, 48.4 MiB for all 3,292); file "
         "handle cache 512 inherited from the baseline. "
         "(scheduling) reads run inline on one shared pool sized by "
-        "vindex_io_concurrent_target, after the cross-pool rayon install was "
+        "vindex_fetch_threads, after the cross-pool rayon install was "
         "removed. "
-        "(codec) Blosc partial decode via blosc_getitem. "
-        "NOTE the depth ceiling: ranges WITHIN a shard are issued as one "
-        "get_partial_many and looped sequentially by the store, so "
-        "outstanding reads equal concurrent SHARD tasks (~234 here), not "
-        "concurrent ranges (~2,080)."
+        "(codec) Blosc partial decode is NOT enabled -- the capability was "
+        "restored to its upstream default in f15e673c, and codec CPU measured "
+        "~4 ms against ~2,000 ms of wall, so it is not a lever. "
+        "NOTE the depth ceiling is GONE: ranges within a shard are now "
+        "submitted individually to the parked I/O pool, so outstanding reads "
+        "are bounded by vindex_fetch_threads rather than by concurrent "
+        "SHARD tasks (~234). This arm's numbers predate that change."
     ),
     config={
         "vindex_shard_index_cache_size": 4096,
-        "vindex_io_concurrent_target": 96,
-        "vindex_decode_concurrent_target": 48,
+        "vindex_fetch_threads": 96,
+        "vindex_decode_threads": 48,
     },
     integer_path=True,
 )
@@ -332,26 +336,26 @@ ABLATIONS: list[Ablation] = [
     Ablation(
         "vindex_io32",
         where="zarrs-python",
-        change="vindex_io_concurrent_target 96 -> 32.",
-        config={"vindex_io_concurrent_target": 32},
+        change="vindex_fetch_threads 96 -> 32.",
+        config={"vindex_fetch_threads": 32},
         requires=(VINDEX_NAME,),
     ),
     Ablation(
         "vindex_io192",
         where="zarrs-python",
-        change="vindex_io_concurrent_target 96 -> 192. Measured client "
+        change="vindex_fetch_threads 96 -> 192. Measured client "
         "ceiling was ~2455 preads/s at 64 threads and REGRESSED to 2090 at "
         "96, so expect a turnover. More relevant at preload 8192, which makes "
         "~16,600 reads available at once.",
-        config={"vindex_io_concurrent_target": 192},
+        config={"vindex_fetch_threads": 192},
         requires=(VINDEX_NAME,),
     ),
     Ablation(
         "vindex_io384",
         where="zarrs-python",
-        change="vindex_io_concurrent_target 96 -> 384. Lustre allows 16 rpcs "
+        change="vindex_fetch_threads 96 -> 384. Lustre allows 16 rpcs "
         "x 50 OSTs; finds whether the client or the server binds.",
-        config={"vindex_io_concurrent_target": 384},
+        config={"vindex_fetch_threads": 384},
         requires=(VINDEX_NAME,),
     ),
     # ---- not yet implemented; declared so the matrix shows the gap --------
@@ -370,8 +374,8 @@ ABLATIONS: list[Ablation] = [
         "2,080 outstanding then needs io_uring rather than a thread per read.",
         config={
             "vindex_shard_index_cache_size": 4096,
-            "vindex_io_concurrent_target": 96,
-            "vindex_decode_concurrent_target": 48,
+            "vindex_fetch_threads": 96,
+            "vindex_decode_threads": 48,
         },
         integer_path=True,
         landed=False,
@@ -454,8 +458,8 @@ EXPERIMENT_ARMS: list[ExperimentArm] = [
         zarrs_config={
             "file_handle_cache_size": 512,
             "vindex_shard_index_cache_size": 4096,
-            "vindex_io_concurrent_target": 96,
-            "vindex_decode_concurrent_target": 48,
+            "vindex_fetch_threads": 96,
+            "vindex_decode_threads": 48,
         },
     ),
     ExperimentArm(
@@ -468,8 +472,8 @@ EXPERIMENT_ARMS: list[ExperimentArm] = [
         zarrs_config={
             "file_handle_cache_size": 512,
             "vindex_shard_index_cache_size": 4096,
-            "vindex_io_concurrent_target": 96,
-            "vindex_decode_concurrent_target": 48,
+            "vindex_fetch_threads": 96,
+            "vindex_decode_threads": 48,
         },
     ),
     ExperimentArm(
@@ -482,8 +486,8 @@ EXPERIMENT_ARMS: list[ExperimentArm] = [
         zarrs_config={
             "file_handle_cache_size": 512,
             "vindex_shard_index_cache_size": 4096,
-            "vindex_io_concurrent_target": 96,
-            "vindex_decode_concurrent_target": 48,
+            "vindex_fetch_threads": 96,
+            "vindex_decode_threads": 48,
         },
     ),
     ExperimentArm(
@@ -496,8 +500,8 @@ EXPERIMENT_ARMS: list[ExperimentArm] = [
         zarrs_config={
             "file_handle_cache_size": 512,
             "vindex_shard_index_cache_size": 4096,
-            "vindex_io_concurrent_target": 96,
-            "vindex_decode_concurrent_target": 48,
+            "vindex_fetch_threads": 96,
+            "vindex_decode_threads": 48,
         },
     ),
 ]

@@ -61,11 +61,11 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.chunk_concurrent_maximum", None
             ),
             num_threads=config.get("threading.max_workers", None),
-            vindex_io_concurrent_target=config.get(
-                "codec_pipeline.vindex_io_concurrent_target", None
+            vindex_fetch_threads=config.get(
+                "codec_pipeline.vindex_fetch_threads", None
             ),
-            vindex_decode_concurrent_target=config.get(
-                "codec_pipeline.vindex_decode_concurrent_target", None
+            vindex_decode_threads=config.get(
+                "codec_pipeline.vindex_decode_threads", None
             ),
             vindex_shard_index_cache_size=config.get(
                 "codec_pipeline.vindex_shard_index_cache_size", 0
