@@ -259,6 +259,13 @@ impl Drop for InflightGuard {
 static UNSCOPED: AtomicU64 = AtomicU64::new(0);
 
 impl VindexStats {
+    /// Record one payload read directly, without relying on a thread-local
+    /// scope. Reads now happen on dedicated I/O threads that never enter a
+    /// scope, so the submitter hands the stats object to the closure instead.
+    pub fn record_payload_read(&self, bytes: u64, call: Duration) {
+        self.io[Phase::Payload as usize].record(1, bytes, Duration::ZERO, call, call);
+    }
+
     pub fn record_plan(&self, elapsed: Duration) {
         add_ns(&self.plan_ns, elapsed);
     }
@@ -279,13 +286,12 @@ impl VindexStats {
         add_ns(&self.scatter_ns, elapsed);
     }
 
-    /// Summed decode task time minus the storage wait those tasks blocked on.
-    ///
-    /// This is the closest available estimate of codec CPU. It is a lower
-    /// bound: payload I/O issued by a nested codec worker rather than by the
-    /// task thread is not attributed here and stays inside the decode time.
+    /// Codec CPU. The decode task no longer performs any I/O -- the caller
+    /// fetches, and decode runs on already-resident bytes -- so its time is
+    /// codec work and nothing else. It used to subtract payload wait, which
+    /// is meaningless now that reads happen on separate threads.
     fn codec_ms(&self) -> f64 {
-        (ms(&self.partial_decode_ns) - ms(&self.io[Phase::Payload as usize].wait_ns)).max(0.0)
+        ms(&self.partial_decode_ns)
     }
 
     #[allow(clippy::cast_precision_loss)]

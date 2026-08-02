@@ -30,7 +30,8 @@ use zarrs::array::{
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
-use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
+use zarrs::storage::byte_range::ByteRange;
+use zarrs::storage::{ReadableStorageTraits, ReadableWritableListableStorage, StorageHandle, StoreKey};
 
 mod chunk_item;
 mod concurrency;
@@ -42,7 +43,7 @@ mod utils;
 mod vindex_stats;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
-use crate::store::{StoreConfig, partial_read_max_active, with_io_measurement};
+use crate::store::{StoreConfig, partial_read_max_active, vindex_io_pool, with_io_measurement};
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 use crate::vindex_stats::{Phase, VindexStats};
 
@@ -87,6 +88,11 @@ pub struct CodecPipelineImpl {
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
 }
+
+/// Shard tasks allowed in flight when unset. A safety valve, not a tuning
+/// knob: it only needs to exceed the shards a batch touches, and its threads
+/// park on completions rather than spinning.
+const VINDEX_SHARD_TASKS_DEFAULT: usize = 512;
 
 impl CodecPipelineImpl {
     fn retrieve_chunk_bytes<'a>(
@@ -398,6 +404,7 @@ impl CodecPipelineImpl {
         data_type_size: usize,
         codec_options: &CodecOptions,
         stats: Option<&Arc<VindexStats>>,
+        prefetched: Option<Vec<Option<zarrs::array::ArrayBytesRaw<'static>>>>,
     ) -> PyResult<()> {
         let partial_decoder = partial_decoder_cache.get(&task.key).ok_or_else(|| {
             PyRuntimeError::new_err(format!("Partial decoder not found for key: {}", task.key))
@@ -407,9 +414,15 @@ impl CodecPipelineImpl {
         // codec CPU.
         let _scope = stats.map(|stats| vindex_stats::scope(stats, Phase::Payload));
         let decode_started = stats.map(|_| Instant::now());
-        let decoded = partial_decoder
-            .partial_decode_subsets(&task.subsets, codec_options)
-            .map_codec_err()?;
+        let decoded = match prefetched {
+            // Bytes already in hand: pure CPU, touches no storage.
+            Some(prefetched) => partial_decoder
+                .partial_decode_subsets_prefetched(&task.subsets, prefetched, codec_options)
+                .map_codec_err()?,
+            None => partial_decoder
+                .partial_decode_subsets(&task.subsets, codec_options)
+                .map_codec_err()?,
+        };
         let scratch = decoded.into_fixed().map_py_err::<PyTypeError>()?;
         let scratch: &[u8] = scratch.as_ref();
         if let (Some(stats), Some(started)) = (stats, decode_started) {
@@ -470,6 +483,7 @@ impl CodecPipelineImpl {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn decode_scattered_batch(
         &self,
         items: Vec<ChunkItem>,
@@ -531,18 +545,139 @@ impl CodecPipelineImpl {
         }
         let task_codec_options = codec_options.with_concurrent_target(task_codec_target);
         let execute_started = stats.map(|_| Instant::now());
-        self.vindex_decode_pool.install(|| {
-            tasks.into_par_iter().try_for_each(|task| {
-                Self::decode_scattered_task(
-                    task,
-                    partial_decoder_cache,
-                    output,
-                    data_type_size,
-                    &task_codec_options,
-                    stats,
-                )
+
+        // Ask every shard what it needs to read, before reading anything. The
+        // shard indexes are already resident, so this is pure computation and
+        // touches no storage. A shard that cannot report a plan gets the
+        // fetch-it-yourself path instead.
+        let plans = tasks
+            .iter()
+            .map(|task| {
+                partial_decoder_cache
+                    .get(&task.key)
+                    .and_then(|decoder| {
+                        decoder
+                            .subsets_read_plan(&task.subsets, &task_codec_options)
+                            .transpose()
+                    })
+                    .transpose()
+                    .map_codec_err()
             })
-        })?;
+            .collect::<PyResult<Vec<Option<Vec<Option<ByteRange>>>>>>()?;
+
+        // Submit every read across every shard at once. Nothing throttles
+        // them here: depth is bounded by the I/O pool, and decompression by
+        // the codec's own gate. No thread is parked per shard.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut outstanding = vec![0usize; tasks.len()];
+        for (task_index, plan) in plans.iter().enumerate() {
+            let Some(plan) = plan else { continue };
+            outstanding[task_index] = plan.len();
+            for (range_index, byte_range) in plan.iter().enumerate() {
+                let tx = tx.clone();
+                match byte_range {
+                    Some(byte_range) => {
+                        let store = self.vindex_store.clone();
+                        let key = tasks[task_index].key.clone();
+                        let byte_range = *byte_range;
+                        let stats = stats.cloned();
+                        vindex_io_pool().submit(move || {
+                            let started = stats.as_ref().map(|_| Instant::now());
+                            let fetched = store.get_partial(&key, byte_range);
+                            if let (Some(stats), Some(started)) = (stats, started) {
+                                let bytes = fetched.as_ref().ok().and_then(Option::as_ref).map_or(
+                                    0,
+                                    |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                                );
+                                stats.record_payload_read(bytes, started.elapsed());
+                            }
+                            let _ = tx.send((task_index, range_index, fetched));
+                        });
+                    }
+                    // Absent inner chunk: decodes to the fill value.
+                    None => {
+                        let _ = tx.send((task_index, range_index, Ok(None)));
+                    }
+                }
+            }
+        }
+        drop(tx);
+
+        let mut fetched: Vec<Vec<Option<zarrs::array::ArrayBytesRaw<'static>>>> = plans
+            .iter()
+            .map(|plan| vec![None; plan.as_ref().map_or(0, Vec::len)])
+            .collect();
+        let mut tasks = tasks.into_iter().map(Some).collect::<Vec<_>>();
+
+        // Decode each shard the moment its last byte lands, rather than
+        // waiting for the batch. Errors surface after the scope joins.
+        let failure: Mutex<Option<PyErr>> = Mutex::new(None);
+        self.vindex_decode_pool.install(|| {
+            rayon::scope(|scope| {
+                for (task_index, range_index, result) in rx {
+                    match result {
+                        Ok(bytes) => {
+                            fetched[task_index][range_index] =
+                                bytes.map(|bytes| zarrs::array::ArrayBytesRaw::from(bytes.to_vec()));
+                        }
+                        Err(error) => {
+                            let mut failure = failure.lock().unwrap();
+                            if failure.is_none() {
+                                *failure = Some(PyRuntimeError::new_err(error.to_string()));
+                            }
+                            continue;
+                        }
+                    }
+                    outstanding[task_index] -= 1;
+                    if outstanding[task_index] != 0 {
+                        continue;
+                    }
+                    let Some(task) = tasks[task_index].take() else {
+                        continue;
+                    };
+                    let prefetched = std::mem::take(&mut fetched[task_index]);
+                    let task_codec_options = &task_codec_options;
+                    let failure = &failure;
+                    scope.spawn(move |_| {
+                        if let Err(error) = Self::decode_scattered_task(
+                            task,
+                            partial_decoder_cache,
+                            output,
+                            data_type_size,
+                            task_codec_options,
+                            stats,
+                            Some(prefetched),
+                        ) {
+                            let mut failure = failure.lock().unwrap();
+                            if failure.is_none() {
+                                *failure = Some(error);
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        if let Some(error) = failure.into_inner().unwrap() {
+            return Err(error);
+        }
+
+        // Shards that could not report a plan still need the old path.
+        let unplanned = tasks.into_iter().flatten().collect::<Vec<_>>();
+        if !unplanned.is_empty() {
+            self.vindex_decode_pool.install(|| {
+                unplanned.into_par_iter().try_for_each(|task| {
+                    Self::decode_scattered_task(
+                        task,
+                        partial_decoder_cache,
+                        output,
+                        data_type_size,
+                        &task_codec_options,
+                        stats,
+                        None,
+                    )
+                })
+            })?;
+        }
         if let (Some(stats), Some(started)) = (stats, execute_started) {
             stats.record_execute(started.elapsed());
         }
@@ -663,7 +798,6 @@ impl CodecPipelineImpl {
         // outstanding reads, and the codec's decode gate limits CPU. So this
         // just needs to exceed the number of shards a batch touches. The
         // threads are parked waiting on completions, not spinning.
-        const VINDEX_SHARD_TASKS_DEFAULT: usize = 512;
         let vindex_io_concurrent_target = vindex_io_concurrent_target
             .unwrap_or(VINDEX_SHARD_TASKS_DEFAULT)
             .max(1);

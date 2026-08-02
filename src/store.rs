@@ -18,7 +18,7 @@ mod filesystem;
 mod http;
 mod obstore;
 
-pub use self::concurrent_partial::{partial_read_max_active, with_io_measurement};
+pub use self::concurrent_partial::{partial_read_max_active, vindex_io_pool, with_io_measurement};
 pub use self::filesystem::FilesystemStoreConfig;
 pub use self::http::HttpStoreConfig;
 pub use self::obstore::ObStoreConfig;

@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -187,4 +187,59 @@ pub fn with_io_measurement(
     storage: ReadableWritableListableStorage,
 ) -> ReadableWritableListableStorage {
     Arc::new(MeasuredStorage::new(storage))
+}
+
+/// Pre-spawned threads that do nothing but block in a storage read.
+///
+/// Deliberately not rayon: rayon is a CPU work-stealing scheduler, blocking in
+/// it is against its contract, and `ThreadPool::install` from another pool's
+/// worker runs unrelated jobs on the caller instead of parking it. Reads want
+/// the opposite of work stealing -- a thread that parks in `pread` and costs
+/// nothing until its bytes arrive.
+///
+/// Spawned once, so a batch never pays thread creation. Sized by
+/// `ZARRS_VINDEX_IO_THREADS`. The bound is about bytes in flight and the
+/// storage service rate, not cores, because these threads are almost always
+/// parked.
+pub struct VindexIoPool {
+    tx: crossbeam_channel::Sender<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl VindexIoPool {
+    fn new(threads: usize) -> Self {
+        let (tx, rx) =
+            crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send + 'static>>();
+        for index in 0..threads {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("zarrs-vindex-io-{index}"))
+                // They only wait and move bytes; no codec recursion.
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        job();
+                    }
+                })
+                .expect("failed to spawn vindex io thread");
+        }
+        Self { tx }
+    }
+
+    pub fn submit(&self, job: impl FnOnce() + Send + 'static) {
+        // Receivers live for the process, so this cannot fail.
+        let _ = self.tx.send(Box::new(job));
+    }
+}
+
+pub fn vindex_io_pool() -> &'static VindexIoPool {
+    static POOL: LazyLock<VindexIoPool> = LazyLock::new(|| {
+        let threads = std::env::var("ZARRS_VINDEX_IO_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(64, |n| (n.get() * 8).clamp(64, 1024))
+            });
+        VindexIoPool::new(threads)
+    });
+    &POOL
 }
