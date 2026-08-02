@@ -13,10 +13,12 @@ use zarrs::storage::{
 
 use crate::{runtime::tokio_block_on, utils::PyErrExt};
 
+mod fetch_pool;
 mod filesystem;
 mod http;
 mod obstore;
 
+pub use self::fetch_pool::{FetchPool, default_fetch_threads, shared_fetch_pool};
 pub use self::filesystem::FilesystemStoreConfig;
 pub use self::http::HttpStoreConfig;
 pub use self::obstore::ObStoreConfig;

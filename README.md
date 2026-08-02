@@ -47,6 +47,8 @@ The `ZarrsCodecPipeline` specific options are:
   - Defaults to 4 if `None`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#chunk-concurrent-minimum) for more info.
 - `codec_pipeline.validate_checksums`: enable checksum validation (e.g. with the CRC32C codec).
   - Defaults to `True`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#validate-checksums) for more info.
+- `codec_pipeline.fetch_threads`: the number of threads dedicated to issuing store reads. Reads are handed to these threads rather than run on the `rayon` workers doing codec work, so the number of reads in flight is set by this option instead of by the core count. This matters on high latency stores (object stores, HTTP, network filesystems), where a read costs milliseconds of waiting and almost no CPU; on a local filesystem it makes little difference.
+  - Defaults to 8x the number of logical CPUs, clamped to `[64, 1024]`, if `None`. These threads are almost always parked, so the useful value is a function of store latency and bytes in flight (roughly one compressed chunk per outstanding read), not of how many cores you have.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -80,6 +82,8 @@ Concurrency can be classified into two types:
   - This is chosen automatically in combination with the chunk concurrency.
 
 The product of the chunk and codec concurrency will approximately match `threading.max_workers`.
+
+Reads are not bound by either. They are issued from a dedicated pool sized by `codec_pipeline.fetch_threads`, so the number of requests outstanding against the store is independent of how many threads are decoding. This separation exists because the two want different numbers: decoding is CPU bound and wants roughly the core count, while a read is almost entirely waiting and wants as much depth as the store will usefully serve.
 
 Chunk concurrency is typically favored because:
 - parallel encoding/decoding can have a high overhead with some codecs, especially with small chunks, and

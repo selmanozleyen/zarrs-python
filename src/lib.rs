@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chunk_item::ChunkItem;
 use itertools::Itertools;
@@ -37,7 +37,7 @@ mod tests;
 mod utils;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
-use crate::store::StoreConfig;
+use crate::store::{FetchPool, StoreConfig, default_fetch_threads, shared_fetch_pool};
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
@@ -50,11 +50,99 @@ pub struct CodecPipelineImpl {
     pub(crate) chunk_concurrent_minimum: usize,
     pub(crate) chunk_concurrent_maximum: usize,
     pub(crate) num_threads: usize,
+    /// Reads are issued here rather than from a rayon worker, so how many can
+    /// be outstanding is set by `fetch_threads` instead of by the core count.
+    fetch_pool: Arc<FetchPool>,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
 }
 
 impl CodecPipelineImpl {
+    /// Issue every whole-chunk read before decoding any of them, then decode
+    /// each as it lands.
+    ///
+    /// One read per chunk, and each is independent, so submitting the batch up
+    /// front is what puts the reads in flight together. Depth is then
+    /// `fetch_threads` rather than the rayon width -- the distinction that
+    /// matters on a store where a read is milliseconds of waiting.
+    fn retrieve_whole_chunks_into(
+        &self,
+        items: Vec<ChunkItem>,
+        output: UnsafeCellSlice<u8>,
+        codec_options: &CodecOptions,
+    ) -> PyResult<()> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for (index, item) in items.iter().enumerate() {
+            let tx = tx.clone();
+            let store = self.store.clone();
+            let key = item.key.clone();
+            self.fetch_pool.submit(move || {
+                let _ = tx.send((index, store.get(&key)));
+            });
+        }
+        drop(tx);
+
+        let failure: Mutex<Option<PyErr>> = Mutex::new(None);
+        let mut pending = items.into_iter().map(Some).collect::<Vec<_>>();
+        rayon::scope(|scope| {
+            for (index, fetched) in rx {
+                let Some(item) = pending[index].take() else {
+                    continue;
+                };
+                let failure = &failure;
+                scope.spawn(move |_| {
+                    let outcome = (|| -> PyResult<()> {
+                        let mut output_view = unsafe {
+                            // SAFETY: chunks represent disjoint array subsets
+                            ArrayBytesFixedDisjointView::new(
+                                output,
+                                self.data_type
+                                    .fixed_size()
+                                    .ok_or("variable length data type not supported")
+                                    .map_py_err::<PyTypeError>()?,
+                                bytemuck::must_cast_slice(&item.array_shape),
+                                item.subset.clone(),
+                            )
+                            .map_py_err::<PyRuntimeError>()?
+                        };
+                        let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
+                        match fetched.map_py_err::<PyRuntimeError>()? {
+                            Some(chunk_encoded) => {
+                                let chunk_encoded: Vec<u8> = chunk_encoded.into();
+                                self.codec_chain.decode_into(
+                                    Cow::Owned(chunk_encoded),
+                                    &item.shape,
+                                    &self.data_type,
+                                    &self.fill_value,
+                                    target,
+                                    codec_options,
+                                )
+                            }
+                            // Missing chunk: fill value.
+                            None => copy_fill_value_into(
+                                &self.data_type,
+                                &self.fill_value,
+                                target,
+                            ),
+                        }
+                        .map_codec_err()
+                    })();
+                    if let Err(error) = outcome {
+                        let mut failure = failure.lock().unwrap();
+                        if failure.is_none() {
+                            *failure = Some(error);
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(error) = failure.into_inner().unwrap() {
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
     fn retrieve_chunk_bytes<'a>(
         &self,
         item: &ChunkItem,
@@ -217,9 +305,11 @@ impl CodecPipelineImpl {
         chunk_concurrent_minimum=None,
         chunk_concurrent_maximum=None,
         num_threads=None,
+        fetch_threads=None,
         direct_io=false,
     ))]
     #[new]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         array_metadata: &str,
         mut store_config: StoreConfig,
@@ -227,6 +317,7 @@ impl CodecPipelineImpl {
         chunk_concurrent_minimum: Option<usize>,
         chunk_concurrent_maximum: Option<usize>,
         num_threads: Option<usize>,
+        fetch_threads: Option<usize>,
         direct_io: bool,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
@@ -246,6 +337,9 @@ impl CodecPipelineImpl {
         let chunk_concurrent_maximum =
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
+        // Reads park rather than compute, so this is a bytes-in-flight bound
+        // and wants to exceed the core count, not track it.
+        let fetch_pool = shared_fetch_pool(fetch_threads.unwrap_or_else(default_fetch_threads).max(1));
 
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
@@ -275,6 +369,7 @@ impl CodecPipelineImpl {
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
+            fetch_pool,
             fill_value,
             data_type,
         })
@@ -378,9 +473,15 @@ impl CodecPipelineImpl {
                 .map_codec_err()
             };
 
+            // Partial chunks keep the existing path: their I/O happens inside
+            // a partial decoder, which this does not reach into.
+            let (whole_chunks, partial_chunks): (Vec<_>, Vec<_>) =
+                chunk_descriptions.into_iter().partition(is_whole_chunk);
+            self.retrieve_whole_chunks_into(whole_chunks, output, &codec_options)?;
+
             iter_concurrent_limit!(
                 chunk_concurrent_limit,
-                chunk_descriptions,
+                partial_chunks,
                 try_for_each,
                 update_chunk_subset
             )?;

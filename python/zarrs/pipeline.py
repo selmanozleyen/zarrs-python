@@ -61,6 +61,7 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.chunk_concurrent_maximum", None
             ),
             num_threads=config.get("threading.max_workers", None),
+            fetch_threads=config.get("codec_pipeline.fetch_threads", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
         )
     except TypeError as e:
