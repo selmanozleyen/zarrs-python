@@ -18,7 +18,7 @@ echo "Running on node: $(hostname)"
 echo "Start time: $(date)"
 
 # Record provenance before run
-python /Users/selman.ozleyen/.gemini/antigravity-ide/scratch/check_provenance.py
+python bench/check_provenance.py
 
 DATASETS=(
   "/ictstr01/groups/ml01/datasets/selman.ozleyen/tahoe100_collection.zarr/dataset_0"
