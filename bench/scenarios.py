@@ -10,30 +10,29 @@ Fixed sampling regime
 The sampling config is FIXED, not swept::
 
     chunk_size      = 1       pure random, every row drawn independently
-    preload_nchunks = 8192    rows materialised per fetch
+    preload_nchunks = 1024    rows materialised per fetch
     batch_size      = 1024    rows handed to the consumer
 
-``_in_memory_size = chunk_size * preload_nchunks = 8192`` rows per fetch, so
-one fetch feeds **8 batches**.
+``_in_memory_size = chunk_size * preload_nchunks = 1024`` rows per fetch, so
+**one fetch is exactly one batch**. Every batch performs I/O, which is what
+makes per-batch numbers interpretable.
 
 *** THE RUNNER MUST ASSERT THIS. ***
-Earlier runs used roughly one fetch per batch, which is a DIFFERENT workload:
-it issues ~2,080 reads at a time instead of ~16,600, and this workload is
-depth-limited, so the two are not comparable. Any result produced without
-these exact values is invalid and must not be compared against one that was.
-
-*** METHODOLOGY CONSEQUENCE - do not report a per-batch median. ***
-Only 1 batch in 8 performs I/O; the other 7 slice an in-memory buffer. A
-per-batch median would land on a cheap batch and understate cost by ~8x, and
-a per-batch mean would hide the bimodality. Report **samples per second over
-the whole run** (total rows / total wall time). That is invariant to how
-fetches align with batches, which is exactly why it is the headline metric.
+A previous regime used preload_nchunks=8192, where one fetch fed 8 batches
+and only 1 batch in 8 did any I/O. Per-batch figures from that regime are
+not comparable to these. samples/second IS comparable across both, because
+it is invariant to how fetches align with batches -- which is why it stays
+the headline metric even now that per-batch numbers mean something.
 
 Read count at this regime (measured geometry: inner chunk 91,549 elements,
 ~1450 nnz/row, so a 1-row run spans 1 + 1450/91549 = 1.016 inner chunks)::
 
-    per fetch:  8192 rows * 2 arrays * 1.016 = ~16,600 reads
-    per batch:  ~2,080 reads (amortised)
+    per fetch = per batch:  1024 rows * 2 arrays * 1.016 = ~2,080 reads
+
+Depth note: 2,080 reads are available at once, against a baseline measured
+to be concurrency-limited at ~16 and a Lustre ceiling near 2,455 preads/s.
+So this regime still offers far more outstanding work than any arm can
+currently consume, and the reduction from ~16,600 should not itself bind.
 
 Pure random is the most read-expensive regime possible: ~1 read per row per
 array, and no coalescing is available because 1024 random rows out of 100.6M
@@ -49,11 +48,11 @@ from dataclasses import dataclass, field
 # --------------------------------------------------------------------------
 
 CHUNK_SIZE = 1
-PRELOAD_NCHUNKS = 8192
+PRELOAD_NCHUNKS = 1024
 BATCH_SIZE = 1024
 
-ROWS_PER_FETCH = CHUNK_SIZE * PRELOAD_NCHUNKS  # 8192
-BATCHES_PER_FETCH = ROWS_PER_FETCH // BATCH_SIZE  # 8
+ROWS_PER_FETCH = CHUNK_SIZE * PRELOAD_NCHUNKS  # 1024
+BATCHES_PER_FETCH = ROWS_PER_FETCH // BATCH_SIZE  # 1
 
 # Measured tahoe100_converted geometry.
 NNZ_PER_ROW = 1450.0
@@ -293,7 +292,7 @@ if __name__ == "__main__":
         f"  -> {ROWS_PER_FETCH} rows/fetch, {BATCHES_PER_FETCH} batches/fetch, "
         f"~{reads_per_fetch():,} reads/fetch"
     )
-    print("  -> report SAMPLES/SECOND, not a per-batch median\n")
+    print("  -> 1 fetch = 1 batch; per-batch numbers are meaningful\n")
     print(f"{'ablation':<24} {'where':<24} {'int-path':<9} landed")
     for a in ABLATIONS:
         print(
