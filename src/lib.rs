@@ -650,7 +650,23 @@ impl CodecPipelineImpl {
         let chunk_concurrent_maximum =
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
-        let vindex_io_concurrent_target = vindex_io_concurrent_target.unwrap_or(num_threads).max(1);
+        // Not a tuning knob: a safety valve that should never bind.
+        //
+        // This sizes the pool running shard tasks. A shard task now only
+        // submits its inner-chunk reads to the codec's dedicated I/O threads
+        // and waits, so capping it caps how many shards can have reads in
+        // flight at all. Defaulting it to the rayon thread count meant 16 on
+        // a `-c16` allocation, throttling a ~234-shard batch to 16 shards'
+        // worth of reads however many I/O threads existed.
+        //
+        // The bounds that matter live elsewhere: `ZARRS_IO_THREADS` limits
+        // outstanding reads, and the codec's decode gate limits CPU. So this
+        // just needs to exceed the number of shards a batch touches. The
+        // threads are parked waiting on completions, not spinning.
+        const VINDEX_SHARD_TASKS_DEFAULT: usize = 512;
+        let vindex_io_concurrent_target = vindex_io_concurrent_target
+            .unwrap_or(VINDEX_SHARD_TASKS_DEFAULT)
+            .max(1);
         let vindex_decode_concurrent_target = vindex_decode_concurrent_target
             .unwrap_or(num_threads)
             .max(1);
