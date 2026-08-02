@@ -271,13 +271,18 @@ class Ablation:
 # on it. Measured separately, the zarrs-python half alone was 7946 ms against
 # a 7931 ms baseline -- i.e. nothing. Splitting them in a matrix reports the
 # vindex work as worthless, which is a measurement artefact, not a result.
-VINDEX_NAME = "vindex (sorted+shard-grouped, shard-indices cached, fd cached)"
+VINDEX_NAME = "vindex (many fd cache, many shard idx cache)"
+VINDEX_FLAT_NAME = "vindex (flat_parallel, many fd cache, many shard idx cache)"
 VINDEX = Ablation(
     VINDEX_NAME,
     where="annbatch + zarrs-python",
     change=(
-        "EVERY TRICK ON. One tick spanning two codebases; neither half does "
-        "anything alone. "
+        "WHAT IS IMPLEMENTED TODAY. One tick spanning two "
+        "codebases; neither half does anything alone. Coordinates are always "
+        "SORTED -- that is a default, not an option: it costs an argsort plus "
+        "an inverse permutation on 1024 ints, it is what makes zarr#4172 fire "
+        "at all, and it yields longer runs and tighter grouping. There is no "
+        "regime where sorting loses, so it is not ablated. "
         "(annbatch) emit an integer row array at chunk_size=1 instead of 1024 "
         "one-row slices, so zarr builds a CoordinateIndexer -- this is also "
         "what makes zarr-python#4172 live. "
@@ -346,6 +351,27 @@ ABLATIONS: list[Ablation] = [
     ),
     # ---- not yet implemented; declared so the matrix shows the gap --------
     Ablation(
+        VINDEX_FLAT_NAME,
+        where="zarrs + zarrs-python",
+        change="THE TARGET. Drop shard grouping entirely. Shard indices are "
+        "already resident, so the full read plan is known before any payload "
+        "I/O: a flat list of ~2,080 (file, offset, length), one per needed "
+        "inner chunk, each decompressing independently. Issue them all "
+        "concurrently, decompress each on completion, scatter. Lifts "
+        "outstanding reads from ~234 (shard tasks) to ~2,080 (chunks) and "
+        "removes the ceiling. NOT IMPLEMENTED: needs zarrs to expose the "
+        "byte-range seam, since partial_decode_subsets today runs on a "
+        "per-shard decoder that owns its index and maps internally. Reaching "
+        "2,080 outstanding then needs io_uring rather than a thread per read.",
+        config={
+            "vindex_shard_index_cache_size": 4096,
+            "vindex_io_concurrent_target": 96,
+            "vindex_decode_concurrent_target": 48,
+        },
+        integer_path=True,
+        landed=False,
+    ),
+    Ablation(
         "vindex_index_preload",
         where="zarrs-python",
         change="Eagerly read every shard index at array open instead of "
@@ -354,21 +380,6 @@ ABLATIONS: list[Ablation] = [
         "batch specifically: measured 2,108-5,259 ms cold against 1,986-2,440 "
         "ms steady. NOT IMPLEMENTED -- needs a new zarrs-python option.",
         config={"vindex_shard_index_cache_size": 4096},
-        requires=(VINDEX_NAME,),
-        landed=False,
-    ),
-    Ablation(
-        "ab_sorted_runs",
-        where="annbatch",
-        change="Sort the selected row indices before handing them to zarr, "
-        "keeping the inverse permutation to scatter results back into the "
-        "shuffled order the consumer expects. Unlocks TWO things: (a) zarr's "
-        "#4172 CoordinateIndexer fast path requires a SORTED 1-D integer "
-        "selection and falls back otherwise, and (b) zarrs-python's planner "
-        "group-runs the coordinates anyway, so sorted input yields longer "
-        "runs and tighter per-shard grouping. Today the stable argsort at "
-        "loader.py:572 preserves shuffled chunk order, so what reaches zarr "
-        "is unsorted and neither fires.",
         requires=(VINDEX_NAME,),
         landed=False,
     ),
@@ -412,6 +423,81 @@ def pending() -> list[Ablation]:
     return [a for a in ABLATIONS if not a.landed]
 
 
+# --------------------------------------------------------------------------
+# Sorted per-inner-chunk fetch experiment matrix
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExperimentArm:
+    name: str
+    input_order: str        # "Original random" or "Stable sorted"
+    split_restoration: str  # "Dataset inverse only" or "Sort inverse + dataset inverse"
+    zarrs_fetch: str        # "Batched per shard" or "Per inner chunk"
+    units: int
+    loader_kwargs: dict
+    zarrs_config: dict
+
+
+EXPERIMENT_ARMS: list[ExperimentArm] = [
+    ExperimentArm(
+        name="Arm A — shard/unsorted",
+        input_order="Original random",
+        split_restoration="Dataset inverse only",
+        zarrs_fetch="Batched per shard",
+        units=234,
+        loader_kwargs={"integer_indexing": True, "sort_integer_indices": False},
+        zarrs_config={
+            "file_handle_cache_size": 512,
+            "vindex_shard_index_cache_size": 4096,
+            "vindex_io_concurrent_target": 96,
+            "vindex_decode_concurrent_target": 48,
+        },
+    ),
+    ExperimentArm(
+        name="Arm B — shard/sorted",
+        input_order="Stable sorted",
+        split_restoration="Sort inverse + dataset inverse",
+        zarrs_fetch="Batched per shard",
+        units=234,
+        loader_kwargs={"integer_indexing": True, "sort_integer_indices": True},
+        zarrs_config={
+            "file_handle_cache_size": 512,
+            "vindex_shard_index_cache_size": 4096,
+            "vindex_io_concurrent_target": 96,
+            "vindex_decode_concurrent_target": 48,
+        },
+    ),
+    ExperimentArm(
+        name="Arm C — chunk/unsorted",
+        input_order="Original random",
+        split_restoration="Dataset inverse only",
+        zarrs_fetch="Per inner chunk",
+        units=2080,
+        loader_kwargs={"integer_indexing": True, "sort_integer_indices": False},
+        zarrs_config={
+            "file_handle_cache_size": 512,
+            "vindex_shard_index_cache_size": 4096,
+            "vindex_io_concurrent_target": 96,
+            "vindex_decode_concurrent_target": 48,
+        },
+    ),
+    ExperimentArm(
+        name="Arm D — chunk/sorted",
+        input_order="Stable sorted",
+        split_restoration="Sort inverse + dataset inverse",
+        zarrs_fetch="Per inner chunk",
+        units=2080,
+        loader_kwargs={"integer_indexing": True, "sort_integer_indices": True},
+        zarrs_config={
+            "file_handle_cache_size": 512,
+            "vindex_shard_index_cache_size": 4096,
+            "vindex_io_concurrent_target": 96,
+            "vindex_decode_concurrent_target": 48,
+        },
+    ),
+]
+
+
 if __name__ == "__main__":
     print(
         f"sampling FIXED: chunk_size={CHUNK_SIZE} "
@@ -429,4 +515,8 @@ if __name__ == "__main__":
             f"{'yes' if a.resolved_integer_path() else '-':<9} "
             f"{'yes' if a.landed else 'NO'}"
         )
-    print(f"\nrunnable: {len(runnable())}   pending: {len(pending())}")
+    print(f"\nrunnable: {len(runnable())}   pending: {len(pending())}\n")
+    print("Experiment Arms:")
+    for arm in EXPERIMENT_ARMS:
+        print(f"  {arm.name:<24} units: ~{arm.units:<5} order: {arm.input_order:<15} fetch: {arm.zarrs_fetch}")
+
