@@ -9,13 +9,17 @@ Fixed sampling regime
 ---------------------
 The sampling config is FIXED, not swept::
 
-    chunk_size      = 1       pure random, every row drawn independently
-    preload_nchunks = 1024    rows materialised per fetch
-    batch_size      = 1024    rows handed to the consumer
+    chunk_size      = 1              pure random, every row drawn independently
+    preload_nchunks = batch_size * 4  rows materialised per fetch
+    batch_size      = 1024            rows handed to the consumer
 
-``_in_memory_size = chunk_size * preload_nchunks = 1024`` rows per fetch, so
-**one fetch is exactly one batch**. Every batch performs I/O, which is what
-makes per-batch numbers interpretable.
+``_in_memory_size = chunk_size * preload_nchunks = 4096`` rows per fetch, so
+**one fetch feeds 4 batches** and ~8,320 reads go out at once rather than
+~2,080. More outstanding work for the I/O pool to chew on.
+
+Only 1 batch in 4 performs I/O, so per-batch figures are bimodal again and a
+median lands on a cheap batch. samples/second over the whole run stays the
+headline; it is invariant to how fetches align with batches.
 
 *** THE RUNNER MUST ASSERT THIS. ***
 A previous regime used preload_nchunks=8192, where one fetch fed 8 batches
@@ -162,11 +166,11 @@ from dataclasses import dataclass, field
 # --------------------------------------------------------------------------
 
 CHUNK_SIZE = 1
-PRELOAD_NCHUNKS = 1024
 BATCH_SIZE = 1024
+PRELOAD_NCHUNKS = BATCH_SIZE * 4  # 4096
 
-ROWS_PER_FETCH = CHUNK_SIZE * PRELOAD_NCHUNKS  # 1024
-BATCHES_PER_FETCH = ROWS_PER_FETCH // BATCH_SIZE  # 1
+ROWS_PER_FETCH = CHUNK_SIZE * PRELOAD_NCHUNKS  # 4096
+BATCHES_PER_FETCH = ROWS_PER_FETCH // BATCH_SIZE  # 4
 
 # Measured tahoe100_converted geometry.
 NNZ_PER_ROW = 1450.0
