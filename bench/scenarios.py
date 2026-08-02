@@ -73,6 +73,35 @@ SHARD tasks, not concurrent ranges::
 That is the ceiling: past ~234 there is nothing left to schedule, so
 ``io384`` cannot help by construction.
 
+Why group by shard at all? Only so the store could reuse one open file and
+loop preads over it. The FD cache (file_handle_cache_size) already provides
+handle reuse, so that rationale is now largely vestigial -- and the grouping
+is what imposes the ceiling.
+
+The flat design removes it. Because shard indices are cached in memory, the
+complete read plan is known BEFORE any payload I/O: a flat list of ~2,080
+``(file, offset, length)``, one per needed inner chunk, each of which
+decompresses independently. So::
+
+    issue all ~2,080 reads concurrently
+        -> as each completes, decompress that chunk
+        -> scatter its elements into the output
+
+Shard grouping is not needed for correctness, and this lifts outstanding
+reads from ~234 to ~2,080.
+
+The obstacle is zarrs' abstraction, not the idea: ``partial_decode_subsets``
+runs on a PER-SHARD partial decoder that owns its shard index and does the
+mapping internally. Flattening across shards requires zarrs to expose the
+seam -- "which byte ranges do I need" separately from "here are the bytes,
+now decode". That is the zarrs-side change, and this is the argument for it.
+
+Decompression threading is NOT the lever. Blosc can decompress a single
+buffer with multiple threads, but each inner chunk is ~360 KB raw,
+``blosc_getitem`` touches roughly one block, and total codec CPU measured
+~4 ms per batch against ~2,000 ms of wall. Parallelism belongs across the
+~2,080 chunks, not within one.
+
 Getting to ~2,080 outstanding means parallelising ranges within a shard.
 Thread-per-range WAS tried and lost badly -- ~340 threads, 50k+ voluntary
 context switches, slower than the batched control at every target up to 96.
@@ -289,19 +318,6 @@ ABLATIONS: list[Ablation] = [
         "config. #4172 is inert here (no CoordinateIndexer is ever built).",
     ),
     VINDEX,
-    Ablation(
-        "baseline_index_cache",
-        where="zarrs-python",
-        change="Baseline + vindex_shard_index_cache_size=4096, WITHOUT the "
-        "integer path. The baseline caches nothing (the option defaults to 0), "
-        "so it rebuilds partial decoders and re-reads shard indexes every "
-        "batch. This arm isolates what the cache alone is worth on the slice "
-        "path, so the vindex win can be split between the sparse path and the "
-        "cache instead of being reported as one lump. 4096 is ~35x the ~117 "
-        "shards per array, i.e. every index resident; 48.4 MiB holds all "
-        "3,292 across the whole collection.",
-        config={"vindex_shard_index_cache_size": 4096},
-    ),
     # ---- depth sweep, all on top of the vindex tick -----------------------
     Ablation(
         "vindex_io32",
