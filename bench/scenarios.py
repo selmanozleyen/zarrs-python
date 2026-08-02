@@ -37,6 +37,54 @@ currently consume, and the reduction from ~16,600 should not itself bind.
 Pure random is the most read-expensive regime possible: ~1 read per row per
 array, and no coalescing is available because 1024 random rows out of 100.6M
 essentially never share an inner chunk.
+
+What the vindex arms actually vary
+----------------------------------
+``vindex`` is one tick spanning two codebases, because neither half does
+anything alone:
+
+* **annbatch** emits an integer row array at ``chunk_size=1`` instead of 1024
+  one-row ``slice`` objects, so zarr constructs a ``CoordinateIndexer``.
+* **zarrs-python** recognises that and takes its native 1-D sparse path:
+  sort and group-run the coordinates, group every sparse subset by
+  ``StoreKey`` (i.e. by physical shard), then one task per shard. Each task
+  issues ONE logical multi-range read for its shard, maps the subsets to
+  inner chunks, groups byte ranges per inner chunk, and decodes and scatters
+  straight into a single contiguous output arena. The output permutation is
+  retained so results land back in the caller's order.
+
+Without the annbatch half there is no ``CoordinateIndexer`` and the whole
+path is dead code -- measured at 7946 ms against a 7931 ms baseline.
+
+``vindex_io32`` / ``io192`` / ``io384`` vary ``vindex_io_concurrent_target``.
+Since the scheduler rework this sizes the SINGLE shared pool, and each shard
+task performs its own read inline on its own thread, so this value **is the
+outstanding-read depth** -- how many shard reads are in flight at once. The
+sweep exists to find where the client stops rewarding depth: the baseline
+measured concurrency-limited at ~16 (~790 reads/s, matching 16 / 21 ms), the
+Lustre client ceiling was ~2455 preads/s at 64 threads but REGRESSED to 2090
+at 96, and Lustre itself would allow 16 rpcs x 50 OSTs. So a turnover is
+expected somewhere in this range; locating it is the point.
+
+``vindex_no_index_cache`` sets ``vindex_shard_index_cache_size`` to 0. Each
+shard index is 15,620 B and there are 3,292 shards, so caching all of them
+costs 48.4 MiB. Uncached, every batch re-reads and re-decodes the index of
+every shard it touches: measured ``build_ms=727`` on a miss versus ``0.029``
+on a hit. This arm is expected to be much SLOWER -- it exists to put a
+number on what those 48.4 MiB buy.
+
+How annbatch should ideally drive this
+--------------------------------------
+1. At ``chunk_size=1``, emit an integer row array, not one-row slices.
+2. **Sort** those indices and keep the inverse permutation, scattering
+   results back into shuffled order afterwards. Sorting is what lets zarr's
+   #4172 fast path fire at all, and it gives zarrs-python longer runs and
+   tighter per-shard grouping. zarrs-python already retains an output
+   permutation, so the two compose.
+3. Keep ``indptr`` resident (already the default in both annbatch and
+   anndata) -- it is the one dense access in this workload.
+4. Ideally hand the whole preload window over at once, so shard grouping and
+   shard-index reuse amortise across more rows than a single batch.
 """
 
 from __future__ import annotations
@@ -223,28 +271,20 @@ ABLATIONS: list[Ablation] = [
         config={"vindex_shard_index_cache_size": 0},
         requires=("vindex",),
     ),
-    # ---- applies to baseline and vindex alike -----------------------------
-    Ablation(
-        "no_fd_cache",
-        where="zarrs-python",
-        change="file_handle_cache_size 512 -> 0, i.e. back to open/stat/close "
-        "per partial read. Isolates what the metadata syscalls cost on Lustre.",
-        config={"file_handle_cache_size": 0},
-    ),
-    Ablation(
-        "direct_io",
-        where="zarrs-python",
-        change="O_DIRECT on. Measured NEGATIVE at 96-way (1024 vs 953 ms) but "
-        "4.7x at low concurrency, so it may return if depth drops.",
-        config={"direct_io": True},
-    ),
     # ---- not yet implemented; declared so the matrix shows the gap --------
     Ablation(
         "ab_sorted_runs",
         where="annbatch",
-        change="Sort row-runs before issuing. The stable argsort at "
-        "loader.py:572 preserves shuffled order, so reads go out in random "
-        "order and sequential locality is discarded.",
+        change="Sort the selected row indices before handing them to zarr, "
+        "keeping the inverse permutation to scatter results back into the "
+        "shuffled order the consumer expects. Unlocks TWO things: (a) zarr's "
+        "#4172 CoordinateIndexer fast path requires a SORTED 1-D integer "
+        "selection and falls back otherwise, and (b) zarrs-python's planner "
+        "group-runs the coordinates anyway, so sorted input yields longer "
+        "runs and tighter per-shard grouping. Today the stable argsort at "
+        "loader.py:572 preserves shuffled chunk order, so what reaches zarr "
+        "is unsorted and neither fires.",
+        requires=("vindex",),
         landed=False,
     ),
     Ablation(
@@ -252,7 +292,11 @@ ABLATIONS: list[Ablation] = [
         where="annbatch -> anndata",
         change="Route through anndata CSRDataset instead of the hand-rolled "
         "MultiBasicIndexer. Gets coordinate selection and indptr caching for "
-        "free. Risk: may not support the direct out= buffer write.",
+        "free. BLOCKED ON VINDEX: CSRDataset issues coordinate selections, "
+        "which only pay off once the vindex path is working and measured, so "
+        "this is downstream of having vindex_* numbers -- not a parallel "
+        "experiment. Risk: may not support the direct out= buffer write.",
+        requires=("vindex",),
         landed=False,
     ),
     Ablation(
