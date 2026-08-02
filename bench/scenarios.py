@@ -66,12 +66,24 @@ Lustre client ceiling was ~2455 preads/s at 64 threads but REGRESSED to 2090
 at 96, and Lustre itself would allow 16 rpcs x 50 OSTs. So a turnover is
 expected somewhere in this range; locating it is the point.
 
-``vindex_no_index_cache`` sets ``vindex_shard_index_cache_size`` to 0. Each
-shard index is 15,620 B and there are 3,292 shards, so caching all of them
-costs 48.4 MiB. Uncached, every batch re-reads and re-decodes the index of
-every shard it touches: measured ``build_ms=727`` on a miss versus ``0.029``
-on a hit. This arm is expected to be much SLOWER -- it exists to put a
-number on what those 48.4 MiB buy.
+Shard-index caching. The option defaults to **0, i.e. off**, because the
+cache cannot detect external mutation. Each index is 15,620 B; there are
+3,292 shards in the collection but the cache is **per zarr array**, and with
+1,639 data + 1,639 indices shards across 14 plates that is ~117 shards per
+array. So ``4096`` is ~35x the working set: every index resident, and 48.4
+MiB would hold all 3,292 even if one cache held the lot.
+
+Because the BASELINE leaves it at 0, it rebuilds partial decoders and
+re-reads shard indexes every batch (``build_ms=727`` on a miss versus
+``0.029`` on a hit). ``vindex`` therefore bundles two wins -- the sparse path
+and the cache -- which is why ``baseline_index_cache`` exists: it turns the
+cache on WITHOUT the integer path, so the two can be separated instead of
+reported as one lump.
+
+``vindex_index_preload`` (not implemented) would go further and read every
+shard index at open rather than lazily on first touch, so no batch pays a
+miss at all. It targets the cold batch specifically: 2,108-5,259 ms cold
+against 1,986-2,440 ms steady.
 
 How annbatch should ideally drive this
 --------------------------------------
@@ -237,6 +249,19 @@ ABLATIONS: list[Ablation] = [
         "config. #4172 is inert here (no CoordinateIndexer is ever built).",
     ),
     VINDEX,
+    Ablation(
+        "baseline_index_cache",
+        where="zarrs-python",
+        change="Baseline + vindex_shard_index_cache_size=4096, WITHOUT the "
+        "integer path. The baseline caches nothing (the option defaults to 0), "
+        "so it rebuilds partial decoders and re-reads shard indexes every "
+        "batch. This arm isolates what the cache alone is worth on the slice "
+        "path, so the vindex win can be split between the sparse path and the "
+        "cache instead of being reported as one lump. 4096 is ~35x the ~117 "
+        "shards per array, i.e. every index resident; 48.4 MiB holds all "
+        "3,292 across the whole collection.",
+        config={"vindex_shard_index_cache_size": 4096},
+    ),
     # ---- depth sweep, all on top of the vindex tick -----------------------
     Ablation(
         "vindex_io32",
@@ -263,15 +288,19 @@ ABLATIONS: list[Ablation] = [
         config={"vindex_io_concurrent_target": 384},
         requires=("vindex",),
     ),
-    Ablation(
-        "vindex_no_index_cache",
-        where="zarrs-python",
-        change="vindex_shard_index_cache_size 4096 -> 0. Isolates what 48.4 "
-        "MiB of cached shard indexes is worth.",
-        config={"vindex_shard_index_cache_size": 0},
-        requires=("vindex",),
-    ),
     # ---- not yet implemented; declared so the matrix shows the gap --------
+    Ablation(
+        "vindex_index_preload",
+        where="zarrs-python",
+        change="Eagerly read every shard index at array open instead of "
+        "populating the cache lazily on first touch, so no batch ever pays an "
+        "index miss. 48.4 MiB for the entire collection. Targets the cold "
+        "batch specifically: measured 2,108-5,259 ms cold against 1,986-2,440 "
+        "ms steady. NOT IMPLEMENTED -- needs a new zarrs-python option.",
+        config={"vindex_shard_index_cache_size": 4096},
+        requires=("vindex",),
+        landed=False,
+    ),
     Ablation(
         "ab_sorted_runs",
         where="annbatch",
