@@ -4,9 +4,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::Instant;
 
 use chunk_item::ChunkItem;
 use itertools::Itertools;
@@ -40,15 +38,12 @@ mod store;
 #[cfg(test)]
 mod tests;
 mod utils;
-mod vindex_stats;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::{
-    StoreConfig, VindexFetchPool, default_vindex_fetch_threads, partial_read_max_active,
-    shared_vindex_fetch_pool, with_io_measurement,
+    StoreConfig, VindexFetchPool, default_vindex_fetch_threads, shared_vindex_fetch_pool,
 };
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
-use crate::vindex_stats::{Phase, VindexStats};
 
 static VINDEX_DECODE_POOLS: LazyLock<Mutex<HashMap<usize, Weak<ThreadPool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -74,16 +69,11 @@ fn shared_vindex_decode_pool(num_threads: usize) -> PyResult<Arc<ThreadPool>> {
 #[pyclass]
 pub struct CodecPipelineImpl {
     pub(crate) store: ReadableWritableListableStorage,
-    /// `store` wrapped so each read is measured. Dispatch is explicit: the
-    /// scattered path submits one job per byte range to `vindex_fetch_pool`.
-    pub(crate) vindex_store: ReadableWritableListableStorage,
     pub(crate) codec_chain: Arc<CodecChain>,
     pub(crate) codec_options: CodecOptions,
     pub(crate) chunk_concurrent_minimum: usize,
     pub(crate) chunk_concurrent_maximum: usize,
     pub(crate) num_threads: usize,
-    pub(crate) vindex_fetch_threads: usize,
-    pub(crate) vindex_decode_threads: usize,
     vindex_fetch_pool: Arc<VindexFetchPool>,
     vindex_decode_pool: Arc<ThreadPool>,
     vindex_shard_index_cache_size: usize,
@@ -407,17 +397,11 @@ impl CodecPipelineImpl {
         output: UnsafeCellSlice<u8>,
         data_type_size: usize,
         codec_options: &CodecOptions,
-        stats: Option<&Arc<VindexStats>>,
         prefetched: Option<Vec<Option<zarrs::array::ArrayBytesRaw<'static>>>>,
     ) -> PyResult<()> {
         let partial_decoder = partial_decoder_cache.get(&task.key).ok_or_else(|| {
             PyRuntimeError::new_err(format!("Partial decoder not found for key: {}", task.key))
         })?;
-        // Payload reads issued below are attributed to this thread, so the
-        // storage wait can be subtracted from the decode time to estimate
-        // codec CPU.
-        let _scope = stats.map(|stats| vindex_stats::scope(stats, Phase::Payload));
-        let decode_started = stats.map(|_| Instant::now());
         let decoded = match prefetched {
             // Bytes already in hand: pure CPU, touches no storage.
             Some(prefetched) => partial_decoder
@@ -429,11 +413,6 @@ impl CodecPipelineImpl {
         };
         let scratch = decoded.into_fixed().map_py_err::<PyTypeError>()?;
         let scratch: &[u8] = scratch.as_ref();
-        if let (Some(stats), Some(started)) = (stats, decode_started) {
-            stats.record_partial_decode(started.elapsed());
-        }
-
-        let scatter_started = stats.map(|_| Instant::now());
         let mut scratch_offset = 0;
         for piece in task.pieces {
             let plan = piece.plan;
@@ -478,12 +457,6 @@ impl CodecPipelineImpl {
             scratch_offset += nbytes;
         }
         debug_assert_eq!(scratch_offset, scratch.len());
-        if let (Some(stats), Some(started)) = (stats, scatter_started) {
-            stats.record_scatter(started.elapsed());
-            stats
-                .scatter_bytes
-                .fetch_add(scratch_offset as u64, Ordering::Relaxed);
-        }
         Ok(())
     }
 
@@ -495,26 +468,8 @@ impl CodecPipelineImpl {
         output: UnsafeCellSlice<u8>,
         data_type_size: usize,
         codec_options: CodecOptions,
-        stats: Option<&Arc<VindexStats>>,
     ) -> PyResult<()> {
-        let num_items = items.len();
-        let plan_started = stats.map(|_| Instant::now());
         let tasks = self.plan_scattered_decode_tasks(items)?;
-        if let (Some(stats), Some(started)) = (stats, plan_started) {
-            stats.record_plan(started.elapsed());
-            let subsets = tasks.iter().map(|task| task.subsets.len()).sum::<usize>();
-            let subsets_max = tasks.iter().map(|task| task.subsets.len()).max().unwrap_or(0);
-            stats.chunk_items.fetch_add(num_items as u64, Ordering::Relaxed);
-            stats
-                .sparse_subsets
-                .fetch_add(subsets as u64, Ordering::Relaxed);
-            stats
-                .shard_tasks
-                .fetch_add(tasks.len() as u64, Ordering::Relaxed);
-            stats
-                .subsets_per_task_max
-                .fetch_max(subsets_max as u64, Ordering::Relaxed);
-        }
         // Two levers, two axes, neither derived from the other:
         //   vindex_fetch_threads  -> how many reads may be outstanding, i.e.
         //                            the size of the fetch pool
@@ -533,15 +488,8 @@ impl CodecPipelineImpl {
         // rate beyond which extra depth only queues -- measurements show 4x
         // depth buying +23% and a further 2.25x buying +11%. A decode thread
         // is CPU-bound, so its bound is core count.
-        let task_codec_target = VINDEX_SHARD_CODEC_TARGET;
-        if stats.is_some() {
-            eprintln!(
-                "zarrs vindex concurrency: fetch_threads={} decode_threads={} codec_target_per_shard={task_codec_target}",
-                self.vindex_fetch_threads, self.vindex_decode_threads,
-            );
-        }
-        let task_codec_options = codec_options.with_concurrent_target(task_codec_target);
-        let execute_started = stats.map(|_| Instant::now());
+        let task_codec_options =
+            codec_options.with_concurrent_target(VINDEX_SHARD_CODEC_TARGET);
 
         // Ask every shard what it needs to read, before reading anything. The
         // shard indexes are already resident, so this is pure computation and
@@ -574,20 +522,11 @@ impl CodecPipelineImpl {
                 let tx = tx.clone();
                 match byte_range {
                     Some(byte_range) => {
-                        let store = self.vindex_store.clone();
+                        let store = self.store.clone();
                         let key = tasks[task_index].key.clone();
                         let byte_range = *byte_range;
-                        let stats = stats.cloned();
                         self.vindex_fetch_pool.submit(move || {
-                            let started = stats.as_ref().map(|_| Instant::now());
                             let fetched = store.get_partial(&key, byte_range);
-                            if let (Some(stats), Some(started)) = (stats, started) {
-                                let bytes = fetched.as_ref().ok().and_then(Option::as_ref).map_or(
-                                    0,
-                                    |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                                );
-                                stats.record_payload_read(bytes, started.elapsed());
-                            }
                             let _ = tx.send((task_index, range_index, fetched));
                         });
                     }
@@ -642,7 +581,6 @@ impl CodecPipelineImpl {
                             output,
                             data_type_size,
                             task_codec_options,
-                            stats,
                             Some(prefetched),
                         ) {
                             let mut failure = failure.lock().unwrap();
@@ -669,14 +607,10 @@ impl CodecPipelineImpl {
                         output,
                         data_type_size,
                         &task_codec_options,
-                        stats,
                         None,
                     )
                 })
             })?;
-        }
-        if let (Some(stats), Some(started)) = (stats, execute_started) {
-            stats.record_execute(started.elapsed());
         }
         Ok(())
     }
@@ -794,9 +728,6 @@ impl CodecPipelineImpl {
 
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
-        // Only the scattered path is instrumented; the basic slice path keeps
-        // the raw store so it pays nothing for counters it does not report.
-        let vindex_store = with_io_measurement(store.clone());
 
         let data_type =
             DataType::from_metadata(&metadata_v3.data_type).map_py_err::<PyTypeError>()?;
@@ -818,14 +749,11 @@ impl CodecPipelineImpl {
 
         Ok(Self {
             store,
-            vindex_store,
             codec_chain,
             codec_options,
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
-            vindex_fetch_threads,
-            vindex_decode_threads,
             vindex_fetch_pool,
             vindex_decode_pool,
             vindex_shard_index_cache_size,
@@ -845,10 +773,6 @@ impl CodecPipelineImpl {
         // Get input array
         let output = Self::nparray_to_unsafe_cell_slice(value)?;
         py.detach(move || {
-            // One stats object per read, shared by every worker it fans out
-            // to, so concurrently reading arrays do not pool their counters.
-            let stats = vindex_stats::enabled().then(|| Arc::new(VindexStats::default()));
-
             // Decoder construction reads sharding indexes, so it must be
             // outside the GIL along with payload I/O and codec work.
             let Some((chunk_concurrent_limit, codec_options)) =
@@ -857,17 +781,9 @@ impl CodecPipelineImpl {
                 return Ok(());
             };
 
-            // Decided up front because it selects the store the partial
-            // decoders are built from: only the scattered path amortises the
-            // I/O pool's cross-pool handoff.
             let scattered = chunk_descriptions
                 .iter()
                 .all(|item| item.chunk_indices.is_some());
-            let read_store = if scattered {
-                &self.vindex_store
-            } else {
-                &self.store
-            };
 
             let partial_chunk_items = chunk_descriptions
                 .iter()
@@ -886,19 +802,13 @@ impl CodecPipelineImpl {
                 partial_chunk_items.clone()
             };
             let num_cache_misses = missing_partial_chunk_items.len();
-            let build_started = stats.as_ref().map(|_| Instant::now());
             let key_decoder_pairs = if num_cache_misses > 0 {
                 self.vindex_decode_pool.install(|| {
                     missing_partial_chunk_items
                         .into_par_iter()
                         .map(|item| {
-                            // Constructing a sharding partial decoder reads and
-                            // decodes the shard index, so this scope isolates
-                            // index I/O from payload I/O.
-                            let _scope = stats
-                                .as_ref()
-                                .map(|stats| vindex_stats::scope(stats, Phase::Index));
-                            let storage_handle = Arc::new(StorageHandle::new(read_store.clone()));
+                            let storage_handle =
+                                Arc::new(StorageHandle::new(self.store.clone()));
                             let input_handle =
                                 StoragePartialDecoder::new(storage_handle, item.key.clone());
                             let partial_decoder = self
@@ -944,16 +854,6 @@ impl CodecPipelineImpl {
             } else {
                 key_decoder_pairs.into_iter().collect::<HashMap<_, _>>()
             };
-            if let (Some(stats), Some(started)) = (stats.as_ref(), build_started) {
-                stats.record_decoder_build(started.elapsed());
-                stats.decoder_cache_hits.fetch_add(
-                    (partial_chunk_items.len() - num_cache_misses) as u64,
-                    Ordering::Relaxed,
-                );
-                stats
-                    .decoder_cache_misses
-                    .fetch_add(num_cache_misses as u64, Ordering::Relaxed);
-            }
 
             let data_type_size = self
                 .data_type
@@ -962,22 +862,13 @@ impl CodecPipelineImpl {
                 .map_py_err::<PyTypeError>()?;
 
             if scattered {
-                let result = self.decode_scattered_batch(
+                return self.decode_scattered_batch(
                     chunk_descriptions,
                     &partial_decoder_cache,
                     output,
                     data_type_size,
                     codec_options,
-                    stats.as_ref(),
                 );
-                if let Some(stats) = stats.as_ref() {
-                    stats.report("scattered");
-                    eprintln!(
-                        "zarrs vindex process-global: max_active_partial_reads={}",
-                        partial_read_max_active(),
-                    );
-                }
-                return result;
             }
 
             // FIXME: the `decode_into` methods only support fixed length data types.
@@ -1043,9 +934,6 @@ impl CodecPipelineImpl {
                 try_for_each,
                 update_chunk_subset
             );
-            if let Some(stats) = stats.as_ref() {
-                stats.report("basic");
-            }
             result?;
 
             Ok(())

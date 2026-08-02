@@ -19,8 +19,7 @@ mod http;
 mod obstore;
 
 pub use self::concurrent_partial::{
-    VindexFetchPool, default_vindex_fetch_threads, partial_read_max_active,
-    shared_vindex_fetch_pool, with_io_measurement,
+    VindexFetchPool, default_vindex_fetch_threads, shared_vindex_fetch_pool,
 };
 pub use self::filesystem::FilesystemStoreConfig;
 pub use self::http::HttpStoreConfig;
