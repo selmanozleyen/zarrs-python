@@ -3,11 +3,13 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chunk_item::ChunkItem;
 use itertools::Itertools;
+use lru::LruCache;
 use numpy::npyffi::PyArrayObject;
 use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -53,6 +55,10 @@ pub struct CodecPipelineImpl {
     pub(crate) chunk_concurrent_minimum: usize,
     pub(crate) chunk_concurrent_maximum: usize,
     pub(crate) num_threads: usize,
+    /// Partial decoders keyed by chunk, retained across calls. Building one
+    /// reads and decodes the shard index, so reusing it across reads of the
+    /// same shards removes that work. `None` when disabled.
+    shard_index_cache: Option<Mutex<LruCache<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>>>,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
 }
@@ -287,6 +293,7 @@ impl CodecPipelineImpl {
         num_threads=None,
         direct_io=false,
         file_handle_cache_size=0,
+        shard_index_cache_size=0,
     ))]
     #[new]
     fn new(
@@ -298,6 +305,7 @@ impl CodecPipelineImpl {
         num_threads: Option<usize>,
         direct_io: bool,
         file_handle_cache_size: usize,
+        shard_index_cache_size: usize,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
@@ -346,6 +354,8 @@ impl CodecPipelineImpl {
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
+            shard_index_cache: NonZeroUsize::new(shard_index_cache_size)
+                .map(|size| Mutex::new(LruCache::new(size))),
             fill_value,
             data_type,
         })
@@ -403,42 +413,88 @@ impl CodecPipelineImpl {
             }
         }
 
-        let mut partial_decoder_cache: HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>> =
-            HashMap::new();
-        if !partial_chunk_items.is_empty() {
-            let key_decoder_pairs =
-                iter_concurrent_limit!(chunk_concurrent_limit, partial_chunk_items, map, |item| {
-                    let storage_handle = Arc::new(StorageHandle::new(self.store.clone()));
-                    let input_handle = StoragePartialDecoder::new(storage_handle, item.key.clone());
-                    let partial_decoder = self
-                        .codec_chain
-                        .clone()
-                        .partial_decoder(
-                            Arc::new(input_handle),
-                            &item.shape,
-                            &self.data_type,
-                            &self.fill_value,
-                            &codec_options,
-                        )
-                        .map_codec_err()?;
-                    let partial_decoder: Arc<dyn ArrayPartialDecoderTraits> =
-                        if cached_keys.contains(&item.key) {
-                            Arc::new(
-                                DecodedChunkCache::new(
-                                    partial_decoder.as_ref(),
-                                    bytemuck::must_cast_slice::<_, u64>(&item.shape),
-                                    self.data_type.clone(),
-                                    &codec_options,
-                                )
-                                .map_codec_err()?,
-                            )
-                        } else {
-                            partial_decoder
-                        };
-                    Ok((item.key.clone(), partial_decoder))
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            partial_decoder_cache.extend(key_decoder_pairs);
+        let shape_for_key: HashMap<StoreKey, Vec<u64>> = partial_chunk_items
+            .iter()
+            .map(|item| {
+                (
+                    item.key.clone(),
+                    bytemuck::must_cast_slice::<_, u64>(&item.shape).to_vec(),
+                )
+            })
+            .collect();
+
+        // Resolve one decoder per key. Only the plain decoder is kept across calls: it holds
+        // the chunk's index, which is the expensive part to rebuild, whereas the wrapper below
+        // holds a whole decoded chunk and is scoped to this read.
+        let mut decoders: HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>> = HashMap::new();
+        let to_build = match &self.shard_index_cache {
+            None => partial_chunk_items,
+            Some(cache) => {
+                let mut cache = cache.lock().unwrap();
+                partial_chunk_items
+                    .into_iter()
+                    .filter(|item| match cache.get(&item.key) {
+                        Some(decoder) => {
+                            decoders.insert(item.key.clone(), decoder.clone());
+                            false
+                        }
+                        None => true,
+                    })
+                    .collect()
+            }
+        };
+        if !to_build.is_empty() {
+            let built = iter_concurrent_limit!(chunk_concurrent_limit, to_build, map, |item| {
+                let storage_handle = Arc::new(StorageHandle::new(self.store.clone()));
+                let input_handle = StoragePartialDecoder::new(storage_handle, item.key.clone());
+                let partial_decoder = self
+                    .codec_chain
+                    .clone()
+                    .partial_decoder(
+                        Arc::new(input_handle),
+                        &item.shape,
+                        &self.data_type,
+                        &self.fill_value,
+                        &codec_options,
+                    )
+                    .map_codec_err()?;
+                Ok((item.key.clone(), partial_decoder))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+            if let Some(cache) = &self.shard_index_cache {
+                let mut cache = cache.lock().unwrap();
+                for (key, decoder) in &built {
+                    cache.put(key.clone(), decoder.clone());
+                }
+            }
+            decoders.extend(built);
+        }
+
+        // Wrap the repeatedly-read keys for this call, in parallel -- each wrap decodes a chunk.
+        let to_wrap = decoders
+            .iter()
+            .filter(|(key, _)| cached_keys.contains(*key))
+            .map(|(key, decoder)| (key.clone(), decoder.clone()))
+            .collect::<Vec<_>>();
+        let mut partial_decoder_cache = decoders;
+        if !to_wrap.is_empty() {
+            let wrapped = iter_concurrent_limit!(
+                chunk_concurrent_limit,
+                to_wrap,
+                map,
+                |(key, decoder): (StoreKey, Arc<dyn ArrayPartialDecoderTraits>)| {
+                    let cache = DecodedChunkCache::new(
+                        decoder.as_ref(),
+                        &shape_for_key[&key],
+                        self.data_type.clone(),
+                        &codec_options,
+                    )
+                    .map_codec_err()?;
+                    Ok((key, Arc::new(cache) as Arc<dyn ArrayPartialDecoderTraits>))
+                }
+            )
+            .collect::<PyResult<Vec<_>>>()?;
+            partial_decoder_cache.extend(wrapped);
         }
 
         py.detach(move || {
@@ -514,6 +570,12 @@ impl CodecPipelineImpl {
         enum InputValue<'a> {
             Array(ArrayBytes<'a>),
             Constant(FillValue),
+        }
+
+        // A cached decoder holds the shard index read when it was built, so it
+        // does not survive a write to that shard.
+        if let Some(cache) = &self.shard_index_cache {
+            cache.lock().unwrap().clear();
         }
 
         // Get input array
