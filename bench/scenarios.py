@@ -103,7 +103,8 @@ REQUIRED_VERSIONS: dict[str, str] = {
 # + a pure-Python FD-cached store. At chunk_size=1 that is 1024 one-row
 # slices per array, and it never constructs a CoordinateIndexer.
 #
-# NO zarrs wheel in the baseline. zarrs is an ablation on top of it.
+# The zarrs pipeline IS in the baseline -- it is how file_handle_cache_size
+# is reached. What the baseline does not have is any vindex configuration.
 # --------------------------------------------------------------------------
 
 BASELINE: dict = {
@@ -177,7 +178,6 @@ VINDEX = Ablation(
         "vindex_decode_concurrent_target": 48,
     },
     integer_path=True,
-    requires=("zarrs",),
 )
 
 
