@@ -153,6 +153,64 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
+def _as_1d_index_array(selection: SelectorTuple) -> np.ndarray | None:
+    """The index array of a one-dimensional fancy selection, if that is what this is."""
+    if isinstance(selection, tuple):
+        if len(selection) != 1:
+            return None
+        selection = selection[0]
+    if isinstance(selection, np.ndarray) and selection.ndim == 1 and selection.size > 1:
+        return selection
+    return None
+
+
+def split_1d_runs(
+    batch_info: Iterable[
+        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
+    ],
+) -> list[tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]]:
+    """Split one-dimensional fancy selections into contiguous runs.
+
+    Gathering unsorted rows from a CSR array selects, within each chunk, one
+    contiguous run per row, and those runs arrive out of order. Taken as a
+    whole that is not a slice, so `make_slice_selection` rejects it and the
+    entire read falls back to zarr-python -- which is most of the data for
+    this kind of workload.
+
+    Each individual run *is* a slice, and the chunk and output selections step
+    through their runs together, so splitting on the positions where either
+    stops advancing by one yields pairs the ordinary per-chunk path already
+    handles. Nothing else about the batch changes.
+
+    Selections that are not one-dimensional fancy indices pass through
+    untouched, so anything this cannot describe still falls back as before.
+    """
+    expanded = []
+    for entry in batch_info:
+        byte_getter, chunk_spec, chunk_selection, out_selection, is_complete = entry
+        chunk_idx = _as_1d_index_array(chunk_selection)
+        out_idx = _as_1d_index_array(out_selection)
+        if chunk_idx is None or out_idx is None or chunk_idx.size != out_idx.size:
+            expanded.append(entry)
+            continue
+
+        # A run ends where either side stops advancing by exactly one.
+        breaks = np.flatnonzero((np.diff(chunk_idx) != 1) | (np.diff(out_idx) != 1)) + 1
+        starts = np.concatenate(([0], breaks))
+        stops = np.concatenate((breaks, [chunk_idx.size]))
+        for start, stop in zip(starts, stops, strict=True):
+            expanded.append(
+                (
+                    byte_getter,
+                    chunk_spec,
+                    (slice(int(chunk_idx[start]), int(chunk_idx[stop - 1]) + 1, 1),),
+                    (slice(int(out_idx[start]), int(out_idx[stop - 1]) + 1, 1),),
+                    is_complete,
+                )
+            )
+    return expanded
+
+
 def make_chunk_info_for_rust_with_indices(
     batch_info: Iterable[
         tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
@@ -163,6 +221,7 @@ def make_chunk_info_for_rust_with_indices(
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True
+    batch_info = split_1d_runs(batch_info)
     for (
         byte_getter,
         chunk_spec,
