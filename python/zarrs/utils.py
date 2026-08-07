@@ -153,14 +153,6 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
-# A run becomes one read, so splitting only pays when a run is worth reading on
-# its own. Sorted rows give runs of roughly one CSR row -- measured at ~1550
-# elements on a real plate. Unsorted rows interleave and collapse to ~1.9,
-# which would turn one gather into hundreds of thousands of reads and is far
-# slower than letting zarr-python handle the whole selection.
-MIN_COORDS_PER_RUN = 32
-
-
 def _unwrap_1d(selection: SelectorTuple):
     """The single selector of a one-dimensional selection, tuple-wrapped or not."""
     if isinstance(selection, tuple):
@@ -188,63 +180,62 @@ def split_1d_runs(
     Gathering rows from a CSR array selects, within each chunk, one contiguous
     run per row. Taken as a whole that is not a slice, so `make_slice_selection`
     rejects it and the entire read falls back to zarr-python -- which is most
-    of the data for this kind of workload.
+    of the data for this kind of workload. Each individual run *is* a slice, so
+    splitting where the selection stops advancing by one yields pairs the
+    ordinary per-chunk path already handles.
 
-    Each individual run *is* a slice, so splitting on the positions where the
-    selection stops advancing by one yields pairs the ordinary per-chunk path
-    already handles. Nothing else about the batch changes.
+    Splitting is only worth it when the runs are long, and zarr says which case
+    this is. `CoordinateIndexer` hands back a plain output **slice** exactly
+    when it did not have to reorder the coordinates -- `sel_sort is None`, the
+    same condition its own fast path keys off -- and a scattered output array
+    otherwise. Coordinates already in chunk order give one run per CSR row,
+    measured at ~1550 elements on a real plate. Reordered ones interleave into
+    runs of ~1.9, where splitting would issue hundreds of thousands of tiny
+    reads and lose badly to letting zarr-python read whole chunks and index
+    them in memory.
 
-    Whether that helps depends entirely on how long the runs are, which is
-    decided by the caller. Sorted row indices give one run per row: measured on
-    a real plate, ~1550 elements per run, and zarr-python hands back a plain
-    output slice. Unsorted indices interleave the rows and collapse runs to
-    ~1.9 elements, where splitting would issue hundreds of thousands of tiny
-    reads -- far worse than not splitting at all. So short runs are declined
-    and left to fall back, and callers who want this path should sort.
+    So a scattered output means decline, and callers wanting this path should
+    sort their indices. Reading zarr's answer rather than measuring run lengths
+    also fails the right way: if that optimisation ever changed and the output
+    were always an array, this would stop splitting and fall back, rather than
+    start fragmenting.
 
-    Selections that are not one-dimensional fancy indices pass through
-    untouched, so anything this cannot describe still falls back as before.
+    Selections this cannot describe pass through untouched and fall back as
+    before.
     """
     expanded = []
     for entry in batch_info:
         byte_getter, chunk_spec, chunk_selection, out_selection, is_complete = entry
         chunk_idx = _as_1d_index_array(chunk_selection)
-        if chunk_idx is None:
-            expanded.append(entry)
-            continue
-
         out = _unwrap_1d(out_selection)
-        if isinstance(out, np.ndarray) and out.size == chunk_idx.size:
-            # A run ends where either side stops advancing by exactly one.
-            breaks = np.flatnonzero((np.diff(chunk_idx) != 1) | (np.diff(out) != 1)) + 1
-            out_start_at = out.__getitem__
-        elif isinstance(out, slice) and (out.step is None or out.step == 1):
-            # Sorted indices: the output is filled in order, so element k of
-            # the selection lands at out.start + k and only the chunk side can
-            # break a run.
-            breaks = np.flatnonzero(np.diff(chunk_idx) != 1) + 1
-            base = out.start or 0
-
-            def out_start_at(k, base=base):
-                return base + k
-        else:
+        if (
+            chunk_idx is None
+            or not isinstance(out, slice)
+            or (out.step is not None and out.step != 1)
+        ):
             expanded.append(entry)
             continue
 
-        if chunk_idx.size < (breaks.size + 1) * MIN_COORDS_PER_RUN:
+        # The output is filled in selection order, so element k lands at
+        # out.start + k and only the chunk side can break a run.
+        breaks = np.flatnonzero(np.diff(chunk_idx) != 1) + 1
+        if breaks.size + 1 == chunk_idx.size:
+            # Every element its own run: one read per element, which is what
+            # the fallback avoids by reading whole chunks.
             expanded.append(entry)
             continue
 
+        base = out.start or 0
         starts = np.concatenate(([0], breaks))
         stops = np.concatenate((breaks, [chunk_idx.size]))
         for start, stop in zip(starts, stops, strict=True):
-            first_out = int(out_start_at(int(start)))
+            start, stop = int(start), int(stop)
             expanded.append(
                 (
                     byte_getter,
                     chunk_spec,
                     (slice(int(chunk_idx[start]), int(chunk_idx[stop - 1]) + 1, 1),),
-                    (slice(first_out, first_out + int(stop - start), 1),),
+                    (slice(base + start, base + stop, 1),),
                     is_complete,
                 )
             )

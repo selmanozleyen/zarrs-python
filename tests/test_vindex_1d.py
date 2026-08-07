@@ -4,11 +4,11 @@ A CSR row selection is a set of contiguous runs, one per row. Read whole it is
 not a slice, so without `split_1d_runs` the pipeline hands the entire read to
 zarr-python -- silently, since the fallback returns correct data.
 
-Whether splitting is worth doing depends on run length, and that is decided by
-the caller. Sorted row indices give one long run per row; unsorted indices
-interleave them into runs of a couple of elements, where splitting would issue
-hundreds of thousands of tiny reads. So these check both that long runs split
-and that short ones are declined rather than shattered.
+Whether splitting is worth it depends on run length, and zarr already says
+which case applies: `CoordinateIndexer` returns a plain output slice exactly
+when the coordinates arrived in chunk order and it did not have to reorder
+them. A scattered output array means the rows interleave, runs collapse to a
+couple of elements, and splitting would be far worse than falling back.
 """
 
 import numpy as np
@@ -17,9 +17,9 @@ import zarr
 from zarr.core import BatchedCodecPipeline
 
 import zarrs  # noqa: F401
-from zarrs.utils import MIN_COORDS_PER_RUN, split_1d_runs
+from zarrs.utils import split_1d_runs
 
-RUN = MIN_COORDS_PER_RUN * 2
+RUN = 64
 
 
 class _Spec:
@@ -31,8 +31,7 @@ def _blocks(starts, length=RUN):
     return np.concatenate([np.arange(s, s + length) for s in starts])
 
 
-def test_splits_long_runs_against_a_slice_output():
-    # The sorted case: chunk side jumps between rows, output fills in order.
+def test_splits_runs_when_the_output_is_a_slice():
     chunk = _blocks([100, 5_000])
     runs = split_1d_runs([("bg", _Spec(), (chunk,), slice(0, chunk.size, 1), False)])
     assert [(r[2], r[3]) for r in runs] == [
@@ -41,18 +40,26 @@ def test_splits_long_runs_against_a_slice_output():
     ]
 
 
-def test_splits_long_runs_against_an_array_output():
+def test_output_slice_offset_is_carried():
     chunk = _blocks([10])
-    out = np.arange(500, 500 + RUN)
-    runs = split_1d_runs([("bg", _Spec(), (chunk,), out, False)])
+    runs = split_1d_runs([("bg", _Spec(), (chunk,), slice(500, 500 + RUN), False)])
     assert [(r[2], r[3]) for r in runs] == [
         ((slice(10, 10 + RUN, 1),), (slice(500, 500 + RUN, 1),))
     ]
 
 
-def test_declines_to_shatter_short_runs():
-    # Every index its own run. Splitting would emit one read per element, far
-    # worse than letting zarr-python take the whole selection.
+def test_declines_a_scattered_output():
+    # An output index array is zarr saying it had to reorder the coordinates,
+    # so the runs interleave. Splitting would fragment; fall back instead.
+    chunk = _blocks([100, 5_000])
+    out = np.concatenate([np.arange(RUN, 2 * RUN), np.arange(0, RUN)])
+    entry = ("bg", _Spec(), (chunk,), out, False)
+    assert split_1d_runs([entry]) == [entry]
+
+
+def test_declines_when_no_two_indices_adjoin():
+    # Every element its own run: one read per element buys nothing over
+    # reading the chunk whole.
     scattered = np.arange(0, 400, 3)
     entry = ("bg", _Spec(), (scattered,), slice(0, scattered.size, 1), False)
     assert split_1d_runs([entry]) == [entry]
@@ -102,4 +109,14 @@ def test_scattered_gather_falls_back_and_is_still_correct(array, monkeypatch):
     rows = np.sort(rng.permutation(100_000)[:500])
     got, fallbacks = _read_counting_fallbacks(array, rows, monkeypatch)
     assert np.array_equal(got, rows.astype("int32"))
-    assert fallbacks, "runs of one element should be declined, not shattered"
+    assert fallbacks, "isolated indices should be declined, not shattered"
+
+
+def test_unsorted_gather_falls_back_and_is_still_correct(array, monkeypatch):
+    # Unsorted rows make zarr reorder, so the output comes back as an index
+    # array and the runs interleave.
+    rng = np.random.default_rng(0)
+    rows = rng.permutation(_blocks([0, 30_000, 61_000, 92_000], length=1_000))
+    got, fallbacks = _read_counting_fallbacks(array, rows, monkeypatch)
+    assert np.array_equal(got, rows.astype("int32"))
+    assert fallbacks, "a reordered gather should be declined"

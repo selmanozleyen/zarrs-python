@@ -191,9 +191,12 @@ if it is null.
 - `ZARRS_PYTHON_FETCH_THREADS` → a `zarr.config` key
   (`codec_pipeline.fetch_threads`), following how `85aa038` exposed
   `codec_pipeline.file_handle_cache_size`; the env var is benchmark scaffolding
-- `MIN_COORDS_PER_RUN = 32` is tuned, not principled. It guards a 30×
-  regression (unsorted rows give 1.9 coords/run against 1550 sorted). Either
-  own it in the docstring with that measurement or weaken it to `> 1`
+- ~~`MIN_COORDS_PER_RUN = 32` is tuned, not principled~~ — replaced by the
+  output-selection type. `CoordinateIndexer` returns a plain slice exactly when
+  `sel_sort is None`, i.e. it did not have to reorder the coordinates, which is
+  the same condition zarr-python#4172 keys off. No constant, and it fails
+  closed: if that optimisation changed, this would stop splitting rather than
+  start fragmenting
 - the pool ships opt-in until a second workload agrees
 - `bench/` and `probe_*.py` do not ship; `tests/test_vindex_1d.py` already
   guards the behaviour permanently
