@@ -312,11 +312,11 @@ impl CodecPipelineImpl {
                     continue;
                 }
                 let item = &items[index];
-                let prefetched = std::mem::take(&mut fetched[index]);
+                let encoded = std::mem::take(&mut fetched[index]);
                 let failure = &failure;
                 scope.spawn(move |_| {
                     if let Err(error) =
-                        self.decode_prefetched_chunk(item, decoders, output, prefetched, codec_options)
+                        self.decode_chunk_from_bytes(item, decoders, output, encoded, codec_options)
                     {
                         let mut failure = failure.lock().unwrap();
                         failure.get_or_insert(error);
@@ -331,13 +331,13 @@ impl CodecPipelineImpl {
         }
     }
 
-    /// Decode one chunk from bytes already fetched for it, into the output.
-    fn decode_prefetched_chunk(
+    /// Decode one chunk from bytes the caller already fetched, into the output.
+    fn decode_chunk_from_bytes(
         &self,
         item: &ChunkItem,
         decoders: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
         output: UnsafeCellSlice<u8>,
-        prefetched: Vec<Option<ArrayBytesRaw<'static>>>,
+        encoded: Vec<Option<ArrayBytesRaw<'static>>>,
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
         let key = &item.key;
@@ -345,7 +345,7 @@ impl CodecPipelineImpl {
             .get(key)
             .ok_or_else(|| PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}")))?;
         let chunk_subset_bytes = decoder
-            .partial_decode_prefetched(&item.chunk_subset, prefetched, codec_options)
+            .partial_decode_from_bytes(&item.chunk_subset, encoded, codec_options)
             .map_codec_err()?;
         let mut output_view = unsafe {
             // SAFETY: chunks represent disjoint array subsets
