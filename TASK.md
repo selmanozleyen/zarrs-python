@@ -40,7 +40,7 @@ zarrs-python side that exposes it is outstanding.
 |---|---|
 | `7a7b2e1` build against zarrs 0.24 | infrastructure |
 | `0897ad9` pool planned chunk fetches | **yes — this is the 6.9×** |
-| `325f198` expose file handle cache | **yes — zarrs-python side only** |
+| ~~`325f198` expose file handle cache~~ | superseded by upstream `85aa038` (#181) |
 | `158a005` split 1-D fancy runs | **yes — without it 2 of 3 reads never reach Rust** |
 | `7ca63c2` decline to shatter short runs | **yes — the guard, and the sorted/slice case** |
 | `0eb90aa`/`ae94efe`/`6f8c904` bench | no |
@@ -171,7 +171,7 @@ Setup:
 - everything volatile created directly on `/localscratch/$USER`: venv,
   `UV_CACHE_DIR`, `CARGO_HOME`, `CARGO_TARGET_DIR`, `TMPDIR`. Build there, do
   not copy from Lustre
-- `ZARRS_PYTHON_FILE_HANDLE_CACHE=512` fixed; do not sweep it
+- `codec_pipeline.file_handle_cache_size = 512` fixed; do not sweep it
 - fresh random seed per run, shuffled config order within each round, three
   replicates
 
@@ -188,11 +188,9 @@ if it is null.
 
 ## Before any of this ships
 
-- env vars → `zarr.config` keys (`codec_pipeline.fetch_threads`,
-  `codec_pipeline.file_handle_cache_size`); the env vars are benchmark
-  scaffolding
-- `file_handle_cache_size` should default on — upstream's `0` is absence of an
-  opinion, not a decision
+- `ZARRS_PYTHON_FETCH_THREADS` → a `zarr.config` key
+  (`codec_pipeline.fetch_threads`), following how `85aa038` exposed
+  `codec_pipeline.file_handle_cache_size`; the env var is benchmark scaffolding
 - `MIN_COORDS_PER_RUN = 32` is tuned, not principled. It guards a 30×
   regression (unsorted rows give 1.9 coords/run against 1550 sorted). Either
   own it in the docstring with that measurement or weaken it to `> 1`

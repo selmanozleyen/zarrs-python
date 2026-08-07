@@ -15,7 +15,8 @@ genuine cold read rather than a measurement of RAM.
 Two knobs, both read from the environment once per process, so comparing
 settings means separate runs:
   ZARRS_PYTHON_FETCH_THREADS      pool size; 0 disables planning entirely
-  ZARRS_PYTHON_FILE_HANDLE_CACHE  open file handles kept; 0 is upstream default
+  BENCH_FD_CACHE                  open file handles kept, via
+                                  codec_pipeline.file_handle_cache_size
 
 Each run prints a checksum of what it read beside the timing. The checksum
 must not move when the knobs do -- that is the correctness check, and it makes
@@ -59,13 +60,18 @@ SEED = int(sys.argv[5]) if len(sys.argv) > 5 else secrets.randbits(63)
 
 COLLECTION = "/ictstr01/groups/ml01/datasets/selman.ozleyen/tahoe100_collection.zarr"
 FETCH = os.environ.get("ZARRS_PYTHON_FETCH_THREADS", "0")
-FDCACHE = os.environ.get("ZARRS_PYTHON_FILE_HANDLE_CACHE", "0")
+FDCACHE = int(os.environ.get("BENCH_FD_CACHE", "512"))
 # "sorted" puts rows in coordinate order, which is what zarr-python's
 # CoordinateIndexer fast path needs and what makes each chunk's runs arrive
 # ascending. "random" is what a minibatch sampler actually produces.
 ORDER = os.environ.get("BENCH_ROW_ORDER", "random")
 
-zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"})
+zarr.config.set(
+    {
+        "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
+        "codec_pipeline.file_handle_cache_size": FDCACHE,
+    }
+)
 
 root = zarr.open_group(COLLECTION, mode="r")
 names = sorted(k for k in root.keys() if k.startswith("dataset_"))
@@ -102,7 +108,7 @@ med = float(np.median(ts)) * 1e3
 res = {
     "label": LABEL,
     "fetch_threads": int(FETCH),
-    "fd_cache": int(FDCACHE),
+    "fd_cache": FDCACHE,
     "seed": SEED,
     "row_order": ORDER,
     "datasets": names,

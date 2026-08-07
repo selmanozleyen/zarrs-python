@@ -20,7 +20,7 @@ FDC=512
 
 for _ in $(seq 1 "$ROUNDS"); do
   printf '%s\n' "${FETCH[@]}" | shuf | while read -r f; do
-    BENCH_ROW_ORDER="$ORDER" ZARRS_PYTHON_FETCH_THREADS=$f ZARRS_PYTHON_FILE_HANDLE_CACHE=$FDC \
+    BENCH_ROW_ORDER="$ORDER" ZARRS_PYTHON_FETCH_THREADS=$f BENCH_FD_CACHE=$FDC \
       uv run --frozen --with anndata python bench/bench_vindex_pool.py "fetch$f" "$ROWS" "$REPS" 1 2>&1 \
       | grep -E '^fetch'
   done

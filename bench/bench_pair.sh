@@ -21,10 +21,10 @@ for i in $(seq 1 "$PAIRS"); do
   seed=$(python3 -c 'import secrets;print(secrets.randbits(63))')
   if [ $((i % 2)) -eq 1 ]; then
     run "$MAIN" main "$seed"
-    ZARRS_PYTHON_FETCH_THREADS=${FETCH:-32} ZARRS_PYTHON_FILE_HANDLE_CACHE=${FDC:-512} \
+    ZARRS_PYTHON_FETCH_THREADS=${FETCH:-32} BENCH_FD_CACHE=${FDC:-512} \
       run "$OURS" ours "$seed"
   else
-    ZARRS_PYTHON_FETCH_THREADS=${FETCH:-32} ZARRS_PYTHON_FILE_HANDLE_CACHE=${FDC:-512} \
+    ZARRS_PYTHON_FETCH_THREADS=${FETCH:-32} BENCH_FD_CACHE=${FDC:-512} \
       run "$OURS" ours "$seed"
     run "$MAIN" main "$seed"
   fi
