@@ -25,9 +25,13 @@ The seed matters more than it looks. With a fixed seed every process reads
 the *same* rows, so the first run pays the cold reads and every run after it
 is served from page cache -- on a node with more RAM than the working set,
 that turns a storage benchmark into a memory benchmark and every knob looks
-inert. Pass a distinct seed per run to keep reads cold. Comparing checksums
-requires the same seed, so do correctness with a shared seed and timing with
-distinct ones.
+inert. The seed therefore defaults to fresh entropy per run.
+
+Comparing two builds needs the opposite: pass both the *same* explicit seed
+so they read identical rows, and the checksums then have to agree. Whichever
+runs second still benefits from the first one's cache, so alternate which
+goes first across pairs and give each pair a fresh random seed -- that is
+what bench_pair.sh does.
 
 Usage: bench_vindex_pool.py <label> <rows_per_batch> [reps] [warmup] [seed]
 """
@@ -37,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import sys
 import time
 
@@ -50,7 +55,7 @@ LABEL = sys.argv[1]
 NROWS = int(sys.argv[2])
 REPS = int(sys.argv[3]) if len(sys.argv) > 3 else 8
 WARMUP = int(sys.argv[4]) if len(sys.argv) > 4 else 2
-SEED = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+SEED = int(sys.argv[5]) if len(sys.argv) > 5 else secrets.randbits(63)
 
 COLLECTION = "/ictstr01/groups/ml01/datasets/selman.ozleyen/tahoe100_collection.zarr"
 FETCH = os.environ.get("ZARRS_PYTHON_FETCH_THREADS", "0")
