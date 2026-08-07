@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chunk_item::ChunkItem;
 use itertools::Itertools;
@@ -19,10 +19,11 @@ use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::{
-    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
-    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound, CodecOptions,
-    DataType, FillValue, copy_fill_value_into, update_array_bytes,
+    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayBytesRaw,
+    ArrayMetadata, ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound,
+    CodecOptions, DataType, FillValue, copy_fill_value_into, update_array_bytes,
 };
+use zarrs::array::codec::api::decode_into_array_bytes_target;
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
@@ -39,6 +40,32 @@ mod utils;
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
+
+/// Number of threads for the fetch pool. Unset or `0` disables planning, so
+/// every chunk reads from inside its own decode as before.
+const FETCH_THREADS: &str = "ZARRS_PYTHON_FETCH_THREADS";
+
+/// The pool that planned reads are issued on.
+///
+/// A fetch thread parks in the storage read and burns no CPU, so this is
+/// sized by how many reads the storage will usefully carry at once, not by
+/// core count. Separate from the rayon pool that decodes, so a slow store
+/// cannot starve decoding and vice versa.
+fn fetch_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var(FETCH_THREADS)
+            .ok()
+            .and_then(|threads| threads.parse::<usize>().ok())
+            .filter(|threads| *threads > 0)?;
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("zarrs-fetch-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
 #[gen_stub_pyclass]
@@ -192,6 +219,154 @@ impl CodecPipelineImpl {
         };
         Ok(UnsafeCellSlice::new(output))
     }
+    /// Decode the chunks that can report their reads, fetching through one pool.
+    ///
+    /// `partial_decode_into` works out which bytes it needs, reads them, and
+    /// decodes them in one call, so overlapping several chunks means a thread
+    /// per chunk parked on its own read. Planning first lets every chunk's
+    /// reads be outstanding at once against a pool sized for storage rather
+    /// than for cores, and each chunk decodes the moment its last byte lands.
+    ///
+    /// Returns which items it handled. Anything it could not plan for -- a
+    /// codec that does not report reads, nested sharding -- is left alone and
+    /// takes the ordinary path.
+    fn decode_planned_chunks(
+        &self,
+        items: &[ChunkItem],
+        decoders: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
+        output: UnsafeCellSlice<u8>,
+        pool: &rayon::ThreadPool,
+        codec_options: &CodecOptions,
+    ) -> PyResult<Vec<bool>> {
+        // Ask every chunk what it needs to read, before reading anything. The
+        // shard indexes are already resident, so this touches no storage.
+        let plans = items
+            .iter()
+            .map(|item| {
+                if is_whole_chunk(item) {
+                    return Ok(None);
+                }
+                decoders
+                    .get(&item.key)
+                    .map(|decoder| decoder.read_plan(&item.chunk_subset, codec_options))
+                    .transpose()
+                    .map_codec_err()
+                    .map(Option::flatten)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let handled = plans.iter().map(Option::is_some).collect::<Vec<_>>();
+        if !handled.iter().any(|planned| *planned) {
+            return Ok(handled);
+        }
+
+        // Submit every read across every chunk at once. Nothing throttles them
+        // here: depth is bounded by the pool, and decoding by the rayon pool
+        // the caller is already on.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut outstanding = vec![0usize; items.len()];
+        for (index, plan) in plans.iter().enumerate() {
+            let Some(plan) = plan else { continue };
+            outstanding[index] = plan.len();
+            for (range_index, byte_range) in plan.iter().enumerate() {
+                let tx = tx.clone();
+                match byte_range {
+                    Some(byte_range) => {
+                        let store = self.store.clone();
+                        let key = items[index].key.clone();
+                        let byte_range = *byte_range;
+                        pool.spawn(move || {
+                            let fetched = store.get_partial(&key, byte_range);
+                            let _ = tx.send((index, range_index, fetched));
+                        });
+                    }
+                    // Absent inner chunk: decodes to the fill value.
+                    None => {
+                        let _ = tx.send((index, range_index, Ok(None)));
+                    }
+                }
+            }
+        }
+        drop(tx);
+
+        let mut fetched: Vec<Vec<Option<ArrayBytesRaw<'static>>>> = plans
+            .iter()
+            .map(|plan| vec![None; plan.as_ref().map_or(0, Vec::len)])
+            .collect();
+        let failure: Mutex<Option<PyErr>> = Mutex::new(None);
+        rayon::scope(|scope| {
+            for (index, range_index, result) in rx {
+                match result {
+                    Ok(bytes) => {
+                        fetched[index][range_index] =
+                            bytes.map(|bytes| ArrayBytesRaw::from(bytes.to_vec()));
+                    }
+                    Err(error) => {
+                        let mut failure = failure.lock().unwrap();
+                        failure.get_or_insert_with(|| PyRuntimeError::new_err(error.to_string()));
+                        continue;
+                    }
+                }
+                outstanding[index] -= 1;
+                if outstanding[index] != 0 {
+                    continue;
+                }
+                let item = &items[index];
+                let prefetched = std::mem::take(&mut fetched[index]);
+                let failure = &failure;
+                scope.spawn(move |_| {
+                    if let Err(error) =
+                        self.decode_prefetched_chunk(item, decoders, output, prefetched, codec_options)
+                    {
+                        let mut failure = failure.lock().unwrap();
+                        failure.get_or_insert(error);
+                    }
+                });
+            }
+        });
+
+        match failure.into_inner().unwrap() {
+            Some(error) => Err(error),
+            None => Ok(handled),
+        }
+    }
+
+    /// Decode one chunk from bytes already fetched for it, into the output.
+    fn decode_prefetched_chunk(
+        &self,
+        item: &ChunkItem,
+        decoders: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
+        output: UnsafeCellSlice<u8>,
+        prefetched: Vec<Option<ArrayBytesRaw<'static>>>,
+        codec_options: &CodecOptions,
+    ) -> PyResult<()> {
+        let key = &item.key;
+        let decoder = decoders
+            .get(key)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}")))?;
+        let chunk_subset_bytes = decoder
+            .partial_decode_prefetched(&item.chunk_subset, prefetched, codec_options)
+            .map_codec_err()?;
+        let mut output_view = unsafe {
+            // SAFETY: chunks represent disjoint array subsets
+            ArrayBytesFixedDisjointView::new(
+                output,
+                self.data_type
+                    .fixed_size()
+                    .ok_or("variable length data type not supported")
+                    .map_py_err::<PyTypeError>()?,
+                bytemuck::must_cast_slice(&item.array_shape),
+                item.subset.clone(),
+            )
+            .map_py_err::<PyRuntimeError>()?
+        };
+        decode_into_array_bytes_target(
+            &chunk_subset_bytes,
+            ArrayBytesDecodeIntoTarget::Fixed(&mut output_view),
+        )
+        .map_codec_err()
+    }
+
 }
 
 #[gen_stub_pymethods]
@@ -315,6 +490,20 @@ impl CodecPipelineImpl {
         }
 
         py.detach(move || {
+            // With a fetch pool configured, chunks that can report their reads
+            // are fetched together and decoded here; the rest fall through to
+            // the loop below untouched.
+            let handled = match fetch_pool() {
+                Some(pool) => self.decode_planned_chunks(
+                    &chunk_descriptions,
+                    &partial_decoder_cache,
+                    output,
+                    pool,
+                    &codec_options,
+                )?,
+                None => vec![false; chunk_descriptions.len()],
+            };
+
             // FIXME: the `decode_into` methods only support fixed length data types.
             // For variable length data types, need a codepath with non `_into` methods.
             // Collect all the subsets and copy into value on the Python side?
@@ -364,9 +553,15 @@ impl CodecPipelineImpl {
                 .map_codec_err()
             };
 
+            let remaining = chunk_descriptions
+                .into_iter()
+                .zip(handled)
+                .filter_map(|(item, handled)| (!handled).then_some(item))
+                .collect::<Vec<_>>();
+
             iter_concurrent_limit!(
                 chunk_concurrent_limit,
-                chunk_descriptions,
+                remaining,
                 try_for_each,
                 update_chunk_subset
             )?;
