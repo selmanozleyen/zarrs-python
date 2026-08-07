@@ -18,15 +18,16 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
+use zarrs::array::codec::api::decode_into_array_bytes_target;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayBytesRaw,
     ArrayMetadata, ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound,
     CodecOptions, DataType, FillValue, copy_fill_value_into, update_array_bytes,
 };
-use zarrs::array::codec::api::decode_into_array_bytes_target;
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
+use zarrs::storage::byte_range::ByteRange;
 use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
 
 mod chunk_item;
@@ -240,15 +241,18 @@ impl CodecPipelineImpl {
     ) -> PyResult<Vec<bool>> {
         // Ask every chunk what it needs to read, before reading anything. The
         // shard indexes are already resident, so this touches no storage.
-        let plans = items
+        let plans: Vec<Option<Vec<Option<ByteRange>>>> = items
             .iter()
             .map(|item| {
                 if is_whole_chunk(item) {
                     return Ok(None);
                 }
+                // `as_planned` is None for any decoder that cannot describe its
+                // reads, which is every codec but sharding.
                 decoders
                     .get(&item.key)
-                    .map(|decoder| decoder.read_plan(&item.chunk_subset, codec_options))
+                    .and_then(|decoder| decoder.as_planned())
+                    .map(|planned| planned.read_plan(&item.chunk_subset, codec_options))
                     .transpose()
                     .map_codec_err()
                     .map(Option::flatten)
@@ -341,10 +345,17 @@ impl CodecPipelineImpl {
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
         let key = &item.key;
-        let decoder = decoders
+        // Only chunks that returned a plan reach here, so the decoder that
+        // produced it must still be able to consume the bytes.
+        let planned = decoders
             .get(key)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}")))?;
-        let chunk_subset_bytes = decoder
+            .and_then(|decoder| decoder.as_planned())
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "Planning partial decoder not found for key: {key}"
+                ))
+            })?;
+        let chunk_subset_bytes = planned
             .partial_decode_from_bytes(&item.chunk_subset, encoded, codec_options)
             .map_codec_err()?;
         let mut output_view = unsafe {
@@ -366,7 +377,6 @@ impl CodecPipelineImpl {
         )
         .map_codec_err()
     }
-
 }
 
 #[gen_stub_pymethods]
