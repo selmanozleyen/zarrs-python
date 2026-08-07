@@ -60,6 +60,10 @@ SEED = int(sys.argv[5]) if len(sys.argv) > 5 else secrets.randbits(63)
 COLLECTION = "/ictstr01/groups/ml01/datasets/selman.ozleyen/tahoe100_collection.zarr"
 FETCH = os.environ.get("ZARRS_PYTHON_FETCH_THREADS", "0")
 FDCACHE = os.environ.get("ZARRS_PYTHON_FILE_HANDLE_CACHE", "0")
+# "sorted" puts rows in coordinate order, which is what zarr-python's
+# CoordinateIndexer fast path needs and what makes each chunk's runs arrive
+# ascending. "random" is what a minibatch sampler actually produces.
+ORDER = os.environ.get("BENCH_ROW_ORDER", "random")
 
 zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"})
 
@@ -80,6 +84,8 @@ for i in range(WARMUP + REPS):
     picks = [
         rng.integers(0, n_obs[j], int((which == j).sum())) for j in range(len(datasets))
     ]
+    if ORDER == "sorted":
+        picks = [np.sort(p) for p in picks]
     t = time.perf_counter()
     outs = [d[rows] for d, rows in zip(datasets, picks) if len(rows)]
     dt = time.perf_counter() - t
@@ -98,6 +104,7 @@ res = {
     "fetch_threads": int(FETCH),
     "fd_cache": int(FDCACHE),
     "seed": SEED,
+    "row_order": ORDER,
     "datasets": names,
     "rows": NROWS,
     "reps": REPS,
@@ -112,7 +119,7 @@ res = {
 }
 print(json.dumps(res))
 print(
-    f"{LABEL:<14} fetch={FETCH:<5} fd={FDCACHE:<5} seed={SEED:<4} rows={NROWS:<6} "
+    f"{LABEL:<14} order={ORDER:<7} fetch={FETCH:<5} fd={FDCACHE:<5} rows={NROWS:<6} "
     f"median={med:>9.1f} ms  {res['rows_per_s']:>9.1f} rows/s  "
     f"checksum={res['checksum']}",
     file=sys.stderr,
