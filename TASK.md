@@ -11,7 +11,19 @@ it. They are independent — either can ship alone.
 The 6.9× on sorted 1024-row CSR gathers comes from four pieces, in a chain
 where each gates the next.
 
-**zarrs — `perf/sharding-read-plan`**
+**zarrs — `perf/sharding-read-plan`** (in `../zarrs`)
+
+Only one commit is required, touching two files:
+
+```
+zarrs_codec/src/codec_traits/array_partial_sync.rs   +54    as_planned, ArrayPartialDecoderPlanned
+.../sharding/sharding_partial_decoder_sync.rs       +224    read_plan, partial_decode_from_bytes
+```
+
+The file handle cache needs **no zarrs change** — `FilesystemStoreOptions::file_handle_cache_size`
+is already upstream (`edb5f735`, zarrs#422), defaulted to `0`. Only the
+zarrs-python side that exposes it is outstanding.
+
 
 | commit | needed for the speedup |
 |---|---|
@@ -28,7 +40,7 @@ where each gates the next.
 |---|---|
 | `7a7b2e1` build against zarrs 0.24 | infrastructure |
 | `0897ad9` pool planned chunk fetches | **yes — this is the 6.9×** |
-| `325f198` expose file handle cache | **yes** |
+| `325f198` expose file handle cache | **yes — zarrs-python side only** |
 | `158a005` split 1-D fancy runs | **yes — without it 2 of 3 reads never reach Rust** |
 | `7ca63c2` decline to shatter short runs | **yes — the guard, and the sorted/slice case** |
 | `0eb90aa`/`ae94efe`/`6f8c904` bench | no |
