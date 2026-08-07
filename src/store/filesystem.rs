@@ -14,12 +14,22 @@ pub struct FilesystemStoreConfig {
     opts: FilesystemStoreOptions,
 }
 
+/// Size of the store's open-file-handle cache. Upstream defaults this to 0,
+/// meaning every read is open + pread + close. That is three syscalls per
+/// planned range, which dominates once reads are issued concurrently -- the
+/// pool then measures syscall overhead rather than read latency.
+const FILE_HANDLE_CACHE: &str = "ZARRS_PYTHON_FILE_HANDLE_CACHE";
+
 impl FilesystemStoreConfig {
     pub fn new(root: String) -> Self {
-        Self {
-            root,
-            opts: FilesystemStoreOptions::default(),
+        let mut opts = FilesystemStoreOptions::default();
+        if let Some(size) = std::env::var(FILE_HANDLE_CACHE)
+            .ok()
+            .and_then(|size| size.parse::<usize>().ok())
+        {
+            opts.file_handle_cache_size(size);
         }
+        Self { root, opts }
     }
 
     pub fn direct_io(&mut self, flag: bool) -> () {
