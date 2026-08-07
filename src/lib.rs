@@ -24,6 +24,8 @@ use zarrs::array::{
     CodecOptions, DataType, FillValue, copy_fill_value_into, update_array_bytes,
 };
 use zarrs::array::codec::api::decode_into_array_bytes_target;
+use zarrs::array::codec::api::CodecSpecificOptions;
+use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecOptions;
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
@@ -44,6 +46,17 @@ use crate::utils::{PyCodecErrExt, PyErrExt as _};
 /// Number of threads for the fetch pool. Unset or `0` disables planning, so
 /// every chunk reads from inside its own decode as before.
 const FETCH_THREADS: &str = "ZARRS_PYTHON_FETCH_THREADS";
+
+/// Read every subchunk index when a partial decoder is built, rather than as
+/// each inner shard is first touched.
+///
+/// Only does anything where inner chunks are themselves shards: a flat shard
+/// has no inner indexes to read, so this is inert on an unnested array.
+const PREFETCH_SUBCHUNK_INDEXES: &str = "ZARRS_PYTHON_PREFETCH_SUBCHUNK_INDEXES";
+
+fn prefetch_subchunk_indexes() -> bool {
+    std::env::var(PREFETCH_SUBCHUNK_INDEXES).is_ok_and(|v| v != "0" && !v.is_empty())
+}
 
 /// The pool that planned reads are issued on.
 ///
@@ -432,8 +445,18 @@ impl CodecPipelineImpl {
         // The codec chain carries its data type and fill value, so every
         // decode and encode below takes them from the chain rather than
         // passing them through at each call.
-        let codec_chain = CodecChain::from_metadata(&metadata_v3.codecs)
-            .map_py_err::<PyTypeError>()?
+        let mut chain =
+            CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?;
+        if prefetch_subchunk_indexes() {
+            chain = chain
+                .with_codec_specific_options(
+                    &CodecSpecificOptions::default().with_option(
+                        ShardingCodecOptions::default().with_prefetch_subchunk_indexes(true),
+                    ),
+                )
+                .map_py_err::<PyTypeError>()?;
+        }
+        let codec_chain = chain
             .with_context(data_type.clone(), fill_value.clone())
             .map_py_err::<PyTypeError>()?;
 
