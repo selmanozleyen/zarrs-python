@@ -21,7 +21,15 @@ Each run prints a checksum of what it read beside the timing. The checksum
 must not move when the knobs do -- that is the correctness check, and it makes
 the first runs of a sweep double as the smoke test.
 
-Usage: bench_vindex_pool.py <label> <rows_per_batch> [reps] [warmup]
+The seed matters more than it looks. With a fixed seed every process reads
+the *same* rows, so the first run pays the cold reads and every run after it
+is served from page cache -- on a node with more RAM than the working set,
+that turns a storage benchmark into a memory benchmark and every knob looks
+inert. Pass a distinct seed per run to keep reads cold. Comparing checksums
+requires the same seed, so do correctness with a shared seed and timing with
+distinct ones.
+
+Usage: bench_vindex_pool.py <label> <rows_per_batch> [reps] [warmup] [seed]
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ LABEL = sys.argv[1]
 NROWS = int(sys.argv[2])
 REPS = int(sys.argv[3]) if len(sys.argv) > 3 else 8
 WARMUP = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+SEED = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 
 COLLECTION = "/ictstr01/groups/ml01/datasets/selman.ozleyen/tahoe100_collection.zarr"
 FETCH = os.environ.get("ZARRS_PYTHON_FETCH_THREADS", "0")
@@ -53,7 +62,7 @@ root = zarr.open_group(COLLECTION, mode="r")
 names = sorted(k for k in root.keys() if k.startswith("dataset_"))
 datasets = [sparse_dataset(root[f"{name}/X"]) for name in names]
 n_obs = [d.shape[0] for d in datasets]
-rng = np.random.default_rng(0)
+rng = np.random.default_rng(SEED)
 
 ts: list[float] = []
 digest = hashlib.sha256()
@@ -83,6 +92,7 @@ res = {
     "label": LABEL,
     "fetch_threads": int(FETCH),
     "fd_cache": int(FDCACHE),
+    "seed": SEED,
     "datasets": names,
     "rows": NROWS,
     "reps": REPS,
@@ -97,7 +107,7 @@ res = {
 }
 print(json.dumps(res))
 print(
-    f"{LABEL:<14} fetch={FETCH:<5} fd={FDCACHE:<5} rows={NROWS:<6} "
+    f"{LABEL:<14} fetch={FETCH:<5} fd={FDCACHE:<5} seed={SEED:<4} rows={NROWS:<6} "
     f"median={med:>9.1f} ms  {res['rows_per_s']:>9.1f} rows/s  "
     f"checksum={res['checksum']}",
     file=sys.stderr,
