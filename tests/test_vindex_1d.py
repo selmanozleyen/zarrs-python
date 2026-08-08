@@ -120,3 +120,32 @@ def test_unsorted_gather_falls_back_and_is_still_correct(array, monkeypatch):
     got, fallbacks = _read_counting_fallbacks(array, rows, monkeypatch)
     assert np.array_equal(got, rows.astype("int32"))
     assert fallbacks, "a reordered gather should be declined"
+
+
+def test_decoder_cache_survives_a_write(tmp_path, monkeypatch):
+    """A cached decoder holds a shard index that a write invalidates.
+
+    The cache is only sound because `store_chunks_with_indices` evicts what it
+    touches. This is the test that catches it if that ever stops happening --
+    stale reads here would be silent and correct-looking.
+    """
+    monkeypatch.setenv("ZARRS_PYTHON_DECODER_CACHE", "1")
+    path = str(tmp_path / "rw.zarr")
+    a = zarr.create_array(
+        store=path, shape=(1000,), chunks=(250,), dtype="int32", zarr_format=3
+    )
+    a[:] = np.arange(1000, dtype="int32")
+
+    rows = _blocks([10, 300, 700], length=50)
+    with zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}):
+        arr = zarr.open_array(path, mode="r+")
+        assert np.array_equal(arr[rows], rows.astype("int32"))
+        # second read comes from the cache
+        assert np.array_equal(arr[rows], rows.astype("int32"))
+
+        arr[300:350] = np.full(50, -7, dtype="int32")
+
+        got = arr[rows]
+        expected = rows.astype("int32").copy()
+        expected[(rows >= 300) & (rows < 350)] = -7
+        assert np.array_equal(got, expected), "read a stale cached shard index"

@@ -62,7 +62,7 @@ premise both caches below rest on.
 
 ---
 
-## Task 1 — outer shard index cache (unbuilt, the larger win)
+## Task 1 — outer shard index cache (BUILT, +14% measured)
 
 ### The problem
 
@@ -121,12 +121,32 @@ Also needs: a size bound and eviction policy (LRU over `size_held()`), and
 thread safety, since `retrieve_chunks_and_apply_index` builds decoders under
 `iter_concurrent_limit!`.
 
-### Definition of done
+### Status: built, opt-in via `ZARRS_PYTHON_DECODER_CACHE`
 
-- index reads per batch drop to ~0 after the first, measured with the same probe
-- correctness after write: a cached shard that is written then read returns the
-  new bytes — this needs a test, it is the whole risk
-- memory bounded and reported
+`decoder_cache` is a field on `CodecPipelineImpl`; `store_chunks_with_indices`
+evicts every key it touches before writing, and
+`test_decoder_cache_survives_a_write` pins that.
+
+Measured on tahoe, sorted 1024 rows, `fetch=128`, 4 shuffled rounds on one
+allocation:
+
+| | rows/s |
+|---|---|
+| off | 839.0 · 894.1 · 915.1 · 964.7 → median **904.6** |
+| on | 938.8 · 1021.3 · 1040.6 · 1067.5 → median **1030.9** |
+
+**+14%**, winning every round including the one where it ran first. Far less
+than "100% of index reads are redundant" suggests, because those reads were
+already concurrent and overlapped other work — the predicted null-ish outcome
+did not happen, but neither did the byte-count-sized win.
+
+Still outstanding before it ships:
+
+- no size bound or eviction policy; the map grows to every shard ever touched
+  (13.5 MiB for this collection, but unbounded in general). `size_held()` is
+  there for exactly this
+- eviction assumes every write goes through this pipeline
+- env var → `zarr.config` key
 
 ---
 
