@@ -228,14 +228,23 @@ def split_1d_runs(
         base = out.start or 0
         starts = np.concatenate(([0], breaks))
         stops = np.concatenate((breaks, [chunk_idx.size]))
-        for start, stop in zip(starts, stops, strict=True):
-            start, stop = int(start), int(stop)
+        # Read every per-run bound out of numpy in one gather rather than four
+        # scalar extractions per run. Worth ~1.2x of this function, which is
+        # itself a few percent of a gather -- the O(n) boundary scan above is
+        # the bulk of it and there is no cheaper way to find the runs.
+        for first, last, out_start, out_stop in zip(
+            chunk_idx[starts].tolist(),
+            (chunk_idx[stops - 1] + 1).tolist(),
+            (starts + base).tolist(),
+            (stops + base).tolist(),
+            strict=True,
+        ):
             expanded.append(
                 (
                     byte_getter,
                     chunk_spec,
-                    (slice(int(chunk_idx[start]), int(chunk_idx[stop - 1]) + 1, 1),),
-                    (slice(base + start, base + stop, 1),),
+                    (slice(first, last, 1),),
+                    (slice(out_start, out_stop, 1),),
                     is_complete,
                 )
             )
