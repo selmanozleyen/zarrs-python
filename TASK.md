@@ -62,7 +62,7 @@ premise both caches below rest on.
 
 ---
 
-## Task 1 — outer shard index cache (BUILT, +14% measured)
+## Task 1 — outer shard index cache (BUILT — helps only at small batches)
 
 ### The problem
 
@@ -135,18 +135,36 @@ allocation:
 | off | 839.0 · 894.1 · 915.1 · 964.7 → median **904.6** |
 | on | 938.8 · 1021.3 · 1040.6 · 1067.5 → median **1030.9** |
 
-**+14%**, winning every round including the one where it ran first. Far less
-than "100% of index reads are redundant" suggests, because those reads were
-already concurrent and overlapped other work — the predicted null-ish outcome
-did not happen, but neither did the byte-count-sized win.
+**+14% at 1024 rows**, winning every round including the one where it ran
+first. But it does not survive larger batches:
 
-Still outstanding before it ships:
+| batch | cache effect | throughput |
+|---:|---|---:|
+| 1024 | **+14%**, won 4/4 rounds | ~950 rows/s |
+| 4096 | ~0%, median +2% and mean -2% | ~1900 rows/s |
+| 9192 | ~0%, off won 3/4 rounds | ~3300 rows/s |
+
+Index reads are a fixed cost per *shard touched*, and by ~1024 rows a batch
+already hits most of the 962 shards in the collection. Quadrupling the batch
+reads the same indexes while doing 4x the data work, so the share the cache
+removes shrinks to nothing. Throughput rising 3.5x from 1024 to 9192 is the
+same effect seen from the other side.
+
+**Recommendation: do not ship as-is.** A loader using batches past ~1024 gets
+nothing, while carrying unbounded memory growth and a write-invalidation
+hazard. Either scope it to small batches with that stated, or drop it.
+
+Caveat: four replicates per arm in a noisy shared environment, with a visible
+warming trend within each sweep. Enough to rule out a large effect at 4096+,
+not enough to resolve a few percent.
+
+Still outstanding if it does ship:
 
 - no size bound or eviction policy; the map grows to every shard ever touched
-  (13.5 MiB for this collection, but unbounded in general). `size_held()` is
-  there for exactly this
+  (13.5 MiB for this collection, unbounded in general). `size_held()` is there
+  for exactly this
 - eviction assumes every write goes through this pipeline
-- env var → `zarr.config` key
+- env var -> `zarr.config` key
 
 ---
 
