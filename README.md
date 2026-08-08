@@ -51,6 +51,9 @@ The `ZarrsCodecPipeline` specific options are:
   - Defaults to `0` (disabled). Only applies to filesystem stores, and has no effect when `direct_io` is enabled.
   - Cached handles are invalidated on writes through this pipeline, but not on modification from anywhere else — and `zarr-python` itself is such a writer, since `resize`, `delete_dir` and metadata writes go through its own store. A cached handle can then still read a chunk file that has been deleted. Only enable this while nothing is modifying the array.
   - The cache is per `Array` object, not per process, so compare `file_handle_cache_size` times the number of open arrays against `ulimit -n`. See [here](https://docs.rs/zarrs_filesystem/latest/zarrs_filesystem/struct.FilesystemStoreOptions.html#method.file_handle_cache_size) for more info.
+- `codec_pipeline.partial_decoder_cache_size`: the number of **bytes** of decoded chunk state to retain between reads. Reading part of a chunk builds a partial decoder, and building one can read from storage and keep the result — for a sharded chunk that is the decoded shard index, and for a compressed chunk it is the decoded chunk. Without this the decoder is rebuilt and that work repeated on every call, so an array read repeatedly in pieces — a training loop over random rows, say — pays for it once per chunk per batch. Decoders are retained in a least-recently-used cache and evicted by the bytes they hold, so the bound holds whatever the chunk geometry is.
+  - Defaults to `0` (disabled). What a chunk costs depends on its layout: a shard index is `2 * 8` bytes per inner chunk, so a shard of 920 inner chunks holds 14.4 KiB and a 16 MiB budget covers about 1100 shards, whereas a compressed unsharded chunk holds its whole decoded self. A decoder that retained nothing — an unsharded, uncompressed chunk — is not admitted, and the cache stays empty.
+  - Entries are dropped on writes through this pipeline, but not on modification from anywhere else — and `zarr-python` itself is such a writer, since `resize`, `delete_dir` and metadata writes go through its own store. A retained decoder can then describe a chunk that has since changed. Only enable this while nothing is modifying the array.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -67,6 +70,7 @@ zarr.config.set({
         "chunk_concurrent_maximum": None,
         "chunk_concurrent_minimum": 4,
         "file_handle_cache_size": 0,
+        "partial_decoder_cache_size": 0,
         "direct_io": False,
         "strict": False
     }

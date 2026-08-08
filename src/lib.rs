@@ -30,6 +30,7 @@ use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
 
 mod chunk_item;
 mod concurrency;
+mod partial_decoder_cache;
 mod runtime;
 mod store;
 #[cfg(test)]
@@ -37,6 +38,7 @@ mod tests;
 mod utils;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
+use crate::partial_decoder_cache::PartialDecoderCache;
 use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
@@ -50,6 +52,8 @@ pub struct CodecPipelineImpl {
     pub(crate) chunk_concurrent_minimum: usize,
     pub(crate) chunk_concurrent_maximum: usize,
     pub(crate) num_threads: usize,
+    /// Partial decoders retained across reads, or [`None`] when disabled.
+    partial_decoder_cache: Option<PartialDecoderCache>,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
 }
@@ -219,6 +223,7 @@ impl CodecPipelineImpl {
         num_threads=None,
         direct_io=false,
         file_handle_cache_size=0,
+        partial_decoder_cache_size=0,
     ))]
     #[new]
     fn new(
@@ -230,6 +235,7 @@ impl CodecPipelineImpl {
         num_threads: Option<usize>,
         direct_io: bool,
         file_handle_cache_size: usize,
+        partial_decoder_cache_size: usize,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
@@ -278,9 +284,18 @@ impl CodecPipelineImpl {
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
+            partial_decoder_cache: PartialDecoderCache::new(partial_decoder_cache_size),
             fill_value,
             data_type,
         })
+    }
+
+    /// Bytes currently retained by the partial decoder cache, `0` when disabled.
+    #[getter]
+    fn partial_decoder_cache_held(&self) -> usize {
+        self.partial_decoder_cache
+            .as_ref()
+            .map_or(0, PartialDecoderCache::held)
     }
 
     fn retrieve_chunks_and_apply_index(
@@ -307,6 +322,20 @@ impl CodecPipelineImpl {
             .collect::<Vec<_>>();
         let mut partial_decoder_cache: HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>> =
             HashMap::new();
+        // Serve whatever the cache already holds and build only the rest.
+        let partial_chunk_items = match &self.partial_decoder_cache {
+            None => partial_chunk_items,
+            Some(cache) => partial_chunk_items
+                .into_iter()
+                .filter(|item| match cache.get(&item.key) {
+                    Some(decoder) => {
+                        partial_decoder_cache.insert(item.key.clone(), decoder);
+                        false
+                    }
+                    None => true,
+                })
+                .collect(),
+        };
         if !partial_chunk_items.is_empty() {
             let key_decoder_pairs =
                 iter_concurrent_limit!(chunk_concurrent_limit, partial_chunk_items, map, |item| {
@@ -326,6 +355,11 @@ impl CodecPipelineImpl {
                     Ok((item.key.clone(), partial_decoder))
                 })
                 .collect::<PyResult<Vec<_>>>()?;
+            if let Some(cache) = &self.partial_decoder_cache {
+                for (key, decoder) in &key_decoder_pairs {
+                    cache.put(key.clone(), decoder);
+                }
+            }
             partial_decoder_cache.extend(key_decoder_pairs);
         }
 
@@ -402,6 +436,12 @@ impl CodecPipelineImpl {
         enum InputValue<'a> {
             Array(ArrayBytes<'a>),
             Constant(FillValue),
+        }
+
+        // A cached decoder holds the chunk as it was when built, so it does not
+        // survive a write to that chunk.
+        if let Some(cache) = &self.partial_decoder_cache {
+            cache.clear();
         }
 
         // Get input array

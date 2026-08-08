@@ -20,6 +20,11 @@ class ChunkItem:
 
 @typing.final
 class CodecPipelineImpl:
+    @property
+    def partial_decoder_cache_held(self) -> builtins.int:
+        r"""
+        Bytes currently retained by the partial decoder cache, `0` when disabled.
+        """
     def __new__(
         cls,
         array_metadata: builtins.str,
@@ -31,6 +36,7 @@ class CodecPipelineImpl:
         num_threads: builtins.int | None = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
+        partial_decoder_cache_size: builtins.int = 0,
     ) -> CodecPipelineImpl: ...
     def retrieve_chunks_and_apply_index(
         self,

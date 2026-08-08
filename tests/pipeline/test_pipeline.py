@@ -165,3 +165,89 @@ def test_file_handle_cache(tmp_path: Path, cache_size: int) -> None:
         np.testing.assert_array_equal(z[...], ground_truth_arr)
         # Shard files stay open only while the cache is enabled.
         assert _open_fds() - before == cache_size
+
+
+# A shard of 2x2 inner chunks indexes each with an (offset, length) pair of u64.
+SHARD_INDEX_BYTES = 2 * 2 * 2 * 8
+# z[5:25] straddles 2 shard rows x 5 shard columns, and 2 chunk rows x 10 chunk
+# columns — chunk row 1 falls whole inside it, so needs no partial decoder.
+PARTIAL_SHARDS = 2 * 5
+PARTIAL_CHUNK_BYTES = 2 * 10 * (10 * 10 * 8)
+
+
+def _cache_held(z: zarr.Array) -> int:
+    return z._async_array.codec_pipeline.impl.partial_decoder_cache_held
+
+
+@pytest.mark.parametrize(
+    "cache_size", [0, SHARD_INDEX_BYTES, PARTIAL_SHARDS * SHARD_INDEX_BYTES, 1 << 20]
+)
+def test_partial_decoder_cache(tmp_path: Path, cache_size: int) -> None:
+    with zarr.config.set(
+        {
+            "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
+            "codec_pipeline.partial_decoder_cache_size": cache_size,
+        }
+    ):
+        z = zarr.create_array(
+            tmp_path / "foo.zarr",
+            dtype=np.float64,
+            shape=(80, 100),
+            chunks=(10, 10),
+            shards=(20, 20),
+        )
+        ground_truth_arr = np.random.random(z.shape)
+        z[...] = ground_truth_arr
+
+        # Repeated partial reads are what the cache serves; a whole-shard read
+        # needs no partial decoder and so contributes nothing.
+        for _ in range(3):
+            np.testing.assert_array_equal(z[5:25, :], ground_truth_arr[5:25, :])
+        np.testing.assert_array_equal(z[...], ground_truth_arr)
+        # Every index touched is retained until the budget evicts the oldest.
+        assert _cache_held(z) == min(PARTIAL_SHARDS * SHARD_INDEX_BYTES, cache_size)
+
+        # A retained decoder describes the chunk as it was, so a write must drop it.
+        ground_truth_arr = np.random.random(z.shape)
+        z[...] = ground_truth_arr
+        assert _cache_held(z) == 0
+        np.testing.assert_array_equal(z[5:25, :], ground_truth_arr[5:25, :])
+
+
+@pytest.mark.parametrize(
+    ("shards", "compressors", "expected"),
+    [
+        # Sharded: the shard index, whether or not inner chunks are compressed.
+        ((20, 20), "auto", PARTIAL_SHARDS * SHARD_INDEX_BYTES),
+        ((20, 20), None, PARTIAL_SHARDS * SHARD_INDEX_BYTES),
+        # Unsharded and compressed: the decoded chunk, since a subset of it
+        # cannot be served without decompressing the whole.
+        (None, "auto", PARTIAL_CHUNK_BYTES),
+        # Unsharded and uncompressed: nothing was read to build the decoder.
+        (None, None, 0),
+    ],
+)
+def test_partial_decoder_cache_holds(
+    tmp_path: Path,
+    shards: tuple[int, ...] | None,
+    compressors: str | None,
+    expected: int,
+) -> None:
+    with zarr.config.set(
+        {
+            "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
+            "codec_pipeline.partial_decoder_cache_size": 1 << 30,
+        }
+    ):
+        z = zarr.create_array(
+            tmp_path / "foo.zarr",
+            dtype=np.float64,
+            shape=(80, 100),
+            chunks=(10, 10),
+            shards=shards,
+            compressors=compressors,
+        )
+        ground_truth_arr = np.random.random(z.shape)
+        z[...] = ground_truth_arr
+        np.testing.assert_array_equal(z[5:25, :], ground_truth_arr[5:25, :])
+        assert _cache_held(z) == expected
