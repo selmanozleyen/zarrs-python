@@ -20,15 +20,14 @@ use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::codec::api::decode_into_array_bytes_target;
 use zarrs::array::{
-    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayBytesRaw,
-    ArrayMetadata, ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound,
-    CodecOptions, DataType, FillValue, copy_fill_value_into, update_array_bytes,
+    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
+    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound, CodecOptions,
+    DataType, FillValue, ReadPlan, copy_fill_value_into, update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
-use zarrs::storage::byte_range::ByteRange;
-use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
+use zarrs::storage::{MaybeBytes, ReadableWritableListableStorage, StorageHandle, StoreKey};
 
 mod chunk_item;
 mod concurrency;
@@ -45,6 +44,37 @@ use crate::utils::{PyCodecErrExt, PyErrExt as _};
 /// Number of threads for the fetch pool. Unset or `0` disables planning, so
 /// every chunk reads from inside its own decode as before.
 const FETCH_THREADS: &str = "ZARRS_PYTHON_FETCH_THREADS";
+
+/// Threads decoding planned chunks. Unset follows rayon's global pool.
+///
+/// The pooled path decodes on `rayon::scope`, so without this it inherits
+/// whatever rayon sized itself to. That is the right number only if rayon
+/// respects the CPU affinity mask -- on a cluster the host may have far more
+/// CPUs than the allocation, and sizing to the host oversubscribes every
+/// decode.
+const DECODE_THREADS: &str = "ZARRS_PYTHON_DECODE_THREADS";
+
+/// The pool planned chunks decode on.
+///
+/// Decoding is CPU-bound, so this wants to be about the core count -- unlike
+/// the fetch pool, which parks in `pread` and is sized by how many reads the
+/// storage will carry. Keeping them separate is the point: one is bounded by
+/// cores, the other by the storage service.
+fn decode_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var(DECODE_THREADS)
+            .ok()
+            .and_then(|threads| threads.parse::<usize>().ok())
+            .filter(|threads| *threads > 0)?;
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("zarrs-decode-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
 
 /// Keep partial decoders, and therefore shard indexes, between calls.
 ///
@@ -102,8 +132,7 @@ pub struct CodecPipelineImpl {
     /// [`None`] unless enabled: a cached decoder holds an index that a write
     /// invalidates, so this is only sound if every write goes through
     /// [`store_chunks_with_indices`], which evicts what it touches.
-    pub(crate) decoder_cache:
-        Option<Mutex<HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>>>,
+    pub(crate) decoder_cache: Option<Mutex<HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>>>,
 }
 
 impl CodecPipelineImpl {
@@ -265,7 +294,7 @@ impl CodecPipelineImpl {
     ) -> PyResult<Vec<bool>> {
         // Ask every chunk what it needs to read, before reading anything. The
         // shard indexes are already resident, so this touches no storage.
-        let plans: Vec<Option<Vec<Option<ByteRange>>>> = items
+        let plans: Vec<Option<ReadPlan>> = items
             .iter()
             .map(|item| {
                 if is_whole_chunk(item) {
@@ -296,7 +325,7 @@ impl CodecPipelineImpl {
         for (index, plan) in plans.iter().enumerate() {
             let Some(plan) = plan else { continue };
             outstanding[index] = plan.len();
-            for (range_index, byte_range) in plan.iter().enumerate() {
+            for (range_index, byte_range) in plan.byte_ranges().iter().enumerate() {
                 let tx = tx.clone();
                 match byte_range {
                     Some(byte_range) => {
@@ -317,41 +346,55 @@ impl CodecPipelineImpl {
         }
         drop(tx);
 
-        let mut fetched: Vec<Vec<Option<ArrayBytesRaw<'static>>>> = plans
+        let mut fetched: Vec<Vec<MaybeBytes>> = plans
             .iter()
-            .map(|plan| vec![None; plan.as_ref().map_or(0, Vec::len)])
+            .map(|plan| vec![None; plan.as_ref().map_or(0, ReadPlan::len)])
             .collect();
         let failure: Mutex<Option<PyErr>> = Mutex::new(None);
-        rayon::scope(|scope| {
-            for (index, range_index, result) in rx {
-                match result {
-                    Ok(bytes) => {
-                        fetched[index][range_index] =
-                            bytes.map(|bytes| ArrayBytesRaw::from(bytes.to_vec()));
+        let drain = || {
+            rayon::scope(|scope| {
+                for (index, range_index, result) in rx {
+                    match result {
+                        // Straight from the store to the decoder: `Bytes` is a handle, so
+                        // nothing here copies the encoded chunk.
+                        Ok(bytes) => fetched[index][range_index] = bytes,
+                        Err(error) => {
+                            let mut failure = failure.lock().unwrap();
+                            failure
+                                .get_or_insert_with(|| PyRuntimeError::new_err(error.to_string()));
+                            continue;
+                        }
                     }
-                    Err(error) => {
-                        let mut failure = failure.lock().unwrap();
-                        failure.get_or_insert_with(|| PyRuntimeError::new_err(error.to_string()));
+                    outstanding[index] -= 1;
+                    if outstanding[index] != 0 {
                         continue;
                     }
+                    let item = &items[index];
+                    let plan = plans[index].as_ref().expect("only planned items get here");
+                    let encoded = std::mem::take(&mut fetched[index]);
+                    let failure = &failure;
+                    scope.spawn(move |_| {
+                        if let Err(error) = self.decode_chunk_from_bytes(
+                            item,
+                            plan,
+                            decoders,
+                            output,
+                            encoded,
+                            codec_options,
+                        ) {
+                            let mut failure = failure.lock().unwrap();
+                            failure.get_or_insert(error);
+                        }
+                    });
                 }
-                outstanding[index] -= 1;
-                if outstanding[index] != 0 {
-                    continue;
-                }
-                let item = &items[index];
-                let encoded = std::mem::take(&mut fetched[index]);
-                let failure = &failure;
-                scope.spawn(move |_| {
-                    if let Err(error) =
-                        self.decode_chunk_from_bytes(item, decoders, output, encoded, codec_options)
-                    {
-                        let mut failure = failure.lock().unwrap();
-                        failure.get_or_insert(error);
-                    }
-                });
-            }
-        });
+            });
+        };
+        // Decode on the configured pool when there is one, otherwise on
+        // whatever rayon sized itself to.
+        match decode_pool() {
+            Some(pool) => pool.install(drain),
+            None => drain(),
+        }
 
         match failure.into_inner().unwrap() {
             Some(error) => Err(error),
@@ -363,9 +406,10 @@ impl CodecPipelineImpl {
     fn decode_chunk_from_bytes(
         &self,
         item: &ChunkItem,
+        plan: &ReadPlan,
         decoders: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
         output: UnsafeCellSlice<u8>,
-        encoded: Vec<Option<ArrayBytesRaw<'static>>>,
+        encoded: Vec<MaybeBytes>,
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
         let key = &item.key;
@@ -380,7 +424,7 @@ impl CodecPipelineImpl {
                 ))
             })?;
         let chunk_subset_bytes = planned
-            .partial_decode_from_bytes(&item.chunk_subset, encoded, codec_options)
+            .partial_decode_from_bytes(plan, encoded, codec_options)
             .map_codec_err()?;
         let mut output_view = unsafe {
             // SAFETY: chunks represent disjoint array subsets
@@ -523,8 +567,7 @@ impl CodecPipelineImpl {
                         .iter()
                         .filter(|item| match cache.get(&item.key) {
                             Some(decoder) => {
-                                partial_decoder_cache
-                                    .insert(item.key.clone(), decoder.clone());
+                                partial_decoder_cache.insert(item.key.clone(), decoder.clone());
                                 false
                             }
                             None => true,
@@ -549,7 +592,10 @@ impl CodecPipelineImpl {
                     })
                     .collect::<PyResult<Vec<_>>>()?;
                 if let Some(cache) = &self.decoder_cache {
-                    cache.lock().unwrap().extend(key_decoder_pairs.iter().cloned());
+                    cache
+                        .lock()
+                        .unwrap()
+                        .extend(key_decoder_pairs.iter().cloned());
                 }
                 partial_decoder_cache.extend(key_decoder_pairs);
             }
