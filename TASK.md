@@ -8,8 +8,46 @@ it. They are independent — either can ship alone.
 
 ## Where the fast path stands
 
-The 6.9× on sorted 1024-row CSR gathers comes from four pieces, in a chain
-where each gates the next.
+Measured against **zarr-python**, the baseline a user actually has, at three
+batch sizes. Two runs per cell, arms shuffled within each round, sorted rows,
+`fd=512`.
+
+| arm | 1024 | 4096 | 9192 |
+|---|---|---|---|
+| zarr-python | 150.8 · 185.8 | 401.2 · 430.1 | 483.7 · 477.3 |
+| ours, no pool | 300.8 · 726.8 | 1914.3 · 2383.9 | 2997.2 · 3170.4 |
+| ours + pool 128 | 1409.6 · 1283.8 | 2345.1 · 2570.1 | 3423.6 · 2597.7 |
+
+Speedup over zarr-python, and what the pool itself adds:
+
+| | 1024 | 4096 | 9192 |
+|---|---|---|---|
+| ours, no pool | 3.05× | 5.17× | **6.42×** |
+| ours + pool | **8.00×** | 5.91× | 6.27× |
+| pool's own contribution | 2.62× | 1.14× | **0.98×** |
+
+**The pool contributes nothing at realistic batch sizes.** At 9192 the pooled
+arm (2597.7–3423.6) brackets the unpooled one (2997.2–3170.4) and its mean is
+lower. Same decay as the decoder cache.
+
+**What grows is `split_1d_runs`** — 3.05× → 5.17× → 6.42×, rising with batch
+size, because zarr-python barely scales (168 → 416 → 480 rows/s) while a path
+that reaches Rust does.
+
+Every "6.9×" quoted earlier in this work was pool-vs-our-own-unpooled-path,
+which attributes the whole gain to the pool. Against the real baseline at the
+batch sizes annbatch uses, the pool is worth nothing and the selection fix is
+worth 6.4×.
+
+That matters for the zarrs side specifically: `read_plan`,
+`partial_decode_from_bytes` and `ArrayPartialDecoderPlanned` exist to enable
+the pool. If the pool does not pay here, that API has no justification from
+*this* workload — the measured win is ~180 lines of Python. It may still be
+right for higher-latency stores or small batches, but that is unmeasured.
+
+Caveat: two replicates on a shared node. The 9192 zarr baseline is tight
+(483.7 / 477.3) which is what makes that column trustworthy; the 1024
+no-pool cell spans 2.4× between identical configs and is unusable.
 
 **zarrs — `perf/sharding-read-plan`** (in `../zarrs`)
 

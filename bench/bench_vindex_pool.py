@@ -65,13 +65,19 @@ FDCACHE = int(os.environ.get("BENCH_FD_CACHE", "512"))
 # CoordinateIndexer fast path needs and what makes each chunk's runs arrive
 # ascending. "random" is what a minibatch sampler actually produces.
 ORDER = os.environ.get("BENCH_ROW_ORDER", "random")
+# "zarrs" is this pipeline; "zarr" is zarr-python's own, which is the baseline a
+# user actually has and the only arm that says whether any of this is a win.
+PIPELINE = os.environ.get("BENCH_PIPELINE", "zarrs")
+_PIPELINES = {
+    "zarrs": "zarrs.ZarrsCodecPipeline",
+    "zarr": "zarr.core.codec_pipeline.BatchedCodecPipeline",
+}
 
-zarr.config.set(
-    {
-        "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
-        "codec_pipeline.file_handle_cache_size": FDCACHE,
-    }
-)
+cfg: dict = {"codec_pipeline.path": _PIPELINES[PIPELINE]}
+if PIPELINE == "zarrs":
+    # Not a zarr-python option; setting it there would raise.
+    cfg["codec_pipeline.file_handle_cache_size"] = FDCACHE
+zarr.config.set(cfg)
 
 root = zarr.open_group(COLLECTION, mode="r")
 names = sorted(k for k in root.keys() if k.startswith("dataset_"))
@@ -108,6 +114,7 @@ med = float(np.median(ts)) * 1e3
 res = {
     "label": LABEL,
     "fetch_threads": int(FETCH),
+    "pipeline": PIPELINE,
     "fd_cache": FDCACHE,
     "seed": SEED,
     "row_order": ORDER,
@@ -125,7 +132,7 @@ res = {
 }
 print(json.dumps(res))
 print(
-    f"{LABEL:<14} order={ORDER:<7} fetch={FETCH:<5} fd={FDCACHE:<5} rows={NROWS:<6} "
+    f"{LABEL:<14} pipe={PIPELINE:<6} order={ORDER:<7} fetch={FETCH:<5} rows={NROWS:<6} "
     f"median={med:>9.1f} ms  {res['rows_per_s']:>9.1f} rows/s  "
     f"checksum={res['checksum']}",
     file=sys.stderr,
