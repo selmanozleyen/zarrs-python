@@ -129,6 +129,28 @@ fn hint_reads_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var(HINT_READS).is_ok_and(|v| v == "0").not())
 }
 
+/// How many chunks ahead of the read cursor to hint.
+///
+/// A hint costs neither memory nor a thread, so it need not wait for the byte
+/// budget that gates reads -- but it must not run arbitrarily far ahead either,
+/// because the prefetch lands in page cache and can be evicted before the read
+/// arrives, paying for it twice. So the hints run as their own cursor, a fixed
+/// number of chunks in front of the reads.
+///
+/// `0` hints each chunk immediately before its own reads, which is no lead time
+/// at all.
+const HINT_LOOKAHEAD: &str = "ZARRS_PYTHON_HINT_LOOKAHEAD";
+
+fn hint_lookahead() -> usize {
+    static AHEAD: OnceLock<usize> = OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        std::env::var(HINT_LOOKAHEAD)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
 /// The pool that planned reads are issued on.
 ///
 /// A fetch thread parks in the storage read and burns no CPU, so this is
@@ -395,19 +417,37 @@ impl CodecPipelineImpl {
         // reading holds memory that only its own completion releases; a new one can
         // only add to the peak.
         let budget = fetch_byte_budget();
+        // The order reads are admitted in, so the hint cursor can run ahead of the
+        // read cursor over the same sequence.
+        let order: Vec<usize> = waiting.iter().copied().collect();
+        let lookahead = hint_lookahead();
+
+        // Phase one: tell the store what is coming. One ioctl per chunk, carrying
+        // the exact byte ranges that chunk will read -- not the whole shard -- and
+        // issued `lookahead` chunks before the reads themselves. It costs neither
+        // memory nor a thread, so it is not gated by the byte budget phase two
+        // obeys.
+        let hint_upto = |hinted: &mut usize, target: usize| {
+            if !hint_reads_enabled() {
+                return;
+            }
+            while *hinted < order.len().min(target) {
+                let index = order[*hinted];
+                let plan = plans[index]
+                    .as_ref()
+                    .expect("only planned items are queued");
+                let ranges: Vec<ByteRange> = plan.reads().map(|(_, range)| range).collect();
+                // A hint that fails costs nothing but the hint.
+                let _ = self.store.hint_will_read(&items[index].key, &ranges);
+                *hinted += 1;
+            }
+        };
+
+        // Phase two: the reads themselves, gated by the byte budget.
         let submit = |index: usize| {
             let plan = plans[index]
                 .as_ref()
                 .expect("only planned items are queued");
-            // Start every read of this chunk before waiting on any of them. The
-            // plan already names them all, and on Lustre one ioctl carries the
-            // lot, so the storage begins work that no thread is yet parked on.
-            // Stores that cannot hint do nothing here.
-            if hint_reads_enabled() {
-                let ranges: Vec<ByteRange> = plan.reads().map(|(_, range)| range).collect();
-                // A hint that fails costs nothing but the hint.
-                let _ = self.store.hint_will_read(&items[index].key, &ranges);
-            }
             for (entry, byte_range) in plan.reads() {
                 let tx = tx.clone();
                 let store = self.store.clone();
@@ -421,9 +461,16 @@ impl CodecPipelineImpl {
 
         let drain = || {
             let mut in_flight = 0u64;
+            let mut hinted = 0usize;
             let mut admit = |waiting: &mut std::collections::VecDeque<usize>,
-                             in_flight: &mut u64| {
-                while let Some(&index) = waiting.front() {
+                             in_flight: &mut u64,
+                             hinted: &mut usize| {
+                loop {
+                    // Keep the hint cursor ahead of wherever the reads have reached,
+                    // including before the first read is issued.
+                    let read_cursor = order.len() - waiting.len();
+                    hint_upto(hinted, read_cursor + lookahead + 1);
+                    let Some(&index) = waiting.front() else { break };
                     let bytes = plan_bytes(plans[index].as_ref().expect("queued"));
                     // Always admit one, so a chunk bigger than the whole budget still runs.
                     if *in_flight > 0 && *in_flight + bytes > budget {
@@ -434,7 +481,7 @@ impl CodecPipelineImpl {
                     submit(index);
                 }
             };
-            admit(&mut waiting, &mut in_flight);
+            admit(&mut waiting, &mut in_flight, &mut hinted);
 
             rayon::scope(|scope| {
                 let decode = |index: usize, fetched: &mut Vec<Vec<MaybeBytes>>| {
@@ -477,7 +524,7 @@ impl CodecPipelineImpl {
                                     decode(index, &mut fetched);
                                     done += 1;
                                     in_flight -= plan_bytes(plans[index].as_ref().expect("queued"));
-                                    admit(&mut waiting, &mut in_flight);
+                                    admit(&mut waiting, &mut in_flight, &mut hinted);
                                 }
                             }
                             Err(error) => {
@@ -494,7 +541,7 @@ impl CodecPipelineImpl {
                                     done += 1;
                                     in_flight -= plan_bytes(plans[index].as_ref().expect("queued"));
                                     fetched[index] = Vec::new();
-                                    admit(&mut waiting, &mut in_flight);
+                                    admit(&mut waiting, &mut in_flight, &mut hinted);
                                 }
                             }
                         }
