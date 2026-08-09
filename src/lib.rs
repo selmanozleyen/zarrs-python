@@ -355,8 +355,9 @@ impl CodecPipelineImpl {
             rayon::scope(|scope| {
                 for (index, range_index, result) in rx {
                     match result {
-                        // Straight from the store to the decoder: `Bytes` is a handle, so
-                        // nothing here copies the encoded chunk.
+                        // Handed on as the store returned it. `Bytes` is a handle, so
+                        // this side no longer copies the encoded chunk -- the inner
+                        // decoder still copies each range out of it when it decodes.
                         Ok(bytes) => fetched[index][range_index] = bytes,
                         Err(error) => {
                             let mut failure = failure.lock().unwrap();
