@@ -384,7 +384,18 @@ impl CodecPipelineImpl {
         // only add to the peak.
         let budget = fetch_byte_budget();
         let submit = |index: usize| {
-            let plan = plans[index].as_ref().expect("only planned items are queued");
+            let plan = plans[index]
+                .as_ref()
+                .expect("only planned items are queued");
+            // Start every read of this chunk before waiting on any of them. The
+            // plan already names them all, and on Lustre one ioctl carries the
+            // lot, so the storage begins work that no thread is yet parked on.
+            // Stores that cannot hint do nothing here.
+            let ranges: Vec<ByteRange> = plan.reads().map(|(_, range)| range).collect();
+            if let Err(error) = self.store.hint_will_read(&items[index].key, &ranges) {
+                // A hint that fails costs nothing but the hint.
+                let _ = error;
+            }
             for (entry, byte_range) in plan.reads() {
                 let tx = tx.clone();
                 let store = self.store.clone();
@@ -398,7 +409,8 @@ impl CodecPipelineImpl {
 
         let drain = || {
             let mut in_flight = 0u64;
-            let mut admit = |waiting: &mut std::collections::VecDeque<usize>, in_flight: &mut u64| {
+            let mut admit = |waiting: &mut std::collections::VecDeque<usize>,
+                             in_flight: &mut u64| {
                 while let Some(&index) = waiting.front() {
                     let bytes = plan_bytes(plans[index].as_ref().expect("queued"));
                     // Always admit one, so a chunk bigger than the whole budget still runs.
