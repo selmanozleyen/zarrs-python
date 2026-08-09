@@ -151,6 +151,34 @@ fn hint_lookahead() -> usize {
     })
 }
 
+/// Threads issuing hints. Small by design: an ioctl per chunk is cheap, but a
+/// batch of hundreds of chunks is hundreds of syscalls, and doing them on the
+/// thread that also admits reads delays phase two for no reason.
+///
+/// Kept separate from the fetch pool so a hint can never occupy a slot a read
+/// wants. Hints are advisory, so one arriving after its read has already been
+/// issued is harmless -- it simply does nothing.
+const HINT_THREADS: &str = "ZARRS_PYTHON_HINT_THREADS";
+
+fn hint_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var(HINT_THREADS)
+            .ok()
+            .and_then(|threads| threads.parse::<usize>().ok())
+            .unwrap_or(2);
+        if threads == 0 {
+            return None; // hint on the calling thread
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("zarrs-hint-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 /// The pool that planned reads are issued on.
 ///
 /// A fetch thread parks in the storage read and burns no CPU, so this is
@@ -437,8 +465,16 @@ impl CodecPipelineImpl {
                     .as_ref()
                     .expect("only planned items are queued");
                 let ranges: Vec<ByteRange> = plan.reads().map(|(_, range)| range).collect();
+                let key = items[index].key.clone();
+                let store = self.store.clone();
                 // A hint that fails costs nothing but the hint.
-                let _ = self.store.hint_will_read(&items[index].key, &ranges);
+                let issue = move || {
+                    let _ = store.hint_will_read(&key, &ranges);
+                };
+                match hint_pool() {
+                    Some(pool) => pool.spawn(issue),
+                    None => issue(),
+                }
                 *hinted += 1;
             }
         };
