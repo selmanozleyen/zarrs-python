@@ -139,6 +139,11 @@ fn hint_reads_enabled() -> bool {
 ///
 /// `0` hints each chunk immediately before its own reads, which is no lead time
 /// at all.
+///
+/// Measured no difference at ~129 chunks per call: `0`, `8` and unbounded all
+/// landed within the run-to-run spread on a 9192-row draw. Kept as a knob because
+/// the argument for a window is about a regime that has not been measured yet --
+/// a batch large enough that prefetching all of it would not stay resident.
 const HINT_LOOKAHEAD: &str = "ZARRS_PYTHON_HINT_LOOKAHEAD";
 
 fn hint_lookahead() -> usize {
@@ -158,6 +163,11 @@ fn hint_lookahead() -> usize {
 /// Kept separate from the fetch pool so a hint can never occupy a slot a read
 /// wants. Hints are advisory, so one arriving after its read has already been
 /// issued is harmless -- it simply does nothing.
+///
+/// Measured no difference against hinting on the calling thread at ~129 chunks
+/// per call. The reasoning holds for larger batches, where the syscalls would
+/// otherwise be serial on the thread admitting reads, but that is reasoning
+/// rather than evidence.
 const HINT_THREADS: &str = "ZARRS_PYTHON_HINT_THREADS";
 
 fn hint_pool() -> Option<&'static rayon::ThreadPool> {
