@@ -322,54 +322,39 @@ impl CodecPipelineImpl {
         // the caller is already on.
         let (tx, rx) = std::sync::mpsc::channel();
         let mut outstanding = vec![0usize; items.len()];
+        // Chunks with nothing to read at all -- every inner chunk absent, so the
+        // whole selection is the fill value. No message will arrive to complete
+        // them, so they are decoded alongside the ones that are waiting on reads.
+        let mut nothing_to_read = Vec::new();
         for (index, plan) in plans.iter().enumerate() {
             let Some(plan) = plan else { continue };
-            outstanding[index] = plan.len();
-            for (range_index, byte_range) in plan.byte_ranges().iter().enumerate() {
+            outstanding[index] = plan.reads().count();
+            if outstanding[index] == 0 {
+                nothing_to_read.push(index);
+                continue;
+            }
+            for (entry, byte_range) in plan.reads() {
                 let tx = tx.clone();
-                match byte_range {
-                    Some(byte_range) => {
-                        let store = self.store.clone();
-                        let key = items[index].key.clone();
-                        let byte_range = *byte_range;
-                        pool.spawn(move || {
-                            let fetched = store.get_partial(&key, byte_range);
-                            let _ = tx.send((index, range_index, fetched));
-                        });
-                    }
-                    // Absent inner chunk: decodes to the fill value.
-                    None => {
-                        let _ = tx.send((index, range_index, Ok(None)));
-                    }
-                }
+                let store = self.store.clone();
+                let key = items[index].key.clone();
+                pool.spawn(move || {
+                    let fetched = store.get_partial(&key, byte_range);
+                    let _ = tx.send((index, entry, fetched));
+                });
             }
         }
         drop(tx);
 
+        // An entry with nothing to read keeps its place and decodes to the fill
+        // value, so the vector is sized by entries rather than by reads.
         let mut fetched: Vec<Vec<MaybeBytes>> = plans
             .iter()
-            .map(|plan| vec![None; plan.as_ref().map_or(0, ReadPlan::len)])
+            .map(|plan| vec![None; plan.as_ref().map_or(0, ReadPlan::num_entries)])
             .collect();
         let failure: Mutex<Option<PyErr>> = Mutex::new(None);
         let drain = || {
             rayon::scope(|scope| {
-                for (index, range_index, result) in rx {
-                    match result {
-                        // Handed on as the store returned it. `Bytes` is a handle, so
-                        // this side no longer copies the encoded chunk -- the inner
-                        // decoder still copies each range out of it when it decodes.
-                        Ok(bytes) => fetched[index][range_index] = bytes,
-                        Err(error) => {
-                            let mut failure = failure.lock().unwrap();
-                            failure
-                                .get_or_insert_with(|| PyRuntimeError::new_err(error.to_string()));
-                            continue;
-                        }
-                    }
-                    outstanding[index] -= 1;
-                    if outstanding[index] != 0 {
-                        continue;
-                    }
+                let decode = |index: usize, fetched: &mut Vec<Vec<MaybeBytes>>| {
                     let item = &items[index];
                     let plan = plans[index].as_ref().expect("only planned items get here");
                     let encoded = std::mem::take(&mut fetched[index]);
@@ -387,6 +372,28 @@ impl CodecPipelineImpl {
                             failure.get_or_insert(error);
                         }
                     });
+                };
+
+                for index in &nothing_to_read {
+                    decode(*index, &mut fetched);
+                }
+                for (index, entry, result) in rx {
+                    match result {
+                        // Handed on as the store returned it. `Bytes` is a handle, so
+                        // this side no longer copies the encoded chunk -- the inner
+                        // decoder still copies each range out of it when it decodes.
+                        Ok(bytes) => fetched[index][entry] = bytes,
+                        Err(error) => {
+                            let mut failure = failure.lock().unwrap();
+                            failure
+                                .get_or_insert_with(|| PyRuntimeError::new_err(error.to_string()));
+                            continue;
+                        }
+                    }
+                    outstanding[index] -= 1;
+                    if outstanding[index] == 0 {
+                        decode(index, &mut fetched);
+                    }
                 }
             });
         };
