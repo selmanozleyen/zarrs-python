@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Not;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -115,6 +116,17 @@ fn plan_bytes(plan: &ReadPlan) -> u64 {
             ByteRange::FromStart(_, None) => 0,
         })
         .sum()
+}
+
+/// Whether to tell the store which ranges a chunk will read before reading them.
+///
+/// On by default; set to `0` to compare against not hinting, or to disable it on a
+/// store where the hint turns out to cost more than it saves.
+const HINT_READS: &str = "ZARRS_PYTHON_HINT_READS";
+
+fn hint_reads_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var(HINT_READS).is_ok_and(|v| v == "0").not())
 }
 
 /// The pool that planned reads are issued on.
@@ -391,10 +403,10 @@ impl CodecPipelineImpl {
             // plan already names them all, and on Lustre one ioctl carries the
             // lot, so the storage begins work that no thread is yet parked on.
             // Stores that cannot hint do nothing here.
-            let ranges: Vec<ByteRange> = plan.reads().map(|(_, range)| range).collect();
-            if let Err(error) = self.store.hint_will_read(&items[index].key, &ranges) {
+            if hint_reads_enabled() {
+                let ranges: Vec<ByteRange> = plan.reads().map(|(_, range)| range).collect();
                 // A hint that fails costs nothing but the hint.
-                let _ = error;
+                let _ = self.store.hint_will_read(&items[index].key, &ranges);
             }
             for (entry, byte_range) in plan.reads() {
                 let tx = tx.clone();
