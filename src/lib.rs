@@ -18,7 +18,6 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
-use zarrs::array::codec::api::decode_into_array_bytes_target;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
     ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound, CodecOptions,
@@ -431,9 +430,6 @@ impl CodecPipelineImpl {
                     "Planning partial decoder not found for key: {key}"
                 ))
             })?;
-        let chunk_subset_bytes = planned
-            .partial_decode_from_bytes(plan, encoded, codec_options)
-            .map_codec_err()?;
         let mut output_view = unsafe {
             // SAFETY: chunks represent disjoint array subsets
             ArrayBytesFixedDisjointView::new(
@@ -447,11 +443,17 @@ impl CodecPipelineImpl {
             )
             .map_py_err::<PyRuntimeError>()?
         };
-        decode_into_array_bytes_target(
-            &chunk_subset_bytes,
-            ArrayBytesDecodeIntoTarget::Fixed(&mut output_view),
-        )
-        .map_codec_err()
+        // Into the output directly. Decoding to an owned buffer first would allocate
+        // one per chunk and copy it into place, on the path whose whole point is
+        // throughput.
+        planned
+            .partial_decode_from_bytes_into(
+                plan,
+                encoded,
+                ArrayBytesDecodeIntoTarget::Fixed(&mut output_view),
+                codec_options,
+            )
+            .map_codec_err()
     }
 }
 
