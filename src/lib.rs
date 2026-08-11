@@ -20,8 +20,9 @@ use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
-    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound, CodecOptions,
-    DataPlan, DataType, FillValue, IndexPlan, ReadPlan, copy_fill_value_into, update_array_bytes,
+    ArrayPartialDecoderTraits, ArraySubset, ArrayToBytesCodecTraits, CodecChain, CodecChainBound,
+    CodecOptions, DataPlan, DataType, FillValue, IndexPlan, ReadPlan, copy_fill_value_into,
+    update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
@@ -55,16 +56,19 @@ const FETCH_THREADS_DEFAULT: usize = 32;
 /// bound does not bite on ordinary batches and only clips pathological ones.
 const FETCH_BYTE_BUDGET_DEFAULT: u64 = 512 * 1024 * 1024;
 
+/// How many encoded bytes one read brings in.
+fn range_bytes(byte_range: ByteRange) -> u64 {
+    match byte_range {
+        ByteRange::FromStart(_, Some(length)) | ByteRange::Suffix(length) => length,
+        // A range with no length reads to the end, which is not something a shard
+        // index describes. Counted as nothing rather than guessed at.
+        ByteRange::FromStart(_, None) => 0,
+    }
+}
+
 /// How many encoded bytes a plan's reads will bring in.
 fn plan_bytes(plan: &DataPlan) -> u64 {
-    plan.reads()
-        .map(|(_, byte_range)| match byte_range {
-            ByteRange::FromStart(_, Some(length)) | ByteRange::Suffix(length) => length,
-            // A range with no length reads to the end, which is not something a shard
-            // index describes. Counted as nothing rather than guessed at.
-            ByteRange::FromStart(_, None) => 0,
-        })
-        .sum()
+    plan.reads().map(|(_, byte_range)| range_bytes(byte_range)).sum()
 }
 
 /// The pool that planned reads are issued on.
@@ -89,6 +93,25 @@ fn fetch_pool(threads: usize) -> Option<&'static rayon::ThreadPool> {
                     .ok()
             })
             .flatten()
+    })
+    .as_ref()
+}
+
+/// The pool planned entries decode on, the moment their read lands.
+///
+/// A fetch thread must not decode -- that turns an I/O thread into a CPU consumer --
+/// but `rayon::spawn` from inside the fetch pool would do exactly that, since it
+/// targets the current pool. This is the explicit CPU-sized target instead: the fetch
+/// thread hands the bytes here and returns to reading. One pool per process, sized by
+/// the first pipeline that asks, exactly as [`fetch_pool`] is.
+fn decode_pool(threads: usize) -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.max(1))
+            .thread_name(|index| format!("zarrs-decode-{index}"))
+            .build()
+            .ok()
     })
     .as_ref()
 }
@@ -329,13 +352,17 @@ impl CodecPipelineImpl {
         Ok(data)
     }
 
-    /// Decode the chunks that can report their reads, fetching through one pool.
+    /// Decode the chunks that can report their reads, dispatching each read the
+    /// moment it lands.
     ///
     /// `partial_decode_into` works out which bytes it needs, reads them, and
     /// decodes them in one call, so overlapping several chunks means a thread
     /// per chunk parked on its own read. Planning first lets every chunk's
     /// reads be outstanding at once against a pool sized for storage rather
-    /// than for cores, and each chunk decodes the moment its last byte lands.
+    /// than for cores -- and entries are independent, so each read decodes as
+    /// it arrives instead of waiting for its chunk's slowest read. The fetch
+    /// thread never decodes: it hands the bytes to the decode pool and returns
+    /// to reading.
     ///
     /// Returns which items it handled. Anything it could not plan for -- a codec
     /// that does not report reads -- is left alone and takes the ordinary path.
@@ -344,7 +371,7 @@ impl CodecPipelineImpl {
         items: &[ChunkItem],
         decoders: &HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
         output: UnsafeCellSlice<u8>,
-        pool: &rayon::ThreadPool,
+        pool: &'static rayon::ThreadPool,
         codec_options: &CodecOptions,
     ) -> PyResult<Vec<bool>> {
         // Ask every chunk what it needs to read, before reading anything. The
@@ -371,184 +398,251 @@ impl CodecPipelineImpl {
         // A nested shard's first plan names its inner-shard indexes rather than the
         // data. One batched wave of index reads exchanges them all for data plans.
         let plans = self.resolve_plans(plans, items, pool, codec_options)?;
-
         let handled = plans.iter().map(Option::is_some).collect::<Vec<_>>();
-        if !handled.iter().any(|planned| *planned) {
+
+        let Some(decode_pool) = decode_pool(self.num_threads) else {
+            return Ok(vec![false; items.len()]);
+        };
+        let chunks: Vec<PlannedChunk> = plans
+            .into_iter()
+            .zip(items)
+            .filter_map(|(plan, item)| {
+                plan.map(|plan| PlannedChunk {
+                    key: item.key.clone(),
+                    subset: item.subset.clone(),
+                    array_shape: item.array_shape.clone(),
+                    plan,
+                })
+            })
+            .collect();
+        if chunks.is_empty() {
             return Ok(handled);
         }
+        let data_type_size = self
+            .data_type
+            .fixed_size()
+            .ok_or("variable length data type not supported")
+            .map_py_err::<PyTypeError>()?;
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut outstanding = vec![0usize; items.len()];
-        // Chunks with nothing to read at all -- every inner chunk absent, so the
-        // whole selection is the fill value. No message will arrive to complete
-        // them, so they are decoded alongside the ones that are waiting on reads.
-        let mut nothing_to_read = Vec::new();
-        // Chunks whose reads have not been issued yet, in order.
-        let mut waiting = std::collections::VecDeque::new();
-        for (index, plan) in plans.iter().enumerate() {
-            let Some(plan) = plan else { continue };
-            outstanding[index] = plan.reads().count();
-            if outstanding[index] == 0 {
-                nothing_to_read.push(index);
-            } else {
-                waiting.push_back(index);
-            }
+        // One completion per accounted task: an absent fill per chunk, plus one
+        // decode (or failed fetch) per entry. Receiving exactly this many is the
+        // barrier that keeps every borrow alive until the last task is done.
+        let total = chunks.len()
+            + chunks
+                .iter()
+                .map(|chunk| chunk.plan.num_entries())
+                .sum::<usize>();
+        let (done, done_rx) = std::sync::mpsc::channel();
+
+        // SAFETY: `output` borrows the caller's buffer for this call. The loop below
+        // receives one message per task in `total` before returning, and every spawned
+        // task sends exactly one, so no task -- and no copy of this slice -- outlives
+        // the borrow.
+        let output: UnsafeCellSlice<'static, u8> = unsafe { std::mem::transmute(output) };
+
+        let waiting = (0..chunks.len()).collect();
+        let dispatch = Arc::new(PlannedDispatch {
+            store: self.store.clone(),
+            chunks,
+            output,
+            data_type_size,
+            codec_options: *codec_options,
+            budget: self.fetch_byte_budget,
+            admission: Mutex::new(Admission {
+                in_flight: 0,
+                waiting,
+            }),
+            failure: Mutex::new(None),
+            fetch_pool: pool,
+            decode_pool,
+            done,
+        });
+
+        // Fills need no fetched data, so they all run while the first reads are
+        // still in flight.
+        for index in 0..dispatch.chunks.len() {
+            let dispatch = dispatch.clone();
+            decode_pool.spawn(move || dispatch.fill_absent(index));
         }
-        let expected = nothing_to_read.len() + waiting.len();
+        dispatch.admit();
 
-        // An entry with nothing to read keeps its place and decodes to the fill
-        // value, so the vector is sized by entries rather than by reads.
-        let mut fetched: Vec<Vec<MaybeBytes>> = plans
-            .iter()
-            .map(|plan| vec![None; plan.as_ref().map_or(0, DataPlan::num_entries)])
-            .collect();
-        let failure: Mutex<Option<PyErr>> = Mutex::new(None);
+        for _ in 0..total {
+            done_rx
+                .recv()
+                .expect("dispatch holds a sender until every task is counted");
+        }
 
-        // Reads are issued for as many chunks as fit in a byte budget, and a new chunk
-        // starts only as an earlier one retires. Bounding bytes rather than chunks is
-        // what makes the limit mean something: a chunk is worth whatever its selection
-        // covers, which varies by orders of magnitude across one batch.
-        //
-        // Finishing beats starting, so the queue is drained in order. A chunk already
-        // reading holds memory that only its own completion releases; a new one can
-        // only add to the peak.
-        let budget = self.fetch_byte_budget;
-        let submit = |index: usize| {
-            let plan = plans[index]
-                .as_ref()
-                .expect("only planned items are queued");
-            for (entry, byte_range) in plan.reads() {
-                let tx = tx.clone();
-                let store = self.store.clone();
-                let key = items[index].key.clone();
-                pool.spawn(move || {
-                    let fetched = store.get_partial(&key, byte_range);
-                    let _ = tx.send((index, entry, fetched));
-                });
-            }
-        };
-
-        let drain = || {
-            let mut in_flight = 0u64;
-            let admit = |waiting: &mut std::collections::VecDeque<usize>, in_flight: &mut u64| {
-                while let Some(&index) = waiting.front() {
-                    let bytes = plan_bytes(plans[index].as_ref().expect("queued"));
-                    // Always admit one, so a chunk bigger than the whole budget still runs.
-                    if *in_flight > 0 && *in_flight + bytes > budget {
-                        break;
-                    }
-                    waiting.pop_front();
-                    *in_flight += bytes;
-                    submit(index);
-                }
-            };
-            admit(&mut waiting, &mut in_flight);
-
-            rayon::scope(|scope| {
-                let decode = |index: usize, fetched: &mut Vec<Vec<MaybeBytes>>| {
-                    let item = &items[index];
-                    let plan = plans[index].as_ref().expect("only planned items get here");
-                    let encoded = std::mem::take(&mut fetched[index]);
-                    let failure = &failure;
-                    scope.spawn(move |_| {
-                        if let Err(error) =
-                            self.decode_chunk_from_bytes(item, plan, output, encoded, codec_options)
-                        {
-                            let mut failure = failure.lock().unwrap();
-                            failure.get_or_insert(error);
-                        }
-                    });
-                };
-
-                for index in &nothing_to_read {
-                    decode(*index, &mut fetched);
-                }
-                // Counted rather than run to channel close: a sender stays alive
-                // while chunks are still queued, so closure cannot end this.
-                let mut done = nothing_to_read.len();
-                let mut failed = vec![false; items.len()];
-                if done < expected {
-                    for (index, entry, result) in rx {
-                        match result {
-                            // Handed on as the store returned it. `Bytes` is a handle,
-                            // so this side no longer copies the encoded chunk -- the
-                            // inner decoder still copies each range out of it.
-                            Ok(bytes) => {
-                                fetched[index][entry] = bytes;
-                                outstanding[index] -= 1;
-                                if outstanding[index] == 0 && !failed[index] {
-                                    decode(index, &mut fetched);
-                                    done += 1;
-                                    in_flight -= plan_bytes(plans[index].as_ref().expect("queued"));
-                                    admit(&mut waiting, &mut in_flight);
-                                }
-                            }
-                            Err(error) => {
-                                let mut guard = failure.lock().unwrap();
-                                guard.get_or_insert_with(|| {
-                                    PyRuntimeError::new_err(error.to_string())
-                                });
-                                drop(guard);
-                                // This chunk will never complete. Retire it here, or the
-                                // count never reaches `expected` and its bytes are never
-                                // released to the chunks still queued behind it.
-                                if !failed[index] {
-                                    failed[index] = true;
-                                    done += 1;
-                                    in_flight -= plan_bytes(plans[index].as_ref().expect("queued"));
-                                    fetched[index] = Vec::new();
-                                    admit(&mut waiting, &mut in_flight);
-                                }
-                            }
-                        }
-                        if done == expected {
-                            break;
-                        }
-                    }
-                }
-            });
-        };
-        // Decodes run on rayon's global pool, which `threading.max_workers`
-        // already sizes; the fetch pool above is the one sized by storage.
-        drain();
-
-        match failure.into_inner().unwrap() {
+        match dispatch.failure.lock().unwrap().take() {
             Some(error) => Err(error),
             None => Ok(handled),
         }
     }
+}
 
-    /// Decode one chunk from bytes the caller already fetched, into the output.
-    fn decode_chunk_from_bytes(
-        &self,
-        item: &ChunkItem,
-        plan: &DataPlan,
-        output: UnsafeCellSlice<u8>,
-        encoded: Vec<MaybeBytes>,
-        codec_options: &CodecOptions,
-    ) -> PyResult<()> {
-        let mut output_view = unsafe {
-            // SAFETY: chunks represent disjoint array subsets
-            ArrayBytesFixedDisjointView::new(
-                output,
-                self.data_type
-                    .fixed_size()
-                    .ok_or("variable length data type not supported")
-                    .map_py_err::<PyTypeError>()?,
-                bytemuck::must_cast_slice(&item.array_shape),
-                item.subset.clone(),
-            )
-            .map_py_err::<PyRuntimeError>()?
-        };
-        // Into the output directly, through the decoder the plan itself holds.
-        // Decoding to an owned buffer first would allocate one per chunk and
-        // copy it into place, on the path whose whole point is throughput.
-        plan.decode_into(
-            encoded,
-            ArrayBytesDecodeIntoTarget::Fixed(&mut output_view),
-            codec_options,
-        )
-        .map_codec_err()
+/// One planned chunk, owned so its tasks can outlive the borrow of the batch.
+struct PlannedChunk {
+    key: StoreKey,
+    subset: ArraySubset,
+    array_shape: Vec<std::num::NonZeroU64>,
+    plan: DataPlan,
+}
+
+/// How much encoded data is in flight, and the chunks waiting on room.
+///
+/// Reads are issued for as many chunks as fit in a byte budget, and a new chunk
+/// starts only as earlier reads retire. Bounding bytes rather than chunks is
+/// what makes the limit mean something: a chunk is worth whatever its selection
+/// covers, which varies by orders of magnitude across one batch.
+struct Admission {
+    in_flight: u64,
+    waiting: std::collections::VecDeque<usize>,
+}
+
+/// Everything a spawned fetch or decode task needs, shared by `Arc`.
+///
+/// A fetch thread reads, hands the bytes straight to the decode pool, and returns
+/// to reading -- no coordinator thread buffers arrivals in between. The byte budget
+/// is released as each entry's *decode* completes, which is when the fetched buffer
+/// is actually dropped; releasing at arrival would admit new reads while the old
+/// bytes are still held by decodes.
+struct PlannedDispatch {
+    store: ReadableWritableListableStorage,
+    chunks: Vec<PlannedChunk>,
+    /// See the SAFETY note where this is made `'static`: no task outlives the call.
+    output: UnsafeCellSlice<'static, u8>,
+    data_type_size: usize,
+    codec_options: CodecOptions,
+    budget: u64,
+    admission: Mutex<Admission>,
+    failure: Mutex<Option<PyErr>>,
+    fetch_pool: &'static rayon::ThreadPool,
+    decode_pool: &'static rayon::ThreadPool,
+    /// One `()` per completed task; the dispatching call counts them to know when
+    /// every borrow is dead.
+    done: std::sync::mpsc::Sender<()>,
+}
+
+impl PlannedDispatch {
+    fn record_failure(&self, error: PyErr) {
+        self.failure.lock().unwrap().get_or_insert(error);
+    }
+
+    /// Issue reads for every waiting chunk that fits in the byte budget.
+    ///
+    /// Finishing beats starting, so the queue drains in order: a chunk already
+    /// reading holds memory that only its own decodes release; a new one can only
+    /// add to the peak. One chunk is always admitted, so a chunk bigger than the
+    /// whole budget still runs.
+    fn admit(self: &Arc<Self>) {
+        let mut admission = self.admission.lock().unwrap();
+        while let Some(&index) = admission.waiting.front() {
+            let bytes = plan_bytes(&self.chunks[index].plan);
+            if admission.in_flight > 0 && admission.in_flight + bytes > self.budget {
+                break;
+            }
+            admission.waiting.pop_front();
+            admission.in_flight += bytes;
+            for (entry, byte_range) in self.chunks[index].plan.reads() {
+                let dispatch = self.clone();
+                self.fetch_pool
+                    .spawn(move || dispatch.fetch_entry(index, entry, byte_range));
+            }
+        }
+    }
+
+    /// Retire one read's bytes and admit whatever now fits.
+    fn release(self: &Arc<Self>, byte_range: ByteRange) {
+        self.admission.lock().unwrap().in_flight -= range_bytes(byte_range);
+        self.admit();
+    }
+
+    /// Fetch-pool side of one entry: read it, hand it to the decode pool, return.
+    fn fetch_entry(self: Arc<Self>, index: usize, entry: usize, byte_range: ByteRange) {
+        match self.store.get_partial(&self.chunks[index].key, byte_range) {
+            Ok(bytes) => {
+                let dispatch = self.clone();
+                self.decode_pool
+                    .spawn(move || dispatch.decode_entry(index, entry, bytes, byte_range));
+            }
+            Err(error) => {
+                // This entry will never decode, so its accounting retires here.
+                self.record_failure(PyRuntimeError::new_err(error.to_string()));
+                self.release(byte_range);
+                let _ = self.done.send(());
+            }
+        }
+    }
+
+    /// Decode-pool side of one entry, the moment its read landed.
+    fn decode_entry(self: Arc<Self>, index: usize, entry: usize, bytes: MaybeBytes, byte_range: ByteRange) {
+        // A batch that has already failed returns its first error; decoding more of
+        // it would be work nobody reads.
+        if self.failure.lock().unwrap().is_none() {
+            let chunk = &self.chunks[index];
+            // Each task builds its own view: distinct entries write disjoint
+            // subdivisions, so concurrent views of the same buffer are the contract.
+            let view = unsafe {
+                // SAFETY: chunks represent disjoint array subsets
+                ArrayBytesFixedDisjointView::new(
+                    self.output,
+                    self.data_type_size,
+                    bytemuck::must_cast_slice(&chunk.array_shape),
+                    chunk.subset.clone(),
+                )
+            }
+            .map_py_err::<PyRuntimeError>();
+            let result = match view {
+                Ok(mut view) => chunk
+                    .plan
+                    .decode_entry_into(
+                        entry,
+                        bytes,
+                        ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+                        &self.codec_options,
+                    )
+                    .map_codec_err(),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                self.record_failure(error);
+            }
+        }
+        // The fetched bytes drop with this call, so the budget frees now -- not at
+        // arrival, when the decode still holds them.
+        self.release(byte_range);
+        let _ = self.done.send(());
+    }
+
+    /// Fill one chunk's absent units. Needs no fetched data, so it runs before any
+    /// read returns.
+    fn fill_absent(self: Arc<Self>, index: usize) {
+        if self.failure.lock().unwrap().is_none() {
+            let chunk = &self.chunks[index];
+            let view = unsafe {
+                // SAFETY: chunks represent disjoint array subsets
+                ArrayBytesFixedDisjointView::new(
+                    self.output,
+                    self.data_type_size,
+                    bytemuck::must_cast_slice(&chunk.array_shape),
+                    chunk.subset.clone(),
+                )
+            }
+            .map_py_err::<PyRuntimeError>();
+            let result = match view {
+                Ok(mut view) => chunk
+                    .plan
+                    .fill_absent_into(
+                        ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+                        &self.codec_options,
+                    )
+                    .map_codec_err(),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                self.record_failure(error);
+            }
+        }
+        let _ = self.done.send(());
     }
 }
 
