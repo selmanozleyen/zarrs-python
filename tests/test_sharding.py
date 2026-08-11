@@ -9,6 +9,7 @@ from zarr.abc.store import Store
 from zarr.api.asynchronous import create_array as create_async_array
 from zarr.codecs import (
     BloscCodec,
+    BytesCodec,
     ShardingCodec,
     TransposeCodec,
 )
@@ -322,3 +323,44 @@ async def test_sharding_with_empty_inner_chunk(
     print("read data")
     data_read = await a.getitem(...)
     assert np.array_equal(data_read, data)
+
+
+@pytest.mark.parametrize("index_location", ["start", "end"])
+def test_nested_sharding_reads_match(tmp_path, index_location: IndexLocation) -> None:
+    """Nested sharding decodes through the planned path.
+
+    A shard whose inner chunks are themselves shards returns a plan naming the
+    inner-shard indexes first; the pipeline must exchange it for the data plan
+    before decoding. Selections straddle inner-shard boundaries so subchunks are
+    wanted in part, which is exactly the case that takes the index round.
+    """
+    data = np.arange(0, 64 * 64, dtype="uint16").reshape((64, 64))
+    arr = create_array(
+        str(tmp_path / "nested.zarr"),
+        shape=data.shape,
+        shards=ShardsConfigParam(shape=(32, 32), index_location=index_location),
+        chunks=(16, 16),
+        serializer=ShardingCodec(
+            chunk_shape=(8, 8),
+            codecs=[BytesCodec(), BloscCodec(cname="lz4")],
+            index_location=index_location,
+        ),
+        dtype=data.dtype,
+        fill_value=0,
+    )
+    arr[...] = data
+
+    codecs = arr.metadata.to_dict()["codecs"]
+    assert codecs[0]["name"] == "sharding_indexed"
+    assert codecs[0]["configuration"]["codecs"][0]["name"] == "sharding_indexed", (
+        "the array is not nested, so this test is not testing nesting"
+    )
+
+    for selection in [
+        np.s_[...],
+        np.s_[3:29, 5:27],  # straddles inner-shard boundaries: part-wanted subchunks
+        np.s_[0:8, 0:8],  # exactly one innermost shard
+        np.s_[30:34, 30:34],  # straddles the outer shard boundary too
+        np.s_[63:64, 0:64],  # a row in the last shard
+    ]:
+        assert np.array_equal(arr[selection], data[selection])

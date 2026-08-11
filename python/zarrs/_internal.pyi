@@ -2,44 +2,17 @@
 # ruff: noqa: E501, F401
 
 import builtins
-import typing
-
 import numpy.typing
+import typing
 import zarr.abc.store
 
 @typing.final
 class ChunkItem:
-    def __new__(
-        cls,
-        key: builtins.str,
-        chunk_subset: typing.Sequence[slice],
-        chunk_shape: typing.Sequence[builtins.int],
-        subset: typing.Sequence[slice],
-        shape: typing.Sequence[builtins.int],
-    ) -> ChunkItem: ...
+    def __new__(cls, key: builtins.str, chunk_subset: typing.Sequence[slice], chunk_shape: typing.Sequence[builtins.int], subset: typing.Sequence[slice], shape: typing.Sequence[builtins.int]) -> ChunkItem: ...
 
 @typing.final
 class CodecPipelineImpl:
-    def __new__(
-        cls,
-        array_metadata: builtins.str,
-        store_config: zarr.abc.store.Store,
-        *,
-        validate_checksums: builtins.bool = False,
-        chunk_concurrent_minimum: builtins.int | None = None,
-        chunk_concurrent_maximum: builtins.int | None = None,
-        num_threads: builtins.int | None = None,
-        direct_io: builtins.bool = False,
-        file_handle_cache_size: builtins.int = 0,
-    ) -> CodecPipelineImpl: ...
-    def retrieve_chunks_and_apply_index(
-        self,
-        chunk_descriptions: typing.Sequence[ChunkItem],
-        value: numpy.typing.NDArray[typing.Any],
-    ) -> None: ...
-    def store_chunks_with_indices(
-        self,
-        chunk_descriptions: typing.Sequence[ChunkItem],
-        value: numpy.typing.NDArray[typing.Any],
-        write_empty_chunks: builtins.bool,
-    ) -> None: ...
+    def __new__(cls, array_metadata: builtins.str, store_config: zarr.abc.store.Store, *, validate_checksums: builtins.bool = False, chunk_concurrent_minimum: typing.Optional[builtins.int] = None, chunk_concurrent_maximum: typing.Optional[builtins.int] = None, num_threads: typing.Optional[builtins.int] = None, direct_io: builtins.bool = False, file_handle_cache_size: builtins.int = 0, fetch_threads: typing.Optional[builtins.int] = None, fetch_byte_budget: typing.Optional[builtins.int] = None, partial_decoder_cache: builtins.bool = True) -> CodecPipelineImpl: ...
+    def retrieve_chunks_and_apply_index(self, chunk_descriptions: typing.Sequence[ChunkItem], value: numpy.typing.NDArray[typing.Any]) -> None: ...
+    def store_chunks_with_indices(self, chunk_descriptions: typing.Sequence[ChunkItem], value: numpy.typing.NDArray[typing.Any], write_empty_chunks: builtins.bool) -> None: ...
+

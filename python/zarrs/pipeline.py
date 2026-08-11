@@ -65,6 +65,21 @@ def get_codec_pipeline_impl(
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
             ),
+            # Reads planned across a batch are issued on a pool of this many
+            # threads, sized by what the storage will carry rather than by
+            # cores. 0 disables planned reads entirely.
+            fetch_threads=config.get("codec_pipeline.fetch_threads", None),
+            # Encoded bytes allowed in flight at once across planned reads.
+            fetch_byte_budget=config.get("codec_pipeline.fetch_byte_budget", None),
+            # The shard-index cache: a kept partial decoder's only heavy state
+            # is its decoded shard index, so keeping decoders between calls is
+            # how indexes stay resident (data bytes are never cached -- that is
+            # the page cache's job). Sound while every write goes through this
+            # pipeline, which evicts what it touches; disable when another
+            # process or library writes the same array.
+            partial_decoder_cache=config.get(
+                "codec_pipeline.partial_decoder_cache", True
+            ),
         )
     except TypeError as e:
         if strict:

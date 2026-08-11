@@ -153,6 +153,104 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
+def _unwrap_1d(selection: SelectorTuple):
+    """The single selector of a one-dimensional selection, tuple-wrapped or not."""
+    if isinstance(selection, tuple):
+        if len(selection) != 1:
+            return None
+        selection = selection[0]
+    return selection
+
+
+def _as_1d_index_array(selection: SelectorTuple) -> np.ndarray | None:
+    """The index array of a one-dimensional fancy selection, if that is what this is."""
+    selection = _unwrap_1d(selection)
+    if isinstance(selection, np.ndarray) and selection.ndim == 1 and selection.size > 1:
+        return selection
+    return None
+
+
+def split_1d_runs(
+    batch_info: Iterable[
+        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
+    ],
+) -> list[tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]]:
+    """Split one-dimensional fancy selections into contiguous runs.
+
+    Gathering rows from a CSR array selects, within each chunk, one contiguous
+    run per row. Taken as a whole that is not a slice, so `make_slice_selection`
+    rejects it and the entire read falls back to zarr-python -- which is most
+    of the data for this kind of workload. Each individual run *is* a slice, so
+    splitting where the selection stops advancing by one yields pairs the
+    ordinary per-chunk path already handles.
+
+    Splitting is only worth it when the runs are long, and zarr says which case
+    this is. `CoordinateIndexer` hands back a plain output **slice** exactly
+    when it did not have to reorder the coordinates -- `sel_sort is None`, the
+    same condition its own fast path keys off -- and a scattered output array
+    otherwise. Coordinates already in chunk order give one run per CSR row,
+    measured at ~1550 elements on a real plate. Reordered ones interleave into
+    runs of ~1.9, where splitting would issue hundreds of thousands of tiny
+    reads and lose badly to letting zarr-python read whole chunks and index
+    them in memory.
+
+    So a scattered output means decline, and callers wanting this path should
+    sort their indices. Reading zarr's answer rather than measuring run lengths
+    also fails the right way: if that optimisation ever changed and the output
+    were always an array, this would stop splitting and fall back, rather than
+    start fragmenting.
+
+    Selections this cannot describe pass through untouched and fall back as
+    before.
+    """
+    expanded = []
+    for entry in batch_info:
+        byte_getter, chunk_spec, chunk_selection, out_selection, is_complete = entry
+        chunk_idx = _as_1d_index_array(chunk_selection)
+        out = _unwrap_1d(out_selection)
+        if (
+            chunk_idx is None
+            or not isinstance(out, slice)
+            or (out.step is not None and out.step != 1)
+        ):
+            expanded.append(entry)
+            continue
+
+        # The output is filled in selection order, so element k lands at
+        # out.start + k and only the chunk side can break a run.
+        breaks = np.flatnonzero(np.diff(chunk_idx) != 1) + 1
+        if breaks.size + 1 == chunk_idx.size:
+            # Every element its own run: one read per element, which is what
+            # the fallback avoids by reading whole chunks.
+            expanded.append(entry)
+            continue
+
+        base = out.start or 0
+        starts = np.concatenate(([0], breaks))
+        stops = np.concatenate((breaks, [chunk_idx.size]))
+        # Read every per-run bound out of numpy in one gather rather than four
+        # scalar extractions per run. Worth ~1.2x of this function, which is
+        # itself a few percent of a gather -- the O(n) boundary scan above is
+        # the bulk of it and there is no cheaper way to find the runs.
+        for first, last, out_start, out_stop in zip(
+            chunk_idx[starts].tolist(),
+            (chunk_idx[stops - 1] + 1).tolist(),
+            (starts + base).tolist(),
+            (stops + base).tolist(),
+            strict=True,
+        ):
+            expanded.append(
+                (
+                    byte_getter,
+                    chunk_spec,
+                    (slice(first, last, 1),),
+                    (slice(out_start, out_stop, 1),),
+                    is_complete,
+                )
+            )
+    return expanded
+
+
 def make_chunk_info_for_rust_with_indices(
     batch_info: Iterable[
         tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
@@ -163,6 +261,7 @@ def make_chunk_info_for_rust_with_indices(
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True
+    batch_info = split_1d_runs(batch_info)
     for (
         byte_getter,
         chunk_spec,
