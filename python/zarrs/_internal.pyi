@@ -37,6 +37,11 @@ class CodecPipelineImpl:
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
         value: numpy.typing.NDArray[typing.Any],
+        *,
+        plan_reads: builtins.bool = False,
+        plan_reads_merge_gap_bytes: builtins.int = 0,
+        plan_reads_fetch_threads: builtins.int = 0,
+        plan_reads_fetch_byte_budget: builtins.int = 0,
     ) -> None: ...
     def store_chunks_with_indices(
         self,
