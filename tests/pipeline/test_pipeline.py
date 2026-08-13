@@ -165,3 +165,52 @@ def test_file_handle_cache(tmp_path: Path, cache_size: int) -> None:
         np.testing.assert_array_equal(z[...], ground_truth_arr)
         # Shard files stay open only while the cache is enabled.
         assert _open_fds() - before == cache_size
+
+
+@pytest.mark.parametrize("cache_size", [0, 4])
+def test_shard_index_cache(tmp_path: Path, cache_size: int) -> None:
+    path = tmp_path / "foo.zarr"
+    ground_truth_arr = _sharded_array(path)
+    # A subset of one shard, so the read goes through a partial decoder.
+    subset = (slice(0, 5), slice(0, 5))
+
+    with zarr.config.set(
+        {
+            "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
+            "codec_pipeline.shard_index_cache_size": cache_size,
+        }
+    ):
+        z = zarr.open_array(path, mode="r")
+        np.testing.assert_array_equal(z[subset], ground_truth_arr[subset])
+
+        # Break the last byte of the shard index checksum, leaving the chunk data intact.
+        # Only a read that re-decodes the index can notice.
+        shard = path / "c" / "0" / "0"
+        corrupted = bytearray(shard.read_bytes())
+        corrupted[-1] ^= 0xFF
+        shard.write_bytes(corrupted)
+
+        if cache_size:
+            np.testing.assert_array_equal(z[subset], ground_truth_arr[subset])
+        else:
+            with pytest.raises(RuntimeError, match="checksum is invalid"):
+                z[subset]
+
+
+def test_shard_index_cache_invalidated_by_write(tmp_path: Path) -> None:
+    path = tmp_path / "foo.zarr"
+    ground_truth_arr = _sharded_array(path)
+    subset = (slice(0, 5), slice(0, 5))
+
+    with zarr.config.set(
+        {
+            "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
+            "codec_pipeline.shard_index_cache_size": 4,
+        }
+    ):
+        z = zarr.open_array(path, mode="r+")
+        np.testing.assert_array_equal(z[subset], ground_truth_arr[subset])
+        # Rewriting the shard moves its inner chunks, so a stale index would misread it.
+        ground_truth_arr[subset] = np.random.random((5, 5))
+        z[subset] = ground_truth_arr[subset]
+        np.testing.assert_array_equal(z[...], ground_truth_arr)

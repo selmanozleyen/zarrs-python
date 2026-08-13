@@ -51,6 +51,10 @@ The `ZarrsCodecPipeline` specific options are:
   - Defaults to `0` (disabled). Only applies to filesystem stores, and has no effect when `direct_io` is enabled.
   - Cached handles are invalidated on writes through this pipeline, but not on modification from anywhere else — and `zarr-python` itself is such a writer, since `resize`, `delete_dir` and metadata writes go through its own store. A cached handle can then still read a chunk file that has been deleted. Only enable this while nothing is modifying the array.
   - The cache is per `Array` object, not per process, so compare `file_handle_cache_size` times the number of open arrays against `ulimit -n`. See [here](https://docs.rs/zarrs_filesystem/latest/zarrs_filesystem/struct.FilesystemStoreOptions.html#method.file_handle_cache_size) for more info.
+- `codec_pipeline.shard_index_cache_size`: the number of shard indexes kept in a least-recently-used cache. If nonzero, a partial read of a shard reuses the index decoded by an earlier read instead of fetching and decoding it again, which removes one read per shard per call. Like the file handle cache, this matters most on network filesystems and for repeated small reads of the same shards, such as random-access sampling.
+  - Defaults to `0` (disabled). Applies to any store, but only sharded arrays have an index to cache — for unsharded arrays a partial read has nothing to reuse.
+  - Each entry costs 16 bytes per inner chunk of the shard, so size it against the number of shards read repeatedly rather than the array size.
+  - Cached indexes are invalidated on writes through this pipeline, but not on modification from anywhere else — the same caveat as `file_handle_cache_size` above. Only enable this while nothing else is modifying the array.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -67,6 +71,7 @@ zarr.config.set({
         "chunk_concurrent_maximum": None,
         "chunk_concurrent_minimum": 4,
         "file_handle_cache_size": 0,
+        "shard_index_cache_size": 0,
         "direct_io": False,
         "strict": False
     }
