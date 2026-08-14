@@ -4,8 +4,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use chunk_item::ChunkItem;
 use itertools::Itertools;
@@ -15,32 +16,252 @@ use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_stub_gen::define_stub_info_gatherer;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
-    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecOptions, DataType,
-    FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
+    ArrayPartialDecoderTraits, ArraySubset, ArrayToBytesCodecTraits, CodecChain, CodecOptions,
+    DataType, FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
-use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
+use zarrs::storage::byte_range::ByteRange;
+use zarrs::storage::{Bytes, ReadableWritableListableStorage, StorageHandle, StoreKey};
 
 mod chunk_item;
 mod concurrency;
+mod io_pool;
 mod runtime;
+mod shard_index;
 mod store;
 #[cfg(test)]
 mod tests;
 mod utils;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
+use crate::shard_index::{ReadGroup, ShardLayout};
 use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
+
+/// Bytes allowed to sit fetched but undecoded when the caller does not say.
+const DEFAULT_FETCH_BYTE_BUDGET: u64 = 256 << 20;
+
+/// Reads outstanding on the ring when the caller does not say.
+///
+/// Much larger than any sane thread count, which is the whole point of a ring: depth costs a queue
+/// entry here rather than a thread and a stack. Still bounded, because the byte budget is what
+/// limits memory and depth beyond what the device will service only lengthens the queue.
+const DEFAULT_FETCH_DEPTH: usize = 256;
+
+/// What `plan_reads` was asked to do, beyond the fact that it was asked.
+#[derive(Clone, Copy)]
+pub(crate) struct PlanOptions {
+    /// Reads within this many bytes of each other become one read. Zero merges only touching ones.
+    pub merge_gap_bytes: u64,
+    /// Threads issuing reads. Separate from the decode pool because these block on IO.
+    pub fetch_threads: usize,
+    /// Ceiling on bytes fetched but not yet decoded.
+    pub fetch_byte_budget: u64,
+    /// How those reads are issued: blocking threads, a ring, or whichever this process can have.
+    pub io_backend: io_pool::Backend,
+    /// Reads outstanding at once on the ring. Meaningless for the thread backend, where the thread
+    /// count is the depth.
+    pub fetch_depth: usize,
+    /// How many reads ahead of the read cursor to issue FADVISE(WILLNEED) hints for. Zero disables
+    /// hinting entirely, which is the behaviour every earlier generation had.
+    pub hint_lookahead: usize,
+}
+
+/// What every stage of a planned read needs, so a stage takes one argument rather than six.
+struct ReadContext<'a> {
+    layout: &'a ShardLayout,
+    /// Inner chunk shape as plain `u64`s, which is what the index arithmetic wants.
+    inner_shape: Vec<u64>,
+    /// Inner chunks along each dimension of a shard.
+    chunks_per_shard: Vec<u64>,
+    output: UnsafeCellSlice<'a, u8>,
+    data_type_size: usize,
+    codec_options: &'a CodecOptions,
+}
+
+/// One inner chunk that can be read a piece at a time: its shard, which chunk, where it sits in
+/// the shard, and which of the shard's items want it.
+type SubChunkUnit<'a> = (usize, u64, Option<ByteRange>, &'a [usize]);
+
+/// One store read: its shard, the inner chunks it covers, and which items want each of them.
+type WholeUnit<'a> = (usize, &'a ReadGroup, &'a HashMap<u64, Vec<usize>>);
+
+/// What one shard contributes to a read, decided before any of its data is fetched.
+struct ShardPlan {
+    /// Which of the shard's items want each inner chunk, as indices into its item list.
+    ///
+    /// Built here because working it out is free — deciding which chunks to read means walking
+    /// every item's chunks anyway. Without it, decoding a chunk means asking every item of the
+    /// shard whether it overlaps, which is `items × chunks` work for `items` worth of answers.
+    wanted_by: HashMap<u64, Vec<usize>>,
+    reads: ShardReads,
+}
+
+enum ShardReads {
+    /// The shard does not exist, so everything asked of it is the fill value.
+    Absent,
+    /// Inner chunks that can be read a piece at a time, with the byte range of each.
+    SubChunk(Vec<(u64, Option<ByteRange>)>),
+    /// Reads that must fetch whole inner chunks, and the chunks each one covers.
+    Whole(Vec<ReadGroup>),
+}
+
+/// The items that want one inner chunk, or nothing if it turns out none do.
+fn wanted(wanted_by: &HashMap<u64, Vec<usize>>, subchunk: u64) -> &[usize] {
+    wanted_by.get(&subchunk).map_or(&[], Vec::as_slice)
+}
+
+/// Threads that issue reads, kept apart from the decode pool.
+///
+/// A fetch thread can block waiting for the byte budget, and only a decode can release it. Sharing
+/// one pool would let blocked fetches occupy every thread the decodes need, so the pipeline would
+/// stall on itself. Process-wide rather than per array: a caller reading the several arrays of a
+/// sparse matrix should not get one pool per array.
+static FETCH_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+fn fetch_pool(threads: usize) -> &'static rayon::ThreadPool {
+    FETCH_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.max(1))
+            .thread_name(|i| format!("zarrs-fetch-{i}"))
+            .build()
+            .expect("the fetch pool is built once, with a valid thread count")
+    })
+}
+
+/// A ceiling on bytes that have been fetched but not yet decoded.
+///
+/// Without it a read plan large enough to cover an array would fetch all of it before the first
+/// decode finished. Credit is held by every decode of a read and returned when the last of them
+/// drops it, so the ceiling counts exactly the bytes waiting to be decoded.
+struct ByteBudget {
+    limit: u64,
+    in_flight: Mutex<u64>,
+    freed: Condvar,
+}
+
+impl ByteBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            in_flight: Mutex::new(0),
+            freed: Condvar::new(),
+        }
+    }
+
+    /// Wait until `bytes` fit under the ceiling, then hold them until the returned credit drops.
+    ///
+    /// A read larger than the whole ceiling is admitted on its own rather than never, which is
+    /// what keeps a ceiling smaller than one read from wedging the pipeline.
+    /// Shared rather than borrowed: a credit outlives the fetch that took it, travelling into decode
+    /// tasks whose lifetime rayon cannot relate to a local borrow. One `Arc` clone per read is
+    /// nothing beside the read, and it costs the type its lifetime parameter, which is what lets a
+    /// credit be handed to `Scope::spawn` at all.
+    fn admit(self: &Arc<Self>, bytes: u64) -> Credit {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        while *in_flight > 0 && in_flight.saturating_add(bytes) > self.limit {
+            in_flight = self.freed.wait(in_flight).unwrap();
+        }
+        *in_flight += bytes;
+        Credit {
+            budget: Arc::clone(self),
+            bytes,
+        }
+    }
+
+    /// [`admit`](Self::admit) for a caller that must not be parked.
+    ///
+    /// The ring runs submission and completion on ONE thread, so a blocking admit there stops both:
+    /// no completion is reaped, and the credit that would unblock it is released by a decode that
+    /// only a reaped completion can start. It is not a deadlock -- decodes already queued do finish
+    /// -- but the ring sits idle through every one of them, which is why depth never helped. A
+    /// caller who cannot block asks instead, and simply submits less.
+    fn try_admit(self: &Arc<Self>, bytes: u64) -> Option<Credit> {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        if *in_flight > 0 && in_flight.saturating_add(bytes) > self.limit {
+            return None;
+        }
+        *in_flight += bytes;
+        Some(Credit {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+struct Credit {
+    budget: Arc<ByteBudget>,
+    bytes: u64,
+}
+
+impl Drop for Credit {
+    fn drop(&mut self) {
+        *self.budget.in_flight.lock().unwrap() -= self.bytes;
+        self.budget.freed.notify_all();
+    }
+}
+
+/// Indices of the inner chunks a subset of a shard overlaps.
+fn subchunks_overlapping(subset: &ArraySubset, inner_shape: &[u64]) -> Vec<Vec<u64>> {
+    let ranges: Vec<_> = subset
+        .to_ranges()
+        .iter()
+        .zip(inner_shape)
+        .map(|(range, size)| (range.start / size)..=((range.end - 1) / size))
+        .collect();
+    ranges
+        .into_iter()
+        .multi_cartesian_product()
+        .collect::<Vec<_>>()
+}
+
+fn ravel(indices: &[u64], shape: &[u64]) -> Option<u64> {
+    let mut raveled = 0u64;
+    for (index, size) in indices.iter().zip(shape) {
+        if index >= size {
+            return None;
+        }
+        raveled = raveled.checked_mul(*size)?.checked_add(*index)?;
+    }
+    Some(raveled)
+}
+
+fn unravel(mut raveled: u64, shape: &[u64]) -> Vec<u64> {
+    let mut indices = vec![0; shape.len()];
+    for (index, size) in indices.iter_mut().zip(shape).rev() {
+        *index = raveled % size;
+        raveled /= size;
+    }
+    indices
+}
+
+/// A view of `subset` within the output array `item` writes into.
+fn new_output_view<'a>(
+    output: UnsafeCellSlice<'a, u8>,
+    data_type_size: usize,
+    item: &'a ChunkItem,
+    subset: &ArraySubset,
+) -> PyResult<ArrayBytesFixedDisjointView<'a>> {
+    unsafe {
+        // SAFETY: the boxes written by one read are disjoint subsets of the output
+        ArrayBytesFixedDisjointView::new(
+            output,
+            data_type_size,
+            bytemuck::must_cast_slice(&item.array_shape),
+            subset.clone(),
+        )
+        .map_py_err::<PyRuntimeError>()
+    }
+}
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
 #[gen_stub_pyclass]
@@ -58,6 +279,16 @@ pub struct CodecPipelineImpl {
     /// holds the shard index it decoded, so this is a shard index cache. `None` when disabled.
     pub(crate) shard_index_cache:
         Option<Mutex<LruCache<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>>>,
+    /// Shard indexes parsed for the read planner, which needs the offsets themselves rather than
+    /// a decoder holding them. Same capacity as `shard_index_cache`; the two would be one cache
+    /// once planning replaces the partial-decoder path.
+    pub(crate) parsed_index_cache: Option<Mutex<LruCache<StoreKey, Arc<Vec<u64>>>>>,
+    /// How this array's shards are laid out, worked out on the first read that needs it.
+    /// `None` once resolved means the chunk is not a plain shard, so planning does not apply.
+    pub(crate) shard_layout: OnceLock<Option<ShardLayout>>,
+    /// Directory the store's keys are relative to, for backends that need a file rather than a
+    /// store. `None` for HTTP and object stores, which have no path and so cannot use a ring.
+    pub(crate) fs_root: Option<PathBuf>,
 }
 
 impl CodecPipelineImpl {
@@ -97,9 +328,15 @@ impl CodecPipelineImpl {
             .validate(item.num_elements, &self.data_type)
             .map_codec_err()?;
 
-        // Every write goes through here, and a write makes a cached shard index stale.
+        // Both shard index caches, and the read planner that uses them, exist for read-only work.
+        // Rather than track which cached index a write invalidates, every write empties them. A
+        // write moves where a shard's inner chunks live, and being wrong about that is silently
+        // wrong data, so this trades cache warmth for having no coherence rules to get wrong.
         if let Some(cache) = &self.shard_index_cache {
-            cache.lock().unwrap().pop(&item.key);
+            cache.lock().unwrap().clear();
+        }
+        if let Some(cache) = &self.parsed_index_cache {
+            cache.lock().unwrap().clear();
         }
 
         if value_decoded.is_fill_value(&self.fill_value) {
@@ -226,6 +463,461 @@ impl CodecPipelineImpl {
         Ok(partial_decoders)
     }
 
+    /// The shard index of `key`, read from the store and kept for later calls.
+    fn shard_index(
+        &self,
+        key: &StoreKey,
+        layout: &ShardLayout,
+        codec_options: &CodecOptions,
+    ) -> PyResult<Option<Arc<Vec<u64>>>> {
+        if let Some(index) = self
+            .parsed_index_cache
+            .as_ref()
+            .and_then(|cache| cache.lock().unwrap().get(key).cloned())
+        {
+            return Ok(Some(index));
+        }
+        let Some(encoded) = self
+            .store
+            .get_partial(key, layout.index_byte_range())
+            .map_py_err::<PyRuntimeError>()?
+        else {
+            return Ok(None); // the shard does not exist, so every chunk in it is the fill value
+        };
+        let index = Arc::new(layout.decode_index(&encoded, codec_options)?);
+        if let Some(cache) = &self.parsed_index_cache {
+            cache.lock().unwrap().put(key.clone(), index.clone());
+        }
+        Ok(Some(index))
+    }
+
+    /// Everything one shard contributes to a read, worked out before any data is fetched.
+    ///
+    /// The unit in both variants is a single inner chunk, which is what keeps the pipeline from
+    /// deadlocking: a unit depends on exactly one read, so a budget that admits only one read at a
+    /// time still makes progress. A requested run spanning two inner chunks becomes two units, not
+    /// one unit waiting on two reads.
+    fn plan_shard(
+        &self,
+        ctx: &ReadContext<'_>,
+        key: &StoreKey,
+        items: &[&ChunkItem],
+        max_gap: u64,
+    ) -> PyResult<ShardPlan> {
+        let mut wanted_by: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (item_index, item) in items.iter().enumerate() {
+            for subchunk in subchunks_overlapping(&item.chunk_subset, &ctx.inner_shape) {
+                let subchunk = ravel(&subchunk, &ctx.chunks_per_shard)
+                    .ok_or_else(|| PyRuntimeError::new_err("chunk index out of bounds"))?;
+                wanted_by.entry(subchunk).or_default().push(item_index);
+            }
+        }
+        let mut needed: Vec<u64> = wanted_by.keys().copied().collect();
+        needed.sort_unstable();
+
+        let Some(index) = self.shard_index(key, ctx.layout, ctx.codec_options)? else {
+            return Ok(ShardPlan {
+                wanted_by,
+                reads: ShardReads::Absent,
+            });
+        };
+        let reads = if ctx.layout.can_read_sub_chunk() {
+            // Reads happen inside the chunk's decoder, which asks for only the bytes wanted, so
+            // there is nothing to merge and nothing to split from the decode.
+            ShardReads::SubChunk(
+                needed
+                    .into_iter()
+                    .map(|subchunk| (subchunk, ShardLayout::subchunk_byte_range(&index, subchunk)))
+                    .collect(),
+            )
+        } else {
+            ShardReads::Whole(ShardLayout::merge_reads(&index, needed, max_gap))
+        };
+        Ok(ShardPlan { wanted_by, reads })
+    }
+
+    /// Write the fill value over everything a shard was asked for, for a shard that does not exist.
+    fn fill_shard(&self, ctx: &ReadContext<'_>, items: &[&ChunkItem]) -> PyResult<()> {
+        for item in items {
+            let mut view = new_output_view(ctx.output, ctx.data_type_size, item, &item.subset)?;
+            copy_fill_value_into(
+                &self.data_type,
+                &self.fill_value,
+                ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+            )
+            .map_codec_err()?;
+        }
+        Ok(())
+    }
+
+    /// Write each requested box's share of one inner chunk into the output.
+    ///
+    /// `decoder` is `None` when the chunk is absent from the shard, in which case the boxes get the
+    /// fill value. Otherwise it decodes straight into the output view — no intermediate buffer, and
+    /// one decoder for the whole chunk, so a chain that must inflate it does so once however many
+    /// boxes fall inside.
+    fn decode_subchunk_into(
+        &self,
+        ctx: &ReadContext<'_>,
+        items: &[&ChunkItem],
+        wanted: &[usize],
+        subchunk_start: &[u64],
+        decoder: Option<&Arc<dyn ArrayPartialDecoderTraits>>,
+    ) -> PyResult<()> {
+        let subchunk_subset =
+            ArraySubset::new_with_start_shape(subchunk_start.to_vec(), ctx.inner_shape.clone())
+                .map_py_err::<PyRuntimeError>()?;
+        for item in wanted.iter().map(|&index| items[index]) {
+            let overlap = match item.chunk_subset.overlap(&subchunk_subset) {
+                Ok(overlap) if overlap.num_elements() > 0 => overlap,
+                _ => continue,
+            };
+            let destination = overlap
+                .relative_to(item.chunk_subset.start())
+                .and_then(|relative| relative.offset(item.subset.start()))
+                .map_py_err::<PyRuntimeError>()?;
+            let mut view = new_output_view(ctx.output, ctx.data_type_size, item, &destination)?;
+            let target = ArrayBytesDecodeIntoTarget::Fixed(&mut view);
+            match decoder {
+                Some(decoder) => {
+                    let source = overlap
+                        .relative_to(subchunk_start)
+                        .map_py_err::<PyRuntimeError>()?;
+                    decoder
+                        .partial_decode_into(&source, target, ctx.codec_options)
+                        .map_codec_err()?;
+                }
+                None => copy_fill_value_into(&self.data_type, &self.fill_value, target)
+                    .map_codec_err()?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Where one inner chunk starts within its shard.
+    fn subchunk_start(ctx: &ReadContext<'_>, subchunk: u64) -> Vec<u64> {
+        unravel(subchunk, &ctx.chunks_per_shard)
+            .iter()
+            .zip(&ctx.inner_shape)
+            .map(|(index, size)| index * size)
+            .collect()
+    }
+
+    /// Serve a read by planning byte ranges against the shard index instead of asking the sharding
+    /// partial decoder for one region at a time.
+    ///
+    /// Every inner chunk a read touches is fetched and decoded once however many of the requested
+    /// boxes fall inside it, and nothing outside those boxes is copied. Units from every shard go
+    /// into one pool, so reads of one shard overlap each other as well as other shards'.
+    ///
+    /// When inner chunks must be fetched whole, fetching and decoding run on separate pools: a
+    /// landed read hands one decode task per chunk straight to the decode pool rather than waiting
+    /// for its siblings, and the bytes it holds are returned to the budget when that decode
+    /// finishes. The fetch pool is separate from the decode pool precisely so that a fetch thread
+    /// blocked on the budget cannot starve the decode that would release it.
+    fn retrieve_planned(
+        &self,
+        layout: &ShardLayout,
+        chunk_descriptions: &[ChunkItem],
+        output: UnsafeCellSlice<u8>,
+        chunk_concurrent_limit: usize,
+        codec_options: &CodecOptions,
+        options: PlanOptions,
+    ) -> PyResult<()> {
+        let ctx = &ReadContext {
+            layout,
+            inner_shape: layout.inner_chunk_shape.iter().map(|d| d.get()).collect(),
+            chunks_per_shard: layout.chunks_per_shard.iter().map(|d| d.get()).collect(),
+            output,
+            data_type_size: self
+                .data_type
+                .fixed_size()
+                .ok_or("variable length data type not supported")
+                .map_py_err::<PyTypeError>()?,
+            codec_options,
+        };
+
+        let mut by_shard: HashMap<&StoreKey, Vec<&ChunkItem>> = HashMap::new();
+        for item in chunk_descriptions {
+            by_shard.entry(&item.key).or_default().push(item);
+        }
+        let shards: Vec<(&StoreKey, Vec<&ChunkItem>)> = by_shard.into_iter().collect();
+        let shard_indices: Vec<usize> = (0..shards.len()).collect();
+
+        // Plan every shard first, and in parallel: an index read is small and usually cached, but
+        // it is still a read and should not queue behind another shard's.
+        let plans = iter_concurrent_limit!(
+            chunk_concurrent_limit,
+            shard_indices,
+            map,
+            |shard: usize| -> PyResult<(usize, ShardPlan)> {
+                let (key, items) = &shards[shard];
+                Ok((
+                    shard,
+                    self.plan_shard(ctx, key, items, options.merge_gap_bytes)?,
+                ))
+            }
+        )
+        .collect::<PyResult<Vec<_>>>()?;
+
+        let mut sub_chunk_units = Vec::new();
+        let mut whole_units = Vec::new();
+        for (shard, plan) in &plans {
+            match &plan.reads {
+                ShardReads::Absent => {
+                    self.fill_shard(ctx, &shards[*shard].1)?;
+                }
+                ShardReads::SubChunk(subchunks) => {
+                    sub_chunk_units.extend(subchunks.iter().map(|&(subchunk, range)| {
+                        (*shard, subchunk, range, wanted(&plan.wanted_by, subchunk))
+                    }));
+                }
+                ShardReads::Whole(groups) => {
+                    whole_units.extend(groups.iter().map(|group| (*shard, group, &plan.wanted_by)));
+                }
+            }
+        }
+
+        self.read_sub_chunk_units(ctx, &shards, &sub_chunk_units, options)?;
+        self.read_whole_units(ctx, &shards, &whole_units, options)?;
+        Ok(())
+    }
+
+    /// Read the inner chunks that can be fetched a piece at a time.
+    ///
+    /// Reading and decoding are one step here: the chunk's decoder asks the store for only the
+    /// bytes each box wants, so there is nothing to hand to a separate decode stage.
+    fn read_sub_chunk_units(
+        &self,
+        ctx: &ReadContext<'_>,
+        shards: &[(&StoreKey, Vec<&ChunkItem>)],
+        sub_chunk_units: &[SubChunkUnit<'_>],
+        options: PlanOptions,
+    ) -> PyResult<()> {
+        if sub_chunk_units.is_empty() {
+            return Ok(());
+        }
+        let budget = Arc::new(ByteBudget::new(options.fetch_byte_budget));
+        let read_unit = |&(shard, subchunk, range, wanted): &SubChunkUnit<'_>| {
+            let bytes = match range {
+                Some(ByteRange::FromStart(_, Some(length))) => length,
+                _ => 0,
+            };
+            // Reading and decoding are one step here, so the credit covers both.
+            let _credit = budget.admit(bytes);
+            let (key, items) = &shards[shard];
+            let decoder = match range {
+                Some(ByteRange::FromStart(offset, Some(length))) => {
+                    Some(ctx.layout.subchunk_decoder(
+                        &self.store,
+                        key,
+                        (offset, length),
+                        &self.data_type,
+                        &self.fill_value,
+                        ctx.codec_options,
+                    )?)
+                }
+                _ => None, // absent from the shard, so it is all fill value
+            };
+            self.decode_subchunk_into(
+                ctx,
+                items,
+                wanted,
+                &Self::subchunk_start(ctx, subchunk),
+                decoder.as_ref(),
+            )
+        };
+        fetch_pool(options.fetch_threads).install(|| {
+            iter_concurrent_limit!(
+                options.fetch_threads,
+                sub_chunk_units,
+                try_for_each,
+                read_unit
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Read the inner chunks that must be fetched whole, fetching and decoding on separate pools.
+    fn read_whole_units(
+        &self,
+        ctx: &ReadContext<'_>,
+        shards: &[(&StoreKey, Vec<&ChunkItem>)],
+        whole_units: &[WholeUnit<'_>],
+        options: PlanOptions,
+    ) -> PyResult<()> {
+        if whole_units.is_empty() {
+            return Ok(());
+        }
+        let largest = whole_units
+            .iter()
+            .map(|(_, group, _)| group.length)
+            .max()
+            .unwrap_or(0);
+        let budget = Arc::new(ByteBudget::new(options.fetch_byte_budget.max(largest)));
+        let failure: Mutex<Option<PyErr>> = Mutex::new(None);
+        // A ring reads a file, not a store, so a store that is not a directory of files cannot use
+        // one however it was configured.
+        let paths = self.unit_paths(shards, whole_units);
+        let backend = options.io_backend.resolve(paths.is_some());
+
+        // The rayon scope is the DECODE side and only that. Fetching never runs on it: a rayon
+        // worker parked in a read cannot steal, and a fetch blocked on the byte budget holds a
+        // worker that only a decode can release, so sharing one pool lets the fetch side starve the
+        // decode side of the threads that would unblock it. `Scope::spawn` is callable from a
+        // foreign thread, which is what lets a fetch thread hand a landed buffer straight to a core
+        // and go back to reading.
+        rayon::scope(|scope| {
+            // Everything after the bytes arrive, shared by both backends: one decode task per inner
+            // chunk, queued the moment its read lands rather than when its siblings do.
+            let spawn_decodes = |unit: usize, fetched: Option<Arc<Bytes>>, credit: Credit| {
+                let (shard, group, wanted_by) = whole_units[unit];
+                let (_, items) = &shards[shard];
+                let credit = Arc::new(credit);
+                for &(subchunk, offset, length) in &group.subchunks {
+                    let credit = credit.clone();
+                    let fetched = fetched.clone();
+                    let failure = &failure;
+                    scope.spawn(move |_| {
+                        let decoder = match &fetched {
+                            Some(buffer) => {
+                                match ctx.layout.fetched_subchunk_decoder(
+                                    buffer.clone(),
+                                    usize::try_from(offset).unwrap_or(usize::MAX),
+                                    usize::try_from(length).unwrap_or(0),
+                                    &self.data_type,
+                                    &self.fill_value,
+                                    ctx.codec_options,
+                                ) {
+                                    Ok(decoder) => Some(decoder),
+                                    Err(err) => {
+                                        *failure.lock().unwrap() = Some(err);
+                                        return;
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+                        if let Err(err) = self.decode_subchunk_into(
+                            ctx,
+                            items,
+                            wanted(wanted_by, subchunk),
+                            &Self::subchunk_start(ctx, subchunk),
+                            decoder.as_ref(),
+                        ) {
+                            *failure.lock().unwrap() = Some(err);
+                        }
+                        // Dropping the credit here, and not before, is what makes the budget mean
+                        // "bytes fetched but not yet decoded".
+                        drop(credit);
+                    });
+                }
+            };
+
+            match backend {
+                io_pool::Backend::Uring => {
+                    let paths = paths.as_ref().expect("resolve() only picks Uring with paths");
+                    let reads: Vec<io_pool::UringRead> = whole_units
+                        .iter()
+                        .zip(paths)
+                        .map(|(&(_, group, _), path)| io_pool::UringRead {
+                            path: path.clone(),
+                            offset: group.offset,
+                            length: group.length,
+                        })
+                        .collect();
+                    // The ring is ONE thread doing both submission and completion, so admission has
+                    // to happen at submission and must not park: parking here stops completions
+                    // being reaped, and a reaped completion is what starts the decode that frees
+                    // the credit being waited for. The ring then idles through every queued decode,
+                    // which is why depth bought nothing while admission sat in `on_ready`.
+                    //
+                    // `may_block` is true only when nothing is in flight -- there is no completion
+                    // to lose then, so waiting is waiting for a decode and costs nothing. Otherwise
+                    // a refusal just means submitting fewer reads this round.
+                    let result = io_pool::uring_read_all(
+                        &reads,
+                        options.fetch_depth,
+                        options.hint_lookahead,
+                        |unit, may_block| {
+                            let bytes = whole_units[unit].1.length;
+                            if may_block {
+                                Some(budget.admit(bytes))
+                            } else {
+                                budget.try_admit(bytes)
+                            }
+                        },
+                        |unit, got, credit| match got {
+                            Ok(Some(buffer)) => {
+                                spawn_decodes(unit, Some(Arc::new(Bytes::from(buffer))), credit);
+                            }
+                            Ok(None) => spawn_decodes(unit, None, credit),
+                            Err(err) => {
+                                *failure.lock().unwrap() =
+                                    Some(PyRuntimeError::new_err(err.to_string()));
+                            }
+                        },
+                    );
+                    if let Err(err) = result {
+                        *failure.lock().unwrap() = Some(PyRuntimeError::new_err(err.to_string()));
+                    }
+                }
+                io_pool::Backend::Threads | io_pool::Backend::Auto => {
+                    io_pool::for_each_blocking(
+                        whole_units.len(),
+                        options.fetch_threads,
+                        |unit| {
+                            if failure.lock().unwrap().is_some() {
+                                return;
+                            }
+                            let (shard, group, _) = whole_units[unit];
+                            // Admitted before the read, so the ceiling bounds bytes in flight
+                            // rather than bytes already spent.
+                            let credit = budget.admit(group.length);
+                            let (key, _) = &shards[shard];
+                            let fetched = if group.length == 0 {
+                                None // absent from the shard, so it is all fill value
+                            } else {
+                                match self.store.get_partial(key, group.byte_range()) {
+                                    Ok(Some(bytes)) => Some(Arc::new(bytes)),
+                                    Ok(None) => None,
+                                    Err(err) => {
+                                        *failure.lock().unwrap() =
+                                            Some(PyRuntimeError::new_err(err.to_string()));
+                                        return;
+                                    }
+                                }
+                            };
+                            spawn_decodes(unit, fetched, credit);
+                        },
+                    );
+                }
+            }
+        });
+        if let Some(err) = failure.into_inner().unwrap() {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// The file behind each unit's shard, or `None` when the store is not a directory of files.
+    ///
+    /// A ring needs a path; an HTTP or object store has none, and no amount of configuration makes
+    /// one appear, so this is what decides whether the ring backend is even reachable.
+    fn unit_paths(
+        &self,
+        shards: &[(&StoreKey, Vec<&ChunkItem>)],
+        whole_units: &[WholeUnit<'_>],
+    ) -> Option<Vec<PathBuf>> {
+        let root = self.fs_root.as_ref()?;
+        Some(
+            whole_units
+                .iter()
+                .map(|&(shard, _, _)| root.join(shards[shard].0.as_str()))
+                .collect(),
+        )
+    }
+
     fn py_untyped_array_to_array_object<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
     ) -> &'a PyArrayObject {
@@ -292,6 +984,8 @@ impl CodecPipelineImpl {
         file_handle_cache_size=0,
         shard_index_cache_size=0,
     ))]
+    // The argument list is the Python constructor's, so its width is not ours to choose.
+    #[allow(clippy::too_many_arguments)]
     #[new]
     fn new(
         array_metadata: &str,
@@ -323,6 +1017,12 @@ impl CodecPipelineImpl {
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
+        // Captured before the config is turned into a trait object, which is where the root stops
+        // being visible. Only a filesystem store has one.
+        let fs_root = match &store_config {
+            StoreConfig::Filesystem(config) => Some(PathBuf::from(&config.root)),
+            StoreConfig::Http(_) | StoreConfig::ObStore(_) => None,
+        };
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
 
@@ -355,14 +1055,28 @@ impl CodecPipelineImpl {
             data_type,
             shard_index_cache: NonZeroUsize::new(shard_index_cache_size)
                 .map(|capacity| Mutex::new(LruCache::new(capacity))),
+            parsed_index_cache: NonZeroUsize::new(shard_index_cache_size)
+                .map(|capacity| Mutex::new(LruCache::new(capacity))),
+            shard_layout: OnceLock::new(),
+            fs_root,
         })
     }
 
+    #[pyo3(signature = (chunk_descriptions, value, *, plan_reads=false, plan_reads_merge_gap_bytes=0, plan_reads_fetch_threads=0, plan_reads_fetch_byte_budget=0, plan_reads_io="auto".to_string(), plan_reads_fetch_depth=0, plan_reads_hint_lookahead=0))]
+    // Likewise: these are the options `zarr.config` exposes, one parameter each.
+    #[allow(clippy::too_many_arguments)]
     fn retrieve_chunks_and_apply_index(
         &self,
         py: Python,
         chunk_descriptions: Vec<chunk_item::ChunkItem>, // FIXME: Ref / iterable?
         value: &Bound<'_, PyUntypedArray>,
+        plan_reads: bool,
+        plan_reads_merge_gap_bytes: u64,
+        plan_reads_fetch_threads: usize,
+        plan_reads_fetch_byte_budget: u64,
+        plan_reads_io: String,
+        plan_reads_fetch_depth: usize,
+        plan_reads_hint_lookahead: usize,
     ) -> PyResult<()> {
         // Get input array
         let output = Self::nparray_to_unsafe_cell_slice(value)?;
@@ -373,6 +1087,58 @@ impl CodecPipelineImpl {
         else {
             return Ok(());
         };
+
+        if plan_reads {
+            let layout = self.shard_layout.get_or_init(|| {
+                ShardLayout::new(&self.codec_chain, &chunk_descriptions[0].shape)
+                    .ok()
+                    .flatten()
+            });
+            if let Some(layout) = layout {
+                return py.detach(|| {
+                    self.retrieve_planned(
+                        layout,
+                        &chunk_descriptions,
+                        output,
+                        chunk_concurrent_limit,
+                        &codec_options,
+                        PlanOptions {
+                            merge_gap_bytes: plan_reads_merge_gap_bytes,
+                            fetch_threads: if plan_reads_fetch_threads == 0 {
+                                rayon::current_num_threads()
+                            } else {
+                                plan_reads_fetch_threads
+                            },
+                            fetch_byte_budget: if plan_reads_fetch_byte_budget == 0 {
+                                DEFAULT_FETCH_BYTE_BUDGET
+                            } else {
+                                plan_reads_fetch_byte_budget
+                            },
+                            // An unknown name is the caller's typo, not a licence to silently
+                            // measure a backend they did not ask for.
+                            io_backend: io_pool::Backend::parse(&plan_reads_io).ok_or_else(
+                                || {
+                                    PyValueError::new_err(format!(
+                                        "unknown plan_reads_io {plan_reads_io:?}, \
+                                         expected auto, threads or uring"
+                                    ))
+                                },
+                            )?,
+                            // The ring wants far more outstanding reads than a thread pool can
+                            // afford, so it does not inherit the thread count.
+                            fetch_depth: if plan_reads_fetch_depth == 0 {
+                                DEFAULT_FETCH_DEPTH
+                            } else {
+                                plan_reads_fetch_depth
+                            },
+                            // Zero means no hinting, so it cannot have a nonzero default: this
+                            // branch has to be able to measure itself against its own absence.
+                            hint_lookahead: plan_reads_hint_lookahead,
+                        },
+                    )
+                });
+            }
+        }
 
         let partial_decoder_cache =
             self.partial_decoders(&chunk_descriptions, chunk_concurrent_limit, &codec_options)?;
@@ -515,12 +1281,62 @@ impl CodecPipelineImpl {
     }
 }
 
+/// Whether this process can create an io_uring, and so whether `plan_reads_io="auto"` resolves to
+/// the ring here.
+///
+/// Exists because the fallback is silent by design: asking for `"uring"` on a machine that refuses
+/// one returns correct data from blocking reads, which is indistinguishable from having got the
+/// ring. Anything recording what it measured has to be able to ask.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn uring_available() -> bool {
+    io_pool::uring_usable()
+}
+
+/// The deepest the ring ever actually got, and how many rings were built.
+///
+/// A configured depth of 256 that never exceeds 40 in practice is not a depth of 256, and nothing
+/// else in the record would say so.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn ring_stats() -> (usize, usize) {
+    io_pool::ring_stats()
+}
+
+/// Hints submitted and hints the kernel rejected, since this process started.
+///
+/// A hint phase that changes nothing is only interesting once you know it ran: zero submitted means
+/// the pacing never issued any, submitted-but-all-failed means the opcode was rejected, and
+/// submitted-and-accepted-yet-nothing-changed is the only combination that says anything about the
+/// filesystem.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn hint_stats() -> (usize, usize) {
+    io_pool::hint_stats()
+}
+
+/// Which backend the most recent planned read actually used: `"threads"`, `"uring"`, or `"none"`
+/// if nothing has planned a read yet.
+///
+/// [`uring_available`] says whether a ring *could* be created; this says what was *used*, and the
+/// two disagree precisely when the store has no file paths to give — an object or HTTP store falls
+/// back to threads on a machine whose kernel would happily have provided the ring.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn last_io_backend() -> &'static str {
+    io_pool::last_resolved()
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
+    m.add_function(wrap_pyfunction!(uring_available, m)?)?;
+    m.add_function(wrap_pyfunction!(last_io_backend, m)?)?;
+    m.add_function(wrap_pyfunction!(hint_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(ring_stats, m)?)?;
     Ok(())
 }
 

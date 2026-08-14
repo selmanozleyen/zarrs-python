@@ -12,7 +12,7 @@ from zarr.core.indexing import is_integer
 from zarrs._internal import ChunkItem
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
     from types import EllipsisType
 
     from zarr.abc.store import ByteGetter, ByteSetter
@@ -68,6 +68,71 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
     if all(isinstance(s, slice) for s in selector_tuple):
         return list(selector_tuple)
     return make_slice_selection(selector_tuple)
+
+
+def split_selection_runs(
+    chunk_selection: SelectorTuple, out_selection: SelectorTuple
+) -> Iterator[tuple[SelectorTuple, SelectorTuple]]:
+    """Split a selection whose one integer-array axis is non-consecutive into contiguous boxes.
+
+    zarrs describes a chunk read as a rectangular subset, so a scattered row selection like
+    ``z[[3, 7, 8], :]`` has no single-box description. It is a *stack* of boxes though, so
+    yield one per run of consecutive indices rather than giving up on the whole read.
+
+    Only a single array axis is split. With one advanced index, outer and coordinate indexing
+    agree on what the selection means, so the decomposition is unambiguous; with more than one
+    they disagree (outer product vs. paired points) and the caller must reject it as before.
+    Everything else -- an unsorted axis, a scattered output side -- is also yielded unchanged,
+    because the run's position in the output is only known when the output side is contiguous
+    and in selection order.
+    """
+    chunk_sel = (
+        chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,)
+    )
+    out_sel = out_selection if isinstance(out_selection, tuple) else (out_selection,)
+    unsplit = ((chunk_selection, out_selection),)
+
+    array_axes = [
+        axis for axis, sel in enumerate(chunk_sel) if isinstance(sel, np.ndarray)
+    ]
+    # Equal arity means no axis was dropped, so chunk axis `axis` is output axis `axis`.
+    if len(array_axes) != 1 or len(chunk_sel) != len(out_sel):
+        yield from unsplit
+        return
+    (axis,) = array_axes
+    indices = chunk_sel[axis]
+    out_axis_sel = out_sel[axis]
+    if (
+        indices.ndim != 1
+        # Strictly increasing, so the nth selected index is the nth output position.
+        or (np.diff(indices) < 1).any()
+        or not isinstance(out_axis_sel, slice)
+        or out_axis_sel.step not in (None, 1)
+        or not all(isinstance(sel, slice) for sel in out_sel)
+    ):
+        yield from unsplit
+        return
+    out_start = out_axis_sel.start or 0
+    if out_axis_sel.stop - out_start != indices.size:
+        yield from unsplit
+        return
+
+    # Always emit slices, even for a single run: `resulting_shape_from_index` mis-orders an
+    # advanced index that is not on the leading axis, and the caller's element-count check then
+    # rejects the selection. Slices on both sides of that check sidestep it.
+    boundaries = np.flatnonzero(np.diff(indices) != 1) + 1
+
+    for start, stop in zip(
+        np.concatenate(([0], boundaries)),
+        np.concatenate((boundaries, [indices.size])),
+        strict=True,
+    ):
+        rows = indices[start:stop]
+        box_chunk_sel = list(chunk_sel)
+        box_chunk_sel[axis] = slice(int(rows[0]), int(rows[-1]) + 1)
+        box_out_sel = list(out_sel)
+        box_out_sel[axis] = slice(out_start + int(start), out_start + int(stop))
+        yield tuple(box_chunk_sel), tuple(box_out_sel)
 
 
 def resulting_shape_from_index(
@@ -159,7 +224,25 @@ def make_chunk_info_for_rust_with_indices(
     ],
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
+    *,
+    # Reads only: splitting gives one chunk item per run, and several items sharing a key would
+    # make the write path's read-modify-write of that chunk race with itself.
+    integer_array_indexing: bool = False,
 ) -> RustChunkInfo:
+    if integer_array_indexing:
+        batch_info = [
+            (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
+            for (
+                byte_getter,
+                chunk_spec,
+                chunk_selection,
+                out_selection,
+                is_complete,
+            ) in batch_info
+            for box_chunk_sel, box_out_sel in split_selection_runs(
+                chunk_selection, out_selection
+            )
+        ]
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True
