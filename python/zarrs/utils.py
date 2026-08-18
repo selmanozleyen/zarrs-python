@@ -116,8 +116,16 @@ def split_selection_runs(
     out_axis_sel = out_sel[axis]
     if (
         indices.ndim != 1
-        # Strictly increasing, so the nth selected index is the nth output position.
-        or (indices[1:] <= indices[:-1]).any()
+        # Non-decreasing. The nth selected index must be the nth output position, and
+        # a slice pair states a length- and order-preserving map, so order is required.
+        # Repeats are not: a repeated index simply ends its run early and reads that
+        # index again into the next output position, which the loop below already
+        # emits correctly. Descending is still refused -- not for correctness, for
+        # cost. Runs coalesce only on consecutive indices, so a permutation degrades
+        # to one box per element, and a box is a decode; 13M boxes would be far worse
+        # than the fallback this exists to avoid. Admitting those needs a cost guard,
+        # not just a looser comparison.
+        or (indices[1:] < indices[:-1]).any()
         or not isinstance(out_axis_sel, slice)
         or out_axis_sel.step not in (None, 1)
         or not all(isinstance(sel, slice) for sel in out_sel)

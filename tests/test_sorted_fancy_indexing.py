@@ -105,7 +105,6 @@ UNSUPPORTED = [
     # Unsorted: zarr-python reorders the output, so a run's position in the selection is not
     # its position in the output.
     pytest.param(np.array([9, 2]), id="unsorted-rows"),
-    pytest.param(np.array([3, 3, 4]), id="repeated-rows"),
     # Two array axes: outer and coordinate indexing disagree on what this means.
     pytest.param((np.array([1, 3]), np.array([0, 2])), id="two-array-axes"),
     pytest.param((slice(None), slice(None, None, 2)), id="strided"),
@@ -164,16 +163,18 @@ def test_flag_off_rejects_the_same_read(sharded: tuple[Path, np.ndarray]) -> Non
         # slice(0, 2) despite the indices descending. Building runs from that would give the
         # inverted box slice(7, 4).
         pytest.param(np.array([7, 3]), id="descending-in-one-chunk"),
-        # `Order.check` uses `diff >= 0`, so a repeat counts as increasing and also yields a
-        # contiguous out_selection.
-        pytest.param(np.array([3, 3, 4]), id="repeat-in-one-chunk"),
     ],
 )
 def test_contiguous_output_does_not_imply_sorted_input(
     tmp_path: Path, index: np.ndarray
 ) -> None:
-    """The strictly-increasing check is the only thing standing between these and wrong data:
-    the output side looks perfectly rectangular for both."""
+    """A rectangular output side is not evidence the input was ordered.
+
+    `CoordinateIndexer` sorts only when the chunk-raveled order is wrong, and both
+    indices here live in chunk 0, so `out_selection` comes back as `slice(0, 2)`
+    while the indices descend. The ordering check is what refuses it; nothing about
+    the output side would.
+    """
     expected = np.arange(64, dtype=np.float64)
     path = tmp_path / "one_d.zarr"
     z = zarr.create_array(
@@ -204,3 +205,26 @@ def test_a_split_read_is_rejected_without_the_splitter(
     path, _ = sharded
     with pytest.raises(DiscontiguousArrayError):
         open_strict(path)[np.array([0, 3, 4, 5, 17, 30])]
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        pytest.param(np.array([3, 3, 4]), id="repeat-then-run"),
+        pytest.param(np.array([3, 3, 3]), id="all-repeats"),
+        pytest.param(np.array([2, 5, 5, 9]), id="repeat-mid-selection"),
+        pytest.param(np.array([0, 0, 1, 2, 2]), id="repeats-either-side-of-a-run"),
+    ],
+)
+def test_repeats_are_served_not_refused(
+    sharded: tuple[Path, np.ndarray], index: np.ndarray
+) -> None:
+    """A repeated index is order-preserving, so it needs no reordering to describe.
+
+    It ends its run early and reads that index again into the next output position.
+    Only descending selections are refused now, and for cost rather than correctness.
+    `open_strict` is the point: with no fallback to hide behind, a correct answer here
+    is evidence zarrs served it.
+    """
+    path, values = sharded
+    np.testing.assert_array_equal(open_strict(path)[index, :], values[index, :])
