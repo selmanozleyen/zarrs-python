@@ -4,7 +4,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -16,7 +15,7 @@ use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_stub_gen::define_stub_info_gatherer;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
@@ -55,8 +54,6 @@ const DEFAULT_FETCH_BYTE_BUDGET: u64 = 256 << 20;
 /// Much larger than any sane thread count, which is the whole point of a ring: depth costs a queue
 /// entry here rather than a thread and a stack. Still bounded, because the byte budget is what
 /// limits memory and depth beyond what the device will service only lengthens the queue.
-const DEFAULT_FETCH_DEPTH: usize = 256;
-
 /// What `plan_reads` was asked to do, beyond the fact that it was asked.
 #[derive(Clone, Copy)]
 pub(crate) struct PlanOptions {
@@ -66,14 +63,6 @@ pub(crate) struct PlanOptions {
     pub fetch_threads: usize,
     /// Ceiling on bytes fetched but not yet decoded.
     pub fetch_byte_budget: u64,
-    /// How those reads are issued: blocking threads, a ring, or whichever this process can have.
-    pub io_backend: io_pool::Backend,
-    /// Reads outstanding at once on the ring. Meaningless for the thread backend, where the thread
-    /// count is the depth.
-    pub fetch_depth: usize,
-    /// How many reads ahead of the read cursor to issue FADVISE(WILLNEED) hints for. Zero disables
-    /// hinting entirely, which is the behaviour every earlier generation had.
-    pub hint_lookahead: usize,
 }
 
 /// What every stage of a planned read needs, so a stage takes one argument rather than six.
@@ -178,24 +167,6 @@ impl ByteBudget {
         }
     }
 
-    /// [`admit`](Self::admit) for a caller that must not be parked.
-    ///
-    /// The ring runs submission and completion on ONE thread, so a blocking admit there stops both:
-    /// no completion is reaped, and the credit that would unblock it is released by a decode that
-    /// only a reaped completion can start. It is not a deadlock -- decodes already queued do finish
-    /// -- but the ring sits idle through every one of them, which is why depth never helped. A
-    /// caller who cannot block asks instead, and simply submits less.
-    fn try_admit(self: &Arc<Self>, bytes: u64) -> Option<Credit> {
-        let mut in_flight = self.in_flight.lock().unwrap();
-        if *in_flight > 0 && in_flight.saturating_add(bytes) > self.limit {
-            return None;
-        }
-        *in_flight += bytes;
-        Some(Credit {
-            budget: Arc::clone(self),
-            bytes,
-        })
-    }
 }
 
 struct Credit {
@@ -286,9 +257,6 @@ pub struct CodecPipelineImpl {
     /// How this array's shards are laid out, worked out on the first read that needs it.
     /// `None` once resolved means the chunk is not a plain shard, so planning does not apply.
     pub(crate) shard_layout: OnceLock<Option<ShardLayout>>,
-    /// Directory the store's keys are relative to, for backends that need a file rather than a
-    /// store. `None` for HTTP and object stores, which have no path and so cannot use a ring.
-    pub(crate) fs_root: Option<PathBuf>,
 }
 
 impl CodecPipelineImpl {
@@ -758,8 +726,6 @@ impl CodecPipelineImpl {
         let failure: Mutex<Option<PyErr>> = Mutex::new(None);
         // A ring reads a file, not a store, so a store that is not a directory of files cannot use
         // one however it was configured.
-        let paths = self.unit_paths(shards, whole_units);
-        let backend = options.io_backend.resolve(paths.is_some());
 
         // The rayon scope is the DECODE side and only that. Fetching never runs on it: a rayon
         // worker parked in a read cannot steal, and a fetch blocked on the byte budget holds a
@@ -814,108 +780,39 @@ impl CodecPipelineImpl {
                 }
             };
 
-            match backend {
-                io_pool::Backend::Uring => {
-                    let paths = paths.as_ref().expect("resolve() only picks Uring with paths");
-                    let reads: Vec<io_pool::UringRead> = whole_units
-                        .iter()
-                        .zip(paths)
-                        .map(|(&(_, group, _), path)| io_pool::UringRead {
-                            path: path.clone(),
-                            offset: group.offset,
-                            length: group.length,
-                        })
-                        .collect();
-                    // The ring is ONE thread doing both submission and completion, so admission has
-                    // to happen at submission and must not park: parking here stops completions
-                    // being reaped, and a reaped completion is what starts the decode that frees
-                    // the credit being waited for. The ring then idles through every queued decode,
-                    // which is why depth bought nothing while admission sat in `on_ready`.
-                    //
-                    // `may_block` is true only when nothing is in flight -- there is no completion
-                    // to lose then, so waiting is waiting for a decode and costs nothing. Otherwise
-                    // a refusal just means submitting fewer reads this round.
-                    let result = io_pool::uring_read_all(
-                        &reads,
-                        options.fetch_depth,
-                        options.hint_lookahead,
-                        |unit, may_block| {
-                            let bytes = whole_units[unit].1.length;
-                            if may_block {
-                                Some(budget.admit(bytes))
-                            } else {
-                                budget.try_admit(bytes)
-                            }
-                        },
-                        |unit, got, credit| match got {
-                            Ok(Some(buffer)) => {
-                                spawn_decodes(unit, Some(Arc::new(Bytes::from(buffer))), credit);
-                            }
-                            Ok(None) => spawn_decodes(unit, None, credit),
+            io_pool::for_each_blocking(
+                whole_units.len(),
+                options.fetch_threads,
+                |unit| {
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let (shard, group, _) = whole_units[unit];
+                    // Admitted before the read, so the ceiling bounds bytes in flight
+                    // rather than bytes already spent.
+                    let credit = budget.admit(group.length);
+                    let (key, _) = &shards[shard];
+                    let fetched = if group.length == 0 {
+                        None // absent from the shard, so it is all fill value
+                    } else {
+                        match self.store.get_partial(key, group.byte_range()) {
+                            Ok(Some(bytes)) => Some(Arc::new(bytes)),
+                            Ok(None) => None,
                             Err(err) => {
                                 *failure.lock().unwrap() =
                                     Some(PyRuntimeError::new_err(err.to_string()));
-                            }
-                        },
-                    );
-                    if let Err(err) = result {
-                        *failure.lock().unwrap() = Some(PyRuntimeError::new_err(err.to_string()));
-                    }
-                }
-                io_pool::Backend::Threads | io_pool::Backend::Auto => {
-                    io_pool::for_each_blocking(
-                        whole_units.len(),
-                        options.fetch_threads,
-                        |unit| {
-                            if failure.lock().unwrap().is_some() {
                                 return;
                             }
-                            let (shard, group, _) = whole_units[unit];
-                            // Admitted before the read, so the ceiling bounds bytes in flight
-                            // rather than bytes already spent.
-                            let credit = budget.admit(group.length);
-                            let (key, _) = &shards[shard];
-                            let fetched = if group.length == 0 {
-                                None // absent from the shard, so it is all fill value
-                            } else {
-                                match self.store.get_partial(key, group.byte_range()) {
-                                    Ok(Some(bytes)) => Some(Arc::new(bytes)),
-                                    Ok(None) => None,
-                                    Err(err) => {
-                                        *failure.lock().unwrap() =
-                                            Some(PyRuntimeError::new_err(err.to_string()));
-                                        return;
-                                    }
-                                }
-                            };
-                            spawn_decodes(unit, fetched, credit);
-                        },
-                    );
-                }
-            }
+                        }
+                    };
+                    spawn_decodes(unit, fetched, credit);
+                },
+            );
         });
         if let Some(err) = failure.into_inner().unwrap() {
             return Err(err);
         }
         Ok(())
-    }
-
-    /// The file behind each unit's shard, or `None` when the store is not a directory of files.
-    ///
-    /// A ring needs a path; an HTTP or object store has none, and no amount of configuration makes
-    /// one appear, so this is what decides whether the ring backend is even reachable.
-    fn unit_paths(
-        &self,
-        shards: &[(&StoreKey, Vec<&ChunkItem>)],
-        whole_units: &[WholeUnit<'_>],
-    ) -> Option<Vec<PathBuf>> {
-        let root = self.fs_root.as_ref()?;
-        Some(
-            whole_units
-                .iter()
-                .map(|&(shard, _, _)| root.join(shards[shard].0.as_str()))
-                .collect(),
-        )
     }
 
     fn py_untyped_array_to_array_object<'a>(
@@ -1017,12 +914,6 @@ impl CodecPipelineImpl {
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
-        // Captured before the config is turned into a trait object, which is where the root stops
-        // being visible. Only a filesystem store has one.
-        let fs_root = match &store_config {
-            StoreConfig::Filesystem(config) => Some(PathBuf::from(&config.root)),
-            StoreConfig::Http(_) | StoreConfig::ObStore(_) => None,
-        };
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
 
@@ -1058,11 +949,10 @@ impl CodecPipelineImpl {
             parsed_index_cache: NonZeroUsize::new(shard_index_cache_size)
                 .map(|capacity| Mutex::new(LruCache::new(capacity))),
             shard_layout: OnceLock::new(),
-            fs_root,
         })
     }
 
-    #[pyo3(signature = (chunk_descriptions, value, *, plan_reads=false, plan_reads_merge_gap_bytes=0, plan_reads_fetch_threads=0, plan_reads_fetch_byte_budget=0, plan_reads_io="auto".to_string(), plan_reads_fetch_depth=0, plan_reads_hint_lookahead=0))]
+    #[pyo3(signature = (chunk_descriptions, value, *, plan_reads=false, plan_reads_merge_gap_bytes=0, plan_reads_fetch_threads=0, plan_reads_fetch_byte_budget=0))]
     // Likewise: these are the options `zarr.config` exposes, one parameter each.
     #[allow(clippy::too_many_arguments)]
     fn retrieve_chunks_and_apply_index(
@@ -1074,9 +964,6 @@ impl CodecPipelineImpl {
         plan_reads_merge_gap_bytes: u64,
         plan_reads_fetch_threads: usize,
         plan_reads_fetch_byte_budget: u64,
-        plan_reads_io: String,
-        plan_reads_fetch_depth: usize,
-        plan_reads_hint_lookahead: usize,
     ) -> PyResult<()> {
         // Get input array
         let output = Self::nparray_to_unsafe_cell_slice(value)?;
@@ -1114,26 +1001,6 @@ impl CodecPipelineImpl {
                             } else {
                                 plan_reads_fetch_byte_budget
                             },
-                            // An unknown name is the caller's typo, not a licence to silently
-                            // measure a backend they did not ask for.
-                            io_backend: io_pool::Backend::parse(&plan_reads_io).ok_or_else(
-                                || {
-                                    PyValueError::new_err(format!(
-                                        "unknown plan_reads_io {plan_reads_io:?}, \
-                                         expected auto, threads or uring"
-                                    ))
-                                },
-                            )?,
-                            // The ring wants far more outstanding reads than a thread pool can
-                            // afford, so it does not inherit the thread count.
-                            fetch_depth: if plan_reads_fetch_depth == 0 {
-                                DEFAULT_FETCH_DEPTH
-                            } else {
-                                plan_reads_fetch_depth
-                            },
-                            // Zero means no hinting, so it cannot have a nonzero default: this
-                            // branch has to be able to measure itself against its own absence.
-                            hint_lookahead: plan_reads_hint_lookahead,
                         },
                     )
                 });
@@ -1281,62 +1148,12 @@ impl CodecPipelineImpl {
     }
 }
 
-/// Whether this process can create an io_uring, and so whether `plan_reads_io="auto"` resolves to
-/// the ring here.
-///
-/// Exists because the fallback is silent by design: asking for `"uring"` on a machine that refuses
-/// one returns correct data from blocking reads, which is indistinguishable from having got the
-/// ring. Anything recording what it measured has to be able to ask.
-#[gen_stub_pyfunction]
-#[pyfunction]
-fn uring_available() -> bool {
-    io_pool::uring_usable()
-}
-
-/// The deepest the ring ever actually got, and how many rings were built.
-///
-/// A configured depth of 256 that never exceeds 40 in practice is not a depth of 256, and nothing
-/// else in the record would say so.
-#[gen_stub_pyfunction]
-#[pyfunction]
-fn ring_stats() -> (usize, usize) {
-    io_pool::ring_stats()
-}
-
-/// Hints submitted and hints the kernel rejected, since this process started.
-///
-/// A hint phase that changes nothing is only interesting once you know it ran: zero submitted means
-/// the pacing never issued any, submitted-but-all-failed means the opcode was rejected, and
-/// submitted-and-accepted-yet-nothing-changed is the only combination that says anything about the
-/// filesystem.
-#[gen_stub_pyfunction]
-#[pyfunction]
-fn hint_stats() -> (usize, usize) {
-    io_pool::hint_stats()
-}
-
-/// Which backend the most recent planned read actually used: `"threads"`, `"uring"`, or `"none"`
-/// if nothing has planned a read yet.
-///
-/// [`uring_available`] says whether a ring *could* be created; this says what was *used*, and the
-/// two disagree precisely when the store has no file paths to give — an object or HTTP store falls
-/// back to threads on a machine whose kernel would happily have provided the ring.
-#[gen_stub_pyfunction]
-#[pyfunction]
-fn last_io_backend() -> &'static str {
-    io_pool::last_resolved()
-}
-
 /// A Python module implemented in Rust.
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
-    m.add_function(wrap_pyfunction!(uring_available, m)?)?;
-    m.add_function(wrap_pyfunction!(last_io_backend, m)?)?;
-    m.add_function(wrap_pyfunction!(hint_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(ring_stats, m)?)?;
     Ok(())
 }
 

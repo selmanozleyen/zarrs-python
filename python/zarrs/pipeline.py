@@ -223,13 +223,6 @@ class ZarrsCodecPipeline(CodecPipeline):
                     plan_reads_fetch_byte_budget=config.get(
                         "codec_pipeline.plan_reads_fetch_byte_budget", 0
                     ),
-                    plan_reads_io=config.get("codec_pipeline.plan_reads_io", "auto"),
-                    plan_reads_hint_lookahead=config.get(
-                        "codec_pipeline.plan_reads_hint_lookahead", 0
-                    ),
-                    plan_reads_fetch_depth=config.get(
-                        "codec_pipeline.plan_reads_fetch_depth", 0
-                    ),
                 ),
                 chunks_desc.chunk_info_with_indices,
                 out,

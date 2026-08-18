@@ -28,16 +28,6 @@ bytemuck = { version = "1.24.0", features = ["must_cast"] }
 pyo3-object_store = "0.7.0" # object_store 0.12
 zarrs_object_store = "0.5.0" # object_store 0.12
 
-# Target-gated because io-uring 0.7 does not build on darwin at all -- it reaches for
-# MAP_POPULATE, cpu_set_t and SYS_io_uring_setup, none of which exist in libc there. And gated
-# again at RUNTIME in io_pool, because "the kernel has io_uring" and "this process may create a
-# ring" are different questions: LRZ AI allows it (`kernel.io_uring_disabled=0`) while the HMGU
-# cluster refuses with EPERM (`=2`).
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
-# For POSIX_FADV_WILLNEED and the page size the hint phase aligns to. Already in the tree as a
-# transitive dependency; named here because this crate now calls it directly.
-libc = "0.2"
 
 [profile.release]
 lto = true
