@@ -53,10 +53,19 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                diff = np.diff(dim_selection)
-                if (diff != 1).any() and (diff != 0).any():
-                    raise DiscontiguousArrayError(diff)
-                ls.append(slice(dim_selection[0], dim_selection[-1] + 1, 1))
+                # Compared in int64, never with np.diff on the incoming dtype. A
+                # selection can arrive unsigned, and there a decrease wraps to a
+                # huge positive difference, so every ordering test built on
+                # subtraction silently inverts: uint8 [255, 0] differences to 1 and
+                # reads as consecutive.
+                sel = dim_selection.astype(np.int64, copy=False)
+                steps = sel[1:] - sel[:-1]
+                if (steps != 1).any() and (steps != 0).any():
+                    raise DiscontiguousArrayError(steps)
+                # int() for the same reason: `dim_selection[-1] + 1` on an unsigned
+                # numpy scalar at the dtype maximum wraps to 0 and gives an empty
+                # slice rather than an error.
+                ls.append(slice(int(dim_selection[0]), int(dim_selection[-1]) + 1, 1))
         else:
             ls.append(dim_selection)
     return ls
@@ -100,12 +109,15 @@ def split_selection_runs(
         yield from unsplit
         return
     (axis,) = array_axes
-    indices = chunk_sel[axis]
+    # int64 up front so no ordering test below can be fooled by an unsigned dtype
+    # wrapping a decrease into a large positive step. Array indices cannot exceed
+    # int64, so the cast is lossless.
+    indices = chunk_sel[axis].astype(np.int64, copy=False)
     out_axis_sel = out_sel[axis]
     if (
         indices.ndim != 1
         # Strictly increasing, so the nth selected index is the nth output position.
-        or (np.diff(indices) < 1).any()
+        or (indices[1:] <= indices[:-1]).any()
         or not isinstance(out_axis_sel, slice)
         or out_axis_sel.step not in (None, 1)
         or not all(isinstance(sel, slice) for sel in out_sel)
@@ -120,7 +132,7 @@ def split_selection_runs(
     # Always emit slices, even for a single run: `resulting_shape_from_index` mis-orders an
     # advanced index that is not on the leading axis, and the caller's element-count check then
     # rejects the selection. Slices on both sides of that check sidestep it.
-    boundaries = np.flatnonzero(np.diff(indices) != 1) + 1
+    boundaries = np.flatnonzero(indices[1:] != indices[:-1] + 1) + 1
 
     for start, stop in zip(
         np.concatenate(([0], boundaries)),
