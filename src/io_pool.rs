@@ -1,10 +1,4 @@
-//! Issuing the reads of a planned read.
-//!
-//! One way only: a pool of blocking threads. There was an io_uring backend and an
-//! FADVISE hint phase here; both are gone. The ring never beat threads on either site
-//! measured, could not be created at all where `kernel.io_uring_disabled=2`, and forced
-//! every caller to carry a backend choice, a ring depth and a hint lookahead that did
-//! nothing on the path they actually took.
+//! Issuing the reads of a planned read, on a pool of blocking threads.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

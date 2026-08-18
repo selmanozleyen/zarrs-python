@@ -53,18 +53,14 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                # Compared in int64, never with np.diff on the incoming dtype. A
-                # selection can arrive unsigned, and there a decrease wraps to a
-                # huge positive difference, so every ordering test built on
-                # subtraction silently inverts: uint8 [255, 0] differences to 1 and
-                # reads as consecutive.
+                # int64, never the incoming dtype: unsigned [255, 0] differences to
+                # 1 and would read as consecutive.
                 sel = dim_selection.astype(np.int64, copy=False)
                 steps = sel[1:] - sel[:-1]
                 if (steps != 1).any() and (steps != 0).any():
                     raise DiscontiguousArrayError(steps)
-                # int() for the same reason: `dim_selection[-1] + 1` on an unsigned
-                # numpy scalar at the dtype maximum wraps to 0 and gives an empty
-                # slice rather than an error.
+                # int() likewise: `+ 1` on an unsigned scalar at the dtype maximum
+                # wraps to 0 and yields an empty slice.
                 ls.append(slice(int(dim_selection[0]), int(dim_selection[-1]) + 1, 1))
         else:
             ls.append(dim_selection)
@@ -109,22 +105,18 @@ def split_selection_runs(
         yield from unsplit
         return
     (axis,) = array_axes
-    # int64 up front so no ordering test below can be fooled by an unsigned dtype
-    # wrapping a decrease into a large positive step. Array indices cannot exceed
-    # int64, so the cast is lossless.
+    # int64 up front, so no ordering test below can be fooled by an unsigned dtype
+    # wrapping a decrease. Lossless: array indices cannot exceed int64.
     indices = chunk_sel[axis].astype(np.int64, copy=False)
     out_axis_sel = out_sel[axis]
     if (
         indices.ndim != 1
-        # Non-decreasing. The nth selected index must be the nth output position, and
-        # a slice pair states a length- and order-preserving map, so order is required.
-        # Repeats are not: a repeated index simply ends its run early and reads that
-        # index again into the next output position, which the loop below already
-        # emits correctly. Descending is still refused -- not for correctness, for
-        # cost. Runs coalesce only on consecutive indices, so a permutation degrades
-        # to one box per element, and a box is a decode; 13M boxes would be far worse
-        # than the fallback this exists to avoid. Admitting those needs a cost guard,
-        # not just a looser comparison.
+        # Non-decreasing: a slice pair is an order-preserving map, so order is
+        # required. Repeats are not -- one ends its run early and reads that index
+        # again into the next output position, which the loop below handles.
+        # Descending is refused for cost, not correctness: runs coalesce only on
+        # consecutive indices, so a permutation becomes one box per element and every
+        # box is a decode. Admitting those wants a cost guard on box count.
         or (indices[1:] < indices[:-1]).any()
         or not isinstance(out_axis_sel, slice)
         or out_axis_sel.step not in (None, 1)

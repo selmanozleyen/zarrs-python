@@ -171,9 +171,8 @@ def test_contiguous_output_does_not_imply_sorted_input(
     """A rectangular output side is not evidence the input was ordered.
 
     `CoordinateIndexer` sorts only when the chunk-raveled order is wrong, and both
-    indices here live in chunk 0, so `out_selection` comes back as `slice(0, 2)`
-    while the indices descend. The ordering check is what refuses it; nothing about
-    the output side would.
+    indices live in chunk 0, so `out_selection` comes back `slice(0, 2)` while the
+    indices descend. The ordering check refuses it; nothing about the output would.
     """
     expected = np.arange(64, dtype=np.float64)
     path = tmp_path / "one_d.zarr"
@@ -219,12 +218,10 @@ def test_a_split_read_is_rejected_without_the_splitter(
 def test_repeats_are_served_not_refused(
     sharded: tuple[Path, np.ndarray], index: np.ndarray
 ) -> None:
-    """A repeated index is order-preserving, so it needs no reordering to describe.
+    """A repeat ends its run early and reads that index again into the next output slot.
 
-    It ends its run early and reads that index again into the next output position.
-    Only descending selections are refused now, and for cost rather than correctness.
-    `open_strict` is the point: with no fallback to hide behind, a correct answer here
-    is evidence zarrs served it.
+    Through `open_strict`, so there is no fallback to answer correctly on zarrs'
+    behalf: a right answer here is evidence zarrs served it.
     """
     path, values = sharded
     np.testing.assert_array_equal(open_strict(path)[index, :], values[index, :])

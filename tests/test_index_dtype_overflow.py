@@ -1,18 +1,13 @@
 """An index array's dtype must not change which selections are accepted.
 
-The ordering tests here used to be built on `np.diff`, which subtracts in the
-incoming dtype. On an unsigned index array a decrease wraps to a large positive
-step, so every such test silently inverted:
+Subtracting in the incoming dtype inverts the comparison, because on an unsigned
+array a decrease wraps to a large positive step:
 
     np.diff(np.array([255, 0], dtype="uint8"))   -> array([1], dtype=uint8)
 
-that is, the most extreme possible decrease reads as "consecutive". The slice built
-from it, `slice(255, 0 + 1)`, is empty, so the read returned nothing for a selection
-that asked for two rows. `np.uint64` is worse than merely wrong: mixing it with a
-signed step promotes to float64 and loses exactness above 2**53.
-
-Everything is compared in int64 now. Array indices cannot exceed int64, so the cast
-is lossless, and the tests below are the ones that fail without it.
+the most extreme possible decrease reads as consecutive, and the slice built from it,
+`slice(255, 0 + 1)`, is empty. uint64 is worse than wrong: mixed with a signed step it
+promotes to float64 and loses exactness above 2**53.
 """
 
 from __future__ import annotations
