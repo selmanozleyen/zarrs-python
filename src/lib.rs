@@ -59,14 +59,22 @@ pub struct CodecPipelineImpl {
     /// reads and decodes the shard index, so reusing it across reads of the
     /// same shards removes that work. `None` when disabled.
     shard_index_cache: Option<Mutex<LruCache<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>>>,
+    /// Total decoded bytes the per-read chunk cache may hold. Zero disables it.
+    pub(crate) chunk_cache_budget_bytes: u64,
+    /// Items sharing a key before its decode is worth caching.
+    pub(crate) chunk_cache_min_items: u64,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
 }
 
-/// Total decoded bytes `retrieve_chunks_and_apply_index` may hold in chunk caches at once.
+/// Default for `chunk_cache_budget_bytes`: total decoded bytes the chunk cache may hold.
+///
+/// A key whose chunk does not fit in what is left is not cached, so the budget also acts as
+/// a per-chunk ceiling: on a sharded array the chunk is the whole shard, which for a large
+/// shard geometry can exceed any sensible budget and disable the cache entirely.
 const CHUNK_CACHE_BUDGET_BYTES: u64 = 256 << 20;
 
-/// Items sharing a key before caching it is worth doing.
+/// Default for `chunk_cache_min_items`: items sharing a key before caching it is worth doing.
 ///
 /// The cache decodes the key's whole chunk, which for a sharded array is the whole shard --
 /// more work than a couple of targeted partial decodes. Only amortise it over enough items.
@@ -294,6 +302,8 @@ impl CodecPipelineImpl {
         direct_io=false,
         file_handle_cache_size=0,
         shard_index_cache_size=0,
+        chunk_cache_budget_bytes=CHUNK_CACHE_BUDGET_BYTES,
+        chunk_cache_min_items=CHUNK_CACHE_MIN_ITEMS,
     ))]
     #[new]
     fn new(
@@ -306,6 +316,8 @@ impl CodecPipelineImpl {
         direct_io: bool,
         file_handle_cache_size: usize,
         shard_index_cache_size: usize,
+        chunk_cache_budget_bytes: u64,
+        chunk_cache_min_items: u64,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
@@ -356,6 +368,8 @@ impl CodecPipelineImpl {
             num_threads,
             shard_index_cache: NonZeroUsize::new(shard_index_cache_size)
                 .map(|size| Mutex::new(LruCache::new(size))),
+            chunk_cache_budget_bytes,
+            chunk_cache_min_items,
             fill_value,
             data_type,
         })
@@ -395,10 +409,10 @@ impl CodecPipelineImpl {
         let element_size = self.data_type.fixed_size().unwrap_or(0) as u64;
         let mut repeated = partial_chunk_items
             .iter()
-            .filter(|item| items_per_key[&item.key] >= CHUNK_CACHE_MIN_ITEMS)
+            .filter(|item| items_per_key[&item.key] >= self.chunk_cache_min_items)
             .collect::<Vec<_>>();
         repeated.sort_by_key(|item| std::cmp::Reverse(items_per_key[&item.key]));
-        let mut budget = CHUNK_CACHE_BUDGET_BYTES;
+        let mut budget = self.chunk_cache_budget_bytes;
         let mut cached_keys: HashSet<StoreKey> = HashSet::new();
         for item in repeated {
             let bytes = item

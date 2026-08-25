@@ -56,6 +56,8 @@ The `ZarrsCodecPipeline` specific options are:
   - Read only case, one integer-array axis, indices non-decreasing (repeats fine). Anything else falls back to `zarr-python` as before.
 - `codec_pipeline.shard_index_cache_size`: the number of chunks whose partial decoder is retained between reads. Building one reads and decodes the chunk's index, so for a sharded array repeatedly read in pieces — a training loop over random rows, say — caching them removes an index read and decode per shard per batch.
   - Defaults to `0` (disabled). Cleared on any write through this pipeline, but a cached index does not observe modification from anywhere else, including `zarr-python`'s own `resize` and `delete_dir`. Only enable this while nothing is modifying the array.
+- `codec_pipeline.chunk_cache_budget_bytes`, `codec_pipeline.chunk_cache_min_items`: tune the per-read cache that `integer_array_indexing` uses when several runs land in one chunk, so the chunk is decoded once rather than once per run.
+  - Default `268435456` (256 MiB) and `4`. A key is cached only when at least `chunk_cache_min_items` runs read it and its decoded chunk still fits the budget, so the budget doubles as a per-chunk ceiling: on a sharded array the chunk is the whole shard, and a shard larger than the budget is never cached. Set the budget to `0` to disable the cache and keep the rest of `integer_array_indexing`.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
