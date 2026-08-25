@@ -23,9 +23,10 @@ from zarrs.utils import DiscontiguousArrayError, make_slice_selection
 if TYPE_CHECKING:
     from pathlib import Path
 
-SETTINGS = {
+PLANNED = {
     "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
     "codec_pipeline.integer_array_indexing": True,
+    "codec_pipeline.plan_reads": True,
     # No fallback to hide behind: a selection zarrs cannot serve must raise rather
     # than be served correctly by zarr-python and look like a passing test.
     "codec_pipeline.strict": True,
@@ -69,7 +70,7 @@ def test_unsigned_rows_read_the_same_as_signed(dtype: str, sharded) -> None:
     """A selection's dtype is not part of its meaning."""
     path, values = sharded
     rows = [3, 4, 5, 11, 12, 27]
-    with zarr.config.set(SETTINGS):
+    with zarr.config.set(PLANNED):
         array = zarr.open_array(path, mode="r")
         unsigned = array[np.array(rows, dtype=dtype), :]
         signed = array[np.array(rows, dtype="int64"), :]
@@ -85,5 +86,5 @@ def test_unsorted_unsigned_is_still_refused(dtype: str, sharded) -> None:
     quietly served as though it were increasing.
     """
     path, _ = sharded
-    with zarr.config.set(SETTINGS), pytest.raises(Exception):  # noqa: B017, PT011
+    with zarr.config.set(PLANNED), pytest.raises(Exception):  # noqa: B017, PT011
         zarr.open_array(path, mode="r")[np.array([27, 3], dtype=dtype), :]

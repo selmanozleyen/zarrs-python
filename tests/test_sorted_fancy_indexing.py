@@ -28,10 +28,16 @@ CHUNKS = (8, 6)
 SHARDS = (16, 12)
 
 
-@pytest.fixture(autouse=True)
-def _split_reads():
-    """Off by default -- see the README."""
-    with zarr.config.set({"codec_pipeline.integer_array_indexing": True}):
+@pytest.fixture(autouse=True, params=[False, True], ids=["unplanned", "planned"])
+def _split_reads(request):
+    """Off by default -- see the README. Every case below must hold either way: planning changes
+    how a selection is read, never what it returns."""
+    with zarr.config.set(
+        {
+            "codec_pipeline.integer_array_indexing": True,
+            "codec_pipeline.plan_reads": request.param,
+        }
+    ):
         yield
 
 

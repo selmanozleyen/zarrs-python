@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, TypedDict
 from warnings import warn
 
@@ -64,6 +65,9 @@ def get_codec_pipeline_impl(
             direct_io=config.get("codec_pipeline.direct_io", False),
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
+            ),
+            shard_index_cache_size=config.get(
+                "codec_pipeline.shard_index_cache_size", 0
             ),
         )
     except TypeError as e:
@@ -178,6 +182,9 @@ class ZarrsCodecPipeline(CodecPipeline):
         # FIXME: Error if array is not in host memory
         if not out.dtype.isnative:
             raise RuntimeError("Non-native byte order not supported")
+        # Read from config per call rather than captured at construction, so it can be flipped
+        # between reads of an open array while benchmarking.
+        plan_reads = config.get("codec_pipeline.plan_reads", False)
         try:
             if self.impl is None:
                 raise UnsupportedMetadataError()
@@ -204,7 +211,19 @@ class ZarrsCodecPipeline(CodecPipeline):
         else:
             out: NDArrayLike = out.as_ndarray_like()
             await asyncio.to_thread(
-                self.impl.retrieve_chunks_and_apply_index,
+                partial(
+                    self.impl.retrieve_chunks_and_apply_index,
+                    plan_reads=plan_reads,
+                    plan_reads_merge_gap_bytes=config.get(
+                        "codec_pipeline.plan_reads_merge_gap_bytes", 0
+                    ),
+                    plan_reads_fetch_threads=config.get(
+                        "codec_pipeline.plan_reads_fetch_threads", 0
+                    ),
+                    plan_reads_fetch_byte_budget=config.get(
+                        "codec_pipeline.plan_reads_fetch_byte_budget", 0
+                    ),
+                ),
                 chunks_desc.chunk_info_with_indices,
                 out,
             )
