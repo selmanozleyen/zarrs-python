@@ -18,11 +18,7 @@ import numpy as np
 import pytest
 import zarr
 
-from zarrs.utils import (
-    DiscontiguousArrayError,
-    UnsortedArrayIndexError,
-    UnsupportedVIndexingError,
-)
+from zarrs.utils import DiscontiguousArrayError, UnsupportedVIndexingError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -170,8 +166,7 @@ def test_contiguous_output_does_not_imply_sorted_input(
 
     `CoordinateIndexer` sorts only when the chunk-raveled order is wrong, and both
     indices live in chunk 0, so `out_selection` comes back `slice(0, 2)` while the
-    indices descend. With the flag on that refusal is `UnsortedArrayIndexError`, which the
-    pipeline does not catch, so it fails outright rather than being rerouted.
+    indices descend. The ordering check refuses it; nothing about the output would.
     """
     expected = np.arange(64, dtype=np.float64)
     path = tmp_path / "one_d.zarr"
@@ -180,25 +175,11 @@ def test_contiguous_output_does_not_imply_sorted_input(
     )
     z[:] = expected
 
-    with pytest.raises(
-        (DiscontiguousArrayError, UnsupportedVIndexingError, UnsortedArrayIndexError)
-    ):
+    with pytest.raises((DiscontiguousArrayError, UnsupportedVIndexingError)):
         open_strict(path).vindex[index]
 
-    # A fallback pipeline does not rescue it.
-    with (
-        pytest.raises(UnsortedArrayIndexError),
-        zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}),
-    ):
-        zarr.open_array(path, mode="r").vindex[index]
-
-    # Turning the flag off restores the old routing, and the answer is still correct.
-    with zarr.config.set(
-        {
-            "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
-            "codec_pipeline.integer_array_indexing": False,
-        }
-    ):
+    # And the fallback must still answer it correctly.
+    with zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}):
         got = zarr.open_array(path, mode="r").vindex[index]
     np.testing.assert_array_equal(got, expected[index])
 

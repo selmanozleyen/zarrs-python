@@ -20,7 +20,6 @@ import zarr
 
 from zarrs.utils import (
     DiscontiguousArrayError,
-    UnsortedArrayIndexError,
     _as_int64_batch_info,
     make_slice_selection,
     split_selection_runs,
@@ -92,16 +91,9 @@ def test_unsigned_rows_read_the_same_as_signed(dtype: str, sharded) -> None:
 
 @pytest.mark.parametrize("dtype", UNSIGNED)
 def test_unsorted_unsigned_is_still_refused(dtype: str, sharded) -> None:
-    """Descending rows must not be admitted just because the dtype hides the descent.
-
-    Which refusal depends on chunking: zarr splits per chunk first, so a lone index per item
-    hides the descent and lands on `DiscontiguousArrayError` instead.
-    """
+    """Descending rows must not be admitted just because the dtype hides the descent."""
     path, _ = sharded
-    with (
-        zarr.config.set(SETTINGS),
-        pytest.raises((UnsortedArrayIndexError, DiscontiguousArrayError)),
-    ):
+    with zarr.config.set(SETTINGS), pytest.raises(DiscontiguousArrayError):
         zarr.open_array(path, mode="r")[np.array([27, 3], dtype=dtype), :]
 
 

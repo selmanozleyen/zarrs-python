@@ -42,13 +42,6 @@ class FillValueNoneError(Exception):
     pass
 
 
-class UnsortedArrayIndexError(Exception):
-    """An integer-array selection was not in non-decreasing order.
-
-    Not caught by the pipeline, so it reaches the caller instead of falling back.
-    """
-
-
 def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
     """Normalise the batch's integer-array indices to int64, lazily.
 
@@ -132,6 +125,8 @@ def split_selection_runs(
     out_axis_sel = out_sel[axis]
     if (
         indices.ndim != 1
+        # Non-decreasing only: any decrease would mean one box per element, a decode each.
+        or (indices[1:] < indices[:-1]).any()
         or not isinstance(out_axis_sel, slice)
         or out_axis_sel.step not in (None, 1)
         or not all(isinstance(sel, slice) for sel in out_sel)
@@ -141,9 +136,6 @@ def split_selection_runs(
     # this line can be removed once https://github.com/zarr-developers/zarr-python/issues/4285 is fixed
     if (indices < 0).any():
         raise DiscontiguousArrayError(indices)
-    # Non-decreasing only: any decrease would mean one box per element, a decode each.
-    if (indices[1:] < indices[:-1]).any():
-        raise UnsortedArrayIndexError(indices)
     out_start = out_axis_sel.start or 0
     if out_axis_sel.stop - out_start != indices.size:
         yield from unsplit
