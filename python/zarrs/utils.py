@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
 
+    BatchInfo = Iterable[
+        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
+    ]
+
 
 # adapted from https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
 def get_max_threads() -> int:
@@ -38,6 +42,38 @@ class FillValueNoneError(Exception):
     pass
 
 
+class UnsortedArrayIndexError(Exception):
+    """An integer-array selection was not in non-decreasing order.
+
+    Deliberately outside the set of exceptions the pipeline catches to fall back on, so
+    enabling ``codec_pipeline.integer_array_indexing`` surfaces a selection zarrs will not
+    serve well rather than quietly routing it to zarr-python at a different cost profile.
+    """
+
+
+def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
+    """Normalise every integer-array index in the batch to int64, lazily.
+
+    Done once here so nothing downstream has to think about the incoming dtype: an unsigned
+    index makes ordinary arithmetic lie, `[255, 0]` as uint8 differences to 1 and reads as a
+    step forward rather than a drop of 255, and `+ 1` on 255 wraps to 0. zarr hands the
+    pipeline int64 today, so this is a guarantee rather than a conversion -- `copy=False`
+    makes it free, and a selection holding no array is passed through untouched.
+    """
+
+    def cast(sel: SelectorTuple) -> SelectorTuple:
+        if isinstance(sel, np.ndarray):
+            return sel.astype(np.int64, copy=False)
+        if isinstance(sel, tuple) and any(isinstance(s, np.ndarray) for s in sel):
+            return tuple(map(cast, sel))
+        return sel
+
+    return (
+        (byte_getter, chunk_spec, cast(chunk_sel), cast(out_sel), is_complete)
+        for byte_getter, chunk_spec, chunk_sel, out_sel, is_complete in batch_info
+    )
+
+
 # This is a (mostly) copy of the function from zarr.core.indexing that fixes:
 #   DeprecationWarning: Conversion of an array with ndim > 0 to a scalar is deprecated
 # TODO: Upstream this fix
@@ -53,14 +89,11 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                # int64, never the incoming dtype: unsigned [255, 0] differences to
-                # 1 and would read as consecutive.
-                sel = dim_selection.astype(np.int64, copy=False)
-                steps = sel[1:] - sel[:-1]
+                # Assumes int64 (see `_as_int64`): differencing an unsigned index would
+                # wrap a decrease into a step of 1 and read as consecutive.
+                steps = dim_selection[1:] - dim_selection[:-1]
                 if (steps != 1).any() and (steps != 0).any():
                     raise DiscontiguousArrayError(steps)
-                # int() likewise: `+ 1` on an unsigned scalar at the dtype maximum
-                # wraps to 0 and yields an empty slice.
                 ls.append(slice(int(dim_selection[0]), int(dim_selection[-1]) + 1, 1))
         else:
             ls.append(dim_selection)
@@ -105,25 +138,23 @@ def split_selection_runs(
         yield from unsplit
         return
     (axis,) = array_axes
-    # int64 up front, so no ordering test below can be fooled by an unsigned dtype
-    # wrapping a decrease. Lossless: array indices cannot exceed int64.
-    indices = chunk_sel[axis].astype(np.int64, copy=False)
+    # Assumes int64
+    indices = chunk_sel[axis]
     out_axis_sel = out_sel[axis]
     if (
         indices.ndim != 1
-        # Non-decreasing: a slice pair is an order-preserving map, so order is
-        # required. Repeats are not -- one ends its run early and reads that index
-        # again into the next output position, which the loop below handles.
-        # Descending is refused for cost, not correctness: runs coalesce only on
-        # consecutive indices, so a permutation becomes one box per element and every
-        # box is a decode. Admitting those wants a cost guard on box count.
-        or (indices[1:] < indices[:-1]).any()
         or not isinstance(out_axis_sel, slice)
         or out_axis_sel.step not in (None, 1)
         or not all(isinstance(sel, slice) for sel in out_sel)
     ):
         yield from unsplit
         return
+    # this line can be removed once https://github.com/zarr-developers/zarr-python/issues/4285 is fixed
+    if (indices < 0).any():
+        raise DiscontiguousArrayError(indices)
+    # Non-decreasing only: any decrease would mean one box per element, a decode each.
+    if (indices[1:] < indices[:-1]).any():
+        raise UnsortedArrayIndexError(indices)
     out_start = out_axis_sel.start or 0
     if out_axis_sel.stop - out_start != indices.size:
         yield from unsplit
@@ -231,9 +262,7 @@ class RustChunkInfo:
 
 
 def make_chunk_info_for_rust_with_indices(
-    batch_info: Iterable[
-        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
-    ],
+    batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
     *,
@@ -241,6 +270,7 @@ def make_chunk_info_for_rust_with_indices(
     # make the write path's read-modify-write of that chunk race with itself.
     integer_array_indexing: bool = False,
 ) -> RustChunkInfo:
+    batch_info = _as_int64_batch_info(batch_info)
     if integer_array_indexing:
         batch_info = [
             (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)

@@ -1,6 +1,10 @@
 from ._internal import __version__
 from .pipeline import ZarrsCodecPipeline as _ZarrsCodecPipeline
-from .utils import DiscontiguousArrayError, UnsupportedVIndexingError
+from .utils import (
+    DiscontiguousArrayError,
+    UnsortedArrayIndexError,
+    UnsupportedVIndexingError,
+)
 
 
 # Need to do this redirection so people can access the pipeline as `zarrs.ZarrsCodecPipeline` instead of `zarrs.pipeline.ZarrsCodecPipeline`
@@ -11,6 +15,7 @@ class ZarrsCodecPipeline(_ZarrsCodecPipeline):
 __all__ = [
     "ZarrsCodecPipeline",
     "DiscontiguousArrayError",
+    "UnsortedArrayIndexError",
     "UnsupportedVIndexingError",
     "__version__",
 ]

@@ -18,7 +18,11 @@ import numpy as np
 import pytest
 import zarr
 
-from zarrs.utils import DiscontiguousArrayError, UnsupportedVIndexingError
+from zarrs.utils import (
+    DiscontiguousArrayError,
+    UnsortedArrayIndexError,
+    UnsupportedVIndexingError,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -167,6 +171,9 @@ def test_contiguous_output_does_not_imply_sorted_input(
     `CoordinateIndexer` sorts only when the chunk-raveled order is wrong, and both
     indices live in chunk 0, so `out_selection` comes back `slice(0, 2)` while the
     indices descend. The ordering check refuses it; nothing about the output would.
+
+    With the feature flag on, that refusal is `UnsortedArrayIndexError`, which the pipeline
+    does not catch -- an unsorted selection fails outright rather than being rerouted.
     """
     expected = np.arange(64, dtype=np.float64)
     path = tmp_path / "one_d.zarr"
@@ -175,11 +182,26 @@ def test_contiguous_output_does_not_imply_sorted_input(
     )
     z[:] = expected
 
-    with pytest.raises((DiscontiguousArrayError, UnsupportedVIndexingError)):
+    with pytest.raises(
+        (DiscontiguousArrayError, UnsupportedVIndexingError, UnsortedArrayIndexError)
+    ):
         open_strict(path).vindex[index]
 
-    # And the fallback must still answer it correctly.
-    with zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}):
+    # The fallback does not rescue it: UnsortedArrayIndexError is deliberately outside the
+    # set the pipeline catches, so it surfaces even with a fallback pipeline available.
+    with (
+        pytest.raises(UnsortedArrayIndexError),
+        zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}),
+    ):
+        zarr.open_array(path, mode="r").vindex[index]
+
+    # Turning the flag off restores the old routing, and the answer is still correct.
+    with zarr.config.set(
+        {
+            "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
+            "codec_pipeline.integer_array_indexing": False,
+        }
+    ):
         got = zarr.open_array(path, mode="r").vindex[index]
     np.testing.assert_array_equal(got, expected[index])
 
