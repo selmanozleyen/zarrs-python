@@ -43,11 +43,7 @@ class FillValueNoneError(Exception):
 
 
 def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
-    """Normalise the batch's integer-array indices to int64, lazily.
-
-    Nothing downstream then has to think about dtype: unsigned `[255, 0]` differences to 1,
-    not -255. zarr hands over int64 today, so this is a guarantee, and `copy=False` is free.
-    """
+    """Normalise the batch's integer-array indices to int64, lazily."""
 
     def cast(sel: SelectorTuple) -> SelectorTuple:
         if isinstance(sel, np.ndarray):
@@ -77,8 +73,7 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                # Assumes int64 (see `_as_int64`): differencing an unsigned index would
-                # wrap a decrease into a step of 1 and read as consecutive.
+                # int64 (see `_as_int64`): an unsigned diff wraps a decrease into +1.
                 steps = dim_selection[1:] - dim_selection[:-1]
                 if (steps != 1).any() and (steps != 0).any():
                     raise DiscontiguousArrayError(steps)
@@ -120,7 +115,6 @@ def split_selection_runs(
         yield from unsplit
         return
     (axis,) = array_axes
-    # Assumes int64
     indices = chunk_sel[axis]
     out_axis_sel = out_sel[axis]
     if (
@@ -141,9 +135,8 @@ def split_selection_runs(
         yield from unsplit
         return
 
-    # Always emit slices, even for a single run: `resulting_shape_from_index` mis-orders an
-    # advanced index that is not on the leading axis, and the caller's element-count check then
-    # rejects the selection. Slices on both sides of that check sidestep it.
+    # Always slices, even for one run: `resulting_shape_from_index` mis-orders a non-leading
+    # advanced index, and the caller's element-count check then rejects the selection.
     boundaries = np.flatnonzero(indices[1:] != indices[:-1] + 1) + 1
 
     for start, stop in zip(
@@ -247,8 +240,7 @@ def make_chunk_info_for_rust_with_indices(
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
     *,
-    # Reads only: splitting gives one chunk item per run, and several items sharing a key would
-    # make the write path's read-modify-write of that chunk race with itself.
+    # Reads only: items sharing a chunk key would race in the write path's read-modify-write.
     integer_array_indexing: bool = False,
 ) -> RustChunkInfo:
     batch_info = _as_int64_batch_info(batch_info)
