@@ -31,11 +31,16 @@ class CodecPipelineImpl:
         num_threads: builtins.int | None = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
+        shard_index_cache_size: builtins.int = 0,
     ) -> CodecPipelineImpl: ...
     def retrieve_chunks_and_apply_index(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
         value: numpy.typing.NDArray[typing.Any],
+        *,
+        plan_reads: builtins.bool = False,
+        fetch_threads: builtins.int = 0,
+        fetch_byte_budget: builtins.int = 0,
     ) -> None: ...
     def store_chunks_with_indices(
         self,

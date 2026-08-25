@@ -28,7 +28,10 @@ N_VAR = 5000
 CHUNK = 4096
 SHARD = 16384
 
-CONFIGS = {"unplanned": {"codec_pipeline.integer_array_indexing": True}}
+ZARRS = {
+    "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
+    "codec_pipeline.integer_array_indexing": True,
+}
 
 
 @pytest.fixture(params=["zstd", "none"])
@@ -71,30 +74,26 @@ def row_span_selection(indptr: np.ndarray, rows: np.ndarray) -> np.ndarray:
     return np.concatenate([np.arange(indptr[r], indptr[r + 1]) for r in rows])
 
 
-@pytest.mark.parametrize("config", list(CONFIGS), ids=list(CONFIGS))
 @pytest.mark.parametrize(
     "n_rows",
     # 1 row is a single run; 256 of 400 rows is dense enough that runs share inner chunks.
     [1, 8, 64, 256],
 )
 def test_sampled_rows_match(
-    csr: tuple[Path, dict[str, np.ndarray]], config: str, n_rows: int
+    csr: tuple[Path, dict[str, np.ndarray]], n_rows: int
 ) -> None:
     path, truth = csr
     rng = np.random.default_rng(n_rows)
     rows = np.sort(rng.choice(N_OBS, size=n_rows, replace=False))
     selection = row_span_selection(truth["indptr"], rows)
 
-    with zarr.config.set(
-        {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"} | CONFIGS[config]
-    ):
+    with zarr.config.set(ZARRS):
         for name in ("indices", "data"):
             got = zarr.open_array(path / name, mode="r")[selection]
             np.testing.assert_array_equal(got, truth[name][selection])
 
 
-@pytest.mark.parametrize("config", list(CONFIGS), ids=list(CONFIGS))
-def test_indptr_gather(csr: tuple[Path, dict[str, np.ndarray]], config: str) -> None:
+def test_indptr_gather(csr: tuple[Path, dict[str, np.ndarray]]) -> None:
     """The row boundaries are a scattered gather of single elements, and consecutive sampled
     rows share a boundary, so the positions must be deduplicated to stay strictly increasing."""
     path, truth = csr
@@ -102,16 +101,13 @@ def test_indptr_gather(csr: tuple[Path, dict[str, np.ndarray]], config: str) -> 
     rows = np.sort(rng.choice(N_OBS, size=32, replace=False))
     wanted = np.unique(np.concatenate([rows, rows + 1]))
 
-    with zarr.config.set(
-        {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"} | CONFIGS[config]
-    ):
+    with zarr.config.set(ZARRS):
         got = zarr.open_array(path / "indptr", mode="r")[wanted]
     np.testing.assert_array_equal(got, truth["indptr"][wanted])
 
 
-@pytest.mark.parametrize("config", list(CONFIGS), ids=list(CONFIGS))
 def test_a_single_row_spanning_a_chunk_boundary(
-    csr: tuple[Path, dict[str, np.ndarray]], config: str
+    csr: tuple[Path, dict[str, np.ndarray]],
 ) -> None:
     """A row's span has nothing to do with the chunk grid, so some rows straddle a boundary and
     some straddle a shard boundary. Those are the cases where a run becomes several reads."""
@@ -124,9 +120,7 @@ def test_a_single_row_spanning_a_chunk_boundary(
     ]
     assert straddling, "expected some rows to cross a chunk boundary"
 
-    with zarr.config.set(
-        {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"} | CONFIGS[config]
-    ):
+    with zarr.config.set(ZARRS):
         array = zarr.open_array(path / "data", mode="r")
         for row in straddling[:5]:
             selection = np.arange(indptr[row], indptr[row + 1])

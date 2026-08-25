@@ -51,9 +51,19 @@ The `ZarrsCodecPipeline` specific options are:
   - Defaults to `0` (disabled). Only applies to filesystem stores, and has no effect when `direct_io` is enabled.
   - Cached handles are invalidated on writes through this pipeline, but not on modification from anywhere else — and `zarr-python` itself is such a writer, since `resize`, `delete_dir` and metadata writes go through its own store. A cached handle can then still read a chunk file that has been deleted. Only enable this while nothing is modifying the array.
   - The cache is per `Array` object, not per process, so compare `file_handle_cache_size` times the number of open arrays against `ulimit -n`. See [here](https://docs.rs/zarrs_filesystem/latest/zarrs_filesystem/struct.FilesystemStoreOptions.html#method.file_handle_cache_size) for more info.
+- `codec_pipeline.shard_index_cache_size`: the number of shard indexes kept in a least-recently-used cache. If nonzero, a partial read of a shard reuses an index decoded by an earlier read instead of fetching and decoding it again, removing one read per shard per call. Matters most on network filesystems and for repeated small reads of the same shards, such as random-access sampling.
+  - Defaults to `0` (disabled). Only sharded arrays have an index to cache. Each entry costs 16 bytes per inner chunk, so size it against the number of shards read repeatedly, not the array size.
+  - Read-only by design: any write through this pipeline empties the cache, and modification from elsewhere is not seen — the same caveat as `file_handle_cache_size`. Only enable it while nothing else is modifying the array.
 - `codec_pipeline.integer_array_indexing`: serve reads with a sorted integer-array index (`z[[3, 7, 8, 9], :]`, `z[:, cols]`, 1-D `z.vindex[idx]`) through `zarrs` instead of falling back to the `zarr-python` pipeline. A chunk read is described to `zarrs` as a rectangular subset, and such a selection is a stack of them, so the pipeline emits one per run of consecutive indices.
-  - Defaults to `False`. Whether it helps depends on how dense the selection is: each run decodes separately, so several runs inside one inner chunk decode it once each where `zarr-python` decodes it once in total. Measure before enabling it.
-  - Reads only, and only when the indices are sorted and non-decreasing on a single axis. Unsorted indices, and two or more integer-array axes, still fall back, because `zarr-python` reorders the output for those and a run's position in the selection is then not its position in the output.
+  - Defaults to `False`.
+  - Reads only, and only when the indices are sorted and strictly increasing on a single axis. Unsorted or repeated indices, and two or more integer-array axes, still fall back, because `zarr-python` reorders the output for those and a run's position in the selection is then not its position in the output.
+  - Reads of a sharded array are then planned rather than served region by region: the shard index is read directly and the byte ranges of exactly the inner chunks the selection needs are issued, so each needed inner chunk is fetched and decoded once however many of the emitted boxes fall inside it. Without that, several boxes inside one inner chunk decode it once each where `zarr-python` decodes it once in total. Uses `shard_index_cache_size` for the parsed indexes.
+  - Planning applies only to a chunk whose codec chain is exactly the sharding codec. Any codec wrapping it means the shard bytes are not laid out as the index describes, so the array falls through to the normal path. Unsharded arrays fall through too.
+  - Units from every shard are issued into one pool, so reads overlap within a shard as well as across shards, and fetching and decoding run on separate pools. Sub-chunk reads are preserved when there is no compressor; a compressor makes the inner chunk atomic. Reads that touch are merged into one request, which costs nothing: a shard written in one pass lays its inner chunks down contiguously in index order, so a dense selection collapses into single large reads without reading a byte outside the request.
+- `codec_pipeline.fetch_threads`: threads issuing the reads of a planned read. These block on IO, so they are their own pool rather than sharing the decode pool — a fetch waiting on the byte budget must not occupy the thread that would release it.
+  - Defaults to `0`, meaning the size of the `rayon` pool. Raise it where per-request latency dominates. The pool is process-wide and sized on first use.
+- `codec_pipeline.fetch_byte_budget`: ceiling on bytes fetched but not yet decoded. Without one, a read plan covering an array would fetch all of it before the first decode finished.
+  - Defaults to `0`, meaning 256 MiB. A read larger than the whole budget is admitted on its own, so a small budget throttles rather than deadlocks.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -70,7 +80,10 @@ zarr.config.set({
         "chunk_concurrent_maximum": None,
         "chunk_concurrent_minimum": 4,
         "file_handle_cache_size": 0,
+        "shard_index_cache_size": 0,
         "integer_array_indexing": False,
+        "fetch_threads": 0,
+        "fetch_byte_budget": 0,
         "direct_io": False,
         "strict": False
     }
