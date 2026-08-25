@@ -45,20 +45,15 @@ class FillValueNoneError(Exception):
 class UnsortedArrayIndexError(Exception):
     """An integer-array selection was not in non-decreasing order.
 
-    Deliberately outside the set of exceptions the pipeline catches to fall back on, so
-    enabling ``codec_pipeline.integer_array_indexing`` surfaces a selection zarrs will not
-    serve well rather than quietly routing it to zarr-python at a different cost profile.
+    Not caught by the pipeline, so it reaches the caller instead of falling back.
     """
 
 
 def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
-    """Normalise every integer-array index in the batch to int64, lazily.
+    """Normalise the batch's integer-array indices to int64, lazily.
 
-    Done once here so nothing downstream has to think about the incoming dtype: an unsigned
-    index makes ordinary arithmetic lie, `[255, 0]` as uint8 differences to 1 and reads as a
-    step forward rather than a drop of 255, and `+ 1` on 255 wraps to 0. zarr hands the
-    pipeline int64 today, so this is a guarantee rather than a conversion -- `copy=False`
-    makes it free, and a selection holding no array is passed through untouched.
+    Nothing downstream then has to think about dtype: unsigned `[255, 0]` differences to 1,
+    not -255. zarr hands over int64 today, so this is a guarantee, and `copy=False` is free.
     """
 
     def cast(sel: SelectorTuple) -> SelectorTuple:
@@ -111,18 +106,12 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
 def split_selection_runs(
     chunk_selection: SelectorTuple, out_selection: SelectorTuple
 ) -> Iterator[tuple[SelectorTuple, SelectorTuple]]:
-    """Split a selection whose one integer-array axis is non-consecutive into contiguous boxes.
+    """Split a selection with one non-consecutive integer-array axis into contiguous boxes.
 
-    zarrs describes a chunk read as a rectangular subset, so a scattered row selection like
-    ``z[[3, 7, 8], :]`` has no single-box description. It is a *stack* of boxes though, so
-    yield one per run of consecutive indices rather than giving up on the whole read.
-
-    Only a single array axis is split. With one advanced index, outer and coordinate indexing
-    agree on what the selection means, so the decomposition is unambiguous; with more than one
-    they disagree (outer product vs. paired points) and the caller must reject it as before.
-    Everything else -- an unsorted axis, a scattered output side -- is also yielded unchanged,
-    because the run's position in the output is only known when the output side is contiguous
-    and in selection order.
+    zarrs describes a chunk read as a rectangular subset, so ``z[[3, 7, 8], :]`` has no
+    single-box description -- but it is a *stack* of boxes, one per run of consecutive
+    indices. Only one array axis is split: with two, outer and coordinate indexing disagree
+    on what the selection means. Anything not splittable is yielded unchanged.
     """
     chunk_sel = (
         chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,)

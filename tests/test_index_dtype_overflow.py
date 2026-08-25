@@ -59,9 +59,8 @@ def sharded(tmp_path: Path) -> tuple[Path, np.ndarray]:
 def test_wraparound_decrease_is_not_consecutive() -> None:
     """[255, 0] as uint8 differences to 1. It is a decrease of 255, not a step of 1.
 
-    `make_slice_selection` differences its input directly, so it is the normalisation at the
-    pipeline boundary that keeps this from reading as a step forward. Neither half is a
-    guarantee alone, so go through the boundary rather than calling it with a bare array.
+    `make_slice_selection` differences directly, so go through the boundary that normalises:
+    neither half is a guarantee alone.
     """
     selection = (np.array([255, 0], dtype="uint8"),)
     ((_, _, chunk_selection, _, _),) = _as_int64_batch_info(
@@ -95,11 +94,8 @@ def test_unsigned_rows_read_the_same_as_signed(dtype: str, sharded) -> None:
 def test_unsorted_unsigned_is_still_refused(dtype: str, sharded) -> None:
     """Descending rows must not be admitted just because the dtype hides the descent.
 
-    Which refusal depends on chunking: zarr splits the read per chunk before the pipeline
-    sees it, so with these small chunks each item carries a single (chunk-relative, possibly
-    negative) index and the descent is no longer visible -- that lands on
-    `DiscontiguousArrayError`. Coarser chunks keep the pair intact and raise
-    `UnsortedArrayIndexError`. Either way it must not be served as though increasing.
+    Which refusal depends on chunking: zarr splits per chunk first, so a lone index per item
+    hides the descent and lands on `DiscontiguousArrayError` instead.
     """
     path, _ = sharded
     with (
@@ -112,10 +108,8 @@ def test_unsorted_unsigned_is_still_refused(dtype: str, sharded) -> None:
 def test_negative_chunk_relative_index_is_refused() -> None:
     """A negative index must never become a slice bound.
 
-    zarr hands the pipeline chunk-relative indices, and its sharding indexer miscomputes
-    them for unsigned dtypes -- `[27, 3]` as uint8 arrives as `[-13]`. Absolute slice
-    bounds cannot express that: `slice(-13, -12)` reads as an empty subset, which reaches
-    zarrs as a size mismatch rather than an error naming the cause.
+    Indices are chunk-relative, and zarr miscomputes them for unsigned dtypes -- uint8
+    `[27, 3]` arrives as `[-13]`. `slice(-13, -12)` is an empty subset, not a row near the end.
     """
     with pytest.raises(DiscontiguousArrayError):
         list(
@@ -127,11 +121,7 @@ def test_negative_chunk_relative_index_is_refused() -> None:
 
 
 def test_sorted_selections_never_produce_a_negative_bound(sharded) -> None:
-    """The guard above must not be firing on ordinary reads.
-
-    Every box a sorted selection yields has non-negative bounds, so the refusal is reserved
-    for the miscomputed case and is not quietly rejecting work zarrs can serve.
-    """
+    """The guard above must not be firing on ordinary reads."""
     path, values = sharded
     rng = np.random.default_rng(0)
     with zarr.config.set(SETTINGS):
