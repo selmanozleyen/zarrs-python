@@ -183,7 +183,12 @@ class ZarrsCodecPipeline(CodecPipeline):
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
             chunks_desc = make_chunk_info_for_rust_with_indices(
-                batch_info, drop_axes, out.shape
+                batch_info,
+                drop_axes,
+                out.shape,
+                integer_array_indexing=config.get(
+                    "codec_pipeline.integer_array_indexing", False
+                ),
             )
         except (
             UnsupportedMetadataError,
