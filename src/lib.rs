@@ -58,13 +58,13 @@ pub struct CodecPipelineImpl {
 }
 
 /// Total decoded bytes `retrieve_chunks_and_apply_index` may hold in chunk caches at once.
-const CHUNK_CACHE_BUDGET_BYTES: u64 = 256 << 20;
+const CHUNK_CACHE_BUDGET_BYTES: u64 = 8192 << 20;
 
 /// Items sharing a key before caching it is worth doing.
 ///
 /// The cache decodes the key's whole chunk, which for a sharded array is the whole shard --
 /// more work than a couple of targeted partial decodes. Only amortise it over enough items.
-const CHUNK_CACHE_MIN_ITEMS: u64 = 4;
+const CHUNK_CACHE_MIN_ITEMS: u64 = 2;
 
 /// A partial decoder that decodes its chunk once and answers every later request from memory.
 ///
