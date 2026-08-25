@@ -2,7 +2,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -20,13 +20,16 @@ use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
-    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecOptions, DataType,
-    FillValue, StoragePartialDecoder, copy_fill_value_into, update_array_bytes,
+    ArrayPartialDecoderTraits, ArraySubset, ArrayToBytesCodecTraits, CodecChain, CodecError,
+    CodecOptions, DataType, FillValue, Indexer, StoragePartialDecoder, copy_fill_value_into,
+    update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
-use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
+use zarrs::storage::{
+    ReadableWritableListableStorage, StorageError, StorageHandle, StoreKey,
+};
 
 mod chunk_item;
 mod concurrency;
@@ -52,6 +55,71 @@ pub struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
+}
+
+/// Total decoded bytes `retrieve_chunks_and_apply_index` may hold in chunk caches at once.
+const CHUNK_CACHE_BUDGET_BYTES: u64 = 256 << 20;
+
+/// Items sharing a key before caching it is worth doing.
+///
+/// The cache decodes the key's whole chunk, which for a sharded array is the whole shard --
+/// more work than a couple of targeted partial decodes. Only amortise it over enough items.
+const CHUNK_CACHE_MIN_ITEMS: u64 = 4;
+
+/// A partial decoder that decodes its chunk once and answers every later request from memory.
+///
+/// An integer-array selection is served as one chunk item per run of consecutive indices, so
+/// several runs inside one chunk would otherwise decode that chunk once per run. Wrapping the
+/// key's decoder in this makes the repeats free while leaving one item per run, which is what
+/// keeps the per-run concurrency of the caller's `iter_concurrent_limit!` intact.
+struct DecodedChunkCache {
+    shape: Vec<u64>,
+    data_type: DataType,
+    decoded: ArrayBytes<'static>,
+}
+
+impl DecodedChunkCache {
+    fn new(
+        inner: &dyn ArrayPartialDecoderTraits,
+        shape: &[u64],
+        data_type: DataType,
+        options: &CodecOptions,
+    ) -> Result<Self, CodecError> {
+        let whole = ArraySubset::new_with_shape(shape.to_vec());
+        let decoded = inner.partial_decode(&whole, options)?.into_owned();
+        Ok(Self {
+            shape: shape.to_vec(),
+            data_type,
+            decoded,
+        })
+    }
+}
+
+impl ArrayPartialDecoderTraits for DecodedChunkCache {
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn exists(&self) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    fn size_held(&self) -> usize {
+        self.decoded.size()
+    }
+
+    fn supports_partial_decode(&self) -> bool {
+        true
+    }
+
+    fn partial_decode(
+        &self,
+        indexer: &dyn Indexer,
+        _options: &CodecOptions,
+    ) -> Result<ArrayBytes<'_>, CodecError> {
+        self.decoded
+            .extract_array_subset(indexer, &self.shape, &self.data_type)
+    }
 }
 
 impl CodecPipelineImpl {
@@ -305,6 +373,36 @@ impl CodecPipelineImpl {
             .filter(|item| !(is_whole_chunk(item)))
             .unique_by(|item| item.key.clone())
             .collect::<Vec<_>>();
+
+        // A key read by several items is a chunk that would be decoded once per item.
+        // Cache the decode for those, most-repeated first, until the budget runs out -- the
+        // rest keep the plain decoder, so a wide read degrades to today's behaviour instead
+        // of exhausting memory.
+        let mut items_per_key: HashMap<&StoreKey, u64> = HashMap::new();
+        for item in chunk_descriptions.iter().filter(|i| !is_whole_chunk(i)) {
+            *items_per_key.entry(&item.key).or_default() += 1;
+        }
+        let element_size = self.data_type.fixed_size().unwrap_or(0) as u64;
+        let mut repeated = partial_chunk_items
+            .iter()
+            .filter(|item| items_per_key[&item.key] >= CHUNK_CACHE_MIN_ITEMS)
+            .collect::<Vec<_>>();
+        repeated.sort_by_key(|item| std::cmp::Reverse(items_per_key[&item.key]));
+        let mut budget = CHUNK_CACHE_BUDGET_BYTES;
+        let mut cached_keys: HashSet<StoreKey> = HashSet::new();
+        for item in repeated {
+            let bytes = item
+                .shape
+                .iter()
+                .map(|n| n.get())
+                .product::<u64>()
+                .saturating_mul(element_size);
+            if bytes <= budget {
+                budget -= bytes;
+                cached_keys.insert(item.key.clone());
+            }
+        }
+
         let mut partial_decoder_cache: HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>> =
             HashMap::new();
         if !partial_chunk_items.is_empty() {
@@ -323,6 +421,20 @@ impl CodecPipelineImpl {
                             &codec_options,
                         )
                         .map_codec_err()?;
+                    let partial_decoder: Arc<dyn ArrayPartialDecoderTraits> =
+                        if cached_keys.contains(&item.key) {
+                            Arc::new(
+                                DecodedChunkCache::new(
+                                    partial_decoder.as_ref(),
+                                    bytemuck::must_cast_slice::<_, u64>(&item.shape),
+                                    self.data_type.clone(),
+                                    &codec_options,
+                                )
+                                .map_codec_err()?,
+                            )
+                        } else {
+                            partial_decoder
+                        };
                     Ok((item.key.clone(), partial_decoder))
                 })
                 .collect::<PyResult<Vec<_>>>()?;
