@@ -48,7 +48,8 @@ use pyo3::PyResult;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
-    ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, CodecOptions,
+    ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
+    CodecOptions,
 };
 use zarrs::storage::StoreKey;
 use zarrs::storage::byte_range::ByteRange;
@@ -221,15 +222,21 @@ impl CodecPipelineImpl {
         // the call size, so revisit if the scope widens to a whole batch.
         let (done_tx, done_rx): (Sender<(Job<'_>, MaybeBytes)>, Receiver<_>) = unbounded();
 
-        let reads = AtomicUsize::new(0);
-        let decodes = AtomicUsize::new(0);
+        let reads_counter = AtomicUsize::new(0);
+        let decodes_counter = AtomicUsize::new(0);
         let first_error: Mutex<Option<String>> = Mutex::new(None);
-        let record = |e: String| {
+        let record_owned = |e: String| {
             let mut slot = first_error.lock().expect("error slot poisoned");
             if slot.is_none() {
                 *slot = Some(e);
             }
         };
+        // Every worker closure is `move`, and a loop body would otherwise move the counter
+        // into the first iteration. `&AtomicUsize` is Copy, so hand each closure a
+        // reference instead.
+        let reads = &reads_counter;
+        let decodes = &decodes_counter;
+        let record = &record_owned;
 
         self.decode_pool.scope(|decoders| {
             // Long-lived workers: one spawn per worker per call, not one per chunk, so a

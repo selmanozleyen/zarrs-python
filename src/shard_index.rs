@@ -25,9 +25,9 @@ use std::sync::Arc;
 use pyo3::PyResult;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecConfiguration;
+use zarrs::array::data_type::uint64;
 use zarrs::array::{
-    ArrayBytes, ArrayToBytesCodecTraits, BytesRepresentation, CodecChain, CodecOptions, DataType,
-    FillValue,
+    ArrayBytes, ArrayToBytesCodecTraits, BytesRepresentation, CodecChain, CodecOptions, FillValue,
 };
 use zarrs::metadata::v3::MetadataV3;
 use zarrs::metadata_ext::codec::sharding::ShardingIndexLocation;
@@ -111,7 +111,7 @@ impl ShardInfo {
             .index_chain
             .encoded_representation(
                 &index_shape,
-                &DataType::UInt64,
+                &uint64(),
                 &FillValue::from(ABSENT),
             )
             .map_codec_err()?;
@@ -152,7 +152,7 @@ impl ShardInfo {
             .decode(
                 Cow::Owned(encoded.into()),
                 &index_shape,
-                &DataType::UInt64,
+                &uint64(),
                 &FillValue::from(ABSENT),
                 options,
             )
