@@ -516,16 +516,15 @@ impl CodecPipelineImpl {
         }
         // An item sharing no inner chunk with another gains nothing here, and zarrs decodes
         // the inner chunks of one contiguous request in a single call, so leave it be.
-        let shared = items
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                consumers
-                    .values()
-                    .any(|indices| indices.len() > 1 && indices.contains(&index))
-            })
-            .collect::<Vec<bool>>();
-        for (index, item) in items.iter_mut().enumerate() {
+        let mut shared = vec![false; items.len()];
+        for indices in consumers.values() {
+            if indices.len() > 1 {
+                for &index in indices {
+                    shared[index] = true;
+                }
+            }
+        }
+        for (index, item) in items.iter().enumerate() {
             if !shared[index] {
                 plain.push(item.clone());
             }
