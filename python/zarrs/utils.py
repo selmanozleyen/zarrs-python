@@ -235,6 +235,71 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
+def _chunk_unit_items(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> list[ChunkItem] | None:
+    """One item per inner chunk, or None if this entry is not that shape.
+
+    The inner chunk is what the codec chain fetches and decodes; `chunk_spec.shape` is
+    the SHARD. Grouping a selection by decode unit therefore needs the inner chunk
+    shape, which the pipeline reads off the array metadata and passes in -- it was
+    never unreachable, only never passed.
+
+    Each group becomes a whole-inner-chunk subset plus the indices wanted from it, so
+    the chunk is read once, decoded once and gathered once, however many of its
+    elements the selection asks for. That is what zarr-python does, and it is why a
+    run of consecutive indices and a strided scatter cost it the same.
+
+    Narrow on purpose: one 1-D integer axis, non-negative and NON-DECREASING, with a
+    contiguous output slice. Sorted is what makes it work -- each chunk's elements are
+    then one contiguous run of the output, the only output shape a ChunkItem can
+    describe.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if drop_axes or inner_shape is None or len(inner_shape) != 1:
+        return None
+    chunk_sel = chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,)
+    out_sel = out_selection if isinstance(out_selection, tuple) else (out_selection,)
+    if len(chunk_sel) != 1 or len(out_sel) != 1 or len(chunk_spec.shape) != 1:
+        return None
+    (indices,) = chunk_sel
+    (out_axis_sel,) = out_sel
+    if not isinstance(indices, np.ndarray) or indices.ndim != 1 or indices.size == 0:
+        return None
+    if not isinstance(out_axis_sel, slice):
+        return None
+    indices = indices.astype(np.int64, copy=False)
+    if (indices < 0).any() or (indices[1:] < indices[:-1]).any():
+        return None
+    start = out_axis_sel.start or 0
+    if out_axis_sel.step not in (None, 1) or out_axis_sel.stop - start != indices.size:
+        return None
+
+    inner = int(inner_shape[0])
+    extent = int(chunk_spec.shape[0])
+    chunk_ids = indices // inner
+    cuts = np.flatnonzero(chunk_ids[1:] != chunk_ids[:-1]) + 1
+    bounds = np.concatenate(([0], cuts, [indices.size]))
+    items: list[ChunkItem] = []
+    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
+        a, b = int(a), int(b)
+        lo = int(chunk_ids[a]) * inner
+        hi = min(lo + inner, extent)
+        items.append(
+            ChunkItem(
+                key=byte_getter.path,
+                # Exactly one inner chunk, as a subset: zarrs decodes it once.
+                chunk_subset=[slice(lo, hi)],
+                chunk_shape=chunk_spec.shape,
+                subset=[slice(start + a, start + b)],
+                shape=shape,
+                # Relative to the chunk subset, because that is the buffer gathered from.
+                coords=[int(i) - lo for i in indices[a:b]],
+            )
+        )
+    return items
+
+
 def make_chunk_info_for_rust_with_indices(
     batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
@@ -242,8 +307,20 @@ def make_chunk_info_for_rust_with_indices(
     *,
     # Reads only: items sharing a chunk key would race in the write path's read-modify-write.
     integer_array_indexing: bool = False,
+    chunk_unit_indexing: bool = False,
+    inner_chunk_shape: tuple[int, ...] | None = None,
 ) -> RustChunkInfo:
     batch_info = _as_int64_batch_info(batch_info)
+    unit_items: list[ChunkItem] = []
+    if chunk_unit_indexing:
+        kept = []
+        for entry in batch_info:
+            items = _chunk_unit_items(entry, shape, drop_axes, inner_chunk_shape)
+            if items is None:
+                kept.append(entry)
+            else:
+                unit_items.extend(items)
+        batch_info = kept
     if integer_array_indexing:
         batch_info = [
             (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
@@ -259,7 +336,7 @@ def make_chunk_info_for_rust_with_indices(
             )
         ]
     is_constant = shape == ()
-    chunk_info_with_indices: list[ChunkItem] = []
+    chunk_info_with_indices: list[ChunkItem] = list(unit_items)
     write_empty_chunks: bool = True
     for (
         byte_getter,

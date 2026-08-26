@@ -350,6 +350,54 @@ impl CodecPipelineImpl {
                     )
                     .map_py_err::<PyRuntimeError>()?
                 };
+                if let Some(coords) = &item.coords {
+                    // The chunk is the read and decode unit. `chunk_subset` is exactly one
+                    // inner chunk, and an ArraySubset indexer is what takes zarrs'
+                    // chunks-in-subset path, where the chunk is fetched and decoded once.
+                    //
+                    // Handing zarrs the coordinates instead reaches
+                    // `partial_decode_fixed_indexer`, which walks them one at a time: two
+                    // ArrayIndices allocations, a subchunk-decoder cache lookup and a
+                    // `partial_decode` call PER ELEMENT. `partial_decode_into` is not usable
+                    // here either -- it requires indexer.len() == output elements, and a
+                    // whole chunk is deliberately larger than what is wanted from it.
+                    let key = &item.key;
+                    let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
+                        PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
+                    })?;
+                    let decoded = partial_decoder
+                        .partial_decode(&item.chunk_subset, &codec_options)
+                        .map_codec_err()?;
+                    let ArrayBytes::Fixed(raw) = decoded else {
+                        return Err(PyTypeError::new_err(
+                            "variable length data type not supported",
+                        ));
+                    };
+                    let size = self
+                        .data_type
+                        .fixed_size()
+                        .ok_or("variable length data type not supported")
+                        .map_py_err::<PyTypeError>()?;
+                    // The gather zarr-python does with one numpy fancy index, over a buffer
+                    // that is already decoded: a load and a store per element. The output
+                    // side is contiguous because the indices reached us non-decreasing, so
+                    // one chunk's elements are one run of the output.
+                    let mut gathered = vec![0u8; coords.len() * size];
+                    for (n, &c) in coords.iter().enumerate() {
+                        let src = usize::try_from(c).map_py_err::<PyRuntimeError>()? * size;
+                        let Some(element) = raw.get(src..src + size) else {
+                            return Err(PyRuntimeError::new_err(format!(
+                                "coordinate {c} is outside the {} elements decoded for {key}",
+                                raw.len() / size
+                            )));
+                        };
+                        gathered[n * size..(n + 1) * size].copy_from_slice(element);
+                    }
+                    output_view
+                        .copy_from_slice(&gathered)
+                        .map_py_err::<PyRuntimeError>()?;
+                    return Ok(());
+                }
                 let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
                 // See zarrs::array::Array::retrieve_chunk_subset_into
                 if is_whole_chunk(&item) {

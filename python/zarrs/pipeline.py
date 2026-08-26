@@ -136,6 +136,19 @@ class ZarrsCodecPipeline(CodecPipeline):
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
 
+    def _inner_chunk_shape(self) -> tuple[int, ...] | None:
+        """The shape of the unit the codec chain decodes, or None if not sharded.
+
+        `chunk_spec.shape` in a batch entry is the SHARD extent, so nothing downstream
+        could tell which parts of a selection share a decode. The sharding codec knows,
+        and the pipeline holds the array metadata, so it is one lookup away.
+        """
+        for codec in getattr(self.metadata, "codecs", ()) or ():
+            chunk_shape = getattr(codec, "chunk_shape", None)
+            if chunk_shape is not None:
+                return tuple(int(s) for s in chunk_shape)
+        return None
+
     @property
     def supports_partial_decode(self) -> bool:
         return False
@@ -189,6 +202,10 @@ class ZarrsCodecPipeline(CodecPipeline):
                 integer_array_indexing=config.get(
                     "codec_pipeline.integer_array_indexing", False
                 ),
+                chunk_unit_indexing=config.get(
+                    "codec_pipeline.chunk_unit_indexing", False
+                ),
+                inner_chunk_shape=self._inner_chunk_shape(),
             )
         except (
             UnsupportedMetadataError,
