@@ -1,181 +1,399 @@
-//! A reader pool and a decode pool: one job per innermost chunk. A reader fetches that
-//! chunk's bytes and signals the decode pool; a decode worker decodes the chunk once and
-//! copies out the elements the selection wants from it.
+//! A reader pool and a decode pool, both plain OS threads that live for the process.
 //!
-//! Why the halves are split at all: `partial_decode` reads *and* decodes inside one call
-//! on one worker, so a worker parked on the filesystem cannot decode a chunk another
-//! worker already fetched. A read here costs ~16x a decode (~2.9 ms against ~0.185 ms for
-//! a 358 KB blosc chunk), so what matters is how many reads are outstanding -- which is
-//! what `read_concurrency` sets, independently of the decode width.
+//! One job per innermost chunk. A reader does the blocking byte-range read and hands the
+//! bytes to a decode worker; the worker decodes the chunk once and copies out the elements
+//! the selection wants. A read costs ~16x a decode here (~2.9 ms against ~0.185 ms for a
+//! 358 KB blosc chunk), so what matters is how many reads are outstanding, and that is what
+//! `read_concurrency` sets independently of the decode width.
 //!
-//! Shape:
+//! # Why not rayon
 //!
-//! - **Two fixed `rayon::ThreadPool`s for the process**, built on the first read request,
-//!   never rebuilt, never torn down. Opening a group allocates nothing; a read request is
-//!   closures handed to threads that already exist. `pool.scope()` per call is what makes
-//!   the borrows scoped while the threads outlive them -- plain `std::thread` cannot do
-//!   both, since scoped threads must join before the borrow ends and persistent threads
-//!   need `'static` messages, which a borrowed output piece is not.
-//! - **Readers get their own pool**, oversubscribed past the core count on purpose: a read
-//!   is latency-bound and a parked thread costs a stack, not a core. Because the pool is
-//!   dedicated, a reader parked in `get_partial` starves no decoder.
-//! - **Long-lived workers, not a task per chunk.** Each pool spawns its width once per
-//!   call and each worker drains the queue until it closes, so a decode worker reuses one
-//!   scratch buffer across every chunk it handles.
-//! - **Nothing nests.** The codec chain gets `concurrent_target(1)`, so a decode worker
-//!   spawns no work underneath itself. All the parallelism is R readers plus D decoders.
+//! It deadlocked. Rayon assumes a task runs to completion so its worker can return to the
+//! scheduler; a task that parks on a channel breaks that. The thread running a
+//! `ThreadPool::scope` closure blocks inside `ScopeBase::complete` waiting for the tasks it
+//! spawned, and while blocked rayon has it *steal* work from its own pool -- so it picked up
+//! one of the decode workers and parked in `recv`, waiting for the sender that only it could
+//! ever drop. gdb caught it exactly:
 //!
-//! Byte extents come from `shard_index`, which reads sharding's own offset/size table --
-//! so this runs against the RELEASED zarrs, with no patched crate anywhere.
+//! ```text
+//! #8 StackJob::execute            the scope closure body
+//! #6 ScopeBase::complete          waiting for its spawned jobs
+//! #4 WorkerThread::wait_until_cold  looking for work to steal while it waits
+//! #3 HeapJob::execute             stole a decode worker
+//! #1 std::thread::functions::park blocked on done_rx.recv() -- on itself
+//! ```
 //!
-//! Safety: the output is carved with `split_at_mut` before any job runs and each piece
-//! travels *inside* its job. Moving a `&mut [u8]` through the channel is what transfers
-//! exclusivity, so disjointness is checked by the compiler instead of asserted in a
-//! comment. No `UnsafeCellSlice` on this path; the one `unsafe` is the scratch view, which
-//! has a single writer on its own thread.
+//! Blocking belongs on threads nothing schedules. These are `std::thread`s, spawned once,
+//! parked on `recv` between calls, and nothing can steal them.
 //!
-//! ponytail: the pool's scope is ONE call, so a chunk touched by two selections is read
-//! and decoded twice, and read concurrency is capped by the items in one call (~70 here).
-//! Widening the scope to a whole batch fixes both at once -- a job would carry several
-//! (piece, coords) targets and dedup would be exact -- but it needs the Python side to
-//! hand over more than one selection at a time. Next step, deliberately not this one.
+//! Tokio would not help either: the store here is `FilesystemStore` and `get_partial` is a
+//! blocking `pread`, so tokio would hand it to `spawn_blocking` -- the same threads with an
+//! async layer in front. The tokio runtime this crate already has is an async->sync bridge
+//! for the *remote* stores, which is the opposite direction. Tokio earns its keep on the
+//! object-store path, where one thread can hold thousands of requests outstanding.
+//!
+//! # Data movement
+//!
+//! Exactly one copy, and it is the gather:
+//!
+//! 1. `get_partial` -> `Bytes`: allocated by the store, **moved** through the channel.
+//! 2. decode -> scratch: a write, into a buffer each worker keeps and reuses forever.
+//! 3. gather scratch -> output: the one copy, scattered to contiguous, straight into the
+//!    numpy buffer. No intermediate `Vec`, no assembly pass.
+//!
+//! # Safety
+//!
+//! Writing into the output from a worker needs a `'static` message, so a job carries a raw
+//! region rather than a borrowed slice. The disjointness that makes this sound is
+//! **verified** before any job is sent: regions are sorted by the offset each item's own
+//! subset names and checked for overlap, and the caller blocks until every job it sent has
+//! replied, so the buffer outlives the jobs. The fused path makes the same aliasing argument
+//! in a comment and never checks it.
+//!
+//! ponytail: the pool's scope is ONE call, so a chunk touched by two selections is read and
+//! decoded twice, and read concurrency is capped by the items in one call (~70 here).
+//! Widening to a whole batch fixes both -- a job would carry several (region, coords)
+//! targets and dedup would be exact -- but it needs the Python side to hand over more than
+//! one selection at a time.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use pyo3::PyResult;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
     ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
-    CodecOptions,
+    CodecOptions, DataType, FillValue,
 };
-use zarrs::storage::StoreKey;
 use zarrs::storage::byte_range::ByteRange;
-use zarrs::storage::MaybeBytes;
+use zarrs::storage::{MaybeBytes, ReadableWritableListableStorage, StoreKey};
 
 use crate::CodecPipelineImpl;
 use crate::chunk_item::ChunkItem;
 use crate::shard_index::ShardInfo;
 use crate::utils::{PyCodecErrExt as _, PyErrExt as _};
 
-/// Two fixed pools for the process, built on the first read request and never rebuilt.
+/// A disjoint region of the output, owned exclusively by one job.
 ///
-/// zarr builds one `CodecPipelineImpl` per array, so pools owned by a pipeline are built
-/// once per ARRAY: the 14-store set came to 28 pipelines and 2,240 threads. They are built
-/// here instead, lazily, so opening a group allocates nothing at all -- the threads appear
-/// when a read is first asked for, and from then on a request is just closures handed to
-/// threads that already exist.
-///
-/// Fixed, not rebuildable: the width is whatever the first read request asked for, and a
-/// later request for a different width is an error rather than a silent rebuild. Sweeping
-/// `read_concurrency` therefore takes one job per point, which is what the ratios want
-/// anyway -- each job runs its own pool arm beside its own fallback arm, and the ratios are
-/// what get compared across points, never the absolutes.
-static READ_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-static DECODE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+/// A raw pointer rather than `&mut [u8]` so a job is `'static` and can be handed to a thread
+/// that outlives the call. Sound because `verify_disjoint` proves no two regions in a call
+/// overlap, and because the caller does not return until every job has replied.
+struct OutRegion {
+    ptr: *mut u8,
+    len: usize,
+    /// Where this region starts in the output, in bytes. Kept for the overlap check and for
+    /// error messages; not used to address memory.
+    offset: usize,
+}
 
-/// The process-wide pool for `name`, built at `width` if this is the first request.
-fn fixed_pool(
-    cell: &'static OnceLock<rayon::ThreadPool>,
-    width: usize,
-    name: &'static str,
-) -> PyResult<&'static rayon::ThreadPool> {
-    let width = width.max(1);
-    if cell.get().is_none() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(width)
-            .thread_name(move |i| format!("zarrs-{name}-{i}"))
-            .build()
-            .map_py_err::<PyRuntimeError>()?;
-        // A racing caller may have won; theirs is as good as ours, and the width is
-        // checked below either way.
-        let _ = cell.set(pool);
+// SAFETY: each region is exclusive to its job (checked by `verify_disjoint`) and the buffer
+// outlives the job (the caller blocks for every reply before returning).
+unsafe impl Send for OutRegion {}
+
+impl OutRegion {
+    /// # Safety
+    /// Only one job may hold this region, and the output buffer must still be alive.
+    unsafe fn as_mut(&self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
-    let pool = cell.get().expect("set above");
-    // A knob that was set is not a knob that arrived. The pool is fixed for the process, so
-    // a second width cannot be served -- and running at the first caller's width instead
-    // would put a number in the report under the wrong config.
-    if pool.current_num_threads() != width {
+}
+
+/// The coordinates wanted from a chunk, borrowed from the `ChunkItem` the caller holds.
+///
+/// Same argument as `OutRegion`: `'static` for the channel, alive because the caller blocks.
+struct CoordsRef {
+    ptr: *const u64,
+    len: usize,
+}
+
+// SAFETY: read-only, and the `ChunkItem` it points into outlives the job.
+unsafe impl Send for CoordsRef {}
+
+impl CoordsRef {
+    unsafe fn as_slice(&self) -> &[u64] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// What one worker reports back when it is done with a job.
+enum Outcome {
+    /// A chunk was read and decoded.
+    Decoded,
+    /// The chunk was absent; the region was filled with the fill value.
+    Filled,
+    Failed(String),
+}
+
+/// One innermost chunk of work.
+struct Job {
+    key: StoreKey,
+    range: ByteRange,
+    out: OutRegion,
+    coords: CoordsRef,
+    /// Everything the decode needs, shared rather than copied per job.
+    ctx: Arc<JobContext>,
+    /// Where to report completion. Per call, so a reply finds the right caller.
+    done: Sender<Outcome>,
+}
+
+/// The per-array state a decode needs, shared by every job of a call.
+struct JobContext {
+    shard: Arc<ShardInfo>,
+    store: ReadableWritableListableStorage,
+    data_type: DataType,
+    fill_value: FillValue,
+    codec_options: CodecOptions,
+    element_size: usize,
+}
+
+/// The process-wide pipeline: R reader threads and D decode threads, parked between calls.
+struct Pipeline {
+    jobs: Sender<Job>,
+    read_threads: usize,
+    decode_threads: usize,
+}
+
+static PIPELINE: OnceLock<Pipeline> = OnceLock::new();
+/// Serialises construction. `OnceLock::get().is_none()` then `set()` is check-then-act: two
+/// first callers both spawn R + D threads and the loser's are thrown away -- and when they
+/// asked for different widths, which one gets the "fixed for the process" error is a coin
+/// flip. `pipeline.py` dispatches reads through `asyncio.to_thread` and the GIL is released,
+/// so concurrent first calls are ordinary, not hypothetical.
+static PIPELINE_INIT: Mutex<()> = Mutex::new(());
+
+/// Start the threads on the first read request, at the configured widths.
+///
+/// Fixed for the process: a later request for a different width is an error rather than a
+/// silent run at somebody else's width, which would put a number in the report under the
+/// wrong config. Sweeping `read_concurrency` therefore takes one job per point, which is
+/// what the ratios want anyway -- each job runs its own pool arm beside its own fallback arm
+/// and the ratios are compared across points, never the absolutes.
+fn pipeline(read_threads: usize, decode_threads: usize) -> PyResult<&'static Pipeline> {
+    let (read_threads, decode_threads) = (read_threads.max(1), decode_threads.max(1));
+    if PIPELINE.get().is_none() {
+        let _init = PIPELINE_INIT.lock().expect("pipeline init poisoned");
+        // Re-check under the lock: whoever held it may have built it already.
+        if PIPELINE.get().is_some() {
+            return check_widths(PIPELINE.get().expect("just checked"), read_threads, decode_threads);
+        }
+        let (job_tx, job_rx) = unbounded::<Job>();
+        // Unbounded on purpose: a reader never waits for a decoder. Peak resident is
+        // items-per-call x encoded chunk size, small at ~70 items per call.
+        let (decode_tx, decode_rx) = unbounded::<(Job, MaybeBytes)>();
+
+        for i in 0..read_threads {
+            let (job_rx, decode_tx) = (job_rx.clone(), decode_tx.clone());
+            std::thread::Builder::new()
+                .name(format!("zarrs-read-{i}"))
+                .spawn(move || read_loop(&job_rx, &decode_tx))
+                .map_py_err::<PyRuntimeError>()?;
+        }
+        for i in 0..decode_threads {
+            let decode_rx = decode_rx.clone();
+            std::thread::Builder::new()
+                .name(format!("zarrs-decode-{i}"))
+                .spawn(move || decode_loop(&decode_rx))
+                .map_py_err::<PyRuntimeError>()?;
+        }
+        let _ = PIPELINE.set(Pipeline {
+            jobs: job_tx,
+            read_threads,
+            decode_threads,
+        });
+    }
+    check_widths(PIPELINE.get().expect("set above"), read_threads, decode_threads)
+}
+
+/// The widths are fixed for the process, so a call asking for different ones is refused
+/// rather than run at somebody else's width -- which would put a number in the report under
+/// the wrong config.
+fn check_widths(
+    pipeline: &'static Pipeline,
+    read_threads: usize,
+    decode_threads: usize,
+) -> PyResult<&'static Pipeline> {
+    if pipeline.read_threads != read_threads || pipeline.decode_threads != decode_threads {
         return Err(PyRuntimeError::new_err(format!(
-            "the {name} pool has {} threads and this call asked for {width}; it is fixed \
-             for the process, so sweep it one job per point",
-            pool.current_num_threads()
+            "the pipeline is running {} readers and {} decoders and this call asked for {} \
+             and {}; the threads are fixed for the process, so sweep one job per point",
+            pipeline.read_threads, pipeline.decode_threads, read_threads, decode_threads
         )));
     }
-    Ok(pool)
+    Ok(pipeline)
+}
+
+/// A reader: block on the filesystem, hand the bytes on, take the next job.
+///
+/// Never decodes. Parks on `recv` when there is nothing to read, for the life of the process.
+fn read_loop(jobs: &Receiver<Job>, decodes: &Sender<(Job, MaybeBytes)>) {
+    while let Ok(job) = jobs.recv() {
+        match job.ctx.store.get_partial(&job.key, job.range) {
+            // The bytes are MOVED to a decoder, not copied.
+            Ok(bytes) => {
+                if decodes.send((job, bytes)).is_err() {
+                    return; // no decoders left: the process is going away
+                }
+            }
+            Err(e) => {
+                let key = job.key.clone();
+                let _ = job.done.send(Outcome::Failed(format!("read {key} failed: {e}")));
+            }
+        }
+    }
+}
+
+/// A decode worker: decode the whole chunk into a scratch buffer it keeps forever, then
+/// copy out the wanted elements.
+fn decode_loop(decodes: &Receiver<(Job, MaybeBytes)>) {
+    // Allocated once per thread, reused for every chunk it ever handles, rather than once
+    // per chunk (which would be ~2,081 allocations of 386 KB per batch).
+    let mut scratch: Vec<u8> = Vec::new();
+    while let Ok((job, bytes)) = decodes.recv() {
+        let outcome = match decode_one(&job, bytes, &mut scratch) {
+            Ok(outcome) => outcome,
+            Err(e) => Outcome::Failed(e),
+        };
+        let _ = job.done.send(outcome);
+    }
+}
+
+fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Outcome, String> {
+    let ctx = &job.ctx;
+    let size = ctx.element_size;
+    // SAFETY: this job owns this region exclusively (checked by `verify_disjoint`) and the
+    // output buffer is alive because the caller has not returned.
+    let out = unsafe { job.out.as_mut() };
+    // SAFETY: read-only, and the ChunkItem it points into outlives this job.
+    let coords = unsafe { job.coords.as_slice() };
+
+    let Some(bytes) = bytes else {
+        // The index named an extent the store does not have.
+        return Err(format!("{} vanished between index and read", job.key));
+    };
+
+    let shape = &ctx.shard.inner_shape;
+    let elements: u64 = shape.iter().map(|s| s.get()).product();
+    let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
+    scratch.clear();
+    scratch.resize(needed, 0);
+
+    let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
+    {
+        let slice = UnsafeCellSlice::new(scratch.as_mut_slice());
+        let mut view = unsafe {
+            // SAFETY: this view is the only writer to `scratch`, which this thread owns.
+            ArrayBytesFixedDisjointView::new(
+                slice,
+                size,
+                &shape_u64,
+                ArraySubset::new_with_shape(shape_u64.clone()),
+            )
+            .map_err(|e| e.to_string())?
+        };
+        // The whole chunk, deliberately: blosc partial decode is quantised to blocks, which
+        // prices one getitem per element at 23,233x a full decode plus a gather.
+        ctx.shard
+            .inner_chain
+            .decode_into(
+                Cow::Owned(bytes.into()),
+                shape,
+                &ctx.data_type,
+                &ctx.fill_value,
+                ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+                &ctx.codec_options,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+
+    gather(scratch, coords, out, size).map_err(|e| format!("{}: {e}", job.key))?;
+    Ok(Outcome::Decoded)
+}
+
+/// The gather zarr-python does with one numpy fancy index, over an already-decoded buffer.
+///
+/// `out` is exactly `coords.len()` elements and contiguous, because the indices reached us
+/// non-decreasing -- so this writes straight into the output. This is the one copy.
+fn gather(scratch: &[u8], coords: &[u64], out: &mut [u8], size: usize) -> Result<(), String> {
+    if out.len() != coords.len() * size {
+        return Err("output region does not match the coordinate count".to_string());
+    }
+    for (n, &c) in coords.iter().enumerate() {
+        let src = usize::try_from(c).map_err(|e| e.to_string())? * size;
+        let Some(element) = scratch.get(src..src + size) else {
+            return Err(format!(
+                "coordinate {c} is outside the {} elements decoded",
+                scratch.len() / size
+            ));
+        };
+        out[n * size..(n + 1) * size].copy_from_slice(element);
+    }
+    Ok(())
+}
+
+/// An absent chunk contributes only fill value, repeated.
+fn fill(out: &mut [u8], fill_value: &FillValue, size: usize) -> Result<(), String> {
+    let bytes = fill_value.as_ne_bytes();
+    if bytes.len() != size {
+        return Err("the fill value is not one element wide".to_string());
+    }
+    for slot in out.chunks_exact_mut(size) {
+        slot.copy_from_slice(bytes);
+    }
+    Ok(())
 }
 
 /// What the pool did, so a run can prove this path executed rather than assuming it.
 ///
-/// The fused path produces correct output too, so only a count separates "the pool ran"
-/// from "the pool was configured and something else ran". `chunks == reads == decodes` is
-/// the invariant: one job per innermost chunk, read once, decoded once. Absent chunks are
-/// counted separately because they have no read to issue.
+/// The fused path produces correct output too, so only a count separates "the pool ran" from
+/// "the pool was configured and something else ran".
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PoolCounts {
     pub chunks: usize,
-    pub reads: usize,
-    pub decodes: usize,
+    pub decoded: usize,
     pub absent: usize,
     pub shard_indexes: usize,
-    /// Items this path could not take; these fall back to the fused path.
     pub declined: usize,
 }
 
-/// One innermost chunk: fetch `range` from `key`, decode it, copy `coords` into `piece`.
-struct Job<'a> {
-    key: StoreKey,
-    range: ByteRange,
-    /// Exclusively owned by this job. Travelling inside the job is what makes the
-    /// disjointness a move rather than an assertion.
-    piece: &'a mut [u8],
-    coords: &'a [u64],
-}
-
-/// An item whose chunk has been located in its shard. `None` range = the chunk is absent.
-struct Located<'a> {
-    item: &'a ChunkItem,
-    range: Option<ByteRange>,
-}
-
 impl CodecPipelineImpl {
-    /// Read and decode `items` with a reader pool feeding a decode pool.
+    /// Read and decode `items` through the process-wide reader and decode pools.
     ///
     /// `items` must be chunk-unit items: one whole innermost chunk each, carrying the
-    /// coordinates wanted from it. Returns the items this path could not take, for the
-    /// caller to run down the fused path.
+    /// coordinates wanted from it. Returns the items this path could not take, for the caller
+    /// to run down the fused path.
     pub(crate) fn retrieve_read_decode_pool<'a>(
         &self,
-        shard: &ShardInfo,
+        shard: &Arc<ShardInfo>,
         items: &'a [ChunkItem],
         output: &mut [u8],
         codec_options: &CodecOptions,
     ) -> PyResult<(Vec<&'a ChunkItem>, PoolCounts)> {
-        let size = self
+        let element_size = self
             .data_type
             .fixed_size()
             .ok_or("variable length data type not supported")
             .map_py_err::<PyTypeError>()?;
 
-        // Flat by construction: a target of one means a decode worker spawns nothing
-        // underneath itself. Inheriting the fused path's target would renest silently --
+        // Nothing nests: the codec chain gets a target of one, so a decode does not spawn
+        // work underneath itself. Inheriting the fused path's target would renest silently --
         // and that target is the 4 of the (4, 4) split `calc_concurrency_outer_inner`
-        // produces here, which is what leaves the fused path using a quarter of its
-        // threads.
-        let codec_options = codec_options.clone().with_concurrent_target(1);
-        let codec_options = &codec_options;
+        // produces here, which is what leaves the fused path using a quarter of its threads.
+        let ctx = Arc::new(JobContext {
+            shard: shard.clone(),
+            store: self.store.clone(),
+            data_type: self.data_type.clone(),
+            fill_value: self.fill_value.clone(),
+            codec_options: codec_options.clone().with_concurrent_target(1),
+            element_size,
+        });
 
-        // Built on the first read request; from here on this is a lookup, and the work is
-        // closures handed to threads that already exist.
-        let read_pool = fixed_pool(&READ_POOL, self.read_concurrency, "read")?;
-        let decode_pool = fixed_pool(&DECODE_POOL, self.decode_concurrency, "decode")?;
+        let pipeline = pipeline(self.read_concurrency, self.decode_concurrency)?;
 
-        // ------------------------------------------------- locate each chunk in its shard
-        let (located, declined, shard_indexes) = self.locate_chunks(shard, items, codec_options)?;
+        // ---------------------------------------------- locate each chunk in its shard
+        let (located, declined, shard_indexes) = self.locate_chunks(shard, items, &ctx)?;
         let declined_n = declined.len();
         if located.is_empty() {
             return Ok((
@@ -188,171 +406,95 @@ impl CodecPipelineImpl {
             ));
         }
 
-        // --------------------------------------------------- the output, split up front
-        // Each item's slice of the output, carved at the offset its own subset names --
-        // NOT sequentially in item order. A call carries several entries, one per shard,
-        // each with its own out_selection start, and declined items leave holes that
-        // belong to the fused path. Carving in item order would hand a worker somebody
-        // else's bytes.
-        //
-        // This path is 1-D by construction (`_chunk_unit_items` declines anything else),
-        // so an output offset is just `subset.start * size`.
-        let mut order: Vec<usize> = (0..located.len()).collect();
-        order.sort_by_key(|&i| output_offset(located[i].item));
-
-        let mut carved: Vec<(usize, &mut [u8])> = Vec::with_capacity(order.len());
-        let mut rest: &mut [u8] = output;
-        let mut cursor = 0usize;
-        for &i in &order {
-            let item = located[i].item;
-            let off = output_offset(item) * size;
-            let len = coords_of(item)?.len() * size;
-            if off < cursor {
+        // ------------------------------------------------------ carve the output, checked
+        let mut regions = Vec::with_capacity(located.len());
+        for (item, _) in &located {
+            let offset = output_offset(item) * element_size;
+            let len = coords_of(item)?.len() * element_size;
+            if offset + len > output.len() {
                 return Err(PyRuntimeError::new_err(format!(
-                    "{} overlaps an earlier item's output: pieces must be disjoint",
-                    item.key
-                )));
-            }
-            let skip = off - cursor;
-            if skip + len > rest.len() {
-                return Err(PyRuntimeError::new_err(format!(
-                    "{} names output bytes {off}..{} beyond the {} available",
+                    "{} names output bytes {offset}..{} beyond the {} available",
                     item.key,
-                    off + len,
-                    cursor + rest.len()
+                    offset + len,
+                    output.len()
                 )));
             }
-            let (_hole, tail) = rest.split_at_mut(skip);
-            let (piece, tail) = tail.split_at_mut(len);
-            carved.push((i, piece));
-            rest = tail;
-            cursor = off + len;
+            regions.push(OutRegion {
+                // SAFETY of the pointer arithmetic: offset + len is within the slice, checked
+                // just above.
+                ptr: unsafe { output.as_mut_ptr().add(offset) },
+                len,
+                offset,
+            });
         }
+        verify_disjoint(&regions, &located)?;
 
-        // ------------------------------------------------------------------ the job list
-        let mut jobs: Vec<Job<'_>> = Vec::with_capacity(carved.len());
+        // --------------------------------------------- absent chunks: no read, no decode
+        let (done_tx, done_rx) = bounded::<Outcome>(located.len());
         let mut absent = 0usize;
-        for (i, piece) in carved {
-            let item = located[i].item;
-            let coords = coords_of(item)?;
-            match located[i].range {
-                Some(range) => jobs.push(Job {
-                    key: item.key.clone(),
-                    range,
-                    piece,
-                    coords,
-                }),
-                // Absent chunk: every element the selection wants from it is the fill
-                // value, written now. There is no read and no decode to do.
+        let mut sent = 0usize;
+        for ((item, range), region) in located.iter().zip(regions) {
+            match range {
+                Some(range) => {
+                    pipeline
+                        .jobs
+                        .send(Job {
+                            key: item.key.clone(),
+                            range: *range,
+                            out: region,
+                            coords: CoordsRef {
+                                ptr: coords_of(item)?.as_ptr(),
+                                len: coords_of(item)?.len(),
+                            },
+                            ctx: ctx.clone(),
+                            done: done_tx.clone(),
+                        })
+                        .map_py_err::<PyRuntimeError>()?;
+                    sent += 1;
+                }
                 None => {
                     absent += 1;
-                    fill_piece(piece, &self.fill_value, size)?;
+                    // SAFETY: this region belongs to no job; nothing else can touch it.
+                    let out = unsafe { region.as_mut() };
+                    fill(out, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
                 }
             }
         }
+        drop(done_tx);
 
-        let chunks = jobs.len();
-        if jobs.is_empty() {
-            return Ok((
-                declined,
-                PoolCounts {
-                    absent,
-                    shard_indexes,
-                    declined: declined_n,
-                    ..PoolCounts::default()
-                },
-            ));
-        }
-
-        // ------------------------------------------------------------ read, then decode
-        let (job_tx, job_rx): (Sender<Job<'_>>, Receiver<Job<'_>>) = unbounded();
-        for job in jobs {
-            job_tx.send(job).expect("receiver is alive");
-        }
-        drop(job_tx); // readers see the queue close once it drains
-
-        // Unbounded on purpose: a reader never waits for a decoder. Peak resident is
-        // items-per-call x encoded chunk size, small at ~70 items per call; it scales with
-        // the call size, so revisit if the scope widens to a whole batch.
-        let (done_tx, done_rx): (Sender<(Job<'_>, MaybeBytes)>, Receiver<_>) = unbounded();
-
-        let reads_counter = AtomicUsize::new(0);
-        let decodes_counter = AtomicUsize::new(0);
-        let first_error: Mutex<Option<String>> = Mutex::new(None);
-        let record_owned = |e: String| {
-            let mut slot = first_error.lock().expect("error slot poisoned");
-            if slot.is_none() {
-                *slot = Some(e);
-            }
-        };
-        // Every worker closure is `move`, and a loop body would otherwise move the counter
-        // into the first iteration. `&AtomicUsize` is Copy, so hand each closure a
-        // reference instead.
-        let reads = &reads_counter;
-        let decodes = &decodes_counter;
-        let record = &record_owned;
-
-        decode_pool.scope(|decoders| {
-            // Long-lived workers: one spawn per worker per call, not one per chunk, so a
-            // worker's scratch buffer is reused across every chunk it handles.
-            for _ in 0..decode_pool.current_num_threads() {
-                let done_rx = done_rx.clone();
-                decoders.spawn(move |_| {
-                    let mut scratch: Vec<u8> = Vec::new();
-                    while let Ok((job, bytes)) = done_rx.recv() {
-                        match self.decode_into_piece(
-                            shard,
-                            bytes,
-                            job.piece,
-                            job.coords,
-                            size,
-                            &mut scratch,
-                            codec_options,
-                        ) {
-                            Ok(()) => {
-                                decodes.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(e) => record(format!("decode {} failed: {e}", job.key)),
-                        }
+        // ------------------------------------------------------------------ wait for all
+        // Every job must reply before this returns: the regions and coordinate slices the
+        // workers hold point into memory owned by the caller.
+        let mut decoded = 0usize;
+        let mut first_error: Option<String> = None;
+        for _ in 0..sent {
+            match done_rx.recv() {
+                Ok(Outcome::Decoded) => decoded += 1,
+                Ok(Outcome::Filled) => absent += 1,
+                Ok(Outcome::Failed(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
-                });
-            }
-            drop(done_rx);
-
-            read_pool.scope(|readers| {
-                for _ in 0..read_pool.current_num_threads() {
-                    let job_rx = job_rx.clone();
-                    let done_tx = done_tx.clone();
-                    readers.spawn(move |_| {
-                        while let Ok(job) = job_rx.recv() {
-                            match self.store.get_partial(&job.key, job.range) {
-                                Ok(bytes) => {
-                                    reads.fetch_add(1, Ordering::Relaxed);
-                                    // The signal: handing the bytes over wakes a decode
-                                    // worker. The reader takes its next job at once.
-                                    if done_tx.send((job, bytes)).is_err() {
-                                        return; // decoders gave up on an error
-                                    }
-                                }
-                                Err(e) => record(format!("read {} failed: {e}", job.key)),
-                            }
-                        }
-                    });
                 }
-            });
-            // Every reader has returned, so no more sends: closing this ends the decoders.
-            drop(done_tx);
-        });
-
-        if let Some(e) = first_error.lock().expect("error slot poisoned").take() {
+                // A worker died without replying. Returning now would free memory the
+                // survivors still hold, so this is not recoverable.
+                Err(e) => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "a pool worker stopped without replying after {decoded} of {sent} \
+                         chunks ({e}); the pool cannot be trusted for the rest of this run"
+                    )));
+                }
+            }
+        }
+        if let Some(e) = first_error {
             return Err(PyRuntimeError::new_err(e));
         }
+
         Ok((
             declined,
             PoolCounts {
-                chunks,
-                reads: reads.load(Ordering::Relaxed),
-                decodes: decodes.load(Ordering::Relaxed),
+                chunks: sent,
+                decoded,
                 absent,
                 shard_indexes,
                 declined: declined_n,
@@ -364,12 +506,13 @@ impl CodecPipelineImpl {
     ///
     /// One index read per distinct shard, cached for the call, so N items sharing a shard
     /// cost one index read rather than N.
+    #[allow(clippy::type_complexity)]
     fn locate_chunks<'a>(
         &self,
         shard: &ShardInfo,
         items: &'a [ChunkItem],
-        codec_options: &CodecOptions,
-    ) -> PyResult<(Vec<Located<'a>>, Vec<&'a ChunkItem>, usize)> {
+        ctx: &JobContext,
+    ) -> PyResult<(Vec<(&'a ChunkItem, Option<ByteRange>)>, Vec<&'a ChunkItem>, usize)> {
         let mut indexes: HashMap<StoreKey, Option<Vec<u64>>> = HashMap::new();
         let mut located = Vec::with_capacity(items.len());
         let mut declined = Vec::new();
@@ -381,115 +524,54 @@ impl CodecPipelineImpl {
             }
             if !indexes.contains_key(&item.key) {
                 let chunks_per_shard = shard.chunks_per_shard(&item.shape)?;
-                let index =
-                    shard.read_index(&self.store, &item.key, &chunks_per_shard, codec_options)?;
+                let index = shard.read_index(
+                    &self.store,
+                    &item.key,
+                    &chunks_per_shard,
+                    &ctx.codec_options,
+                )?;
                 indexes.insert(item.key.clone(), index);
             }
             let Some(index) = indexes.get(&item.key).expect("just inserted") else {
-                // No shard at all: everything in it is the fill value.
-                located.push(Located { item, range: None });
+                located.push((item, None)); // no shard at all: fill value
                 continue;
             };
-            let linear = shard.linear_index_1d(item.chunk_subset.start().first().copied().unwrap_or(0));
-            located.push(Located {
-                item,
-                range: ShardInfo::chunk_range(index, linear)?,
-            });
+            let linear =
+                shard.linear_index_1d(item.chunk_subset.start().first().copied().unwrap_or(0));
+            located.push((item, ShardInfo::chunk_range(index, linear)?));
         }
         let shard_indexes = indexes.len();
         Ok((located, declined, shard_indexes))
     }
-
-    /// Decode one whole innermost chunk into `scratch`, then copy the wanted elements out.
-    ///
-    /// The whole chunk, deliberately: blosc partial decode is quantised to blocks, which
-    /// prices one getitem per element at 23,233x a full decode plus a gather. The chunk is
-    /// the decode unit and the gather picks out of it.
-    #[allow(clippy::too_many_arguments)]
-    fn decode_into_piece(
-        &self,
-        shard: &ShardInfo,
-        bytes: MaybeBytes,
-        piece: &mut [u8],
-        coords: &[u64],
-        size: usize,
-        scratch: &mut Vec<u8>,
-        codec_options: &CodecOptions,
-    ) -> PyResult<()> {
-        let Some(bytes) = bytes else {
-            // The index named an extent but the store has nothing there.
-            return Err(PyRuntimeError::new_err(
-                "the shard index named a byte range the store does not have",
-            ));
-        };
-
-        let shape = &shard.inner_shape;
-        let elements: u64 = shape.iter().map(|s| s.get()).product();
-        let needed = usize::try_from(elements).map_py_err::<PyRuntimeError>()? * size;
-        scratch.clear();
-        scratch.resize(needed, 0);
-
-        let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
-        let slice = UnsafeCellSlice::new(scratch.as_mut_slice());
-        let mut view = unsafe {
-            // SAFETY: this view is the only writer to `scratch`, which this worker owns.
-            ArrayBytesFixedDisjointView::new(
-                slice,
-                size,
-                &shape_u64,
-                ArraySubset::new_with_shape(shape_u64.clone()),
-            )
-            .map_py_err::<PyRuntimeError>()?
-        };
-        shard
-            .inner_chain
-            .decode_into(
-                Cow::Owned(bytes.into()),
-                shape,
-                &self.data_type,
-                &self.fill_value,
-                ArrayBytesDecodeIntoTarget::Fixed(&mut view),
-                codec_options,
-            )
-            .map_codec_err()?;
-
-        gather(scratch, coords, piece, size)
-    }
 }
 
-/// The gather zarr-python does with one numpy fancy index, over an already-decoded buffer.
+/// Prove no two regions overlap before any of them is handed to a thread.
 ///
-/// `piece` is exactly `coords.len()` elements and contiguous, because the indices reached
-/// us non-decreasing -- so this writes straight into the output with no temporary.
-fn gather(scratch: &[u8], coords: &[u64], piece: &mut [u8], size: usize) -> PyResult<()> {
-    if piece.len() != coords.len() * size {
-        return Err(PyRuntimeError::new_err(
-            "output piece does not match the coordinate count",
-        ));
-    }
-    for (n, &c) in coords.iter().enumerate() {
-        let src = usize::try_from(c).map_py_err::<PyRuntimeError>()? * size;
-        let Some(element) = scratch.get(src..src + size) else {
-            return Err(PyRuntimeError::new_err(format!(
-                "coordinate {c} is outside the {} elements decoded",
-                scratch.len() / size
-            )));
-        };
-        piece[n * size..(n + 1) * size].copy_from_slice(element);
-    }
-    Ok(())
-}
-
-/// An absent chunk contributes only fill value, repeated across the piece.
-fn fill_piece(piece: &mut [u8], fill_value: &zarrs::array::FillValue, size: usize) -> PyResult<()> {
-    let bytes = fill_value.as_ne_bytes();
-    if bytes.len() != size {
-        return Err(PyRuntimeError::new_err(
-            "the fill value is not one element wide",
-        ));
-    }
-    for slot in piece.chunks_exact_mut(size) {
-        slot.copy_from_slice(bytes);
+/// The chunk-unit grouping emits non-decreasing index groups, so the regions should partition
+/// the part of the output this call owns. Checking it is the difference between a sound
+/// `unsafe` and an assertion in a comment.
+fn verify_disjoint(regions: &[OutRegion], located: &[(&ChunkItem, Option<ByteRange>)]) -> PyResult<()> {
+    let mut order: Vec<usize> = (0..regions.len()).collect();
+    order.sort_by_key(|&i| regions[i].offset);
+    let mut prev_end = 0usize;
+    let mut prev: Option<usize> = None;
+    for &i in &order {
+        let r = &regions[i];
+        if let Some(p) = prev {
+            if r.offset < prev_end {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{} claims output bytes {}..{} which overlap {}'s {}..{}",
+                    located[i].0.key,
+                    r.offset,
+                    r.offset + r.len,
+                    located[p].0.key,
+                    regions[p].offset,
+                    prev_end
+                )));
+            }
+        }
+        prev_end = r.offset + r.len;
+        prev = Some(i);
     }
     Ok(())
 }
@@ -503,8 +585,8 @@ fn coords_of(item: &ChunkItem) -> PyResult<&Vec<u64>> {
 
 /// Where an item's elements land in the output, in elements.
 ///
-/// 1-D only, which is what this path accepts: `_chunk_unit_items` declines any selection
-/// whose chunk subset, chunk selection or output selection is not one-dimensional.
+/// 1-D only, which is what this path accepts: `_chunk_unit_items` declines any selection whose
+/// chunk subset, chunk selection or output selection is not one-dimensional.
 fn output_offset(item: &ChunkItem) -> usize {
     usize::try_from(item.subset.start().first().copied().unwrap_or(0)).unwrap_or(usize::MAX)
 }
