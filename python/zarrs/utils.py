@@ -251,7 +251,7 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
-def _coordinate_chunk_item(entry, shape, drop_axes) -> ChunkItem | None:
+def _coordinate_chunk_item(entry, shape, drop_axes, max_mean_run: int) -> ChunkItem | None:
     """One item per chunk carrying the selection's indices, or None if not that shape.
 
     The splitter turns a scattered selection into one item per run of consecutive indices,
@@ -280,6 +280,14 @@ def _coordinate_chunk_item(entry, shape, drop_axes) -> ChunkItem | None:
         return None
     if (indices < 0).any():
         return None
+    # Which description is cheaper is a property of the selection, not of the caller. A run
+    # of consecutive indices is one range the decoder reads as a range; as coordinates it is
+    # walked element by element. So coordinates are for selections whose runs are SHORT --
+    # strided, permuted, scattered -- and rectangles for the long ones, like a CSR row's
+    # thousands of consecutive elements. The mean run length says which this is, in one pass.
+    runs = 1 + int(np.count_nonzero(indices[1:] != indices[:-1] + 1))
+    if indices.size / runs > max_mean_run:
+        return None
     return ChunkItem(
         key=byte_getter.path,
         # The bounding box, only so the item has a chunk subset at all: what is read is the
@@ -300,13 +308,14 @@ def make_chunk_info_for_rust_with_indices(
     # Reads only: items sharing a chunk key would race in the write path's read-modify-write.
     integer_array_indexing: bool = False,
     coordinate_indexing: bool = False,
+    coordinate_max_mean_run: int = 16,
 ) -> RustChunkInfo:
     batch_info = _as_int64_batch_info(batch_info)
     coordinate_items: list[ChunkItem] = []
     if coordinate_indexing:
         kept = []
         for entry in batch_info:
-            item = _coordinate_chunk_item(entry, shape, drop_axes)
+            item = _coordinate_chunk_item(entry, shape, drop_axes, coordinate_max_mean_run)
             if item is None:
                 kept.append(entry)
             else:

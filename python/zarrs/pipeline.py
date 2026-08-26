@@ -192,6 +192,9 @@ class ZarrsCodecPipeline(CodecPipeline):
                 coordinate_indexing=config.get(
                     "codec_pipeline.coordinate_indexing", False
                 ),
+                coordinate_max_mean_run=config.get(
+                    "codec_pipeline.coordinate_max_mean_run", 16
+                ),
                 integer_array_indexing=config.get(
                     "codec_pipeline.integer_array_indexing", False
                 ),
