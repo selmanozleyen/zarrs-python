@@ -261,6 +261,8 @@ def make_chunk_info_for_rust_with_indices(
 ) -> RustChunkInfo:
     batch_info = _as_int64_batch_info(batch_info)
     if integer_array_indexing:
+        # Only a selection holding an integer array can split, so leave a pure-slice read --
+        # every basic selection -- to pass through without paying for the attempt.
         batch_info = [
             (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
             for (
@@ -270,8 +272,18 @@ def make_chunk_info_for_rust_with_indices(
                 out_selection,
                 is_complete,
             ) in batch_info
-            for box_chunk_sel, box_out_sel in split_selection_runs(
-                chunk_selection, out_selection
+            for box_chunk_sel, box_out_sel in (
+                split_selection_runs(chunk_selection, out_selection)
+                if isinstance(chunk_selection, np.ndarray)
+                or any(
+                    isinstance(sel, np.ndarray)
+                    for sel in (
+                        chunk_selection
+                        if isinstance(chunk_selection, tuple)
+                        else (chunk_selection,)
+                    )
+                )
+                else ((chunk_selection, out_selection),)
             )
         ]
     is_constant = shape == ()
