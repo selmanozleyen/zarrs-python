@@ -44,4 +44,4 @@ lto = true
 # entries, so the sibling crates resolve from crates.io exactly as they do for the
 # released 0.23.6 -- keeping them local pins them at the tag's versions, which splits
 # zarrs_storage in two and leaves zarrs_filesystem too old for file_handle_cache_size.
-zarrs = { git = "https://github.com/selmanozleyen/zarrs", rev = "8c4fd729955eede6f2f4f8f46267dadaeab17276" }
+zarrs = { git = "https://github.com/selmanozleyen/zarrs", rev = "1c62f01ccd8de88ce59cf7e7e6343089ade27786" }
