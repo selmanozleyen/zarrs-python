@@ -159,6 +159,22 @@ def resulting_shape_from_index(
     *,
     pad: bool,
 ) -> tuple[int, ...]:
+    # An all-slice selector of full arity needs none of the bookkeeping below, and it is what
+    # every basic selection and every split integer-array run converts to.
+    if not drop_axes and len(index_tuple) == len(array_shape):
+        fast_shape = []
+        for idx, size in zip(index_tuple, array_shape, strict=True):
+            if type(idx) is not slice:
+                break
+            if idx.step is not None and idx.step > 1:
+                raise DiscontiguousArrayError(
+                    "Step size greater than 1 is not supported"
+                )
+            start, stop, _ = idx.indices(size)
+            fast_shape.append(stop - start)
+        else:
+            return tuple(fast_shape)
+
     result_shape = []
     advanced_index_shapes = [
         idx.shape for idx in index_tuple if isinstance(idx, np.ndarray)
@@ -281,15 +297,22 @@ def make_chunk_info_for_rust_with_indices(
             pad=True,
             drop_axes=drop_axes,
         )
-        shape_chunk_selection = get_shape_for_selector(
-            chunk_selection, chunk_spec.shape, pad=True, drop_axes=drop_axes
-        )
-        if (chunk_size := prod_op(shape_chunk_selection)) != prod_op(
-            shape_chunk_selection_slices
+        # A selector that is already all slices converts to itself, so the check below would
+        # compare a value with itself -- which is every run the splitter emits.
+        if isinstance(chunk_selection, tuple) and all(
+            isinstance(sel, slice) for sel in chunk_selection
         ):
-            raise UnsupportedVIndexingError(
-                f"{shape_chunk_selection} != {shape_chunk_selection_slices}"
+            shape_chunk_selection = shape_chunk_selection_slices
+            chunk_size = prod_op(shape_chunk_selection)
+        else:
+            shape_chunk_selection = get_shape_for_selector(
+                chunk_selection, chunk_spec.shape, pad=True, drop_axes=drop_axes
             )
+            chunk_size = prod_op(shape_chunk_selection)
+            if chunk_size != prod_op(shape_chunk_selection_slices):
+                raise UnsupportedVIndexingError(
+                    f"{shape_chunk_selection} != {shape_chunk_selection_slices}"
+                )
         if not is_constant and chunk_size > prod_op(shape):
             raise IndexError(
                 f"the size of the chunk subset {shape_chunk_selection} and input/output subset {shape} are incompatible"
