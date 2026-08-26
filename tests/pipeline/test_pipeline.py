@@ -167,7 +167,7 @@ def test_file_handle_cache(tmp_path: Path, cache_size: int) -> None:
         assert _open_fds() - before == cache_size
 
 
-@pytest.mark.parametrize("cache_size", [0, 8])
+@pytest.mark.parametrize("cache_size", [0, 8, None])
 def test_shard_index_cache(tmp_path: Path, cache_size: int) -> None:
     with zarr.config.set(
         {

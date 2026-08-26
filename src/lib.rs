@@ -55,9 +55,11 @@ pub struct CodecPipelineImpl {
     pub(crate) chunk_concurrent_minimum: usize,
     pub(crate) chunk_concurrent_maximum: usize,
     pub(crate) num_threads: usize,
-    /// Partial decoders keyed by chunk, retained across calls. Building one
-    /// reads and decodes the shard index, so reusing it across reads of the
-    /// same shards removes that work. `None` when disabled.
+    /// Partial decoders keyed by chunk, retained across calls. Building one reads and
+    /// decodes the shard index, so reusing it across reads of the same shards removes that
+    /// work. An entry is one offset/length pair per inner chunk, so it grows with how much
+    /// of the array has been read rather than with any one read -- hence the optional cap.
+    /// `None` when disabled.
     shard_index_cache: Option<Mutex<LruCache<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>>>,
     /// Innermost chunk shape, the unit the codec chain decodes. `None` when not sharded.
     inner_chunk_shape: Option<Vec<u64>>,
@@ -383,7 +385,7 @@ impl CodecPipelineImpl {
         num_threads=None,
         direct_io=false,
         file_handle_cache_size=0,
-        shard_index_cache_size=0,
+        shard_index_cache_size=None,
     ))]
     #[new]
     fn new(
@@ -395,7 +397,7 @@ impl CodecPipelineImpl {
         num_threads: Option<usize>,
         direct_io: bool,
         file_handle_cache_size: usize,
-        shard_index_cache_size: usize,
+        shard_index_cache_size: Option<usize>,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
@@ -444,8 +446,13 @@ impl CodecPipelineImpl {
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
-            shard_index_cache: NonZeroUsize::new(shard_index_cache_size)
-                .map(|size| Mutex::new(LruCache::new(size))),
+            shard_index_cache: match shard_index_cache_size {
+                // Unbounded by default: an index is small, and capping it only matters for a
+                // dataset with far more shards than the process has memory for their indexes.
+                None => Some(Mutex::new(LruCache::unbounded())),
+                Some(0) => None,
+                Some(size) => NonZeroUsize::new(size).map(|size| Mutex::new(LruCache::new(size))),
+            },
             inner_chunk_shape: innermost_chunk_shape(array_metadata),
             fill_value,
             data_type,

@@ -56,7 +56,8 @@ The `ZarrsCodecPipeline` specific options are:
   - Read only case, one integer-array axis, indices non-decreasing (repeats fine). Anything else falls back to `zarr-python` as before.
   - Extracting any part of an inner chunk decodes all of it, so each inner chunk a run lands in is decoded once and held for the rest of that read rather than decoded again per run. A read therefore holds at most one inner chunk per run, freed when it returns.
 - `codec_pipeline.shard_index_cache_size`: the number of chunks whose partial decoder is retained between reads. Building one reads and decodes the chunk's index, so for a sharded array repeatedly read in pieces — a training loop over random rows, say — caching them removes an index read and decode per shard per batch.
-  - Defaults to `0` (disabled). Cleared on any write through this pipeline, but a cached index does not observe modification from anywhere else, including `zarr-python`'s own `resize` and `delete_dir`. Only enable this while nothing is modifying the array.
+  - Defaults to `None`, unbounded. An entry holds one offset/length pair per inner chunk, so it is small per shard but accumulates with how much of the array has been read rather than being freed per read: a full pass holds one index per shard. Set an integer to cap the number of entries, for an array with far more shards than there is memory for their indexes, or `0` to disable.
+  - Cleared on any write through this pipeline, but a cached index does not observe modification from anywhere else, including `zarr-python`'s own `resize` and `delete_dir`. Only enable this while nothing is modifying the array.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -74,7 +75,7 @@ zarr.config.set({
         "chunk_concurrent_minimum": 4,
         "file_handle_cache_size": 0,
         "integer_array_indexing": False,
-        "shard_index_cache_size": 0,
+        "shard_index_cache_size": None,
         "direct_io": False,
         "strict": False
     }

@@ -66,7 +66,7 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.file_handle_cache_size", 0
             ),
             shard_index_cache_size=config.get(
-                "codec_pipeline.shard_index_cache_size", 0
+                "codec_pipeline.shard_index_cache_size", None
             ),
         )
     except TypeError as e:
