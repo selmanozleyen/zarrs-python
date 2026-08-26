@@ -74,7 +74,7 @@ use zarrs::storage::{MaybeBytes, ReadableWritableListableStorage, StoreKey};
 use crate::CodecPipelineImpl;
 use crate::chunk_item::ChunkItem;
 use crate::shard_index::ShardInfo;
-use crate::utils::{PyCodecErrExt as _, PyErrExt as _};
+use crate::utils::PyErrExt as _;
 
 /// A disjoint region of the output, owned exclusively by one job.
 ///
@@ -122,8 +122,6 @@ impl CoordsRef {
 enum Outcome {
     /// A chunk was read and decoded.
     Decoded,
-    /// The chunk was absent; the region was filled with the fill value.
-    Filled,
     Failed(String),
 }
 
@@ -470,7 +468,6 @@ impl CodecPipelineImpl {
         for _ in 0..sent {
             match done_rx.recv() {
                 Ok(Outcome::Decoded) => decoded += 1,
-                Ok(Outcome::Filled) => absent += 1,
                 Ok(Outcome::Failed(e)) => {
                     if first_error.is_none() {
                         first_error = Some(e);
