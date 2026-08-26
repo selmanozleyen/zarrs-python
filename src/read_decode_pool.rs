@@ -487,16 +487,27 @@ impl CodecPipelineImpl {
             return Err(PyRuntimeError::new_err(e));
         }
 
-        Ok((
-            declined,
-            PoolCounts {
-                chunks: sent,
-                decoded,
-                absent,
-                shard_indexes,
-                declined: declined_n,
-            },
-        ))
+        let counts = PoolCounts {
+            chunks: sent,
+            decoded,
+            absent,
+            shard_indexes,
+            declined: declined_n,
+        };
+        // Per-call stats, behind an env var so a measurement run stays clean. The shard
+        // index count is the one that matters: those reads happen on the CALLING thread,
+        // one after another, before any job reaches the reader pool -- so they are
+        // full-latency and entirely serial, and if there are many of them per call they
+        // dominate no matter how many readers are waiting.
+        if std::env::var_os("ZARRS_POOL_STATS").is_some() {
+            eprintln!(
+                "POOL call: {} chunks, {} decoded, {} absent, {} shard indexes read \
+                 serially, {} declined",
+                counts.chunks, counts.decoded, counts.absent, counts.shard_indexes,
+                counts.declined
+            );
+        }
+        Ok((declined, counts))
     }
 
     /// Where each item's innermost chunk lives, from its shard's own offset/size table.
