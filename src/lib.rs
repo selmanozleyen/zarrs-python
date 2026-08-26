@@ -32,6 +32,7 @@ mod chunk_item;
 mod concurrency;
 mod read_decode_pool;
 mod runtime;
+mod shard_index;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -59,6 +60,10 @@ pub struct CodecPipelineImpl {
     pub(crate) read_pool: rayon::ThreadPool,
     pub(crate) decode_pool: rayon::ThreadPool,
     pub(crate) read_decode_pool_enabled: bool,
+    /// Present only for a singly-sharded array: the pool locates chunks itself, so it
+    /// needs the shard's index codecs and the codecs inside a shard. `None` means this
+    /// array cannot take the pool path at all.
+    pub(crate) shard: Option<shard_index::ShardInfo>,
 }
 
 impl CodecPipelineImpl {
@@ -281,6 +286,7 @@ impl CodecPipelineImpl {
         let codec_chain =
             Arc::new(CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?);
         let codec_options = CodecOptions::default().with_validate_checksums(validate_checksums);
+        let shard = shard_index::ShardInfo::from_codecs(&metadata_v3.codecs)?;
 
         let chunk_concurrent_minimum =
             chunk_concurrent_minimum.unwrap_or(global_config().chunk_concurrent_minimum());
@@ -338,29 +344,8 @@ impl CodecPipelineImpl {
             read_pool,
             decode_pool,
             read_decode_pool_enabled: read_decode_pool,
+            shard,
         })
-    }
-
-    /// One partial decoder for an item's shard. Extracted so the fused path and the
-    /// read/decode pool build it identically -- two constructions could differ in codec
-    /// options and only one of them would be the thing measured.
-    pub(crate) fn build_partial_decoder(
-        &self,
-        item: &chunk_item::ChunkItem,
-        codec_options: &CodecOptions,
-    ) -> PyResult<Arc<dyn ArrayPartialDecoderTraits>> {
-        let storage_handle = Arc::new(StorageHandle::new(self.store.clone()));
-        let input_handle = StoragePartialDecoder::new(storage_handle, item.key.clone());
-        self.codec_chain
-            .clone()
-            .partial_decoder(
-                Arc::new(input_handle),
-                &item.shape,
-                &self.data_type,
-                &self.fill_value,
-                codec_options,
-            )
-            .map_codec_err()
     }
 
     fn retrieve_chunks_and_apply_index(
@@ -372,10 +357,12 @@ impl CodecPipelineImpl {
         // The read/decode pool, when it is on and every item is a chunk-unit item. It
         // needs an exclusive output slice, so it cannot share the aliasing wrapper the
         // fused path takes -- hence the dispatch here rather than inside the loop.
-        if self.read_decode_pool_enabled
-            && !chunk_descriptions.is_empty()
-            && chunk_descriptions.iter().all(|i| i.coords.is_some())
-        {
+        if let (true, Some(shard)) = (
+            self.read_decode_pool_enabled
+                && !chunk_descriptions.is_empty()
+                && chunk_descriptions.iter().all(|i| i.coords.is_some()),
+            self.shard.as_ref(),
+        ) {
             let output = Self::nparray_to_mut_slice(value)?;
             let (declined, counts) = py.detach(|| {
                 let Some((_, codec_options)) =
@@ -383,14 +370,20 @@ impl CodecPipelineImpl {
                 else {
                     return Ok((Vec::new(), read_decode_pool::PoolCounts::default()));
                 };
-                self.retrieve_read_decode_pool(&chunk_descriptions, output, &codec_options)
+                self.retrieve_read_decode_pool(shard, &chunk_descriptions, output, &codec_options)
             })?;
             // An arm that silently ran the other path is not a result. One job per
             // innermost chunk, read once, decoded once, or this is not what was measured.
             if counts.chunks != counts.reads || counts.chunks != counts.decodes {
                 return Err(PyRuntimeError::new_err(format!(
-                    "read/decode pool accounting does not close: {} chunks, {} reads, {} decodes",
-                    counts.chunks, counts.reads, counts.decodes
+                    "read/decode pool accounting does not close: {} chunks, {} reads, \
+                     {} decodes ({} absent, {} shard indexes, {} declined)",
+                    counts.chunks,
+                    counts.reads,
+                    counts.decodes,
+                    counts.absent,
+                    counts.shard_indexes,
+                    counts.declined
                 )));
             }
             if declined.is_empty() {

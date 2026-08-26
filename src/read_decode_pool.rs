@@ -23,7 +23,10 @@
 //! - **Nothing nests.** The codec chain gets `concurrent_target(1)`, so a decode worker
 //!   spawns no work underneath itself. All the parallelism is R readers plus D decoders.
 //!
-//! Safety: the output is split with `split_at_mut` before any job runs and each piece
+//! Byte extents come from `shard_index`, which reads sharding's own offset/size table --
+//! so this runs against the RELEASED zarrs, with no patched crate anywhere.
+//!
+//! Safety: the output is carved with `split_at_mut` before any job runs and each piece
 //! travels *inside* its job. Moving a `&mut [u8]` through the channel is what transfers
 //! exclusivity, so disjointness is checked by the compiler instead of asserted in a
 //! comment. No `UnsafeCellSlice` on this path; the one `unsafe` is the scratch view, which
@@ -34,11 +37,8 @@
 //! Widening the scope to a whole batch fixes both at once -- a job would carry several
 //! (piece, coords) targets and dedup would be exact -- but it needs the Python side to
 //! hand over more than one selection at a time. Next step, deliberately not this one.
-//!
-//! ponytail: byte ranges come from `chunk_reads` and nothing else here knows where they
-//! came from. Dropping the crate patch in favour of reading the shard index directly is a
-//! change to that one function.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,33 +48,36 @@ use pyo3::PyResult;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
-    ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayPartialDecoderPlanned,
-    ArraySubset, CodecOptions, DataPlan, ReadPlan,
+    ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, CodecOptions,
 };
-use zarrs::storage::{ByteRange, MaybeBytes, StoreKey};
+use zarrs::storage::StoreKey;
+use zarrs::storage::byte_range::ByteRange;
+use zarrs::storage::MaybeBytes;
 
 use crate::CodecPipelineImpl;
 use crate::chunk_item::ChunkItem;
+use crate::shard_index::ShardInfo;
 use crate::utils::{PyCodecErrExt as _, PyErrExt as _};
 
 /// What the pool did, so a run can prove this path executed rather than assuming it.
 ///
 /// The fused path produces correct output too, so only a count separates "the pool ran"
 /// from "the pool was configured and something else ran". `chunks == reads == decodes` is
-/// the invariant: one job per innermost chunk, read once, decoded once.
+/// the invariant: one job per innermost chunk, read once, decoded once. Absent chunks are
+/// counted separately because they have no read to issue.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PoolCounts {
     pub chunks: usize,
     pub reads: usize,
     pub decodes: usize,
-    /// Items whose byte ranges could not be obtained; these fall back to the fused path.
+    pub absent: usize,
+    pub shard_indexes: usize,
+    /// Items this path could not take; these fall back to the fused path.
     pub declined: usize,
 }
 
 /// One innermost chunk: fetch `range` from `key`, decode it, copy `coords` into `piece`.
 struct Job<'a> {
-    plan_idx: usize,
-    entry: usize,
     key: StoreKey,
     range: ByteRange,
     /// Exclusively owned by this job. Travelling inside the job is what makes the
@@ -83,9 +86,10 @@ struct Job<'a> {
     coords: &'a [u64],
 }
 
-/// A chunk whose reads are known, and the plan that decodes them.
-struct Planned {
-    plan: DataPlan,
+/// An item whose chunk has been located in its shard. `None` range = the chunk is absent.
+struct Located<'a> {
+    item: &'a ChunkItem,
+    range: Option<ByteRange>,
 }
 
 impl CodecPipelineImpl {
@@ -96,6 +100,7 @@ impl CodecPipelineImpl {
     /// caller to run down the fused path.
     pub(crate) fn retrieve_read_decode_pool<'a>(
         &self,
+        shard: &ShardInfo,
         items: &'a [ChunkItem],
         output: &mut [u8],
         codec_options: &CodecOptions,
@@ -114,14 +119,15 @@ impl CodecPipelineImpl {
         let codec_options = codec_options.clone().with_concurrent_target(1);
         let codec_options = &codec_options;
 
-        // ---------------------------------------------------- where the reads come from
-        let (plans, planned_items, declined) = self.chunk_reads(items, codec_options)?;
+        // ------------------------------------------------- locate each chunk in its shard
+        let (located, declined, shard_indexes) = self.locate_chunks(shard, items, codec_options)?;
         let declined_n = declined.len();
-        if plans.is_empty() {
+        if located.is_empty() {
             return Ok((
                 declined,
                 PoolCounts {
                     declined: declined_n,
+                    shard_indexes,
                     ..PoolCounts::default()
                 },
             ));
@@ -136,16 +142,16 @@ impl CodecPipelineImpl {
         //
         // This path is 1-D by construction (`_chunk_unit_items` declines anything else),
         // so an output offset is just `subset.start * size`.
-        let mut order: Vec<usize> = (0..planned_items.len()).collect();
-        order.sort_by_key(|&i| output_offset(planned_items[i]));
+        let mut order: Vec<usize> = (0..located.len()).collect();
+        order.sort_by_key(|&i| output_offset(located[i].item));
 
         let mut carved: Vec<(usize, &mut [u8])> = Vec::with_capacity(order.len());
         let mut rest: &mut [u8] = output;
         let mut cursor = 0usize;
         for &i in &order {
-            let item = planned_items[i];
+            let item = located[i].item;
             let off = output_offset(item) * size;
-            let len = item.coords.as_ref().expect("checked in chunk_reads").len() * size;
+            let len = coords_of(item)?.len() * size;
             if off < cursor {
                 return Err(PyRuntimeError::new_err(format!(
                     "{} overlaps an earlier item's output: pieces must be disjoint",
@@ -170,31 +176,22 @@ impl CodecPipelineImpl {
 
         // ------------------------------------------------------------------ the job list
         let mut jobs: Vec<Job<'_>> = Vec::with_capacity(carved.len());
-        for (plan_idx, piece) in carved {
-            let item = planned_items[plan_idx];
-            let coords = item.coords.as_ref().expect("checked in chunk_reads");
-            let mut reads = plans[plan_idx].plan.reads();
-            match (reads.next(), reads.next()) {
-                // One innermost chunk is one read. More would mean the plan covered more
-                // than a chunk, which breaks the one-decode-per-job accounting.
-                (Some((entry, range)), None) => jobs.push(Job {
-                    plan_idx,
-                    entry,
+        let mut absent = 0usize;
+        for (i, piece) in carved {
+            let item = located[i].item;
+            let coords = coords_of(item)?;
+            match located[i].range {
+                Some(range) => jobs.push(Job {
                     key: item.key.clone(),
                     range,
                     piece,
                     coords,
                 }),
-                // Nothing stored: the whole piece is the fill value, written now, with no
-                // read to issue.
-                (None, _) => {
-                    self.fill_piece(&plans[plan_idx], piece, coords, size, codec_options)?;
-                }
-                (Some(_), Some(_)) => {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "{} planned more than one read for a single innermost chunk",
-                        item.key
-                    )));
+                // Absent chunk: every element the selection wants from it is the fill
+                // value, written now. There is no read and no decode to do.
+                None => {
+                    absent += 1;
+                    fill_piece(piece, &self.fill_value, size)?;
                 }
             }
         }
@@ -204,6 +201,8 @@ impl CodecPipelineImpl {
             return Ok((
                 declined,
                 PoolCounts {
+                    absent,
+                    shard_indexes,
                     declined: declined_n,
                     ..PoolCounts::default()
                 },
@@ -241,8 +240,7 @@ impl CodecPipelineImpl {
                     let mut scratch: Vec<u8> = Vec::new();
                     while let Ok((job, bytes)) = done_rx.recv() {
                         match self.decode_into_piece(
-                            &plans[job.plan_idx],
-                            job.entry,
+                            shard,
                             bytes,
                             job.piece,
                             job.coords,
@@ -294,24 +292,25 @@ impl CodecPipelineImpl {
                 chunks,
                 reads: reads.load(Ordering::Relaxed),
                 decodes: decodes.load(Ordering::Relaxed),
+                absent,
+                shard_indexes,
                 declined: declined_n,
             },
         ))
     }
 
-    /// The byte ranges to fetch, one innermost chunk per item.
+    /// Where each item's innermost chunk lives, from its shard's own offset/size table.
     ///
-    /// The only place that knows how a chunk's extent inside its shard is discovered.
-    /// Replace this to drop the crate patch in favour of reading the shard index directly.
-    fn chunk_reads<'a>(
+    /// One index read per distinct shard, cached for the call, so N items sharing a shard
+    /// cost one index read rather than N.
+    fn locate_chunks<'a>(
         &self,
+        shard: &ShardInfo,
         items: &'a [ChunkItem],
         codec_options: &CodecOptions,
-    ) -> PyResult<(Vec<Planned>, Vec<&'a ChunkItem>, Vec<&'a ChunkItem>)> {
-        let mut planners: HashMap<StoreKey, Option<std::sync::Arc<dyn ArrayPartialDecoderPlanned>>> =
-            HashMap::new();
-        let mut plans = Vec::with_capacity(items.len());
-        let mut planned_items = Vec::with_capacity(items.len());
+    ) -> PyResult<(Vec<Located<'a>>, Vec<&'a ChunkItem>, usize)> {
+        let mut indexes: HashMap<StoreKey, Option<Vec<u64>>> = HashMap::new();
+        let mut located = Vec::with_capacity(items.len());
         let mut declined = Vec::new();
 
         for item in items {
@@ -319,44 +318,36 @@ impl CodecPipelineImpl {
                 declined.push(item);
                 continue;
             }
-            let planner = match planners.get(&item.key) {
-                Some(planner) => planner.clone(),
-                None => {
-                    let decoder = self.build_partial_decoder(item, codec_options)?;
-                    // `into_planned` defaults to None, so a decoder that cannot report its
-                    // reads says so rather than erroring.
-                    let planner = decoder.into_planned();
-                    planners.insert(item.key.clone(), planner.clone());
-                    planner
-                }
-            };
-            let Some(planner) = planner else {
-                declined.push(item);
+            if !indexes.contains_key(&item.key) {
+                let chunks_per_shard = shard.chunks_per_shard(&item.shape)?;
+                let index =
+                    shard.read_index(&self.store, &item.key, &chunks_per_shard, codec_options)?;
+                indexes.insert(item.key.clone(), index);
+            }
+            let Some(index) = indexes.get(&item.key).expect("just inserted") else {
+                // No shard at all: everything in it is the fill value.
+                located.push(Located { item, range: None });
                 continue;
             };
-            match planner
-                .read_plan(&item.chunk_subset, codec_options)
-                .map_codec_err()?
-            {
-                Some(ReadPlan::Data(plan)) => {
-                    plans.push(Planned { plan });
-                    planned_items.push(item);
-                }
-                // An index plan needs a second exchange before the data is nameable; only
-                // shards subchunked deeper than one index produce one, and the fused path
-                // reads those minimally already.
-                Some(ReadPlan::Indexes(_)) | None => declined.push(item),
-            }
+            let linear = shard.linear_index_1d(item.chunk_subset.start().first().copied().unwrap_or(0));
+            located.push(Located {
+                item,
+                range: ShardInfo::chunk_range(index, linear)?,
+            });
         }
-        Ok((plans, planned_items, declined))
+        let shard_indexes = indexes.len();
+        Ok((located, declined, shard_indexes))
     }
 
-    /// Decode one chunk into `scratch`, then copy the wanted elements into `piece`.
+    /// Decode one whole innermost chunk into `scratch`, then copy the wanted elements out.
+    ///
+    /// The whole chunk, deliberately: blosc partial decode is quantised to blocks, which
+    /// prices one getitem per element at 23,233x a full decode plus a gather. The chunk is
+    /// the decode unit and the gather picks out of it.
     #[allow(clippy::too_many_arguments)]
     fn decode_into_piece(
         &self,
-        planned: &Planned,
-        entry: usize,
+        shard: &ShardInfo,
         bytes: MaybeBytes,
         piece: &mut [u8],
         coords: &[u64],
@@ -364,70 +355,44 @@ impl CodecPipelineImpl {
         scratch: &mut Vec<u8>,
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
-        self.decode_chunk_into_scratch(
-            planned,
-            Some((entry, bytes)),
-            size,
-            scratch,
-            codec_options,
-        )?;
-        gather(scratch, coords, piece, size, planned)
-    }
+        let Some(bytes) = bytes else {
+            // The index named an extent but the store has nothing there.
+            return Err(PyRuntimeError::new_err(
+                "the shard index named a byte range the store does not have",
+            ));
+        };
 
-    /// A chunk with nothing stored: the fill value, and no read was issued for it.
-    fn fill_piece(
-        &self,
-        planned: &Planned,
-        piece: &mut [u8],
-        coords: &[u64],
-        size: usize,
-        codec_options: &CodecOptions,
-    ) -> PyResult<()> {
-        let mut scratch = Vec::new();
-        self.decode_chunk_into_scratch(planned, None, size, &mut scratch, codec_options)?;
-        gather(&scratch, coords, piece, size, planned)
-    }
-
-    /// Decode the whole innermost chunk into `scratch`, reusing its allocation.
-    ///
-    /// The whole chunk, deliberately: blosc partial decode is quantised to blocks, which
-    /// prices one getitem per element at 23,233x a full decode plus a gather. The chunk is
-    /// the decode unit and the gather picks out of it.
-    fn decode_chunk_into_scratch(
-        &self,
-        planned: &Planned,
-        fetched: Option<(usize, MaybeBytes)>,
-        size: usize,
-        scratch: &mut Vec<u8>,
-        codec_options: &CodecOptions,
-    ) -> PyResult<()> {
-        let shape = planned.plan.subset().shape().to_vec();
-        let needed = planned.plan.subset().num_elements_usize() * size;
+        let shape = &shard.inner_shape;
+        let elements: u64 = shape.iter().map(|s| s.get()).product();
+        let needed = usize::try_from(elements).map_py_err::<PyRuntimeError>()? * size;
         scratch.clear();
         scratch.resize(needed, 0);
 
+        let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
         let slice = UnsafeCellSlice::new(scratch.as_mut_slice());
         let mut view = unsafe {
             // SAFETY: this view is the only writer to `scratch`, which this worker owns.
             ArrayBytesFixedDisjointView::new(
                 slice,
                 size,
-                &shape,
-                ArraySubset::new_with_shape(shape.clone()),
+                &shape_u64,
+                ArraySubset::new_with_shape(shape_u64.clone()),
             )
             .map_py_err::<PyRuntimeError>()?
         };
-        let target = ArrayBytesDecodeIntoTarget::Fixed(&mut view);
-        match fetched {
-            Some((entry, bytes)) => planned
-                .plan
-                .decode_entry_into(entry, bytes, target, codec_options)
-                .map_codec_err(),
-            None => planned
-                .plan
-                .fill_absent_into(target, codec_options)
-                .map_codec_err(),
-        }
+        shard
+            .inner_chain
+            .decode_into(
+                Cow::Owned(bytes.into()),
+                shape,
+                &self.data_type,
+                &self.fill_value,
+                ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+                codec_options,
+            )
+            .map_codec_err()?;
+
+        gather(scratch, coords, piece, size)
     }
 }
 
@@ -435,13 +400,7 @@ impl CodecPipelineImpl {
 ///
 /// `piece` is exactly `coords.len()` elements and contiguous, because the indices reached
 /// us non-decreasing -- so this writes straight into the output with no temporary.
-fn gather(
-    scratch: &[u8],
-    coords: &[u64],
-    piece: &mut [u8],
-    size: usize,
-    planned: &Planned,
-) -> PyResult<()> {
+fn gather(scratch: &[u8], coords: &[u64], piece: &mut [u8], size: usize) -> PyResult<()> {
     if piece.len() != coords.len() * size {
         return Err(PyRuntimeError::new_err(
             "output piece does not match the coordinate count",
@@ -451,14 +410,34 @@ fn gather(
         let src = usize::try_from(c).map_py_err::<PyRuntimeError>()? * size;
         let Some(element) = scratch.get(src..src + size) else {
             return Err(PyRuntimeError::new_err(format!(
-                "coordinate {c} is outside the {} elements decoded for {}",
-                scratch.len() / size,
-                planned.plan.subset()
+                "coordinate {c} is outside the {} elements decoded",
+                scratch.len() / size
             )));
         };
         piece[n * size..(n + 1) * size].copy_from_slice(element);
     }
     Ok(())
+}
+
+/// An absent chunk contributes only fill value, repeated across the piece.
+fn fill_piece(piece: &mut [u8], fill_value: &zarrs::array::FillValue, size: usize) -> PyResult<()> {
+    let bytes = fill_value.as_ne_bytes();
+    if bytes.len() != size {
+        return Err(PyRuntimeError::new_err(
+            "the fill value is not one element wide",
+        ));
+    }
+    for slot in piece.chunks_exact_mut(size) {
+        slot.copy_from_slice(bytes);
+    }
+    Ok(())
+}
+
+fn coords_of(item: &ChunkItem) -> PyResult<&Vec<u64>> {
+    item.coords
+        .as_ref()
+        .ok_or("this path requires chunk-unit items, which carry coordinates")
+        .map_py_err::<PyRuntimeError>()
 }
 
 /// Where an item's elements land in the output, in elements.

@@ -31,8 +31,3 @@ zarrs_object_store = "0.5.0" # object_store 0.12
 [profile.release]
 lto = true
 
-# The read/decode split under test: plan reads, fetch them as a pool, decode each as it
-# lands. Pinned by REV, never by path -- a path patch resolves to whatever a directory
-# happens to hold, which no commit records, and build_venv.sh refuses it.
-[patch.crates-io]
-zarrs = { git = "https://github.com/selmanozleyen/zarrs", rev = "25b67a75e9d916bae9143e0f3d49bc336ddb6ba7" }
