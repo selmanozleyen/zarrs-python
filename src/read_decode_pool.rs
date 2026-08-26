@@ -41,7 +41,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pyo3::PyResult;
@@ -63,49 +63,60 @@ use crate::utils::{PyCodecErrExt as _, PyErrExt as _};
 /// The pools are a PROCESS resource, not an array one.
 ///
 /// zarr builds one `CodecPipelineImpl` per array, so pools owned by the pipeline are built
-/// once per array: 14 stores came to 28 pipelines, 2,240 threads, and the process died of
-/// thread-creation thrash with 2,276 of 2,277 threads parked in futex before a single read
-/// was issued. Shared here instead, so the width is the width no matter how many arrays a
-/// run opens.
-static READ_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-static DECODE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-
-/// The shared pool at `width`, or an error if one already exists at a different width.
+/// once per array: 14 stores came to 28 pipelines, 2,240 threads, and the process hung with
+/// 2,276 of 2,277 threads parked in futex before a single read was issued. One pool per
+/// kind, shared by every array, keeps that at 80 threads.
 ///
-/// Refusing beats silently running at the first caller's width: a knob that was set is not
-/// a knob that arrived, and a pool quietly half the requested size would look like a
-/// finding about read concurrency.
-fn shared_pool(
-    cell: &'static OnceLock<rayon::ThreadPool>,
-    width: usize,
+/// Rebuildable rather than write-once, because a sweep over `read_concurrency` has to run
+/// its points in ONE process: ratios come from within one job, and a write-once pool would
+/// force one job per point. Asking for a width that differs from the live pool's replaces
+/// it; the old pool goes away once the last `Arc` to it is dropped, which is the end of
+/// whichever call still held it.
+static READ_POOL: Registry = Registry::new("read");
+static DECODE_POOL: Registry = Registry::new("decode");
+
+struct Registry {
     name: &'static str,
-) -> PyResult<&'static rayon::ThreadPool> {
-    if let Some(pool) = cell.get() {
+    live: Mutex<Option<(usize, Arc<rayon::ThreadPool>)>>,
+}
+
+impl Registry {
+    const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            live: Mutex::new(None),
+        }
+    }
+
+    /// The shared pool at `width`, building or replacing it if the live one differs.
+    fn pool(&self, width: usize) -> PyResult<Arc<rayon::ThreadPool>> {
+        let width = width.max(1);
+        let mut live = self.live.lock().expect("pool registry poisoned");
+        if let Some((have, pool)) = live.as_ref() {
+            if *have == width {
+                return Ok(pool.clone());
+            }
+        }
+        let name = self.name;
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .thread_name(move |i| format!("zarrs-{name}-{i}"))
+                .build()
+                .map_py_err::<PyRuntimeError>()?,
+        );
+        // A knob that was set is not a knob that arrived: rayon is free to hand back a
+        // different size, and a pool quietly half the requested width would read as a
+        // finding about read concurrency.
         if pool.current_num_threads() != width {
             return Err(PyRuntimeError::new_err(format!(
-                "the {name} pool already exists with {} threads, not the {width} asked for; \
-                 it is process-wide, so every array in a run must ask for the same width",
+                "asked the {name} pool for {width} threads and got {}",
                 pool.current_num_threads()
             )));
         }
-        return Ok(pool);
+        *live = Some((width, pool.clone()));
+        Ok(pool)
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(width)
-        .thread_name(move |i| format!("zarrs-{name}-{i}"))
-        .build()
-        .map_py_err::<PyRuntimeError>()?;
-    // A racing caller may have won; theirs is as good as ours, and the width is checked
-    // on the way back out.
-    let _ = cell.set(pool);
-    let pool = cell.get().expect("just set");
-    if pool.current_num_threads() != width {
-        return Err(PyRuntimeError::new_err(format!(
-            "the {name} pool raced to {} threads, not the {width} asked for",
-            pool.current_num_threads()
-        )));
-    }
-    Ok(pool)
 }
 
 /// What the pool did, so a run can prove this path executed rather than assuming it.
@@ -168,8 +179,10 @@ impl CodecPipelineImpl {
         let codec_options = codec_options.clone().with_concurrent_target(1);
         let codec_options = &codec_options;
 
-        let read_pool = shared_pool(&READ_POOL, self.read_concurrency, "read")?;
-        let decode_pool = shared_pool(&DECODE_POOL, self.decode_concurrency, "decode")?;
+        // Held for the length of this call, so a width change mid-run cannot pull the
+        // pool out from under jobs already queued on it.
+        let read_pool = READ_POOL.pool(self.read_concurrency)?;
+        let decode_pool = DECODE_POOL.pool(self.decode_concurrency)?;
 
         // ------------------------------------------------- locate each chunk in its shard
         let (located, declined, shard_indexes) = self.locate_chunks(shard, items, codec_options)?;
