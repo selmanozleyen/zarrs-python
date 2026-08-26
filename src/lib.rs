@@ -555,13 +555,60 @@ impl CodecPipelineImpl {
                         copy_fill_value_into(&self.data_type, &self.fill_value, target)
                     }
                 } else if let Some(coords) = &item.coords {
-                    // One call for the whole chunk's selection: zarrs takes the coordinates
-                    // as an indexer, so the gather happens once, inside the decoder, instead
-                    // of once per run of consecutive indices.
                     let key = &item.key;
                     let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
                         PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
                     })?;
+                    // An item whose indices all fall inside ONE inner chunk is asking for a
+                    // range the decoder decodes whole anyway, so the bounding range costs
+                    // nothing beyond what is already paid and the wanted elements can be
+                    // taken out of it in a single flat pass. Handing the indices over as an
+                    // indexer instead spends a `Vec` per element and walks them one at a
+                    // time; this spends one allocation and one loop for the whole chunk.
+                    let within_one_inner_chunk = self
+                        .inner_chunk_shape
+                        .as_deref()
+                        .and_then(|inner| inner.first().copied())
+                        .is_some_and(|inner_len| {
+                            item.chunk_subset.shape().first().copied().unwrap_or(u64::MAX)
+                                <= inner_len
+                        });
+                    if within_one_inner_chunk && item.chunk_subset.dimensionality() == 1 {
+                        let decoded = partial_decoder
+                            .partial_decode(&item.chunk_subset, &codec_options)
+                            .map_codec_err()?;
+                        let ArrayBytes::Fixed(raw) = decoded else {
+                            return Err(PyTypeError::new_err(
+                                "variable length data type not supported",
+                            ));
+                        };
+                        let esize = self
+                            .data_type
+                            .fixed_size()
+                            .ok_or("variable length data type not supported")
+                            .map_py_err::<PyTypeError>()?;
+                        let base = item.chunk_subset.start()[0];
+                        let mut gathered = Vec::with_capacity(coords.len() * esize);
+                        for &c in coords {
+                            let off = usize::try_from(c.saturating_sub(base))
+                                .map_py_err::<PyRuntimeError>()?
+                                * esize;
+                            let end = off + esize;
+                            if c < base || end > raw.len() {
+                                return Err(PyRuntimeError::new_err(format!(
+                                    "chunk-unit index {c} is outside the decoded range                                      {base}..{}",
+                                    base + (raw.len() / esize) as u64
+                                )));
+                            }
+                            gathered.extend_from_slice(&raw[off..end]);
+                        }
+                        output_view
+                            .copy_from_slice(&gathered)
+                            .map_py_err::<PyRuntimeError>()?;
+                        return Ok(());
+                    }
+                    // A coordinate item spans its whole shard, so its bounding range is not
+                    // something to decode: hand the indices to zarrs as an indexer.
                     let indexer: Vec<Vec<u64>> = coords.iter().map(|&i| vec![i]).collect();
                     let decoded = partial_decoder
                         .partial_decode(&indexer, &codec_options)

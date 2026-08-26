@@ -80,6 +80,26 @@ def get_codec_pipeline_impl(
         return None
 
 
+def innermost_chunk_len(metadata) -> int:
+    """The extent of the innermost chunk along a 1-D array, or 0 if there is not one.
+
+    The inner chunk is the unit that is fetched and decoded, and it is not the chunk grid:
+    `chunk_spec.shape` is the SHARD. The sharding codec carries the real one, and sharding
+    can nest, so the innermost wins.
+    """
+    shape = None
+    codecs = list(getattr(metadata, "codecs", ()) or ())
+    while codecs:
+        codec = codecs.pop(0)
+        inner = getattr(codec, "chunk_shape", None)
+        if inner is not None:
+            shape = tuple(int(i) for i in inner)
+            codecs = list(getattr(codec, "codecs", ()) or ()) + codecs
+    if shape is None or len(shape) != 1:
+        return 0
+    return shape[0]
+
+
 def get_codec_pipeline_fallback(
     metadata: ArrayMetadata, *, strict: bool
 ) -> BatchedCodecPipeline | None:
@@ -189,6 +209,10 @@ class ZarrsCodecPipeline(CodecPipeline):
                 batch_info,
                 drop_axes,
                 out.shape,
+                chunk_unit_indexing=config.get(
+                    "codec_pipeline.chunk_unit_indexing", False
+                ),
+                inner_chunk_len=innermost_chunk_len(self.metadata),
                 coordinate_indexing=config.get(
                     "codec_pipeline.coordinate_indexing", False
                 ),

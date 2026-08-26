@@ -251,6 +251,73 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
+def _chunk_unit_items(entry, shape, drop_axes, inner_len: int) -> list[ChunkItem] | None:
+    """One item per INNER CHUNK the selection touches, or None if not that shape.
+
+    A coordinate item is one per shard, so the whole selection crosses the boundary as
+    one list and the decoder is asked for elements spread over many inner chunks. A run
+    item is one per run, so a chunk with thousands of runs pays an extraction each. The
+    inner chunk is what is actually fetched, decoded and gathered, so it is what an item
+    should be: `lib.rs` already groups run items by their containing inner chunk and
+    decodes each once, and this puts the indices themselves on that same footing, which
+    leaves one extraction per chunk instead of one per run.
+
+    Indices are non-decreasing here, so grouping by inner chunk cuts them into
+    contiguous stretches and each stretch's OUTPUT positions are contiguous too -- which
+    is what lets every piece keep the one-slice output an item requires.
+    """
+    prepared = _coordinate_prepare(entry, shape, drop_axes)
+    if prepared is None:
+        return None
+    byte_getter, chunk_spec, indices, out_start = prepared
+    if inner_len <= 0:
+        return None
+    # Sorted indices give non-decreasing chunk ids, so a change of id is a cut point and
+    # one pass finds them all.
+    chunk_ids = indices // inner_len
+    if (chunk_ids[1:] < chunk_ids[:-1]).any():
+        return None
+    cuts = np.flatnonzero(chunk_ids[1:] != chunk_ids[:-1]) + 1
+    starts = np.concatenate(([0], cuts))
+    stops = np.concatenate((cuts, [indices.size]))
+    items = []
+    for a, b in zip(starts, stops, strict=True):
+        piece = indices[a:b]
+        items.append(
+            ChunkItem(
+                key=byte_getter.path,
+                chunk_subset=[slice(int(piece[0]), int(piece[-1]) + 1)],
+                chunk_shape=chunk_spec.shape,
+                subset=[slice(out_start + int(a), out_start + int(b))],
+                shape=shape,
+                coords=piece.astype(np.uint64, copy=False).tolist(),
+            )
+        )
+    return items
+
+
+def _coordinate_prepare(entry, shape, drop_axes):
+    """The eligibility both index-carrying paths share: (byte_getter, spec, indices, out_start)."""
+    byte_getter, chunk_spec, chunk_selection, out_selection, _is_complete = entry
+    if drop_axes or len(shape) != 1 or len(chunk_spec.shape) != 1:
+        return None
+    chunk_sel = chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,)
+    out_sel = out_selection if isinstance(out_selection, tuple) else (out_selection,)
+    if len(chunk_sel) != 1 or len(out_sel) != 1:
+        return None
+    indices, out_axis_sel = chunk_sel[0], out_sel[0]
+    if not isinstance(indices, np.ndarray) or indices.ndim != 1 or indices.size == 0:
+        return None
+    if not isinstance(out_axis_sel, slice) or out_axis_sel.step not in (None, 1):
+        return None
+    start = out_axis_sel.start or 0
+    if out_axis_sel.stop - start != indices.size:
+        return None
+    if (indices < 0).any():
+        return None
+    return byte_getter, chunk_spec, indices, start
+
+
 def _coordinate_chunk_item(entry, shape, drop_axes) -> ChunkItem | None:
     """One item per chunk carrying the selection's indices, or None if not that shape.
 
@@ -300,17 +367,23 @@ def make_chunk_info_for_rust_with_indices(
     # Reads only: items sharing a chunk key would race in the write path's read-modify-write.
     integer_array_indexing: bool = False,
     coordinate_indexing: bool = False,
+    chunk_unit_indexing: bool = False,
+    inner_chunk_len: int = 0,
 ) -> RustChunkInfo:
     batch_info = _as_int64_batch_info(batch_info)
     coordinate_items: list[ChunkItem] = []
-    if coordinate_indexing:
+    if chunk_unit_indexing or coordinate_indexing:
         kept = []
         for entry in batch_info:
-            item = _coordinate_chunk_item(entry, shape, drop_axes)
-            if item is None:
+            if chunk_unit_indexing:
+                items = _chunk_unit_items(entry, shape, drop_axes, inner_chunk_len)
+            else:
+                item = _coordinate_chunk_item(entry, shape, drop_axes)
+                items = None if item is None else [item]
+            if items is None:
                 kept.append(entry)
             else:
-                coordinate_items.append(item)
+                coordinate_items.extend(items)
         batch_info = kept
     if integer_array_indexing:
         batch_info = [
