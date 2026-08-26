@@ -54,11 +54,10 @@ pub struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
-    /// Built once, used per call via `scope()`: the pools persist, the borrows do not.
-    /// Reads get their own pool because they block, and a blocked reader must not be able
-    /// to starve a decoder.
-    pub(crate) read_pool: rayon::ThreadPool,
-    pub(crate) decode_pool: rayon::ThreadPool,
+    /// Widths only. The pools themselves are process-wide statics in `read_decode_pool`:
+    /// zarr builds a pipeline per ARRAY, so pools owned here are built once per array.
+    pub(crate) read_concurrency: usize,
+    pub(crate) decode_concurrency: usize,
     pub(crate) read_decode_pool_enabled: bool,
     /// Present only for a singly-sharded array: the pool locates chunks itself, so it
     /// needs the shard's index codecs and the codecs inside a shard. `None` means this
@@ -300,17 +299,6 @@ impl CodecPipelineImpl {
         // a call cannot have more reads outstanding than it has chunks.
         let read_concurrency = read_concurrency.unwrap_or(4 * num_threads);
         let decode_concurrency = decode_concurrency.unwrap_or(num_threads);
-        let read_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(read_concurrency)
-            .thread_name(|i| format!("zarrs-read-{i}"))
-            .build()
-            .map_py_err::<PyRuntimeError>()?;
-        let decode_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(decode_concurrency)
-            .thread_name(|i| format!("zarrs-decode-{i}"))
-            .build()
-            .map_py_err::<PyRuntimeError>()?;
-
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
 
@@ -341,8 +329,8 @@ impl CodecPipelineImpl {
             num_threads,
             fill_value,
             data_type,
-            read_pool,
-            decode_pool,
+            read_concurrency,
+            decode_concurrency,
             read_decode_pool_enabled: read_decode_pool,
             shard,
         })

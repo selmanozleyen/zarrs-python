@@ -40,8 +40,8 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pyo3::PyResult;
@@ -59,6 +59,54 @@ use crate::CodecPipelineImpl;
 use crate::chunk_item::ChunkItem;
 use crate::shard_index::ShardInfo;
 use crate::utils::{PyCodecErrExt as _, PyErrExt as _};
+
+/// The pools are a PROCESS resource, not an array one.
+///
+/// zarr builds one `CodecPipelineImpl` per array, so pools owned by the pipeline are built
+/// once per array: 14 stores came to 28 pipelines, 2,240 threads, and the process died of
+/// thread-creation thrash with 2,276 of 2,277 threads parked in futex before a single read
+/// was issued. Shared here instead, so the width is the width no matter how many arrays a
+/// run opens.
+static READ_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static DECODE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+/// The shared pool at `width`, or an error if one already exists at a different width.
+///
+/// Refusing beats silently running at the first caller's width: a knob that was set is not
+/// a knob that arrived, and a pool quietly half the requested size would look like a
+/// finding about read concurrency.
+fn shared_pool(
+    cell: &'static OnceLock<rayon::ThreadPool>,
+    width: usize,
+    name: &'static str,
+) -> PyResult<&'static rayon::ThreadPool> {
+    if let Some(pool) = cell.get() {
+        if pool.current_num_threads() != width {
+            return Err(PyRuntimeError::new_err(format!(
+                "the {name} pool already exists with {} threads, not the {width} asked for; \
+                 it is process-wide, so every array in a run must ask for the same width",
+                pool.current_num_threads()
+            )));
+        }
+        return Ok(pool);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(width)
+        .thread_name(move |i| format!("zarrs-{name}-{i}"))
+        .build()
+        .map_py_err::<PyRuntimeError>()?;
+    // A racing caller may have won; theirs is as good as ours, and the width is checked
+    // on the way back out.
+    let _ = cell.set(pool);
+    let pool = cell.get().expect("just set");
+    if pool.current_num_threads() != width {
+        return Err(PyRuntimeError::new_err(format!(
+            "the {name} pool raced to {} threads, not the {width} asked for",
+            pool.current_num_threads()
+        )));
+    }
+    Ok(pool)
+}
 
 /// What the pool did, so a run can prove this path executed rather than assuming it.
 ///
@@ -119,6 +167,9 @@ impl CodecPipelineImpl {
         // threads.
         let codec_options = codec_options.clone().with_concurrent_target(1);
         let codec_options = &codec_options;
+
+        let read_pool = shared_pool(&READ_POOL, self.read_concurrency, "read")?;
+        let decode_pool = shared_pool(&DECODE_POOL, self.decode_concurrency, "decode")?;
 
         // ------------------------------------------------- locate each chunk in its shard
         let (located, declined, shard_indexes) = self.locate_chunks(shard, items, codec_options)?;
@@ -238,10 +289,10 @@ impl CodecPipelineImpl {
         let decodes = &decodes_counter;
         let record = &record_owned;
 
-        self.decode_pool.scope(|decoders| {
+        decode_pool.scope(|decoders| {
             // Long-lived workers: one spawn per worker per call, not one per chunk, so a
             // worker's scratch buffer is reused across every chunk it handles.
-            for _ in 0..self.decode_pool.current_num_threads() {
+            for _ in 0..decode_pool.current_num_threads() {
                 let done_rx = done_rx.clone();
                 decoders.spawn(move |_| {
                     let mut scratch: Vec<u8> = Vec::new();
@@ -265,8 +316,8 @@ impl CodecPipelineImpl {
             }
             drop(done_rx);
 
-            self.read_pool.scope(|readers| {
-                for _ in 0..self.read_pool.current_num_threads() {
+            read_pool.scope(|readers| {
+                for _ in 0..read_pool.current_num_threads() {
                     let job_rx = job_rx.clone();
                     let done_tx = done_tx.clone();
                     readers.spawn(move |_| {
