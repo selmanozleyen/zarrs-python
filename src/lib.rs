@@ -472,6 +472,12 @@ impl CodecPipelineImpl {
         let mut ungrouped: Vec<ChunkItem> = Vec::new();
         {
             for item in chunk_descriptions {
+                // A coordinate item already covers everything its chunk is asked for, so
+                // there is nothing to group it with.
+                if item.coords.is_some() {
+                    ungrouped.push(item);
+                    continue;
+                }
                 let origin = (!is_whole_chunk(&item))
                     .then(|| {
                         let chunk_shape = bytemuck::must_cast_slice::<_, u64>(&item.shape);
@@ -548,6 +554,27 @@ impl CodecPipelineImpl {
                         // The chunk is missing, write the fill value
                         copy_fill_value_into(&self.data_type, &self.fill_value, target)
                     }
+                } else if let Some(coords) = &item.coords {
+                    // One call for the whole chunk's selection: zarrs takes the coordinates
+                    // as an indexer, so the gather happens once, inside the decoder, instead
+                    // of once per run of consecutive indices.
+                    let key = &item.key;
+                    let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
+                        PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
+                    })?;
+                    let indexer: Vec<Vec<u64>> = coords.iter().map(|&i| vec![i]).collect();
+                    let decoded = partial_decoder
+                        .partial_decode(&indexer, &codec_options)
+                        .map_codec_err()?;
+                    let ArrayBytes::Fixed(raw) = decoded else {
+                        return Err(PyTypeError::new_err(
+                            "variable length data type not supported",
+                        ));
+                    };
+                    output_view
+                        .copy_from_slice(&raw)
+                        .map_py_err::<PyRuntimeError>()?;
+                    return Ok(());
                 } else {
                     let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
                     let key = &item.key;

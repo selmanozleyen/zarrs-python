@@ -189,6 +189,9 @@ class ZarrsCodecPipeline(CodecPipeline):
                 batch_info,
                 drop_axes,
                 out.shape,
+                coordinate_indexing=config.get(
+                    "codec_pipeline.coordinate_indexing", False
+                ),
                 integer_array_indexing=config.get(
                     "codec_pipeline.integer_array_indexing", False
                 ),
