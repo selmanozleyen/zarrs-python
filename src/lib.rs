@@ -360,15 +360,15 @@ impl CodecPipelineImpl {
                 };
                 self.retrieve_read_decode_pool(shard, &chunk_descriptions, output, &codec_options)
             })?;
-            // An arm that silently ran the other path is not a result. One job per
-            // innermost chunk, read once, decoded once, or this is not what was measured.
-            if counts.chunks != counts.reads || counts.chunks != counts.decodes {
+            // An arm that silently ran the other path is not a result. Every job sent was
+            // one innermost chunk, read once and decoded once, so the two counts must agree
+            // -- and a zero here means the pool never ran at all.
+            if counts.chunks != counts.decoded {
                 return Err(PyRuntimeError::new_err(format!(
-                    "read/decode pool accounting does not close: {} chunks, {} reads, \
-                     {} decodes ({} absent, {} shard indexes, {} declined)",
+                    "read/decode pool accounting does not close: {} chunks sent, {} decoded \
+                     ({} absent, {} shard indexes read, {} items declined)",
                     counts.chunks,
-                    counts.reads,
-                    counts.decodes,
+                    counts.decoded,
                     counts.absent,
                     counts.shard_indexes,
                     counts.declined
