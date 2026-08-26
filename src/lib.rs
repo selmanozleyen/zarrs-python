@@ -62,7 +62,7 @@ pub struct CodecPipelineImpl {
     /// Present only for a singly-sharded array: the pool locates chunks itself, so it
     /// needs the shard's index codecs and the codecs inside a shard. `None` means this
     /// array cannot take the pool path at all.
-    pub(crate) shard: Option<shard_index::ShardInfo>,
+    pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
 }
 
 impl CodecPipelineImpl {
@@ -285,7 +285,7 @@ impl CodecPipelineImpl {
         let codec_chain =
             Arc::new(CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?);
         let codec_options = CodecOptions::default().with_validate_checksums(validate_checksums);
-        let shard = shard_index::ShardInfo::from_codecs(&metadata_v3.codecs)?;
+        let shard = shard_index::ShardInfo::from_codecs(&metadata_v3.codecs)?.map(Arc::new);
 
         let chunk_concurrent_minimum =
             chunk_concurrent_minimum.unwrap_or(global_config().chunk_concurrent_minimum());
