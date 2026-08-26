@@ -68,10 +68,6 @@ def get_codec_pipeline_impl(
             shard_index_cache_size=config.get(
                 "codec_pipeline.shard_index_cache_size", 0
             ),
-            chunk_cache_budget_bytes=config.get(
-                "codec_pipeline.chunk_cache_budget_bytes", 256 * 1024 * 1024
-            ),
-            chunk_cache_min_items=config.get("codec_pipeline.chunk_cache_min_items", 4),
         )
     except TypeError as e:
         if strict:

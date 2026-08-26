@@ -32,8 +32,6 @@ class CodecPipelineImpl:
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
         shard_index_cache_size: builtins.int = 0,
-        chunk_cache_budget_bytes: builtins.int = 268435456,
-        chunk_cache_min_items: builtins.int = 4,
     ) -> CodecPipelineImpl: ...
     def retrieve_chunks_and_apply_index(
         self,
