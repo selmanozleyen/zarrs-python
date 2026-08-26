@@ -23,14 +23,14 @@ use utils::is_whole_chunk;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
     ArrayPartialDecoderTraits, ArraySubset, ArrayToBytesCodecTraits, CodecChain, CodecError,
-    CodecOptions, DataType, FillValue, Indexer, StoragePartialDecoder, copy_fill_value_into,
+    CodecOptions, DataType, FillValue, StoragePartialDecoder, copy_fill_value_into,
     update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
 use zarrs::storage::{
-    ReadableWritableListableStorage, StorageError, StorageHandle, StoreKey,
+    ReadableWritableListableStorage, StorageHandle, StoreKey,
 };
 
 mod chunk_item;
@@ -63,76 +63,171 @@ pub struct CodecPipelineImpl {
     pub(crate) chunk_cache_budget_bytes: u64,
     /// Items sharing a key before its decode is worth caching.
     pub(crate) chunk_cache_min_items: u64,
+    /// Innermost chunk shape, the unit the codec chain decodes. `None` when not sharded.
+    inner_chunk_shape: Option<Vec<u64>>,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
 }
 
 /// Default for `chunk_cache_budget_bytes`: total decoded bytes the chunk cache may hold.
 ///
-/// A key whose chunk does not fit in what is left is not cached, so the budget also acts as
-/// a per-chunk ceiling: on a sharded array the chunk is the whole shard, which for a large
-/// shard geometry can exceed any sensible budget and disable the cache entirely.
+/// The cache holds only the inner chunks a read actually touches, so this bounds it to
+/// roughly the decoded size of the selection rather than of the shards it falls in.
 const CHUNK_CACHE_BUDGET_BYTES: u64 = 256 << 20;
 
 /// Default for `chunk_cache_min_items`: items sharing a key before caching it is worth doing.
-///
-/// The cache decodes the key's whole chunk, which for a sharded array is the whole shard --
-/// more work than a couple of targeted partial decodes. Only amortise it over enough items.
 const CHUNK_CACHE_MIN_ITEMS: u64 = 4;
 
-/// A partial decoder that decodes its chunk once and answers every later request from memory.
+/// The innermost chunk shape of a (possibly nested) sharded array, from its metadata JSON.
 ///
-/// An integer-array selection is served as one chunk item per run of consecutive indices, so
-/// several runs inside one chunk would otherwise decode that chunk once per run. Wrapping the
-/// key's decoder in this makes the repeats free while leaving one item per run, which is what
-/// keeps the per-run concurrency of the caller's `iter_concurrent_limit!` intact.
-struct DecodedChunkCache {
-    shape: Vec<u64>,
-    data_type: DataType,
-    decoded: ArrayBytes<'static>,
+/// This is the unit the codec chain actually decodes: extracting one row of a shard still
+/// decodes the inner chunk holding it. `None` when the array is not sharded, in which case
+/// the chunk itself is that unit.
+fn innermost_chunk_shape(array_metadata: &str) -> Option<Vec<u64>> {
+    let value: serde_json::Value = serde_json::from_str(array_metadata).ok()?;
+    let mut codecs = value.get("codecs")?.as_array()?.clone();
+    let mut shape = None;
+    loop {
+        let Some(sharding) = codecs
+            .iter()
+            .find(|codec| codec.get("name").and_then(serde_json::Value::as_str) == Some("sharding_indexed"))
+            .cloned()
+        else {
+            break;
+        };
+        let Some(configuration) = sharding.get("configuration") else {
+            break;
+        };
+        if let Some(chunk_shape) = configuration
+            .get("chunk_shape")
+            .and_then(serde_json::Value::as_array)
+        {
+            shape = Some(
+                chunk_shape
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .collect::<Vec<u64>>(),
+            );
+        }
+        match configuration
+            .get("codecs")
+            .and_then(serde_json::Value::as_array)
+        {
+            Some(inner) => codecs.clone_from(inner),
+            None => break,
+        }
+    }
+    shape
 }
 
-impl DecodedChunkCache {
+/// The decoded inner chunks a key's items touch, so each is decoded once instead of once
+/// per item.
+///
+/// An integer-array selection is served as one chunk item per run of consecutive indices,
+/// and extracting any part of an inner chunk decodes all of it -- so several runs landing in
+/// one inner chunk decoded it once per run. Only inner chunks wholly containing some item
+/// are held: an item spanning several of them is left to the plain decoder, which keeps this
+/// to the case that actually repeats and avoids stitching pieces back together.
+struct InnerChunkCache {
+    inner_shape: Vec<u64>,
+    data_type: DataType,
+    /// Keyed by the inner chunk's origin within the chunk.
+    chunks: HashMap<Vec<u64>, ArrayBytes<'static>>,
+}
+
+/// The origin of the inner chunk wholly containing `subset`, if there is one.
+fn containing_inner_chunk(subset: &ArraySubset, inner_shape: &[u64]) -> Option<Vec<u64>> {
+    if subset.start().len() != inner_shape.len() {
+        return None;
+    }
+    let mut origin = Vec::with_capacity(inner_shape.len());
+    for ((&start, &end), &extent) in subset
+        .start()
+        .iter()
+        .zip(subset.end_exc().iter())
+        .zip(inner_shape)
+    {
+        if extent == 0 || end == start {
+            return None;
+        }
+        let first = start / extent;
+        if (end - 1) / extent != first {
+            return None; // spans more than one inner chunk on this axis
+        }
+        origin.push(first * extent);
+    }
+    Some(origin)
+}
+
+impl InnerChunkCache {
+    /// Decode every inner chunk that wholly contains one of `subsets`.
+    ///
+    /// Eager, so the cache is immutable afterwards and needs no locking when the per-item
+    /// loop reads it from several threads.
     fn new(
-        inner: &dyn ArrayPartialDecoderTraits,
-        shape: &[u64],
+        decoder: &dyn ArrayPartialDecoderTraits,
+        chunk_shape: &[u64],
+        inner_shape: &[u64],
         data_type: DataType,
+        subsets: &[ArraySubset],
         options: &CodecOptions,
     ) -> Result<Self, CodecError> {
-        let whole = ArraySubset::new_with_shape(shape.to_vec());
-        let decoded = inner.partial_decode(&whole, options)?.into_owned();
+        let origins: HashSet<Vec<u64>> = subsets
+            .iter()
+            .filter_map(|subset| containing_inner_chunk(subset, inner_shape))
+            .collect();
+        let mut chunks = HashMap::with_capacity(origins.len());
+        for origin in origins {
+            // Clip to the chunk: a trailing inner chunk may be partial.
+            let shape = origin
+                .iter()
+                .zip(inner_shape)
+                .zip(chunk_shape)
+                .map(|((&start, &extent), &limit)| extent.min(limit.saturating_sub(start)))
+                .collect::<Vec<u64>>();
+            let extent = ArraySubset::new_with_start_shape(origin.clone(), shape)
+                .map_err(|err| CodecError::Other(err.to_string()))?;
+            let bytes = decoder.partial_decode(&extent, options)?.into_owned();
+            chunks.insert(origin, bytes);
+        }
         Ok(Self {
-            shape: shape.to_vec(),
+            inner_shape: inner_shape.to_vec(),
             data_type,
-            decoded,
+            chunks,
         })
     }
-}
 
-impl ArrayPartialDecoderTraits for DecodedChunkCache {
-    fn data_type(&self) -> &DataType {
-        &self.data_type
-    }
-
-    fn exists(&self) -> Result<bool, StorageError> {
-        Ok(true)
-    }
-
-    fn size_held(&self) -> usize {
-        self.decoded.size()
-    }
-
-    fn supports_partial_decode(&self) -> bool {
-        true
-    }
-
-    fn partial_decode(
+    /// Write `subset` into `view` from the cache, or report that it is not held.
+    fn try_copy_into(
         &self,
-        indexer: &dyn Indexer,
-        _options: &CodecOptions,
-    ) -> Result<ArrayBytes<'_>, CodecError> {
-        self.decoded
-            .extract_array_subset(indexer, &self.shape, &self.data_type)
+        subset: &ArraySubset,
+        view: &mut ArrayBytesFixedDisjointView<'_>,
+    ) -> Result<bool, CodecError> {
+        let Some(origin) = containing_inner_chunk(subset, &self.inner_shape) else {
+            return Ok(false);
+        };
+        let Some(bytes) = self.chunks.get(&origin) else {
+            return Ok(false);
+        };
+        let local = ArraySubset::new_with_start_shape(
+            subset
+                .start()
+                .iter()
+                .zip(&origin)
+                .map(|(&start, &base)| start - base)
+                .collect(),
+            subset.shape().to_vec(),
+        )
+        .map_err(|err| CodecError::Other(err.to_string()))?;
+        let extracted = bytes.extract_array_subset(&local, &self.inner_shape, &self.data_type)?;
+        match extracted {
+            ArrayBytes::Fixed(raw) => {
+                view.copy_from_slice(&raw)
+                    .map_err(|err| CodecError::Other(err.to_string()))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 
@@ -370,6 +465,7 @@ impl CodecPipelineImpl {
                 .map(|size| Mutex::new(LruCache::new(size))),
             chunk_cache_budget_bytes,
             chunk_cache_min_items,
+            inner_chunk_shape: innermost_chunk_shape(array_metadata),
             fill_value,
             data_type,
         })
@@ -398,32 +494,53 @@ impl CodecPipelineImpl {
             .unique_by(|item| item.key.clone())
             .collect::<Vec<_>>();
 
-        // A key read by several items is a chunk that would be decoded once per item.
-        // Cache the decode for those, most-repeated first, until the budget runs out -- the
-        // rest keep the plain decoder, so a wide read degrades to today's behaviour instead
-        // of exhausting memory.
-        let mut items_per_key: HashMap<&StoreKey, u64> = HashMap::new();
+        // Caching a key pays off only when its items *share* inner chunks: extracting any
+        // part of an inner chunk decodes all of it, so N items in one inner chunk cost N
+        // decodes uncached and one cached. Items spread one-per-inner-chunk gain nothing and
+        // would pay a full decode each, so admit on items-per-inner-chunk rather than on
+        // items-per-key, then take the most redundant keys while the budget lasts.
+        let mut subsets_per_key: HashMap<StoreKey, Vec<ArraySubset>> = HashMap::new();
         for item in chunk_descriptions.iter().filter(|i| !is_whole_chunk(i)) {
-            *items_per_key.entry(&item.key).or_default() += 1;
+            subsets_per_key
+                .entry(item.key.clone())
+                .or_default()
+                .push(item.chunk_subset.clone());
         }
         let element_size = self.data_type.fixed_size().unwrap_or(0) as u64;
-        let mut repeated = partial_chunk_items
-            .iter()
-            .filter(|item| items_per_key[&item.key] >= self.chunk_cache_min_items)
-            .collect::<Vec<_>>();
-        repeated.sort_by_key(|item| std::cmp::Reverse(items_per_key[&item.key]));
+        let mut candidates: Vec<(StoreKey, u64, u64)> = Vec::new();
+        for item in &partial_chunk_items {
+            let Some(subsets) = subsets_per_key.get(&item.key) else {
+                continue;
+            };
+            let chunk_shape = bytemuck::must_cast_slice::<_, u64>(&item.shape);
+            let inner_shape = self.inner_chunk_shape.as_deref().unwrap_or(chunk_shape);
+            // Only items lying inside a single inner chunk can be served from the cache.
+            let servable = subsets
+                .iter()
+                .filter_map(|subset| containing_inner_chunk(subset, inner_shape))
+                .collect::<Vec<_>>();
+            let touched = servable.iter().collect::<HashSet<_>>().len() as u64;
+            if touched == 0 {
+                continue;
+            }
+            let per_inner_chunk = servable.len() as u64 / touched;
+            if per_inner_chunk < self.chunk_cache_min_items {
+                continue;
+            }
+            let bytes = touched
+                .saturating_mul(inner_shape.iter().product::<u64>())
+                .saturating_mul(element_size);
+            if bytes > 0 {
+                candidates.push((item.key.clone(), per_inner_chunk, bytes));
+            }
+        }
+        candidates.sort_by_key(|(_, per_inner_chunk, _)| std::cmp::Reverse(*per_inner_chunk));
         let mut budget = self.chunk_cache_budget_bytes;
         let mut cached_keys: HashSet<StoreKey> = HashSet::new();
-        for item in repeated {
-            let bytes = item
-                .shape
-                .iter()
-                .map(|n| n.get())
-                .product::<u64>()
-                .saturating_mul(element_size);
+        for (key, _, bytes) in candidates {
             if bytes <= budget {
                 budget -= bytes;
-                cached_keys.insert(item.key.clone());
+                cached_keys.insert(key);
             }
         }
 
@@ -484,31 +601,37 @@ impl CodecPipelineImpl {
             decoders.extend(built);
         }
 
-        // Wrap the repeatedly-read keys for this call, in parallel -- each wrap decodes a chunk.
-        let to_wrap = decoders
+        // Decode the touched inner chunks of the admitted keys, in parallel -- each is a
+        // decode. Scoped to this call, unlike the decoders above.
+        let to_cache = decoders
             .iter()
             .filter(|(key, _)| cached_keys.contains(*key))
             .map(|(key, decoder)| (key.clone(), decoder.clone()))
             .collect::<Vec<_>>();
-        let mut partial_decoder_cache = decoders;
-        if !to_wrap.is_empty() {
-            let wrapped = iter_concurrent_limit!(
+        let partial_decoder_cache = decoders;
+        let mut inner_caches: HashMap<StoreKey, InnerChunkCache> = HashMap::new();
+        if !to_cache.is_empty() {
+            let built = iter_concurrent_limit!(
                 chunk_concurrent_limit,
-                to_wrap,
+                to_cache,
                 map,
                 |(key, decoder): (StoreKey, Arc<dyn ArrayPartialDecoderTraits>)| {
-                    let cache = DecodedChunkCache::new(
+                    let chunk_shape = &shape_for_key[&key];
+                    let inner_shape = self.inner_chunk_shape.as_deref().unwrap_or(chunk_shape);
+                    let cache = InnerChunkCache::new(
                         decoder.as_ref(),
-                        &shape_for_key[&key],
+                        chunk_shape,
+                        inner_shape,
                         self.data_type.clone(),
+                        &subsets_per_key[&key],
                         &codec_options,
                     )
                     .map_codec_err()?;
-                    Ok((key, Arc::new(cache) as Arc<dyn ArrayPartialDecoderTraits>))
+                    Ok((key, cache))
                 }
             )
             .collect::<PyResult<Vec<_>>>()?;
-            partial_decoder_cache.extend(wrapped);
+            inner_caches.extend(built);
         }
 
         py.detach(move || {
@@ -532,9 +655,9 @@ impl CodecPipelineImpl {
                     )
                     .map_py_err::<PyRuntimeError>()?
                 };
-                let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
                 // See zarrs::array::Array::retrieve_chunk_subset_into
                 if is_whole_chunk(&item) {
+                    let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
                     // See zarrs::array::Array::retrieve_chunk_into
                     if let Some(chunk_encoded) =
                         self.store.get(&item.key).map_py_err::<PyRuntimeError>()?
@@ -554,6 +677,15 @@ impl CodecPipelineImpl {
                         copy_fill_value_into(&self.data_type, &self.fill_value, target)
                     }
                 } else {
+                    // An inner chunk this item lies inside may already be decoded.
+                    if let Some(cache) = inner_caches.get(&item.key)
+                        && cache
+                            .try_copy_into(&item.chunk_subset, &mut output_view)
+                            .map_codec_err()?
+                    {
+                        return Ok(());
+                    }
+                    let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
                     let key = &item.key;
                     let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
                         PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
