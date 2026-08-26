@@ -61,6 +61,11 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.chunk_concurrent_maximum", None
             ),
             num_threads=config.get("threading.max_workers", None),
+            # The reader-pool / decode-pool arm. Off by default: it changes which code
+            # reads the bytes, so it has to be asked for by name.
+            read_decode_pool=config.get("codec_pipeline.read_decode_pool", False),
+            read_concurrency=config.get("codec_pipeline.read_concurrency", None),
+            decode_concurrency=config.get("codec_pipeline.decode_concurrency", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
