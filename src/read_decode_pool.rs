@@ -275,47 +275,78 @@ fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Out
     Ok(Outcome::Decoded)
 }
 
-/// Block until every job sent has replied, returning how many decoded.
+/// Jobs sent to the pool but not yet answered.
 ///
-/// Nothing may return before the last reply: each worker holds an `OutRegion`, a raw pointer
-/// into the output buffer the CALLER owns and frees on the way out. The coordinates are an
-/// `Arc` and would survive on their own; the output regions are what make this load-bearing.
-fn await_replies(done_rx: &Receiver<Outcome>, sent: usize) -> PyResult<usize> {
-    let mut decoded = 0usize;
-    let mut first_error: Option<String> = None;
-    for _ in 0..sent {
-        match done_rx.recv() {
-            Ok(Outcome::Decoded) => decoded += 1,
-            Ok(Outcome::Failed(e)) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
-            // A worker died without replying. Returning now would free memory the survivors
-            // still hold, so this is not recoverable.
-            Err(e) => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "a pool worker stopped without replying after {decoded} of {sent} \
-                     chunks ({e}); the pool cannot be trusted for the rest of this run"
-                )));
-            }
+/// Nothing may return while any remain: each worker holds an `OutRegion`, a raw pointer into
+/// the output buffer the CALLER owns and frees on the way out. The coordinates are an `Arc`
+/// and would survive on their own; the output regions are what make this load-bearing.
+///
+/// That is why this is a VALUE whose `Drop` drains rather than a function to remember to
+/// call. Every exit path then honours it -- an early return, a `?` two lines below, a panic
+/// unwinding through here -- and not just the paths someone thought about. The obvious future
+/// edits are "return as soon as one chunk fails" and "put a timeout on the reply channel";
+/// both would be use-after-free with a plain function and are merely slow with this.
+struct JobsInFlight<'a> {
+    done_rx: &'a Receiver<Outcome>,
+    outstanding: usize,
+    decoded: usize,
+    first_error: Option<String>,
+}
+
+impl<'a> JobsInFlight<'a> {
+    fn new(done_rx: &'a Receiver<Outcome>, sent: usize) -> Self {
+        Self {
+            done_rx,
+            outstanding: sent,
+            decoded: 0,
+            first_error: None,
         }
     }
-    if let Some(e) = first_error {
-        return Err(PyRuntimeError::new_err(e));
+
+    /// Take replies until none are outstanding. Records the first failure rather than
+    /// returning on it: a failed chunk still means that job is done with its region, but the
+    /// others are not, so draining continues either way.
+    fn drain(&mut self) {
+        while self.outstanding > 0 {
+            match self.done_rx.recv() {
+                Ok(Outcome::Decoded) => self.decoded += 1,
+                Ok(Outcome::Failed(e)) => {
+                    if self.first_error.is_none() {
+                        self.first_error = Some(e);
+                    }
+                }
+                // Every sender has dropped, so no job is still holding a region -- a worker
+                // died without replying, and unwinding dropped its `Job`. Nothing left to
+                // wait for, and nothing left pointing into the output.
+                Err(_) => break,
+            }
+            self.outstanding -= 1;
+        }
     }
-    Ok(decoded)
+
+    /// Drain, then report: how many decoded, or the first failure.
+    fn finish(mut self) -> PyResult<usize> {
+        self.drain();
+        if let Some(e) = self.first_error.take() {
+            return Err(PyRuntimeError::new_err(e));
+        }
+        if self.outstanding > 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "a pool worker stopped without replying after {} of {} chunks; the pool \
+                 cannot be trusted for the rest of this run",
+                self.decoded,
+                self.decoded + self.outstanding
+            )));
+        }
+        Ok(self.decoded)
+    }
 }
-/// An absent chunk contributes only fill value, repeated.
-fn fill(out: &mut [u8], fill_value: &FillValue, size: usize) -> Result<(), String> {
-    let bytes = fill_value.as_ne_bytes();
-    if bytes.len() != size {
-        return Err("the fill value is not one element wide".to_string());
+
+impl Drop for JobsInFlight<'_> {
+    fn drop(&mut self) {
+        // Whatever `finish` did not take, because something returned or panicked first.
+        self.drain();
     }
-    for slot in out.chunks_exact_mut(size) {
-        slot.copy_from_slice(bytes);
-    }
-    Ok(())
 }
 
 impl CodecPipelineImpl {
@@ -402,12 +433,12 @@ impl CodecPipelineImpl {
         drop(done_tx);
 
         // ------------------------------------------------------------------ wait for all
-        let decoded = await_replies(&done_rx, sent)?;
+        let decoded = JobsInFlight::new(&done_rx, sent).finish()?;
 
-        // Every job sent was one innermost chunk, read once and decoded once. `await_replies`
-        // waits for exactly `sent` outcomes and fails on any that did not decode, so this
-        // cannot differ -- asserted rather than checked, so a future change to that function
-        // trips it in a debug build instead of silently returning short output.
+        // Every job sent was one innermost chunk, read once and decoded once. `JobsInFlight`
+        // drains exactly `sent` outcomes and fails on any that did not decode, so this cannot
+        // differ -- asserted rather than checked, so a future change trips it in a debug build
+        // instead of silently returning short output.
         debug_assert_eq!(sent, decoded, "pool accounting does not close");
         Ok(declined)
     }
@@ -553,6 +584,18 @@ impl CodecPipelineImpl {
 ///
 /// The chunk-unit grouping emits non-decreasing index groups, so the regions should partition
 /// the part of the output this call owns. Checking it is the difference between a sound
+/// An absent chunk contributes only fill value, repeated.
+fn fill(out: &mut [u8], fill_value: &FillValue, size: usize) -> Result<(), String> {
+    let bytes = fill_value.as_ne_bytes();
+    if bytes.len() != size {
+        return Err("the fill value is not one element wide".to_string());
+    }
+    for slot in out.chunks_exact_mut(size) {
+        slot.copy_from_slice(bytes);
+    }
+    Ok(())
+}
+
 /// `unsafe` and an assertion in a comment.
 fn verify_disjoint(
     regions: &[OutRegion],
@@ -596,4 +639,53 @@ fn coords_of(item: &ChunkItem) -> PyResult<&Arc<[u64]>> {
 /// chunk subset, chunk selection or output selection is not one-dimensional.
 fn output_offset(item: &ChunkItem) -> usize {
     usize::try_from(item.subset.start().first().copied().unwrap_or(0)).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod jobs_in_flight_tests {
+    use super::{JobsInFlight, Outcome};
+    use crossbeam_channel::unbounded;
+
+    #[test]
+    fn drop_drains_the_replies_nobody_waited_for() {
+        // The point of the guard: a caller that returns early still leaves no job holding a
+        // pointer into the output buffer. Simulated by dropping without calling `finish`.
+        let (tx, rx) = unbounded();
+        for _ in 0..3 {
+            tx.send(Outcome::Decoded).expect("send");
+        }
+        {
+            let _inflight = JobsInFlight::new(&rx, 3);
+        }
+        assert!(
+            rx.is_empty(),
+            "drop must have taken every outstanding reply"
+        );
+    }
+
+    #[test]
+    fn finish_reports_the_first_failure_but_still_drains() {
+        let (tx, rx) = unbounded();
+        tx.send(Outcome::Decoded).expect("send");
+        tx.send(Outcome::Failed("first".into())).expect("send");
+        tx.send(Outcome::Failed("second".into())).expect("send");
+
+        let err = JobsInFlight::new(&rx, 3)
+            .finish()
+            .expect_err("a chunk failed");
+        assert!(err.to_string().contains("first"), "{err}");
+        assert!(
+            rx.is_empty(),
+            "a failed chunk must not stop the others being drained"
+        );
+    }
+
+    #[test]
+    fn finish_counts_what_decoded() {
+        let (tx, rx) = unbounded();
+        for _ in 0..5 {
+            tx.send(Outcome::Decoded).expect("send");
+        }
+        assert_eq!(JobsInFlight::new(&rx, 5).finish().expect("all decoded"), 5);
+    }
 }
