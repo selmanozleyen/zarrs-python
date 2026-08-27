@@ -91,6 +91,25 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
     return make_slice_selection(selector_tuple)
 
 
+def _is_sorted_integer_axis(indices: Any, out_axis_sel: Any) -> bool:
+    """Is this one sorted 1-D integer axis written to a contiguous output slice?
+
+    The shared half of the two eligibility tests below, which ask the same question in two
+    styles. Deliberately does NOT judge negative indices or the output length: on a negative
+    index `split_selection_runs` raises and `_chunk_unit_args` declines, and the raise comes
+    before the length check, so the order of those two decisions is part of each caller's
+    behaviour. They stay at the call sites for that reason.
+    """
+    return (
+        isinstance(indices, np.ndarray)
+        and indices.ndim == 1
+        # Non-decreasing only: any decrease would mean one box per element, a decode each.
+        and not (indices[1:] < indices[:-1]).any()
+        and isinstance(out_axis_sel, slice)
+        and out_axis_sel.step in (None, 1)
+    )
+
+
 def split_selection_runs(
     chunk_selection: SelectorTuple, out_selection: SelectorTuple
 ) -> Iterator[tuple[SelectorTuple, SelectorTuple]]:
@@ -117,13 +136,8 @@ def split_selection_runs(
     (axis,) = array_axes
     indices = chunk_sel[axis]
     out_axis_sel = out_sel[axis]
-    if (
-        indices.ndim != 1
-        # Non-decreasing only: any decrease would mean one box per element, a decode each.
-        or (indices[1:] < indices[:-1]).any()
-        or not isinstance(out_axis_sel, slice)
-        or out_axis_sel.step not in (None, 1)
-        or not all(isinstance(sel, slice) for sel in out_sel)
+    if not _is_sorted_integer_axis(indices, out_axis_sel) or not all(
+        isinstance(sel, slice) for sel in out_sel
     ):
         yield from unsplit
         return
@@ -274,15 +288,13 @@ def _chunk_unit_args(
         return None
     (indices,) = chunk_sel
     (out_axis_sel,) = out_sel
-    if not isinstance(indices, np.ndarray) or indices.ndim != 1 or indices.size == 0:
-        return None
-    if not isinstance(out_axis_sel, slice):
+    if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
         return None
     indices = indices.astype(np.int64, copy=False)
-    if (indices < 0).any() or (indices[1:] < indices[:-1]).any():
+    if (indices < 0).any():
         return None
     start = out_axis_sel.start or 0
-    if out_axis_sel.step not in (None, 1) or out_axis_sel.stop - start != indices.size:
+    if out_axis_sel.stop - start != indices.size:
         return None
 
     return (
