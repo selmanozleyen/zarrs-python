@@ -12,6 +12,7 @@ use numpy::npyffi::PyArrayObject;
 use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::wrap_pyfunction;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -631,11 +632,18 @@ impl CodecPipelineImpl {
 }
 
 /// A Python module implemented in Rust.
+/// Print the read/decode pool's time budget. Totals for the process, not per call.
+#[pyfunction]
+fn report_pool_phases() {
+    read_decode_pool::report_phases();
+}
+
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
+    m.add_function(wrap_pyfunction!(report_pool_phases, m)?)?;
     Ok(())
 }
 

@@ -58,7 +58,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use pyo3::PyResult;
@@ -171,6 +173,47 @@ struct Pipeline {
     decode_threads: usize,
 }
 
+/// Worker-side time, in nanoseconds, accumulated across every pool thread.
+///
+/// The caller's own phases are timed inline; these three are not, because they happen on
+/// threads the caller is blocked waiting for. Summed rather than maxed: the question is
+/// where the CPU-seconds go, and this run spends ~18.4 of them against zarr-python's
+/// ~11.2 for the same data.
+static NS_READ: AtomicU64 = AtomicU64::new(0);
+static NS_DECODE: AtomicU64 = AtomicU64::new(0);
+static NS_GATHER: AtomicU64 = AtomicU64::new(0);
+
+/// Caller-side time: the phases the Python thread is inside, holding nothing else up.
+static NS_LOCATE: AtomicU64 = AtomicU64::new(0);
+static NS_DISPATCH: AtomicU64 = AtomicU64::new(0);
+static NS_WAIT: AtomicU64 = AtomicU64::new(0);
+static NS_CALL: AtomicU64 = AtomicU64::new(0);
+static N_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Print the budget once, when the process exits, so a run reports totals rather than a
+/// line per call. Only when ZARRS_PHASE_STATS is set.
+pub(crate) fn report_phases() {
+    let calls = N_CALLS.load(Ordering::Relaxed);
+    if calls == 0 {
+        return;
+    }
+    let ms = |x: &AtomicU64| x.load(Ordering::Relaxed) as f64 / 1e6;
+    let (call, locate, dispatch, wait) = (
+        ms(&NS_CALL), ms(&NS_LOCATE), ms(&NS_DISPATCH), ms(&NS_WAIT),
+    );
+    let (read, decode, gather) = (ms(&NS_READ), ms(&NS_DECODE), ms(&NS_GATHER));
+    eprintln!(
+        "PHASES over {calls} calls, milliseconds\n\
+         \x20 caller  total {call:9.1}  = locate {locate:9.1} + dispatch {dispatch:9.1} \
+         + wait {wait:9.1}\n\
+         \x20 workers          {:9.1}  = read   {read:9.1} + decode   {decode:9.1} \
+         + gather {gather:9.1}\n\
+         \x20 caller time NOT in those three: {:.1} ms",
+        read + decode + gather,
+        call - locate - dispatch - wait,
+    );
+}
+
 static PIPELINE: OnceLock<Pipeline> = OnceLock::new();
 /// Serialises construction. `OnceLock::get().is_none()` then `set()` is check-then-act: two
 /// first callers both spawn R + D threads and the loser's are thrown away -- and when they
@@ -245,7 +288,10 @@ fn check_widths(
 /// Never decodes. Parks on `recv` when there is nothing to read, for the life of the process.
 fn read_loop(reads: &Receiver<ReadJob>, decodes: &Sender<(Job, MaybeBytes)>) {
     while let Ok(read) = reads.recv() {
-        match read.ctx_store().get_partial(&read.key, read.range) {
+        let t0 = Instant::now();
+        let fetched = read.ctx_store().get_partial(&read.key, read.range);
+        NS_READ.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        match fetched {
             Ok(bytes) => {
                 for (at, len, job) in read.members {
                     // `Bytes` is refcounted and `slice` is O(1), so splitting one extent
@@ -323,6 +369,7 @@ fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Out
     scratch.resize(needed, 0);
 
     let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
+    let t_decode = Instant::now();
     {
         let slice = UnsafeCellSlice::new(scratch.as_mut_slice());
         let mut view = unsafe {
@@ -350,7 +397,10 @@ fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Out
             .map_err(|e| e.to_string())?;
     }
 
+    NS_DECODE.fetch_add(t_decode.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let t_gather = Instant::now();
     gather(scratch, coords, out, size).map_err(|e| format!("{}: {e}", job.key))?;
+    NS_GATHER.fetch_add(t_gather.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Ok(Outcome::Decoded)
 }
 
@@ -435,9 +485,12 @@ impl CodecPipelineImpl {
         });
 
         let pipeline = pipeline(self.read_concurrency, self.decode_concurrency)?;
+        let t_call = Instant::now();
 
         // ---------------------------------------------- locate each chunk in its shard
+        let t_locate = Instant::now();
         let (located, declined, shard_indexes) = self.locate_chunks(shard, items, &ctx)?;
+        NS_LOCATE.fetch_add(t_locate.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let declined_n = declined.len();
         if located.is_empty() {
             return Ok((
@@ -474,6 +527,7 @@ impl CodecPipelineImpl {
         verify_disjoint(&regions, &located)?;
 
         // --------------------------------------------- absent chunks: no read, no decode
+        let t_dispatch = Instant::now();
         let (done_tx, done_rx) = bounded::<Outcome>(located.len());
         let mut absent = 0usize;
 
@@ -566,8 +620,10 @@ impl CodecPipelineImpl {
             reads += 1;
         }
         drop(done_tx);
+        NS_DISPATCH.fetch_add(t_dispatch.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // ------------------------------------------------------------------ wait for all
+        let t_wait = Instant::now();
         // Every job must reply before this returns: the regions and coordinate slices the
         // workers hold point into memory owned by the caller.
         let mut decoded = 0usize;
@@ -590,6 +646,9 @@ impl CodecPipelineImpl {
                 }
             }
         }
+        NS_WAIT.fetch_add(t_wait.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        NS_CALL.fetch_add(t_call.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        N_CALLS.fetch_add(1, Ordering::Relaxed);
         if let Some(e) = first_error {
             return Err(PyRuntimeError::new_err(e));
         }
