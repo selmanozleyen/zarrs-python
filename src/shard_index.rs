@@ -43,6 +43,16 @@ impl ShardInfo {
     /// to the right data types, which is why this takes the chain rather than the metadata:
     /// the alternative was re-deriving all of it from `MetadataV3`.
     pub fn from_codec_chain(chain: &CodecChainBound) -> Option<Self> {
+        // Only an EXCLUSIVELY sharded array. A codec either side of the sharding codec means
+        // the shard's bytes on disk are not the shard the index describes: a bytes-to-bytes
+        // codec after it compresses the whole shard, so a byte range into the file addresses
+        // compressed bytes, and an array-to-array codec before it reshapes what the inner
+        // chunks contain. Either way the index still parses and the read still returns
+        // something, which is exactly why this is checked rather than assumed. zarrs calls
+        // this `is_exclusively_sharded`, but that predicate hangs off `Array`.
+        if !chain.array_to_array_codecs().is_empty() || !chain.bytes_to_bytes_codecs().is_empty() {
+            return None;
+        }
         let sharding = chain
             .array_to_bytes_codec()
             .as_any()

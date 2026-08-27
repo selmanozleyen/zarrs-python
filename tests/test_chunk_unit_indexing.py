@@ -150,3 +150,38 @@ def test_two_dimensional_selection_falls_back(tmp_path: Path) -> None:
         got = zarr.open_array(path, mode="r")[rows, :]
 
     np.testing.assert_array_equal(got, values[rows, :])
+
+
+# zarr warns that this layout disables partial reads. That IS the layout under test.
+@pytest.mark.filterwarnings("ignore:Combining a `sharding_indexed` codec")
+def test_a_codec_after_sharding_is_refused(tmp_path: Path) -> None:
+    """Sharding with an OUTER compressor must not take the chunk-unit path.
+
+    A bytes-to-bytes codec after the sharding codec compresses the whole shard, so a byte
+    range into the file addresses compressed bytes rather than the shard the index describes.
+
+    Without the refusal this raises `RuntimeError: the checksum is invalid` -- the crc32c in
+    the default index codecs catches it, because the tail of a compressed shard does not
+    checksum as an index. So it is loud, but it reads as data corruption rather than as an
+    unsupported layout. It would only be SILENT if the index codecs carried no checksum,
+    which is legal but not the default. Either way the refusal turns it into a clean fallback.
+    """
+    from zarr.codecs import BytesCodec, ShardingCodec
+
+    values = np.arange(N, dtype=np.float32)
+    path = tmp_path / "outer_compressed"
+    z = zarr.create_array(
+        path,
+        shape=values.shape,
+        chunks=(SHARD,),
+        dtype="float32",
+        # An explicit sharding serializer leaves the default compressor OUTSIDE it, which is
+        # the layout this refuses. `shards=` would nest the compressor inside instead.
+        serializer=ShardingCodec(chunk_shape=(CHUNK,), codecs=[BytesCodec()]),
+    )
+    z[:] = values
+
+    selection = np.sort(np.random.default_rng(0).choice(N, size=200, replace=False))
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[selection]
+    np.testing.assert_array_equal(got, values[selection])
