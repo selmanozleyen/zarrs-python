@@ -125,16 +125,33 @@ enum Outcome {
     Failed(String),
 }
 
-/// One innermost chunk of work.
+/// One innermost chunk to decode, once its bytes have arrived.
 struct Job {
     key: StoreKey,
-    range: ByteRange,
     out: OutRegion,
     coords: CoordsRef,
     /// Everything the decode needs, shared rather than copied per job.
     ctx: Arc<JobContext>,
     /// Where to report completion. Per call, so a reply finds the right caller.
     done: Sender<Outcome>,
+}
+
+/// One `pread`: a contiguous extent covering one or more inner chunks.
+///
+/// Chunks that sit back to back in the shard are read together. The saving is a syscall
+/// and a seek, never a byte: only ranges that actually touch are merged, so a merged read
+/// fetches exactly what the separate reads would have.
+///
+/// Whether this helps is a property of the STORE, not of the code. A shard written in
+/// chunk-id order makes a run of consecutive ids one extent; the plates measured here were
+/// written concurrently, so id order and byte order barely correlate (r = 0.18) and only
+/// ~16 of 1,952 consecutive-id pairs touch. Sorting by offset is what finds the pairs that
+/// do, and it costs an O(n log n) sort of a few hundred items against ~2.9 ms per read.
+struct ReadJob {
+    key: StoreKey,
+    range: ByteRange,
+    /// `(offset within this extent, encoded length, the chunk to decode)`, in byte order.
+    members: Vec<(usize, usize, Job)>,
 }
 
 /// The per-array state a decode needs, shared by every job of a call.
@@ -149,7 +166,7 @@ struct JobContext {
 
 /// The process-wide pipeline: R reader threads and D decode threads, parked between calls.
 struct Pipeline {
-    jobs: Sender<Job>,
+    jobs: Sender<ReadJob>,
     read_threads: usize,
     decode_threads: usize,
 }
@@ -177,7 +194,7 @@ fn pipeline(read_threads: usize, decode_threads: usize) -> PyResult<&'static Pip
         if PIPELINE.get().is_some() {
             return check_widths(PIPELINE.get().expect("just checked"), read_threads, decode_threads);
         }
-        let (job_tx, job_rx) = unbounded::<Job>();
+        let (job_tx, job_rx) = unbounded::<ReadJob>();
         // Unbounded on purpose: a reader never waits for a decoder. Peak resident is
         // items-per-call x encoded chunk size, small at ~70 items per call.
         let (decode_tx, decode_rx) = unbounded::<(Job, MaybeBytes)>();
@@ -226,20 +243,47 @@ fn check_widths(
 /// A reader: block on the filesystem, hand the bytes on, take the next job.
 ///
 /// Never decodes. Parks on `recv` when there is nothing to read, for the life of the process.
-fn read_loop(jobs: &Receiver<Job>, decodes: &Sender<(Job, MaybeBytes)>) {
-    while let Ok(job) = jobs.recv() {
-        match job.ctx.store.get_partial(&job.key, job.range) {
-            // The bytes are MOVED to a decoder, not copied.
+fn read_loop(reads: &Receiver<ReadJob>, decodes: &Sender<(Job, MaybeBytes)>) {
+    while let Ok(read) = reads.recv() {
+        match read.ctx_store().get_partial(&read.key, read.range) {
             Ok(bytes) => {
-                if decodes.send((job, bytes)).is_err() {
-                    return; // no decoders left: the process is going away
+                for (at, len, job) in read.members {
+                    // `Bytes` is refcounted and `slice` is O(1), so splitting one extent
+                    // across its chunks copies nothing -- each decoder gets a view.
+                    let part = match &bytes {
+                        Some(all) if at + len <= all.len() => Some(all.slice(at..at + len)),
+                        Some(all) => {
+                            let _ = job.done.send(Outcome::Failed(format!(
+                                "{} wanted bytes {at}..{} of an extent {} long",
+                                job.key,
+                                at + len,
+                                all.len()
+                            )));
+                            continue;
+                        }
+                        None => None,
+                    };
+                    if decodes.send((job, part)).is_err() {
+                        return; // no decoders left: the process is going away
+                    }
                 }
             }
             Err(e) => {
-                let key = job.key.clone();
-                let _ = job.done.send(Outcome::Failed(format!("read {key} failed: {e}")));
+                for (_, _, job) in read.members {
+                    let key = job.key.clone();
+                    let _ = job
+                        .done
+                        .send(Outcome::Failed(format!("read {key} failed: {e}")));
+                }
             }
         }
+    }
+}
+
+impl ReadJob {
+    /// Every member of one extent shares a context, so any of them names the store.
+    fn ctx_store(&self) -> &ReadableWritableListableStorage {
+        &self.members[0].2.ctx.store
     }
 }
 
@@ -354,6 +398,8 @@ pub(crate) struct PoolCounts {
     pub absent: usize,
     pub shard_indexes: usize,
     pub declined: usize,
+    /// `pread` calls issued. Below `chunks` when chunks were byte-adjacent and merged.
+    pub reads: usize,
 }
 
 impl CodecPipelineImpl {
@@ -430,33 +476,84 @@ impl CodecPipelineImpl {
         // --------------------------------------------- absent chunks: no read, no decode
         let (done_tx, done_rx) = bounded::<Outcome>(located.len());
         let mut absent = 0usize;
-        let mut sent = 0usize;
+
+        // Absent chunks first: they are output, not I/O, and keeping them out of the
+        // coalescing keeps that a question purely about byte ranges.
+        let mut present: Vec<(StoreKey, u64, u64, Job)> = Vec::with_capacity(located.len());
         for ((item, range), region) in located.iter().zip(regions) {
-            match range {
-                Some(range) => {
-                    pipeline
-                        .jobs
-                        .send(Job {
-                            key: item.key.clone(),
-                            range: *range,
-                            out: region,
-                            coords: CoordsRef {
-                                ptr: coords_of(item)?.as_ptr(),
-                                len: coords_of(item)?.len(),
-                            },
-                            ctx: ctx.clone(),
-                            done: done_tx.clone(),
-                        })
-                        .map_py_err::<PyRuntimeError>()?;
-                    sent += 1;
+            let Some(ByteRange::FromStart(offset, Some(size))) = range else {
+                match range {
+                    None => {
+                        absent += 1;
+                        // SAFETY: this region belongs to no job; nothing else can touch it.
+                        let out = unsafe { region.as_mut() };
+                        fill(out, &self.fill_value, element_size)
+                            .map_py_err::<PyRuntimeError>()?;
+                        continue;
+                    }
+                    // The shard index gives every present chunk an offset and a size, so
+                    // any other shape means the index was read wrong rather than that this
+                    // chunk needs a different path.
+                    Some(other) => {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "{} has byte range {other:?}, which the shard index cannot \
+                             produce for a present chunk",
+                            item.key
+                        )));
+                    }
                 }
-                None => {
-                    absent += 1;
-                    // SAFETY: this region belongs to no job; nothing else can touch it.
-                    let out = unsafe { region.as_mut() };
-                    fill(out, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
-                }
+            };
+            present.push((
+                item.key.clone(),
+                *offset,
+                *size,
+                Job {
+                    key: item.key.clone(),
+                    out: region,
+                    coords: CoordsRef {
+                        ptr: coords_of(item)?.as_ptr(),
+                        len: coords_of(item)?.len(),
+                    },
+                    ctx: ctx.clone(),
+                    done: done_tx.clone(),
+                },
+            ));
+        }
+        let sent = present.len();
+
+        // Sort by (shard, offset) and merge only ranges that actually touch. Cheap --
+        // a few hundred items against ~2.9 ms per read -- and it can never fetch a byte
+        // the unmerged version would not have, because a gap ends a run.
+        present.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        let mut reads = 0usize;
+        while !present.is_empty() {
+            let (key, start, first_size, _) = &present[0];
+            let (key, start, first_size) = (key.clone(), *start, *first_size);
+            let mut end = start + first_size;
+            let mut j = 1usize;
+            while j < present.len() && present[j].0 == key && present[j].1 == end {
+                end += present[j].2;
+                j += 1;
             }
+            let members = present
+                .drain(..j)
+                .map(|(_, offset, size, job)| {
+                    (
+                        usize::try_from(offset - start).unwrap_or(usize::MAX),
+                        usize::try_from(size).unwrap_or(usize::MAX),
+                        job,
+                    )
+                })
+                .collect();
+            pipeline
+                .jobs
+                .send(ReadJob {
+                    key,
+                    range: ByteRange::FromStart(start, Some(end - start)),
+                    members,
+                })
+                .map_py_err::<PyRuntimeError>()?;
+            reads += 1;
         }
         drop(done_tx);
 
@@ -493,6 +590,7 @@ impl CodecPipelineImpl {
             absent,
             shard_indexes,
             declined: declined_n,
+            reads,
         };
         Ok((declined, counts))
     }

@@ -366,12 +366,13 @@ impl CodecPipelineImpl {
             if counts.chunks != counts.decoded {
                 return Err(PyRuntimeError::new_err(format!(
                     "read/decode pool accounting does not close: {} chunks sent, {} decoded \
-                     ({} absent, {} shard indexes read, {} items declined)",
+                     ({} absent, {} shard indexes read, {} items declined, {} reads issued)",
                     counts.chunks,
                     counts.decoded,
                     counts.absent,
                     counts.shard_indexes,
-                    counts.declined
+                    counts.declined,
+                    counts.reads
                 )));
             }
             if declined.is_empty() {
