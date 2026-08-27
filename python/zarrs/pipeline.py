@@ -29,7 +29,8 @@ from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
     UnsupportedVIndexingError,
-    make_chunk_info_for_rust_with_indices,
+    chunk_info_for_read,
+    chunk_info_for_write,
 )
 
 
@@ -61,10 +62,6 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.chunk_concurrent_maximum", None
             ),
             num_threads=config.get("threading.max_workers", None),
-            # A reader pool feeding a decode pool, in place of the fused read-and-decode.
-            # Off by default: it changes which code reads the bytes, and its threads are a
-            # process-wide resource, so it has to be asked for by name.
-            read_decode_pool=config.get("codec_pipeline.read_decode_pool", False),
             read_concurrency=config.get("codec_pipeline.read_concurrency", None),
             decode_concurrency=config.get("codec_pipeline.decode_concurrency", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
@@ -201,17 +198,8 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = make_chunk_info_for_rust_with_indices(
-                batch_info,
-                drop_axes,
-                out.shape,
-                integer_array_indexing=config.get(
-                    "codec_pipeline.integer_array_indexing", False
-                ),
-                chunk_unit_indexing=config.get(
-                    "codec_pipeline.chunk_unit_indexing", False
-                ),
-                inner_chunk_shape=self._inner_chunk_shape(),
+            chunks_desc = chunk_info_for_read(
+                batch_info, drop_axes, out.shape, self._inner_chunk_shape()
             )
         except (
             UnsupportedMetadataError,
@@ -249,9 +237,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = make_chunk_info_for_rust_with_indices(
-                batch_info, drop_axes, value.shape
-            )
+            chunks_desc = chunk_info_for_write(batch_info, drop_axes, value.shape)
         except (
             UnsupportedMetadataError,
             DiscontiguousArrayError,

@@ -58,7 +58,6 @@ pub struct CodecPipelineImpl {
     /// zarr builds a pipeline per ARRAY, so pools owned here are built once per array.
     pub(crate) read_concurrency: usize,
     pub(crate) decode_concurrency: usize,
-    pub(crate) read_decode_pool_enabled: bool,
     /// Present only for a singly-sharded array: the pool locates chunks itself, so it
     /// needs the shard's index codecs and the codecs inside a shard. `None` means this
     /// array cannot take the pool path at all.
@@ -251,9 +250,7 @@ impl CodecPipelineImpl {
         // needs an exclusive output slice, so it cannot share the aliasing wrapper the
         // fused path takes -- hence the dispatch here rather than inside the loop.
         if let (true, Some(shard)) = (
-            self.read_decode_pool_enabled
-                && !chunk_descriptions.is_empty()
-                && chunk_descriptions.iter().all(|i| i.coords.is_some()),
+            !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.coords.is_some()),
             self.shard.as_ref(),
         ) {
             let output = Self::nparray_to_mut_slice(value)?;
@@ -305,7 +302,6 @@ impl CodecPipelineImpl {
         num_threads=None,
         direct_io=false,
         file_handle_cache_size=0,
-        read_decode_pool=false,
         read_concurrency=None,
         decode_concurrency=None,
     ))]
@@ -320,7 +316,6 @@ impl CodecPipelineImpl {
         num_threads: Option<usize>,
         direct_io: bool,
         file_handle_cache_size: usize,
-        read_decode_pool: bool,
         read_concurrency: Option<usize>,
         decode_concurrency: Option<usize>,
     ) -> PyResult<Self> {
@@ -355,7 +350,11 @@ impl CodecPipelineImpl {
         // here, at open, because `zarr.config` is a context each array snapshots -- so two
         // arrays can hold different values, and the one that loses should hear about it next
         // to the config that set it rather than from a read much later.
-        let (read_concurrency, decode_concurrency) = if read_decode_pool {
+        // Only a sharded array can reach the pool, so only a sharded array gets to fix its
+        // widths -- otherwise opening any array at all would settle them for the process.
+        let (read_concurrency, decode_concurrency) = if shard.is_none() {
+            (read_concurrency, decode_concurrency)
+        } else {
             let effective = read_decode_pool::resolve_widths(read_concurrency, decode_concurrency);
             if effective != (read_concurrency, decode_concurrency) {
                 let message = std::ffi::CString::new(format!(
@@ -369,8 +368,6 @@ impl CodecPipelineImpl {
                 PyErr::warn(py, &py.get_type::<PyUserWarning>(), &message, 0)?;
             }
             effective
-        } else {
-            (read_concurrency, decode_concurrency)
         };
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
@@ -404,7 +401,6 @@ impl CodecPipelineImpl {
             data_type,
             read_concurrency,
             decode_concurrency,
-            read_decode_pool_enabled: read_decode_pool,
             shard,
         })
     }

@@ -28,13 +28,6 @@ CHUNKS = (8, 6)
 SHARDS = (16, 12)
 
 
-@pytest.fixture(autouse=True)
-def _split_reads():
-    """Off by default -- see the README."""
-    with zarr.config.set({"codec_pipeline.integer_array_indexing": True}):
-        yield
-
-
 @pytest.fixture
 def sharded(tmp_path: Path) -> tuple[Path, np.ndarray]:
     expected = np.arange(np.prod(SHAPE), dtype=np.float64).reshape(SHAPE)
@@ -135,18 +128,6 @@ def test_writes_are_not_split(sharded: tuple[Path, np.ndarray]) -> None:
         z[index, :] = value
         expected[index, :] = value
         np.testing.assert_array_equal(z[...], expected)
-
-
-def test_flag_off_rejects_the_same_read(sharded: tuple[Path, np.ndarray]) -> None:
-    """The option is what enables this, so with it off the selection is unsupported again."""
-    path, _ = sharded
-    z = open_strict(path)
-    index = np.array([0, 3, 4, 5, 17, 30])
-    with (
-        zarr.config.set({"codec_pipeline.integer_array_indexing": False}),
-        pytest.raises(DiscontiguousArrayError),
-    ):
-        z[index]
 
 
 @pytest.mark.parametrize(

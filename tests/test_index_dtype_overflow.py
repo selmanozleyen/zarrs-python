@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 
 SETTINGS = {
     "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
-    "codec_pipeline.integer_array_indexing": True,
     # No fallback to hide behind: a selection zarrs cannot serve must raise rather
     # than be served correctly by zarr-python and look like a passing test.
     "codec_pipeline.strict": True,

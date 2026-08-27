@@ -295,39 +295,54 @@ def _chunk_unit_args(
     )
 
 
-def make_chunk_info_for_rust_with_indices(
+def chunk_info_for_write(
     batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
-    *,
-    # Reads only: items sharing a chunk key would race in the write path's read-modify-write.
-    integer_array_indexing: bool = False,
-    chunk_unit_indexing: bool = False,
-    inner_chunk_shape: tuple[int, ...] | None = None,
 ) -> RustChunkInfo:
-    batch_info = _as_int64_batch_info(batch_info)
-    if chunk_unit_indexing:
-        # All or nothing. Eligibility turns almost entirely on per-array facts -- one 1-D
-        # axis, no dropped axes, a known inner chunk -- so the entries of a batch come out
-        # uniform in practice, and a batch that is entirely chunk-unit is also exactly what
-        # the read/decode pool can take. Rather than carry a path for mixing the two, which
-        # nothing has been able to produce, an ineligible entry sends the whole batch down
-        # the ordinary route: slower for that read, and one less untested branch.
-        # `batch_info` is a generator, so it has to be materialised before being read
-        # twice: once to test eligibility, once by the ordinary route if it is not taken.
-        batch_info = list(batch_info)
-        unit_args = [
-            _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
-            for entry in batch_info
-        ]
-        if unit_args and all(args is not None for args in unit_args):
-            # The whole batch goes to Rust as one object; no ChunkItem is made in Python.
-            handle = ChunkItems()
-            for args in unit_args:
-                handle.push_entry(*args)
-            return RustChunkInfo(handle, write_empty_chunks=True)
-    if integer_array_indexing:
-        batch_info = [
+    """Describe a write batch to Rust, one item per entry.
+
+    Neither the chunk-unit grouping nor the run splitting a READ gets: both can put two
+    items on one chunk key, and the write path is a read-modify-write, so two items on one
+    key race. A write therefore describes exactly what it was given.
+    """
+    return _chunk_items(_as_int64_batch_info(batch_info), drop_axes, shape)
+
+
+def chunk_info_for_read(
+    batch_info: BatchInfo,
+    drop_axes: tuple[int, ...],
+    shape: tuple[int, ...],
+    inner_chunk_shape: tuple[int, ...] | None,
+) -> RustChunkInfo:
+    """Describe a read batch to Rust, grouped by decode unit where the selection allows.
+
+    Tried in order: one item per inner chunk for the whole batch, which is the cheapest
+    shape and the only one the read/decode pool can take; then one box per run of
+    consecutive indices; then one item per entry, as a write does.
+    """
+    # A generator would be consumed by the eligibility test, and the ordinary route needs
+    # to read the same entries again if that test fails.
+    entries = list(_as_int64_batch_info(batch_info))
+
+    # All or nothing. Eligibility turns almost entirely on per-array facts -- one 1-D axis,
+    # no dropped axes, a known inner chunk shape -- so the entries of a batch come out
+    # uniform in practice. Rather than carry a path for mixing grouped and ungrouped items,
+    # which nothing has been able to produce, one ineligible entry sends the whole batch on:
+    # slower for that read, and one less untested branch.
+    unit_args = [
+        _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
+        for entry in entries
+    ]
+    if unit_args and all(args is not None for args in unit_args):
+        # The whole batch crosses as one object; no ChunkItem is made in Python.
+        handle = ChunkItems()
+        for args in unit_args:
+            handle.push_entry(*args)
+        return RustChunkInfo(handle, write_empty_chunks=True)
+
+    return _chunk_items(
+        [
             (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
             for (
                 byte_getter,
@@ -335,11 +350,22 @@ def make_chunk_info_for_rust_with_indices(
                 chunk_selection,
                 out_selection,
                 is_complete,
-            ) in batch_info
+            ) in entries
             for box_chunk_sel, box_out_sel in split_selection_runs(
                 chunk_selection, out_selection
             )
-        ]
+        ],
+        drop_axes,
+        shape,
+    )
+
+
+def _chunk_items(
+    batch_info: BatchInfo,
+    drop_axes: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> RustChunkInfo:
+    """One ChunkItem per batch entry, the description both paths end at."""
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True

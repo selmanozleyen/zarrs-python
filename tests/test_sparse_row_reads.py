@@ -28,7 +28,7 @@ N_VAR = 5000
 CHUNK = 4096
 SHARD = 16384
 
-CONFIGS = {"unplanned": {"codec_pipeline.integer_array_indexing": True}}
+CONFIGS = {"default": {}}
 
 
 @pytest.fixture(params=["zstd", "none"])

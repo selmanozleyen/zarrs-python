@@ -65,7 +65,6 @@ class CodecPipelineImpl:
         num_threads: builtins.int | None = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
-        read_decode_pool: builtins.bool = False,
         read_concurrency: builtins.int | None = None,
         decode_concurrency: builtins.int | None = None,
     ) -> CodecPipelineImpl: ...

@@ -1,6 +1,6 @@
 """Integer-array selections served one inner chunk at a time.
 
-`codec_pipeline.chunk_unit_indexing` groups a sorted integer selection by the unit the codec
+A sorted integer selection is grouped by the unit the codec
 chain actually decodes -- the inner chunk -- so a chunk is read once, decoded once and gathered
 once however many of its elements are wanted. Handing zarrs a coordinate list instead costs two
 allocations and a partial-decode call PER ELEMENT.
@@ -32,10 +32,7 @@ N = 40_000
 CHUNK = 4_096
 SHARD = 16_384
 
-CHUNK_UNIT = {
-    "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
-    "codec_pipeline.chunk_unit_indexing": True,
-}
+CHUNK_UNIT = {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}
 
 
 @pytest.fixture(params=["zstd", "none"])
