@@ -537,10 +537,8 @@ impl CodecPipelineImpl {
                     // `partial_decode` call PER ELEMENT. `partial_decode_into` is not usable
                     // here either -- it requires indexer.len() == output elements, and a
                     // whole chunk is deliberately larger than what is wanted from it.
-                    let key = &item.key;
-                    let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
-                        PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
-                    })?;
+                    let partial_decoder =
+                        cached_partial_decoder(&partial_decoder_cache, &item.key)?;
                     let decoded = partial_decoder
                         .partial_decode(&item.chunk_subset, &codec_options)
                         .map_codec_err()?;
@@ -558,7 +556,7 @@ impl CodecPipelineImpl {
                     // a buffer first; the pool writes into its own region and skips that.
                     let mut gathered = vec![0u8; coords.len() * size];
                     gather(&raw, coords, &mut gathered, size)
-                        .map_err(|e| PyRuntimeError::new_err(format!("{key}: {e}")))?;
+                        .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", item.key)))?;
                     output_view
                         .copy_from_slice(&gathered)
                         .map_py_err::<PyRuntimeError>()?;
@@ -584,10 +582,8 @@ impl CodecPipelineImpl {
                         copy_fill_value_into(&self.data_type, &self.fill_value, target)
                     }
                 } else {
-                    let key = &item.key;
-                    let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
-                        PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
-                    })?;
+                    let partial_decoder =
+                        cached_partial_decoder(&partial_decoder_cache, &item.key)?;
                     partial_decoder.partial_decode_into(&item.chunk_subset, target, &codec_options)
                 }
                 .map_codec_err()
@@ -634,37 +630,30 @@ impl CodecPipelineImpl {
         codec_options.set_store_empty_chunks(write_empty_chunks);
 
         py.detach(move || {
-            let store_chunk = |item: ChunkItem| match &input {
-                InputValue::Array(input) => {
-                    let chunk_subset_bytes = input
+            // The two inputs differ in how the bytes are OBTAINED, not in what is done with
+            // them, so the store call is written once below rather than in each arm.
+            let store_chunk = |item: ChunkItem| {
+                let chunk_subset_bytes = match &input {
+                    InputValue::Array(input) => input
                         .extract_array_subset(
                             &item.subset,
                             bytemuck::must_cast_slice(&item.array_shape),
                             &self.data_type,
                         )
-                        .map_codec_err()?;
-                    self.store_chunk_subset_bytes(
-                        &item,
-                        &self.codec_chain,
-                        chunk_subset_bytes,
-                        &codec_options,
-                    )
-                }
-                InputValue::Constant(constant_value) => {
-                    let chunk_subset_bytes = ArrayBytes::new_fill_value(
+                        .map_codec_err()?,
+                    InputValue::Constant(constant_value) => ArrayBytes::new_fill_value(
                         &self.data_type,
                         item.chunk_subset.num_elements(),
                         constant_value,
                     )
-                    .map_py_err::<PyRuntimeError>()?;
-
-                    self.store_chunk_subset_bytes(
-                        &item,
-                        &self.codec_chain,
-                        chunk_subset_bytes,
-                        &codec_options,
-                    )
-                }
+                    .map_py_err::<PyRuntimeError>()?,
+                };
+                self.store_chunk_subset_bytes(
+                    &item,
+                    &self.codec_chain,
+                    chunk_subset_bytes,
+                    &codec_options,
+                )
             };
 
             iter_concurrent_limit!(
@@ -677,6 +666,20 @@ impl CodecPipelineImpl {
             Ok(())
         })
     }
+}
+
+/// The partial decoder assembled for this key earlier in the call.
+///
+/// Looked up twice on the read path -- once by the coordinate gather, once by the ordinary
+/// subset decode -- and a miss is a bug in this function rather than a bad input, so both
+/// want the same message.
+fn cached_partial_decoder<'a>(
+    cache: &'a HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
+    key: &StoreKey,
+) -> PyResult<&'a Arc<dyn ArrayPartialDecoderTraits>> {
+    cache
+        .get(key)
+        .ok_or_else(|| PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}")))
 }
 
 /// A Python module implemented in Rust.

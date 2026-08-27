@@ -42,6 +42,21 @@ class UnsupportedMetadataError(Exception):
     pass
 
 
+#: What sends a batch to zarr-python's pipeline instead of this one.
+#:
+#: Every one of these means "zarrs cannot describe this", not "the read failed": an
+#: unsupported dtype, a selection with no rectangular description, metadata zarrs will not
+#: take. `read` and `write` must agree on the set exactly -- a member listed in one and not
+#: the other would make a selection fall back on read and raise on write.
+FALLBACK_TO_ZARR_PYTHON = (
+    UnsupportedMetadataError,
+    DiscontiguousArrayError,
+    UnsupportedVIndexingError,
+    UnsupportedDataTypeError,
+    FillValueNoneError,
+)
+
+
 def get_codec_pipeline_impl(
     metadata: ArrayMetadata, store: Store, *, strict: bool
 ) -> CodecPipelineImpl | None:
@@ -220,13 +235,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             chunks_desc = chunk_info_for_read(
                 batch_info, drop_axes, out.shape, self._inner_chunk_shape()
             )
-        except (
-            UnsupportedMetadataError,
-            DiscontiguousArrayError,
-            UnsupportedVIndexingError,
-            UnsupportedDataTypeError,
-            FillValueNoneError,
-        ):
+        except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
             await self.python_impl.read(batch_info, out, drop_axes)
@@ -257,13 +266,7 @@ class ZarrsCodecPipeline(CodecPipeline):
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
             chunks_desc = chunk_info_for_write(batch_info, drop_axes, value.shape)
-        except (
-            UnsupportedMetadataError,
-            DiscontiguousArrayError,
-            UnsupportedVIndexingError,
-            UnsupportedDataTypeError,
-            FillValueNoneError,
-        ):
+        except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
             await self.python_impl.write(batch_info, value, drop_axes)
