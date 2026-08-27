@@ -30,3 +30,17 @@ zarrs_object_store = "0.5.0" # object_store 0.12
 
 [profile.release]
 lto = true
+
+# zarrs_opendal and zarrs_object_store are separate repositories tracking RELEASED zarrs, so
+# they pull zarrs_storage from crates.io while zarrs comes from git -- two versions of the
+# same crate, hence two distinct AsyncReadableStorageTraits, hence trait bounds that cannot
+# be satisfied. Patched to the same rev so there is one. Pinned by rev, never by path: the
+# build refuses a path patch because it would resolve to whatever a directory happened to
+# hold, which no commit records.
+[patch.crates-io]
+zarrs_storage = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7" }
+zarrs_metadata = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7" }
+zarrs_metadata_ext = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7" }
+zarrs_plugin = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7" }
+zarrs_data_type = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7" }
+zarrs_filesystem = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7" }

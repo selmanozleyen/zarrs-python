@@ -27,7 +27,8 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecConfiguration;
 use zarrs::array::data_type::uint64;
 use zarrs::array::{
-    ArrayBytes, ArrayToBytesCodecTraits, BytesRepresentation, CodecChain, CodecOptions, FillValue,
+    ArrayBytes, ArrayToBytesCodecTraits, BytesRepresentation, CodecChain, CodecChainBound,
+    CodecOptions, DataType, FillValue,
 };
 use zarrs::metadata::v3::MetadataV3;
 use zarrs::metadata_ext::codec::sharding::ShardingIndexLocation;
@@ -43,17 +44,26 @@ const ABSENT: u64 = u64::MAX;
 pub(crate) struct ShardInfo {
     /// The innermost chunk shape -- the unit the codec chain decodes.
     pub inner_shape: Vec<NonZeroU64>,
-    /// The codecs *inside* a shard, which decode one innermost chunk.
-    pub inner_chain: Arc<CodecChain>,
-    /// The codecs the offset/size table is encoded with.
-    index_chain: Arc<CodecChain>,
+    /// The codecs *inside* a shard, which decode one innermost chunk, bound to the array's
+    /// data type and fill value.
+    pub inner_chain: Arc<CodecChainBound>,
+    /// The codecs the offset/size table is encoded with, bound to u64 and the absent marker.
+    index_chain: Arc<CodecChainBound>,
     index_location: ShardingIndexLocation,
 }
 
 impl ShardInfo {
     /// Read the sharding codec out of the array metadata, or `None` if this array is not
     /// singly sharded.
-    pub fn from_codecs(codecs: &[MetadataV3]) -> PyResult<Option<Self>> {
+    /// `data_type` and `fill_value` are the ARRAY's: a codec chain is unbound until it is
+    /// told what it decodes into, and the chain inside a shard decodes the array's elements.
+    /// The index chain binds to u64 and the absent marker instead, which are fixed by the
+    /// sharding codec rather than by the array.
+    pub fn from_codecs(
+        codecs: &[MetadataV3],
+        data_type: &DataType,
+        fill_value: &FillValue,
+    ) -> PyResult<Option<Self>> {
         for codec in codecs {
             if !is_sharding(codec) {
                 continue;
@@ -68,13 +78,14 @@ impl ShardInfo {
             if configuration.codecs.iter().any(is_sharding) {
                 return Ok(None);
             }
-            let inner_chain = Arc::new(
-                CodecChain::from_metadata(&configuration.codecs).map_py_err::<PyTypeError>()?,
-            );
-            let index_chain = Arc::new(
-                CodecChain::from_metadata(&configuration.index_codecs)
-                    .map_py_err::<PyTypeError>()?,
-            );
+            let inner_chain = CodecChain::from_metadata(&configuration.codecs)
+                .map_py_err::<PyTypeError>()?
+                .with_context(data_type.clone(), fill_value.clone())
+                .map_py_err::<PyTypeError>()?;
+            let index_chain = CodecChain::from_metadata(&configuration.index_codecs)
+                .map_py_err::<PyTypeError>()?
+                .with_context(uint64(), FillValue::from(ABSENT))
+                .map_py_err::<PyTypeError>()?;
             return Ok(Some(Self {
                 inner_shape: configuration.chunk_shape.clone(),
                 inner_chain,
@@ -109,7 +120,7 @@ impl ShardInfo {
         index_shape.push(NonZeroU64::new(2).expect("2 is not zero"));
         let representation = self
             .index_chain
-            .encoded_representation(&index_shape, &uint64(), &FillValue::from(ABSENT))
+            .encoded_representation(&index_shape)
             .map_codec_err()?;
         match representation {
             BytesRepresentation::FixedSize(size) => Ok(size),
@@ -148,13 +159,7 @@ impl ShardInfo {
         index_shape.push(NonZeroU64::new(2).expect("2 is not zero"));
         let decoded = self
             .index_chain
-            .decode(
-                Cow::Owned(encoded.into()),
-                &index_shape,
-                &uint64(),
-                &FillValue::from(ABSENT),
-                options,
-            )
+            .decode(Cow::Owned(encoded.into()), &index_shape, options)
             .map_codec_err()?;
         let ArrayBytes::Fixed(raw) = decoded else {
             return Err(PyTypeError::new_err(

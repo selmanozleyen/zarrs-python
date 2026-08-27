@@ -24,7 +24,6 @@
 //! replied, so the buffer outlives the jobs. The fused path makes the same aliasing argument
 //! in a comment and never checks it.
 
-
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -34,7 +33,7 @@ use pyo3::exceptions::PyRuntimeError;
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
     ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
-    CodecOptions, DataType, FillValue,
+    CodecOptions, FillValue,
 };
 use zarrs::storage::byte_range::ByteRange;
 use zarrs::storage::{MaybeBytes, ReadableWritableListableStorage, StoreKey};
@@ -113,8 +112,6 @@ struct Job {
 struct JobContext {
     shard: Arc<ShardInfo>,
     store: ReadableWritableListableStorage,
-    data_type: DataType,
-    fill_value: FillValue,
     codec_options: CodecOptions,
     element_size: usize,
 }
@@ -281,8 +278,6 @@ fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Out
             .decode_into(
                 Cow::Owned(bytes.into()),
                 shape,
-                &ctx.data_type,
-                &ctx.fill_value,
                 ArrayBytesDecodeIntoTarget::Fixed(&mut view),
                 &ctx.codec_options,
             )
@@ -372,8 +367,6 @@ impl CodecPipelineImpl {
         let ctx = Arc::new(JobContext {
             shard: shard.clone(),
             store: self.store.clone(),
-            data_type: self.data_type.clone(),
-            fill_value: self.fill_value.clone(),
             codec_options: (*codec_options).with_concurrent_target(1),
             element_size,
         });
