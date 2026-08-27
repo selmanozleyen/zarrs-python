@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
 
-from ._internal import CodecPipelineImpl
+from ._internal import ChunkItems, CodecPipelineImpl
 from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
@@ -225,11 +225,15 @@ class ZarrsCodecPipeline(CodecPipeline):
             return None
         else:
             out: NDArrayLike = out.as_ndarray_like()
-            await asyncio.to_thread(
-                self.impl.retrieve_chunks_and_apply_index,
-                chunks_desc.chunk_info_with_indices,
-                out,
+            desc = chunks_desc.chunk_info_with_indices
+            # A handle means the batch never became Python objects; it has its own entry
+            # point because the list one takes `Vec<ChunkItem>` and would extract per item.
+            retrieve = (
+                self.impl.retrieve_chunk_items_and_apply_index
+                if isinstance(desc, ChunkItems)
+                else self.impl.retrieve_chunks_and_apply_index
             )
+            await asyncio.to_thread(retrieve, desc, out)
             return None
 
     async def write(
