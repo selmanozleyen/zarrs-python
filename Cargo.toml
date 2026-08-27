@@ -30,4 +30,3 @@ zarrs_object_store = "0.5.0" # object_store 0.12
 
 [profile.release]
 lto = true
-
