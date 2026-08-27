@@ -9,7 +9,7 @@
 //! store will answer at once, which is not the core count. Hence `read_concurrency` and
 //! `decode_concurrency` are separate knobs. On networked or high-latency storage a read can
 //! cost an order of magnitude more than a decode, which is the case this arrangement exists
-//! for; on a local NVMe it may not, and then the widths should be equal, which is what they
+//! for; on a local `NVMe` drive it may not, and then the widths should be equal, which is what they
 //! default to.
 //!
 //! # Data movement
@@ -84,21 +84,6 @@ impl OutRegion {
 
 /// The coordinates wanted from a chunk, borrowed from the `ChunkItem` the caller holds.
 ///
-/// Same argument as `OutRegion`: `'static` for the channel, alive because the caller blocks.
-struct CoordsRef {
-    ptr: *const u64,
-    len: usize,
-}
-
-// SAFETY: read-only, and the `ChunkItem` it points into outlives the job.
-unsafe impl Send for CoordsRef {}
-
-impl CoordsRef {
-    unsafe fn as_slice(&self) -> &[u64] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-}
-
 /// What one worker reports back when it is done with a job.
 enum Outcome {
     /// A chunk was read and decoded.
@@ -111,7 +96,7 @@ struct Job {
     key: StoreKey,
     range: ByteRange,
     out: OutRegion,
-    coords: CoordsRef,
+    coords: Arc<[u64]>,
     /// Everything the decode needs, shared rather than copied per job.
     ctx: Arc<JobContext>,
     /// Where to report completion. Per call, so a reply finds the right caller.
@@ -245,7 +230,7 @@ fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Out
     // output buffer is alive because the caller has not returned.
     let out = unsafe { job.out.as_mut() };
     // SAFETY: read-only, and the ChunkItem it points into outlives this job.
-    let coords = unsafe { job.coords.as_slice() };
+    let coords = &job.coords;
 
     let Some(bytes) = bytes else {
         // The index named an extent the store does not have.
@@ -290,12 +275,11 @@ fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Out
     Ok(Outcome::Decoded)
 }
 
-/// The gather zarr-python does with one numpy fancy index, over an already-decoded buffer.
-///
 /// Block until every job sent has replied, returning how many decoded.
 ///
-/// Nothing may return before the last reply: the regions and coordinate slices the workers
-/// hold point into memory owned by the caller, and the caller frees it on the way out.
+/// Nothing may return before the last reply: each worker holds an `OutRegion`, a raw pointer
+/// into the output buffer the CALLER owns and frees on the way out. The coordinates are an
+/// `Arc` and would survive on their own; the output regions are what make this load-bearing.
 fn await_replies(done_rx: &Receiver<Outcome>, sent: usize) -> PyResult<usize> {
     let mut decoded = 0usize;
     let mut first_error: Option<String> = None;
@@ -403,10 +387,7 @@ impl CodecPipelineImpl {
                         key: item.key.clone(),
                         range: *range,
                         out: region,
-                        coords: CoordsRef {
-                            ptr: coords.as_ptr(),
-                            len: coords.len(),
-                        },
+                        coords: coords.clone(),
                         ctx: ctx.clone(),
                         done: done_tx.clone(),
                     })
@@ -602,7 +583,7 @@ fn verify_disjoint(
     Ok(())
 }
 
-fn coords_of(item: &ChunkItem) -> PyResult<&Vec<u64>> {
+fn coords_of(item: &ChunkItem) -> PyResult<&Arc<[u64]>> {
     item.coords
         .as_ref()
         .ok_or("this path requires chunk-unit items, which carry coordinates")

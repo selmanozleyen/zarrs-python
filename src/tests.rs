@@ -59,7 +59,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                     i.chunk_subset.end_exc()[0],
                     i.subset.start()[0],
                     i.subset.end_exc()[0],
-                    i.coords.clone().unwrap(),
+                    i.coords.as_ref().unwrap().to_vec(),
                 )
             })
             .collect();

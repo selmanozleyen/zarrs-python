@@ -1,4 +1,5 @@
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use numpy::PyReadonlyArray1;
 use pyo3::{
@@ -36,7 +37,10 @@ pub(crate) struct ChunkItem {
     pub array_shape: Vec<NonZeroU64>,
     /// Indices within `chunk_subset`, when this item is a whole inner chunk plus the
     /// elements wanted from it. The chunk is decoded once and these are gathered out.
-    pub coords: Option<Vec<u64>>,
+    /// Shared rather than owned so a pool job can hold one without copying the coordinates
+    /// and without borrowing: an `Arc<[u64]>` is `Send`, so no raw pointer and no lifetime
+    /// argument spanning two functions. One allocation, same as the `Vec` it replaced.
+    pub coords: Option<Arc<[u64]>>,
 }
 
 #[gen_stub_pymethods]
@@ -78,7 +82,7 @@ impl ChunkItem {
             shape: chunk_shape_nonzero_u64,
             num_elements,
             array_shape: shape_nonzero_u64,
-            coords,
+            coords: coords.map(Arc::from),
         })
     }
 }
@@ -207,7 +211,8 @@ pub(crate) fn build_chunk_unit_items(
             coords: Some(
                 (a..b)
                     .map(|i| at(i).map(|v| v - lo))
-                    .collect::<PyResult<Vec<u64>>>()?,
+                    .collect::<PyResult<Vec<u64>>>()?
+                    .into(),
             ),
         });
         a = b;
