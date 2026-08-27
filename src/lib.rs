@@ -278,7 +278,16 @@ impl CodecPipelineImpl {
                 else {
                     return Ok(Vec::new());
                 };
-                self.retrieve_read_decode_pool(shard, chunk_descriptions, output, &codec_options)
+                if read_decode_pool::use_scoped() {
+                    self.retrieve_scoped(shard, chunk_descriptions, output, &codec_options)
+                } else {
+                    self.retrieve_read_decode_pool(
+                        shard,
+                        chunk_descriptions,
+                        output,
+                        &codec_options,
+                    )
+                }
             })?;
             if declined.is_empty() {
                 return Ok(());
@@ -377,7 +386,11 @@ impl CodecPipelineImpl {
                 .map_py_err::<PyValueError>()?;
                 PyErr::warn(py, &py.get_type::<PyUserWarning>(), &message, 0)?;
             }
-            read_decode_pool::start(effective.0, effective.1)?;
+            // The scoped arm spawns per call, so starting a pool it never uses would put a
+            // cost on one arm and not the other.
+            if !read_decode_pool::use_scoped() {
+                read_decode_pool::start(effective.0, effective.1)?;
+            }
             effective
         };
         let store: ReadableWritableListableStorage =

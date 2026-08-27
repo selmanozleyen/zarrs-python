@@ -32,6 +32,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -687,5 +688,275 @@ mod jobs_in_flight_tests {
             tx.send(Outcome::Decoded).expect("send");
         }
         assert_eq!(JobsInFlight::new(&rx, 5).finish().expect("all decoded"), 5);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// EXPERIMENT: scoped workers instead of the process-wide pool.
+//
+// Selected at runtime by ZARRS_SCOPED so one binary measures both shapes back to back, which
+// is the only way to compare them without a rebuild between arms. Delete one of the two once
+// the numbers say which.
+//
+// What it buys: `std::thread::scope` lets a worker BORROW, so the output is carved by
+// `split_at_mut` into real `&mut [u8]` pieces. Overlap becomes unrepresentable rather than
+// checked, which deletes `unsafe impl Send for OutRegion` and `verify_disjoint`, and the
+// scope's join replaces the reply channel and its drop guard -- a scope cannot exit until
+// every thread it spawned has finished.
+//
+// What it costs: threads are spawned per call rather than once per process, and several
+// concurrent calls would each want a set. Hence the ceiling below.
+// ---------------------------------------------------------------------------------------
+
+/// Live scoped workers across every in-flight call.
+///
+/// A call takes what is free rather than waiting for a full set: three permits available
+/// means three threads and get on with it. Total stays under the configured width, which is
+/// the same ceiling the persistent pool enforces, so the concurrency against storage matches.
+/// The floor of one is what stops a call that finds none from waiting forever.
+static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Which of the two shapes this process uses, read once.
+///
+/// An env var rather than a config key on purpose: it exists to measure, not to configure,
+/// and it goes when the measurement decides. Read once so the two arms cannot interleave
+/// within a process, which would make a number meaningless.
+pub(crate) fn use_scoped() -> bool {
+    static SCOPED: OnceLock<bool> = OnceLock::new();
+    *SCOPED.get_or_init(|| std::env::var_os("ZARRS_SCOPED").is_some())
+}
+
+fn take_permits(want: usize, ceiling: usize) -> usize {
+    let mut live = LIVE_WORKERS.load(Ordering::Relaxed);
+    loop {
+        let take = want.min(ceiling.saturating_sub(live)).max(1);
+        match LIVE_WORKERS.compare_exchange_weak(
+            live,
+            live + take,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return take,
+            Err(actual) => live = actual,
+        }
+    }
+}
+
+/// One innermost chunk, and the slice of the output its elements belong in.
+///
+/// Every field borrows from the call. That is the whole point: the threads cannot outlive the
+/// scope, so the compiler checks what the pool can only assert.
+struct ScopedJob<'a> {
+    key: StoreKey,
+    range: ByteRange,
+    out: &'a mut [u8],
+    coords: &'a [u64],
+    ctx: &'a JobContext,
+}
+
+/// Keep the FIRST failure; later ones are usually consequences of it.
+fn record(failure: &Mutex<Option<String>>, message: String) {
+    let mut slot = failure.lock().expect("failure slot poisoned");
+    if slot.is_none() {
+        *slot = Some(message);
+    }
+}
+
+fn scoped_read_loop<'a>(
+    jobs: &Receiver<ScopedJob<'a>>,
+    decodes: &Sender<(ScopedJob<'a>, MaybeBytes)>,
+    failure: &Mutex<Option<String>>,
+) {
+    while let Ok(job) = jobs.recv() {
+        match job.ctx.store.get_partial(&job.key, job.range) {
+            // The bytes are MOVED to a decoder, not copied.
+            Ok(bytes) => {
+                if decodes.send((job, bytes)).is_err() {
+                    return; // no decoders left
+                }
+            }
+            Err(e) => record(failure, format!("read {} failed: {e}", job.key)),
+        }
+    }
+}
+
+fn scoped_decode_loop(
+    decodes: &Receiver<(ScopedJob<'_>, MaybeBytes)>,
+    failure: &Mutex<Option<String>>,
+) {
+    // Allocated once per thread and reused, not once per chunk.
+    let mut scratch: Vec<u8> = Vec::new();
+    while let Ok((mut job, bytes)) = decodes.recv() {
+        if let Err(e) = scoped_decode_one(&mut job, bytes, &mut scratch) {
+            record(failure, e);
+        }
+    }
+}
+
+/// The same decode as the pool's, writing into a borrowed slice rather than through a pointer.
+fn scoped_decode_one(
+    job: &mut ScopedJob<'_>,
+    bytes: MaybeBytes,
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let ctx = job.ctx;
+    let size = ctx.element_size;
+    let Some(bytes) = bytes else {
+        return Err(format!("{} vanished between index and read", job.key));
+    };
+
+    let shape = &ctx.shard.subchunk_shape;
+    let elements: u64 = shape.iter().map(|s| s.get()).product();
+    let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
+    scratch.clear();
+    scratch.resize(needed, 0);
+
+    let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
+    {
+        let slice = UnsafeCellSlice::new(scratch.as_mut_slice());
+        let mut view = unsafe {
+            // SAFETY: this view is the only writer to `scratch`, which this thread owns.
+            ArrayBytesFixedDisjointView::new(
+                slice,
+                size,
+                &shape_u64,
+                ArraySubset::new_with_shape(shape_u64.clone()),
+            )
+            .map_err(|e| e.to_string())?
+        };
+        ctx.shard
+            .inner_chain
+            .decode_into(
+                Cow::Owned(bytes.into()),
+                shape,
+                ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+                &ctx.codec_options,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    gather(scratch, job.coords, job.out, size).map_err(|e| format!("{}: {e}", job.key))
+}
+
+impl CodecPipelineImpl {
+    /// The scoped counterpart of `retrieve_read_decode_pool`.
+    ///
+    /// Same two-phase shape -- locate every chunk, then read and decode concurrently -- with
+    /// three mechanisms deleted because the threads cannot outlive this call:
+    ///
+    /// - the output is carved by `split_at_mut`, so no two jobs can name overlapping bytes and
+    ///   `verify_disjoint` has nothing to check;
+    /// - jobs hold `&mut [u8]` and `&[u64]`, so no raw pointers and no `unsafe impl Send`;
+    /// - the scope's join is the barrier, so there is no reply channel and no drop guard.
+    pub(crate) fn retrieve_scoped<'a>(
+        &self,
+        shard: &Arc<ShardInfo>,
+        items: &'a [ChunkItem],
+        output: &mut [u8],
+        codec_options: &CodecOptions,
+    ) -> PyResult<Vec<&'a ChunkItem>> {
+        let element_size = self.element_size()?;
+        let ctx = JobContext {
+            shard: shard.clone(),
+            store: self.store.clone(),
+            codec_options: (*codec_options).with_concurrent_target(1),
+            element_size,
+        };
+
+        let (located, declined) = self.locate_chunks(shard, items, &ctx)?;
+        if located.is_empty() {
+            return Ok(declined);
+        }
+
+        // Carve the output in ONE pass, in offset order, so each piece is split off the tail
+        // of the last. Overlap is not checked here -- it cannot be expressed: two overlapping
+        // items would need the same bytes twice, and `split_at_mut` has already moved them.
+        // A backwards offset is the one thing to reject, since it means the sort did not
+        // produce a partition.
+        let mut order: Vec<usize> = (0..located.len()).collect();
+        order.sort_by_key(|&i| output_offset(located[i].0));
+
+        let mut jobs: Vec<ScopedJob<'_>> = Vec::with_capacity(order.len());
+        let mut absent: Vec<&mut [u8]> = Vec::new();
+        let mut rest: &mut [u8] = output;
+        let mut cursor = 0usize;
+        for &i in &order {
+            let (item, range) = &located[i];
+            let start = output_offset(item) * element_size;
+            let len = coords_of(item)?.len() * element_size;
+            if start < cursor {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{} claims output bytes from {start}, behind the {cursor} already carved",
+                    item.key
+                )));
+            }
+            let skip = start - cursor;
+            if skip + len > rest.len() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{} names output bytes {start}..{} beyond the buffer",
+                    item.key,
+                    start + len
+                )));
+            }
+            let (_gap, tail) = std::mem::take(&mut rest).split_at_mut(skip);
+            let (piece, tail) = tail.split_at_mut(len);
+            rest = tail;
+            cursor = start + len;
+
+            match range {
+                Some(range) => jobs.push(ScopedJob {
+                    key: item.key.clone(),
+                    range: *range,
+                    out: piece,
+                    coords: coords_of(item)?,
+                    ctx: &ctx,
+                }),
+                None => absent.push(piece),
+            }
+        }
+
+        // No read, no decode, no thread.
+        for piece in absent {
+            fill(piece, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
+        }
+        if jobs.is_empty() {
+            return Ok(declined);
+        }
+
+        let readers = take_permits(self.read_concurrency, self.read_concurrency);
+        let decoders = take_permits(self.decode_concurrency, self.decode_concurrency);
+        let failure: Mutex<Option<String>> = Mutex::new(None);
+
+        std::thread::scope(|scope| {
+            let (job_tx, job_rx) = unbounded::<ScopedJob<'_>>();
+            let (dec_tx, dec_rx) = unbounded::<(ScopedJob<'_>, MaybeBytes)>();
+            for _ in 0..readers {
+                let (job_rx, dec_tx, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
+                scope.spawn(move || scoped_read_loop(&job_rx, &dec_tx, failure));
+            }
+            for _ in 0..decoders {
+                let (dec_rx, failure) = (dec_rx.clone(), &failure);
+                scope.spawn(move || scoped_decode_loop(&dec_rx, failure));
+            }
+            // The clones held here would keep every worker waiting on a channel that will
+            // never deliver again, and the scope cannot exit until they return.
+            drop(job_rx);
+            drop(dec_tx);
+            drop(dec_rx);
+
+            for job in jobs {
+                if job_tx.send(job).is_err() {
+                    record(&failure, "no readers left to take the job".to_string());
+                    break;
+                }
+            }
+            drop(job_tx);
+        });
+
+        LIVE_WORKERS.fetch_sub(readers + decoders, Ordering::AcqRel);
+
+        if let Some(e) = failure.lock().expect("failure slot poisoned").take() {
+            return Err(PyRuntimeError::new_err(e));
+        }
+        Ok(declined)
     }
 }
