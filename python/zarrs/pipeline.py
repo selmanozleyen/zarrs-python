@@ -65,6 +65,12 @@ def get_codec_pipeline_impl(
             # asked for by name. This one flag also selects the chunk-unit decomposition
             # in `read` -- see the note there.
             read_decode_pool=config.get("codec_pipeline.read_decode_pool", False),
+            read_coalesce_max_gap_bytes=config.get(
+                "codec_pipeline.read_coalesce_max_gap_bytes", 0
+            ),
+            read_coalesce_max_bytes=config.get(
+                "codec_pipeline.read_coalesce_max_bytes", 16 << 20
+            ),
             read_concurrency=config.get("codec_pipeline.read_concurrency", None),
             decode_concurrency=config.get("codec_pipeline.decode_concurrency", None),
             direct_io=config.get("codec_pipeline.direct_io", False),

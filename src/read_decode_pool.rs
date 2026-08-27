@@ -521,9 +521,13 @@ impl CodecPipelineImpl {
         }
         let sent = present.len();
 
-        // Sort by (shard, offset) and merge only ranges that actually touch. Cheap --
-        // a few hundred items against ~2.9 ms per read -- and it can never fetch a byte
-        // the unmerged version would not have, because a gap ends a run.
+        // Sort by (shard, offset), then merge runs. With a gap budget of 0 a merged read
+        // fetches exactly what the separate reads would have. Above 0 it deliberately
+        // fetches bytes nobody wants, to buy one seek instead of several -- which is what
+        // zarr-python's sharding decoder does at 1 MiB gap / 16 MiB per read, and is why
+        // a shard written out of chunk-id order costs it nothing and costs us everything.
+        let gap = self.read_coalesce_max_gap_bytes;
+        let cap = self.read_coalesce_max_bytes.max(1);
         present.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
         let mut reads = 0usize;
         while !present.is_empty() {
@@ -531,8 +535,14 @@ impl CodecPipelineImpl {
             let (key, start, first_size) = (key.clone(), *start, *first_size);
             let mut end = start + first_size;
             let mut j = 1usize;
-            while j < present.len() && present[j].0 == key && present[j].1 == end {
-                end += present[j].2;
+            while j < present.len()
+                && present[j].0 == key
+                // Sorted by offset, so this only underflows if two items name the same
+                // chunk; saturating_sub makes that a zero gap rather than a huge one.
+                && present[j].1.saturating_sub(end) <= gap
+                && (present[j].1 + present[j].2).saturating_sub(start) <= cap
+            {
+                end = end.max(present[j].1 + present[j].2);
                 j += 1;
             }
             let members = present

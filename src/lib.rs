@@ -59,6 +59,13 @@ pub struct CodecPipelineImpl {
     pub(crate) read_concurrency: usize,
     pub(crate) decode_concurrency: usize,
     pub(crate) read_decode_pool_enabled: bool,
+    /// Merge two chunk reads separated by at most this many unwanted bytes. 0 merges
+    /// only ranges that actually touch, which on a shard written out of chunk-id order
+    /// finds almost nothing. zarr-python's sharding decoder uses 1 MiB.
+    pub(crate) read_coalesce_max_gap_bytes: u64,
+    /// Ceiling on one merged read, so a generous gap cannot swallow a whole shard.
+    /// zarr-python uses 16 MiB.
+    pub(crate) read_coalesce_max_bytes: u64,
     /// Present only for a singly-sharded array: the pool locates chunks itself, so it
     /// needs the shard's index codecs and the codecs inside a shard. `None` means this
     /// array cannot take the pool path at all.
@@ -256,6 +263,8 @@ impl CodecPipelineImpl {
         direct_io=false,
         file_handle_cache_size=0,
         read_decode_pool=false,
+        read_coalesce_max_gap_bytes=0,
+        read_coalesce_max_bytes=16777216,
         read_concurrency=None,
         decode_concurrency=None,
     ))]
@@ -270,6 +279,8 @@ impl CodecPipelineImpl {
         direct_io: bool,
         file_handle_cache_size: usize,
         read_decode_pool: bool,
+        read_coalesce_max_gap_bytes: u64,
+        read_coalesce_max_bytes: u64,
         read_concurrency: Option<usize>,
         decode_concurrency: Option<usize>,
     ) -> PyResult<Self> {
@@ -332,6 +343,8 @@ impl CodecPipelineImpl {
             read_concurrency,
             decode_concurrency,
             read_decode_pool_enabled: read_decode_pool,
+            read_coalesce_max_gap_bytes,
+            read_coalesce_max_bytes,
             shard,
         })
     }
