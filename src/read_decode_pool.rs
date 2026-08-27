@@ -6,32 +6,6 @@
 //! 358 KB blosc chunk), so what matters is how many reads are outstanding, and that is what
 //! `read_concurrency` sets independently of the decode width.
 //!
-//! # Why not rayon
-//!
-//! It deadlocked. Rayon assumes a task runs to completion so its worker can return to the
-//! scheduler; a task that parks on a channel breaks that. The thread running a
-//! `ThreadPool::scope` closure blocks inside `ScopeBase::complete` waiting for the tasks it
-//! spawned, and while blocked rayon has it *steal* work from its own pool -- so it picked up
-//! one of the decode workers and parked in `recv`, waiting for the sender that only it could
-//! ever drop. gdb caught it exactly:
-//!
-//! ```text
-//! #8 StackJob::execute            the scope closure body
-//! #6 ScopeBase::complete          waiting for its spawned jobs
-//! #4 WorkerThread::wait_until_cold  looking for work to steal while it waits
-//! #3 HeapJob::execute             stole a decode worker
-//! #1 std::thread::functions::park blocked on done_rx.recv() -- on itself
-//! ```
-//!
-//! Blocking belongs on threads nothing schedules. These are `std::thread`s, spawned once,
-//! parked on `recv` between calls, and nothing can steal them.
-//!
-//! Tokio would not help either: the store here is `FilesystemStore` and `get_partial` is a
-//! blocking `pread`, so tokio would hand it to `spawn_blocking` -- the same threads with an
-//! async layer in front. The tokio runtime this crate already has is an async->sync bridge
-//! for the *remote* stores, which is the opposite direction. Tokio earns its keep on the
-//! object-store path, where one thread can hold thousands of requests outstanding.
-//!
 //! # Data movement
 //!
 //! Exactly one copy, and it is the gather:
@@ -49,12 +23,7 @@
 //! subset names and checked for overlap, and the caller blocks until every job it sent has
 //! replied, so the buffer outlives the jobs. The fused path makes the same aliasing argument
 //! in a comment and never checks it.
-//!
-//! ponytail: the pool's scope is ONE call, so a chunk touched by two selections is read and
-//! decoded twice, and read concurrency is capped by the items in one call (~70 here).
-//! Widening to a whole batch fixes both -- a job would carry several (region, coords)
-//! targets and dedup would be exact -- but it needs the Python side to hand over more than
-//! one selection at a time.
+
 
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock};
