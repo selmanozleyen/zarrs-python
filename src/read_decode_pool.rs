@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use pyo3::PyResult;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use pyo3::exceptions::PyRuntimeError;
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
     ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
@@ -385,11 +385,7 @@ impl CodecPipelineImpl {
         output: &mut [u8],
         codec_options: &CodecOptions,
     ) -> PyResult<(Vec<&'a ChunkItem>, PoolCounts)> {
-        let element_size = self
-            .data_type
-            .fixed_size()
-            .ok_or("variable length data type not supported")
-            .map_py_err::<PyTypeError>()?;
+        let element_size = self.element_size()?;
 
         // Nothing nests: the codec chain gets a target of one, so a decode does not spawn
         // work underneath itself. Inheriting the fused path's target would renest silently --
@@ -449,6 +445,7 @@ impl CodecPipelineImpl {
         let mut sent = 0usize;
         for ((item, range), region) in located.iter().zip(regions) {
             if let Some(range) = range {
+                let coords = coords_of(item)?;
                 pipeline
                     .jobs
                     .send(Job {
@@ -456,8 +453,8 @@ impl CodecPipelineImpl {
                         range: *range,
                         out: region,
                         coords: CoordsRef {
-                            ptr: coords_of(item)?.as_ptr(),
-                            len: coords_of(item)?.len(),
+                            ptr: coords.as_ptr(),
+                            len: coords.len(),
                         },
                         ctx: ctx.clone(),
                         done: done_tx.clone(),

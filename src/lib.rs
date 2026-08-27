@@ -65,6 +65,17 @@ pub struct CodecPipelineImpl {
 }
 
 impl CodecPipelineImpl {
+    /// The width of one element, or the error every caller was spelling out for itself.
+    ///
+    /// Everything on the read path indexes buffers by element, so this is asked for at each
+    /// entry point; a variable-length dtype has no answer and none of them can proceed.
+    fn element_size(&self) -> PyResult<usize> {
+        self.data_type
+            .fixed_size()
+            .ok_or("variable length data type not supported")
+            .map_py_err::<PyTypeError>()
+    }
+
     fn retrieve_chunk_bytes<'a>(
         &self,
         item: &ChunkItem,
@@ -486,10 +497,7 @@ impl CodecPipelineImpl {
                     ArrayBytesFixedDisjointView::new(
                         output,
                         // TODO: why is data_type in `item`, it should be derived from `output`, no?
-                        self.data_type
-                            .fixed_size()
-                            .ok_or("variable length data type not supported")
-                            .map_py_err::<PyTypeError>()?,
+                        self.element_size()?,
                         bytemuck::must_cast_slice(&item.array_shape),
                         item.subset.clone(),
                     )
@@ -518,11 +526,7 @@ impl CodecPipelineImpl {
                             "variable length data type not supported",
                         ));
                     };
-                    let size = self
-                        .data_type
-                        .fixed_size()
-                        .ok_or("variable length data type not supported")
-                        .map_py_err::<PyTypeError>()?;
+                    let size = self.element_size()?;
                     // The gather zarr-python does with one numpy fancy index, over a buffer
                     // that is already decoded: a load and a store per element. The output
                     // side is contiguous because the indices reached us non-decreasing, so
