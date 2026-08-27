@@ -41,9 +41,11 @@ use zarrs::storage::{MaybeBytes, ReadableWritableListableStorage, StoreKey};
 use crate::CodecPipelineImpl;
 use crate::chunk_item::ChunkItem;
 use crate::shard_index::ShardInfo;
+use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
+use zarrs::array::{BytesPartialDecoderTraits, ChunkShape};
 
-use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather};
+use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, key_partial_decoder};
 
 /// A disjoint region of the output, owned exclusively by one job.
 ///
@@ -470,6 +472,34 @@ impl CodecPipelineImpl {
             .cloned()
     }
 
+    fn cached_subshard_decoder(
+        &self,
+        key: &(StoreKey, Vec<u64>),
+    ) -> Option<Arc<ShardingPartialDecoder>> {
+        if !self.cache_shard_indexes {
+            return None;
+        }
+        self.subshard_indexes
+            .lock()
+            .expect("subshard index cache poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    fn remember_subshard_decoder(
+        &self,
+        key: (StoreKey, Vec<u64>),
+        decoder: Arc<ShardingPartialDecoder>,
+    ) {
+        if !self.cache_shard_indexes {
+            return;
+        }
+        self.subshard_indexes
+            .lock()
+            .expect("subshard index cache poisoned")
+            .insert(key, decoder);
+    }
+
     fn remember_shard_decoder(&self, key: &StoreKey, decoder: Arc<ShardingPartialDecoder>) {
         if !self.cache_shard_indexes {
             return;
@@ -478,6 +508,127 @@ impl CodecPipelineImpl {
             .lock()
             .expect("shard index cache poisoned")
             .insert(key.clone(), decoder);
+    }
+
+    /// The absolute byte range of the innermost chunk holding element `start`, or `None` if
+    /// any level says it was never written.
+    ///
+    /// One index read per LEVEL, each remembered. A singly sharded array runs this loop once
+    /// and touches only the depth-0 cache, so it does exactly what it did before nesting was
+    /// supported: no path vector is allocated and no second map is consulted.
+    ///
+    /// Below depth 0 the handle is a byte interval of the SAME store key rather than a nested
+    /// interval, because `subchunk_byte_range` returns an offset relative to the level's own
+    /// extent and absolute offsets compose by addition. One interval, not a chain of them.
+    fn locate(
+        &self,
+        shard: &ShardInfo,
+        item: &ChunkItem,
+        start: u64,
+        ctx: &JobContext,
+        reads: &mut usize,
+    ) -> PyResult<Option<ByteRange>> {
+        let file = key_partial_decoder(&self.store, &item.key);
+        let mut shard_shape = item.shape.clone();
+        let mut offset = start;
+        // (offset, length) of the level being descended INTO, absolute in the store value.
+        let mut extent: Option<(u64, u64)> = None;
+        // The subchunk indices taken so far. Only built below depth 0, so the single-level
+        // path never allocates it.
+        let mut path: Vec<u64> = Vec::new();
+
+        for depth in 0..shard.depth() {
+            let subchunk = shard.subchunk_shape_at(depth)[0].get();
+            let index = offset / subchunk;
+            offset %= subchunk;
+
+            let decoder = if depth == 0 {
+                self.decoder_at_depth_0(shard, item, ctx, reads)?
+            } else {
+                let (base, len) = extent.expect("a level below 0 has a parent extent");
+                self.subshard_decoder(
+                    shard,
+                    item,
+                    depth,
+                    &path,
+                    &file,
+                    base,
+                    len,
+                    shard_shape.clone(),
+                    ctx,
+                    reads,
+                )?
+            };
+
+            let Some(range) = decoder.subchunk_byte_range(&[index]).map_codec_err()? else {
+                // Absent at this level: the shard is not there, or the entry is the
+                // never-written marker. Either way there is nothing below it.
+                return Ok(None);
+            };
+            // Always `FromStart` with an explicit length, so the `size` argument is unused.
+            let base = extent.map_or(0, |(base, _)| base);
+            extent = Some((base + range.start(0), range.length(0)));
+
+            shard_shape.clone_from(shard.subchunk_shape_at(depth));
+            if depth + 1 < shard.depth() {
+                path.push(index);
+            }
+        }
+        Ok(extent.map(|(base, len)| ByteRange::FromStart(base, Some(len))))
+    }
+
+    /// The outermost level's decoder, cached by store key alone.
+    fn decoder_at_depth_0(
+        &self,
+        shard: &ShardInfo,
+        item: &ChunkItem,
+        ctx: &JobContext,
+        reads: &mut usize,
+    ) -> PyResult<Arc<ShardingPartialDecoder>> {
+        if let Some(decoder) = self.cached_shard_decoder(&item.key) {
+            return Ok(decoder);
+        }
+        // The lock is NOT held across construction, which reads the index. Two callers can
+        // therefore read one shard's index at the same time and the second insert wins; that
+        // costs a duplicate read and cannot give a different answer. Holding it would
+        // serialise every caller behind one full-latency read.
+        let decoder = Arc::new(shard.level_decoder(
+            0,
+            key_partial_decoder(&self.store, &item.key),
+            item.shape.clone(),
+            &ctx.codec_options,
+        )?);
+        *reads += 1;
+        self.remember_shard_decoder(&item.key, decoder.clone());
+        Ok(decoder)
+    }
+
+    /// A deeper level's decoder, cached by store key AND the path of subchunk indices that
+    /// reaches it — a subshard's index is not the shard's.
+    #[allow(clippy::too_many_arguments)]
+    fn subshard_decoder(
+        &self,
+        shard: &ShardInfo,
+        item: &ChunkItem,
+        depth: usize,
+        path: &[u64],
+        file: &Arc<dyn BytesPartialDecoderTraits>,
+        base: u64,
+        len: u64,
+        shard_shape: ChunkShape,
+        ctx: &JobContext,
+        reads: &mut usize,
+    ) -> PyResult<Arc<ShardingPartialDecoder>> {
+        let key = (item.key.clone(), path.to_vec());
+        if let Some(decoder) = self.cached_subshard_decoder(&key) {
+            return Ok(decoder);
+        }
+        let input = Arc::new(ByteIntervalPartialDecoder::new(file.clone(), base, len));
+        let decoder =
+            Arc::new(shard.level_decoder(depth, input, shard_shape, &ctx.codec_options)?);
+        *reads += 1;
+        self.remember_subshard_decoder(key, decoder.clone());
+        Ok(decoder)
     }
 
     /// Where each item's innermost chunk lives, from its shard's own offset/size table.
@@ -504,32 +655,8 @@ impl CodecPipelineImpl {
                 declined.push(item);
                 continue;
             }
-            let decoder = if let Some(decoder) = self.cached_shard_decoder(&item.key) {
-                decoder
-            } else {
-                // The lock is NOT held across construction, which reads the shard index.
-                // Two callers can therefore read one shard's index at the same time and
-                // the second insert wins; that costs a duplicate read and cannot give a
-                // different answer. Holding it would serialise every caller behind one
-                // full-latency read.
-                let decoder = Arc::new(shard.decoder(
-                    &self.store,
-                    &item.key,
-                    item.shape.clone(),
-                    &ctx.codec_options,
-                )?);
-                reads += 1;
-                self.remember_shard_decoder(&item.key, decoder.clone());
-                decoder
-            };
-            // One Option covers both absences: a shard that is not there at all, and a
-            // subchunk whose index entry is the never-written marker.
-            let subchunk =
-                shard.subchunk_index_1d(item.chunk_subset.start().first().copied().unwrap_or(0));
-            located.push((
-                item,
-                decoder.subchunk_byte_range(&[subchunk]).map_codec_err()?,
-            ));
+            let start = item.chunk_subset.start().first().copied().unwrap_or(0);
+            located.push((item, self.locate(shard, item, start, ctx, &mut reads)?));
         }
         // Reads, not distinct shards: what this counter is for is the serial, full-latency
         // work done on the calling thread, and a cache hit is none of that.

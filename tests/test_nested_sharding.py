@@ -108,14 +108,21 @@ def selections() -> dict[str, np.ndarray]:
 
 
 @pytest.mark.parametrize("name", list(selections()))
-def test_nested_reads_are_correct(nested: tuple[Path, np.ndarray], name: str) -> None:
-    """Values, whichever path serves them. This must hold before and after the descent
-    exists, which is what makes it the test worth writing first."""
+def test_nested_reads_are_correct(
+    nested: tuple[Path, np.ndarray], entries: dict[str, int], name: str
+) -> None:
+    """Values first, then which path served them.
+
+    The values assertion held before the descent existed too -- the fallback got them right.
+    The path assertion is what says the descent is being used rather than merely present.
+    """
     path, truth = nested
     selection = selections()[name]
     with zarr.config.set(ZARRS):
         got = zarr.open_array(path, mode="r")[selection]
     np.testing.assert_array_equal(got, truth[selection])
+    assert entries["handle"] > 0, "nested fell back instead of descending"
+    assert entries["list"] == 0
 
 
 def test_nested_matches_zarr_python_exactly(nested: tuple[Path, np.ndarray]) -> None:

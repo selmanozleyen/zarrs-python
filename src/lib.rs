@@ -77,6 +77,10 @@ pub struct CodecPipelineImpl {
     /// read-only store rejects writes, so nothing this process does can move the bytes a
     /// range addresses; an external writer still can, and no cache here can see that.
     pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Arc<ShardingPartialDecoder>>>,
+    /// The same, for levels BELOW the outermost, keyed by the path of subchunk indices that
+    /// reaches them. Empty and untouched unless the array is nested-sharded, which keeps the
+    /// single-level path free of the key allocation this needs.
+    pub(crate) subshard_indexes: Mutex<HashMap<(StoreKey, Vec<u64>), Arc<ShardingPartialDecoder>>>,
     /// Whether to remember shard indexes at all: true only for a read-only store.
     pub(crate) cache_shard_indexes: bool,
 }
@@ -430,6 +434,7 @@ impl CodecPipelineImpl {
             decode_concurrency,
             shard,
             shard_indexes: Mutex::new(HashMap::new()),
+            subshard_indexes: Mutex::new(HashMap::new()),
             cache_shard_indexes: store_is_read_only,
         })
     }

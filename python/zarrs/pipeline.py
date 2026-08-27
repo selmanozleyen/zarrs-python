@@ -145,17 +145,31 @@ class ZarrsCodecPipeline(CodecPipeline):
         )
 
     def _inner_chunk_shape(self) -> tuple[int, ...] | None:
-        """The shape of the unit the codec chain decodes, or None if not sharded.
+        """The shape of the INNERMOST unit the codec chain decodes, or None if not sharded.
 
-        `chunk_spec.shape` in a batch entry is the SHARD extent, so nothing downstream
-        could tell which parts of a selection share a decode. The sharding codec knows,
-        and the pipeline holds the array metadata, so it is one lookup away.
+        `chunk_spec.shape` in a batch entry is the SHARD extent, so nothing downstream could
+        tell which parts of a selection share a decode. The sharding codec knows, and the
+        pipeline holds the array metadata, so it is one lookup away.
+
+        Descends through nested sharding. Taking the first `chunk_shape` found would name a
+        SUBSHARD on a nested array, and the grouping would then treat a subshard as the decode
+        unit -- decoding many innermost chunks to keep the elements of one, which is the
+        amplification this path exists to avoid. Rust descends the same way when it locates
+        the chunk, so the two have to agree about which level is innermost.
         """
-        for codec in getattr(self.metadata, "codecs", ()) or ():
-            chunk_shape = getattr(codec, "chunk_shape", None)
-            if chunk_shape is not None:
-                return tuple(int(s) for s in chunk_shape)
-        return None
+        codecs = getattr(self.metadata, "codecs", ()) or ()
+        shape = None
+        while True:
+            nested = None
+            for codec in codecs:
+                chunk_shape = getattr(codec, "chunk_shape", None)
+                if chunk_shape is not None:
+                    shape = tuple(int(s) for s in chunk_shape)
+                    nested = getattr(codec, "codecs", ()) or ()
+                    break
+            if nested is None:
+                return shape
+            codecs = nested
 
     @property
     def supports_partial_decode(self) -> bool:
