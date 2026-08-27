@@ -91,6 +91,21 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
     return make_slice_selection(selector_tuple)
 
 
+def _as_selector_tuples(
+    chunk_selection: SelectorTuple, out_selection: SelectorTuple
+) -> tuple[tuple, tuple]:
+    """Both selections as tuples, so an axis can be addressed by position.
+
+    zarr hands a bare slice or array for a one-axis selection and a tuple for anything else.
+    The two eligibility tests below both need positional access, and both must agree about
+    which axis is which, so they ask this once rather than each normalising for itself.
+    """
+    return (
+        chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,),
+        out_selection if isinstance(out_selection, tuple) else (out_selection,),
+    )
+
+
 def _is_sorted_integer_axis(indices: Any, out_axis_sel: Any) -> bool:
     """Is this one sorted 1-D integer axis written to a contiguous output slice?
 
@@ -120,10 +135,7 @@ def split_selection_runs(
     indices. Only one array axis is split: with two, outer and coordinate indexing disagree
     on what the selection means. Anything not splittable is yielded unchanged.
     """
-    chunk_sel = (
-        chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,)
-    )
-    out_sel = out_selection if isinstance(out_selection, tuple) else (out_selection,)
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
     unsplit = ((chunk_selection, out_selection),)
 
     array_axes = [
@@ -280,10 +292,7 @@ def _chunk_unit_args(
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
     if drop_axes or inner_shape is None or len(inner_shape) != 1:
         return None
-    chunk_sel = (
-        chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,)
-    )
-    out_sel = out_selection if isinstance(out_selection, tuple) else (out_selection,)
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
     if len(chunk_sel) != 1 or len(out_sel) != 1 or len(chunk_spec.shape) != 1:
         return None
     (indices,) = chunk_sel
