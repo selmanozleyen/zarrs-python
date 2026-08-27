@@ -4,7 +4,7 @@ use numpy::PyReadonlyArray1;
 use pyo3::{
     Bound, PyErr, PyResult,
     exceptions::{PyIndexError, PyValueError},
-    pyclass, pyfunction, pymethods,
+    pyclass, pymethods,
     types::{PySlice, PySliceMethods as _},
 };
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -136,7 +136,7 @@ fn selection_to_array_subset(
 #[allow(clippy::needless_pass_by_value)]
 // One range per call is the point: this is the 1-D path.
 #[allow(clippy::single_range_in_vec_init)]
-fn build_chunk_unit_items(
+pub(crate) fn build_chunk_unit_items(
     key: &str,
     chunk_shape: Vec<u64>,
     shape: Vec<u64>,
@@ -213,26 +213,6 @@ fn build_chunk_unit_items(
         a = b;
     }
     Ok(items)
-}
-
-/// The items for one entry, as a Python list of `ChunkItem` objects.
-///
-/// Kept for the MIXED batch, where some entries take the chunk-unit path and some do
-/// not: those have to meet in one Python list. When every entry is chunk-unit -- which
-/// is every call the read/decode pool can take, since it requires coords on all of them
-/// -- `ChunkItems` carries them instead and no per-item Python object is made.
-#[pyfunction]
-#[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner))]
-#[allow(clippy::needless_pass_by_value)]
-pub(crate) fn chunk_unit_items(
-    key: &str,
-    chunk_shape: Vec<u64>,
-    shape: Vec<u64>,
-    indices: PyReadonlyArray1<'_, i64>,
-    out_start: u64,
-    inner: u64,
-) -> PyResult<Vec<ChunkItem>> {
-    build_chunk_unit_items(key, chunk_shape, shape, indices, out_start, inner)
 }
 
 /// A whole batch of chunk items, held on the Rust side.

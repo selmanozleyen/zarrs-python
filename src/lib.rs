@@ -265,9 +265,10 @@ impl CodecPipelineImpl {
                 };
                 self.retrieve_read_decode_pool(shard, chunk_descriptions, output, &codec_options)
             })?;
-            // An arm that silently ran the other path is not a result. Every job sent was
-            // one innermost chunk, read once and decoded once, so the two counts must agree
-            // -- and a zero here means the pool never ran at all.
+            // Every job sent was one innermost chunk, read once and decoded once, so the
+            // two counts must agree; a zero means no job reached the pool at all. Checked
+            // rather than assumed, because the pool falling back to the fused path is
+            // otherwise invisible -- the read still returns the right bytes, slower.
             if counts.chunks != counts.decoded {
                 return Err(PyRuntimeError::new_err(format!(
                     "read/decode pool accounting does not close: {} chunks sent, {} decoded \
@@ -669,7 +670,6 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
-    m.add_function(wrap_pyfunction!(chunk_item::chunk_unit_items, m)?)?;
     m.add_class::<chunk_item::ChunkItems>()?;
     Ok(())
 }

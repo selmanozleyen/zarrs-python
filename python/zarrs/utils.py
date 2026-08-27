@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from zarr.core.indexing import is_integer
 
-from zarrs._internal import ChunkItem, ChunkItems, chunk_unit_items
+from zarrs._internal import ChunkItem, ChunkItems
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -306,27 +306,26 @@ def make_chunk_info_for_rust_with_indices(
     inner_chunk_shape: tuple[int, ...] | None = None,
 ) -> RustChunkInfo:
     batch_info = _as_int64_batch_info(batch_info)
-    unit_args: list[tuple] = []
     if chunk_unit_indexing:
-        kept = []
-        for entry in batch_info:
-            args = _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
-            if args is None:
-                kept.append(entry)
-            else:
-                unit_args.append(args)
-        batch_info = kept
-        # Every entry is chunk-unit, which is every call the read/decode pool can take:
-        # the whole batch goes to Rust as one object and no ChunkItem is ever made in
-        # Python. A mixed batch falls through to the list, where the two paths can meet.
-        if unit_args and not kept:
+        # All or nothing. Eligibility turns almost entirely on per-array facts -- one 1-D
+        # axis, no dropped axes, a known inner chunk -- so the entries of a batch come out
+        # uniform in practice, and a batch that is entirely chunk-unit is also exactly what
+        # the read/decode pool can take. Rather than carry a path for mixing the two, which
+        # nothing has been able to produce, an ineligible entry sends the whole batch down
+        # the ordinary route: slower for that read, and one less untested branch.
+        # `batch_info` is a generator, so it has to be materialised before being read
+        # twice: once to test eligibility, once by the ordinary route if it is not taken.
+        batch_info = list(batch_info)
+        unit_args = [
+            _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
+            for entry in batch_info
+        ]
+        if unit_args and all(args is not None for args in unit_args):
+            # The whole batch goes to Rust as one object; no ChunkItem is made in Python.
             handle = ChunkItems()
             for args in unit_args:
                 handle.push_entry(*args)
             return RustChunkInfo(handle, write_empty_chunks=True)
-    unit_items: list[ChunkItem] = [
-        item for args in unit_args for item in chunk_unit_items(*args)
-    ]
     if integer_array_indexing:
         batch_info = [
             (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
@@ -342,7 +341,7 @@ def make_chunk_info_for_rust_with_indices(
             )
         ]
     is_constant = shape == ()
-    chunk_info_with_indices: list[ChunkItem] = list(unit_items)
+    chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True
     for (
         byte_getter,

@@ -42,7 +42,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
         // Chunk 0: 3, 3, 9 (a duplicate, which the path accepts). Chunk 2: 20, 27.
         // Chunk 9: 95, capped by the extent below.
         let indices = PyArray1::from_slice(py, &[3i64, 3, 9, 20, 27, 95]);
-        let items = crate::chunk_item::chunk_unit_items(
+        let items = crate::chunk_item::build_chunk_unit_items(
             "c/0",
             vec![95],
             vec![100],
@@ -76,7 +76,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
         // A negative index would cast to a wild chunk id, so it must be refused.
         let bad = PyArray1::from_slice(py, &[-1i64]);
         assert!(
-            crate::chunk_item::chunk_unit_items(
+            crate::chunk_item::build_chunk_unit_items(
                 "c/0",
                 vec![95],
                 vec![100],
@@ -89,7 +89,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
         // An output subset past the output extent was silently clamped by `slice.indices`.
         let over = PyArray1::from_slice(py, &[0i64, 1]);
         assert!(
-            crate::chunk_item::chunk_unit_items(
+            crate::chunk_item::build_chunk_unit_items(
                 "c/0",
                 vec![95],
                 vec![1],
@@ -117,18 +117,24 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
         handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10)?;
         handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10)?;
 
-        let list_path: Vec<_> =
-            crate::chunk_item::chunk_unit_items("c/0", vec![95], vec![100], a.readonly(), 0, 10)?
-                .into_iter()
-                .chain(crate::chunk_item::chunk_unit_items(
-                    "c/1",
-                    vec![95],
-                    vec![100],
-                    b.readonly(),
-                    2,
-                    10,
-                )?)
-                .collect();
+        let list_path: Vec<_> = crate::chunk_item::build_chunk_unit_items(
+            "c/0",
+            vec![95],
+            vec![100],
+            a.readonly(),
+            0,
+            10,
+        )?
+        .into_iter()
+        .chain(crate::chunk_item::build_chunk_unit_items(
+            "c/1",
+            vec![95],
+            vec![100],
+            b.readonly(),
+            2,
+            10,
+        )?)
+        .collect();
 
         assert_eq!(handle.as_slice().len(), 3);
         assert_eq!(handle.as_slice().len(), list_path.len());
