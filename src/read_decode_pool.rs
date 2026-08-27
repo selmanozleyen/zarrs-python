@@ -2,9 +2,15 @@
 //!
 //! One job per innermost chunk. A reader does the blocking byte-range read and hands the
 //! bytes to a decode worker; the worker decodes the chunk once and copies out the elements
-//! the selection wants. A read costs ~16x a decode here (~2.9 ms against ~0.185 ms for a
-//! 358 KB blosc chunk), so what matters is how many reads are outstanding, and that is what
-//! `read_concurrency` sets independently of the decode width.
+//! the selection wants.
+//!
+//! The two are split because they are bounded by different things: a read waits on storage
+//! and a decode occupies a core, so the useful number of readers is however many reads a
+//! store will answer at once, which is not the core count. Hence `read_concurrency` and
+//! `decode_concurrency` are separate knobs. On networked or high-latency storage a read can
+//! cost an order of magnitude more than a decode, which is the case this arrangement exists
+//! for; on a local NVMe it may not, and then the widths should be equal, which is what they
+//! default to.
 //!
 //! # Data movement
 //!
@@ -265,8 +271,10 @@ fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Out
             )
             .map_err(|e| e.to_string())?
         };
-        // The whole chunk, deliberately: blosc partial decode is quantised to blocks, which
-        // prices one getitem per element at 23,233x a full decode plus a gather.
+        // The whole chunk, deliberately. Partial decode of a compressed chunk is quantised to
+        // the compressor's blocks, so asking for individual elements re-does block work per
+        // element; decoding the chunk once and gathering from the result is cheaper by orders
+        // of magnitude for a selection of any density.
         ctx.shard
             .inner_chain
             .decode_into(
@@ -326,19 +334,6 @@ fn fill(out: &mut [u8], fill_value: &FillValue, size: usize) -> Result<(), Strin
     Ok(())
 }
 
-/// What the pool did, so a run can prove this path executed rather than assuming it.
-///
-/// The fused path produces correct output too, so only a count separates "the pool ran" from
-/// "the pool was configured and something else ran".
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct PoolCounts {
-    pub chunks: usize,
-    pub decoded: usize,
-    pub absent: usize,
-    pub shard_indexes: usize,
-    pub declined: usize,
-}
-
 impl CodecPipelineImpl {
     /// Read and decode `items` through the process-wide reader and decode pools.
     ///
@@ -351,7 +346,7 @@ impl CodecPipelineImpl {
         items: &'a [ChunkItem],
         output: &mut [u8],
         codec_options: &CodecOptions,
-    ) -> PyResult<(Vec<&'a ChunkItem>, PoolCounts)> {
+    ) -> PyResult<Vec<&'a ChunkItem>> {
         let element_size = self.element_size()?;
 
         // Nothing nests: the codec chain gets a target of one, so a decode does not spawn
@@ -368,17 +363,9 @@ impl CodecPipelineImpl {
         let pipeline = pipeline(self.read_concurrency, self.decode_concurrency)?;
 
         // ---------------------------------------------- locate each chunk in its shard
-        let (located, declined, shard_indexes) = self.locate_chunks(shard, items, &ctx)?;
-        let declined_n = declined.len();
+        let (located, declined) = self.locate_chunks(shard, items, &ctx)?;
         if located.is_empty() {
-            return Ok((
-                declined,
-                PoolCounts {
-                    declined: declined_n,
-                    shard_indexes,
-                    ..PoolCounts::default()
-                },
-            ));
+            return Ok(declined);
         }
 
         // ------------------------------------------------------ carve the output, checked
@@ -406,7 +393,6 @@ impl CodecPipelineImpl {
 
         // --------------------------------------------- absent chunks: no read, no decode
         let (done_tx, done_rx) = bounded::<Outcome>(located.len());
-        let mut absent = 0usize;
         let mut sent = 0usize;
         for ((item, range), region) in located.iter().zip(regions) {
             if let Some(range) = range {
@@ -427,7 +413,6 @@ impl CodecPipelineImpl {
                     .map_py_err::<PyRuntimeError>()?;
                 sent += 1;
             } else {
-                absent += 1;
                 // SAFETY: this region belongs to no job; nothing else can touch it.
                 let out = unsafe { region.as_mut() };
                 fill(out, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
@@ -438,30 +423,16 @@ impl CodecPipelineImpl {
         // ------------------------------------------------------------------ wait for all
         let decoded = await_replies(&done_rx, sent)?;
 
-        let counts = PoolCounts {
-            chunks: sent,
-            decoded,
-            absent,
-            shard_indexes,
-            declined: declined_n,
-        };
-        // Per-call stats, behind an env var so ordinary reads stay quiet. The shard
-        // index count is the one that matters: those reads happen on the CALLING thread,
-        // one after another, before any job reaches the reader pool -- so they are
-        // full-latency and entirely serial, and if there are many of them per call they
-        // dominate no matter how many readers are waiting.
-        if std::env::var_os("ZARRS_POOL_STATS").is_some() {
-            eprintln!(
-                "POOL call: {} chunks, {} decoded, {} absent, {} shard indexes read \
-                 serially, {} declined",
-                counts.chunks, counts.decoded, counts.absent, counts.shard_indexes, counts.declined
-            );
-        }
-        Ok((declined, counts))
+        // Every job sent was one innermost chunk, read once and decoded once. `await_replies`
+        // waits for exactly `sent` outcomes and fails on any that did not decode, so this
+        // cannot differ -- asserted rather than checked, so a future change to that function
+        // trips it in a debug build instead of silently returning short output.
+        debug_assert_eq!(sent, decoded, "pool accounting does not close");
+        Ok(declined)
     }
 
     /// What this array remembers about one shard's index.
-    /// A decoder from `cache`, or built, counted as an index read, and remembered.
+    /// A decoder from `cache`, or built and remembered.
     ///
     /// Shared by both levels because they differ only in what keys them and how they are
     /// built: the outermost by store key, deeper ones by that key plus the path of subchunk
@@ -476,7 +447,6 @@ impl CodecPipelineImpl {
         &self,
         cache: &Mutex<HashMap<K, Arc<ShardingPartialDecoder>>>,
         key: &K,
-        reads: &mut usize,
         build: B,
     ) -> PyResult<Arc<ShardingPartialDecoder>>
     where
@@ -494,7 +464,6 @@ impl CodecPipelineImpl {
             }
         }
         let decoder = Arc::new(build()?);
-        *reads += 1;
         if self.cache_shard_indexes {
             cache
                 .lock()
@@ -520,7 +489,6 @@ impl CodecPipelineImpl {
         item: &ChunkItem,
         start: u64,
         ctx: &JobContext,
-        reads: &mut usize,
     ) -> PyResult<Option<ByteRange>> {
         let file = key_partial_decoder(&self.store, &item.key);
         let mut shard_shape = item.shape.clone();
@@ -538,7 +506,7 @@ impl CodecPipelineImpl {
 
             let decoder = if depth == 0 {
                 // Keyed by the store key alone, so the ordinary path never builds a tuple.
-                self.decoder_or_read(&self.shard_indexes, &item.key, reads, || {
+                self.decoder_or_read(&self.shard_indexes, &item.key, || {
                     shard.level_decoder(
                         0,
                         key_partial_decoder(&self.store, &item.key),
@@ -551,7 +519,7 @@ impl CodecPipelineImpl {
                 // part of the key. Only built below depth 0.
                 let (base, len) = extent.expect("a level below 0 has a parent extent");
                 let key = (item.key.clone(), path.clone());
-                self.decoder_or_read(&self.subshard_indexes, &key, reads, || {
+                self.decoder_or_read(&self.subshard_indexes, &key, || {
                     let input = Arc::new(ByteIntervalPartialDecoder::new(file.clone(), base, len));
                     shard.level_decoder(depth, input, shard_shape.clone(), &ctx.codec_options)
                 })?
@@ -584,14 +552,9 @@ impl CodecPipelineImpl {
         shard: &ShardInfo,
         items: &'a [ChunkItem],
         ctx: &JobContext,
-    ) -> PyResult<(
-        Vec<(&'a ChunkItem, Option<ByteRange>)>,
-        Vec<&'a ChunkItem>,
-        usize,
-    )> {
+    ) -> PyResult<(Vec<(&'a ChunkItem, Option<ByteRange>)>, Vec<&'a ChunkItem>)> {
         let mut located = Vec::with_capacity(items.len());
         let mut declined = Vec::new();
-        let mut reads = 0usize;
 
         for item in items {
             if item.coords.is_none() {
@@ -599,11 +562,9 @@ impl CodecPipelineImpl {
                 continue;
             }
             let start = item.chunk_subset.start().first().copied().unwrap_or(0);
-            located.push((item, self.locate(shard, item, start, ctx, &mut reads)?));
+            located.push((item, self.locate(shard, item, start, ctx)?));
         }
-        // Reads, not distinct shards: what this counter is for is the serial, full-latency
-        // work done on the calling thread, and a cache hit is none of that.
-        Ok((located, declined, reads))
+        Ok((located, declined))
     }
 }
 

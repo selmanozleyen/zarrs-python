@@ -272,29 +272,14 @@ impl CodecPipelineImpl {
             self.shard.as_ref(),
         ) {
             let output = Self::nparray_to_mut_slice(value)?;
-            let (declined, counts) = py.detach(|| {
+            let declined = py.detach(|| {
                 let Some((_, codec_options)) =
                     chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
                 else {
-                    return Ok((Vec::new(), read_decode_pool::PoolCounts::default()));
+                    return Ok(Vec::new());
                 };
                 self.retrieve_read_decode_pool(shard, chunk_descriptions, output, &codec_options)
             })?;
-            // Every job sent was one innermost chunk, read once and decoded once, so the
-            // two counts must agree; a zero means no job reached the pool at all. Checked
-            // rather than assumed, because the pool falling back to the fused path is
-            // otherwise invisible -- the read still returns the right bytes, slower.
-            if counts.chunks != counts.decoded {
-                return Err(PyRuntimeError::new_err(format!(
-                    "read/decode pool accounting does not close: {} chunks sent, {} decoded \
-                     ({} absent, {} shard indexes read, {} items declined)",
-                    counts.chunks,
-                    counts.decoded,
-                    counts.absent,
-                    counts.shard_indexes,
-                    counts.declined
-                )));
-            }
             if declined.is_empty() {
                 return Ok(());
             }
