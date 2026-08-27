@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from zarr.core.indexing import is_integer
 
-from zarrs._internal import ChunkItem
+from zarrs._internal import ChunkItem, chunk_unit_items
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -250,6 +250,10 @@ def _chunk_unit_items(
     elements the selection asks for. That is what zarr-python does, and it is why a
     run of consecutive indices and a strided scatter cost it the same.
 
+    The checks here are vectorised numpy and cost nothing, so they stay in Python and
+    hold the semantics; `chunk_unit_items` does the grouping and the item construction
+    in Rust, taking `indices` as a view.
+
     Narrow on purpose: one 1-D integer axis, non-negative and NON-DECREASING, with a
     contiguous output slice. Sorted is what makes it work -- each chunk's elements are
     then one contiguous run of the output, the only output shape a ChunkItem can
@@ -275,29 +279,16 @@ def _chunk_unit_items(
     if out_axis_sel.step not in (None, 1) or out_axis_sel.stop - start != indices.size:
         return None
 
-    inner = int(inner_shape[0])
-    extent = int(chunk_spec.shape[0])
-    chunk_ids = indices // inner
-    cuts = np.flatnonzero(chunk_ids[1:] != chunk_ids[:-1]) + 1
-    bounds = np.concatenate(([0], cuts, [indices.size]))
-    items: list[ChunkItem] = []
-    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
-        a, b = int(a), int(b)
-        lo = int(chunk_ids[a]) * inner
-        hi = min(lo + inner, extent)
-        items.append(
-            ChunkItem(
-                key=byte_getter.path,
-                # Exactly one inner chunk, as a subset: zarrs decodes it once.
-                chunk_subset=[slice(lo, hi)],
-                chunk_shape=chunk_spec.shape,
-                subset=[slice(start + a, start + b)],
-                shape=shape,
-                # Relative to the chunk subset, because that is the buffer gathered from.
-                coords=[int(i) - lo for i in indices[a:b]],
-            )
-        )
-    return items
+    # The grouping and every item is built in Rust: the loop that was here crossed pyo3
+    # once per item and boxed a PyInt per coordinate, which was 83% of a strided run.
+    return chunk_unit_items(
+        byte_getter.path,
+        chunk_spec.shape,
+        shape,
+        indices,
+        start,
+        int(inner_shape[0]),
+    )
 
 
 def make_chunk_info_for_rust_with_indices(

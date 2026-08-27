@@ -622,6 +622,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
+    m.add_function(wrap_pyfunction!(chunk_item::chunk_unit_items, m)?)?;
     Ok(())
 }
 
