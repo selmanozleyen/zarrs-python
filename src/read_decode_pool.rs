@@ -25,6 +25,7 @@
 //! in a comment and never checks it.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -43,7 +44,6 @@ use crate::chunk_item::ChunkItem;
 use crate::shard_index::ShardInfo;
 use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
-use zarrs::array::{BytesPartialDecoderTraits, ChunkShape};
 
 use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, key_partial_decoder};
 
@@ -461,53 +461,47 @@ impl CodecPipelineImpl {
     }
 
     /// What this array remembers about one shard's index.
-    fn cached_shard_decoder(&self, key: &StoreKey) -> Option<Arc<ShardingPartialDecoder>> {
-        if !self.cache_shard_indexes {
-            return None;
-        }
-        self.shard_indexes
-            .lock()
-            .expect("shard index cache poisoned")
-            .get(key)
-            .cloned()
-    }
-
-    fn cached_subshard_decoder(
+    /// A decoder from `cache`, or built, counted as an index read, and remembered.
+    ///
+    /// Shared by both levels because they differ only in what keys them and how they are
+    /// built: the outermost by store key, deeper ones by that key plus the path of subchunk
+    /// indices reaching them. Takes the key by reference and clones it only on INSERT, so a
+    /// cache hit on the ordinary path allocates nothing.
+    ///
+    /// The lock is NOT held across `build`, which reads an index. Two callers can therefore
+    /// read one index at the same time and the second insert wins; that costs a duplicate
+    /// read and cannot give a different answer. Holding it would serialise every caller
+    /// behind one full-latency read.
+    fn decoder_or_read<K, B>(
         &self,
-        key: &(StoreKey, Vec<u64>),
-    ) -> Option<Arc<ShardingPartialDecoder>> {
-        if !self.cache_shard_indexes {
-            return None;
+        cache: &Mutex<HashMap<K, Arc<ShardingPartialDecoder>>>,
+        key: &K,
+        reads: &mut usize,
+        build: B,
+    ) -> PyResult<Arc<ShardingPartialDecoder>>
+    where
+        K: Eq + std::hash::Hash + Clone,
+        B: FnOnce() -> PyResult<ShardingPartialDecoder>,
+    {
+        if self.cache_shard_indexes {
+            let found = cache
+                .lock()
+                .expect("shard index cache poisoned")
+                .get(key)
+                .cloned();
+            if let Some(found) = found {
+                return Ok(found);
+            }
         }
-        self.subshard_indexes
-            .lock()
-            .expect("subshard index cache poisoned")
-            .get(key)
-            .cloned()
-    }
-
-    fn remember_subshard_decoder(
-        &self,
-        key: (StoreKey, Vec<u64>),
-        decoder: Arc<ShardingPartialDecoder>,
-    ) {
-        if !self.cache_shard_indexes {
-            return;
+        let decoder = Arc::new(build()?);
+        *reads += 1;
+        if self.cache_shard_indexes {
+            cache
+                .lock()
+                .expect("shard index cache poisoned")
+                .insert(key.clone(), decoder.clone());
         }
-        self.subshard_indexes
-            .lock()
-            .expect("subshard index cache poisoned")
-            .insert(key, decoder);
-    }
-
-    fn remember_shard_decoder(&self, key: &StoreKey, decoder: Arc<ShardingPartialDecoder>) {
-        if !self.cache_shard_indexes {
-            return;
-        }
-        self.shard_indexes
-            .lock()
-            .expect("shard index cache poisoned")
-            .insert(key.clone(), decoder);
+        Ok(decoder)
     }
 
     /// The absolute byte range of the innermost chunk holding element `start`, or `None` if
@@ -543,21 +537,24 @@ impl CodecPipelineImpl {
             offset %= subchunk;
 
             let decoder = if depth == 0 {
-                self.decoder_at_depth_0(shard, item, ctx, reads)?
+                // Keyed by the store key alone, so the ordinary path never builds a tuple.
+                self.decoder_or_read(&self.shard_indexes, &item.key, reads, || {
+                    shard.level_decoder(
+                        0,
+                        key_partial_decoder(&self.store, &item.key),
+                        item.shape.clone(),
+                        &ctx.codec_options,
+                    )
+                })?
             } else {
+                // A subshard's index is not its shard's, so the path taken to reach it is
+                // part of the key. Only built below depth 0.
                 let (base, len) = extent.expect("a level below 0 has a parent extent");
-                self.subshard_decoder(
-                    shard,
-                    item,
-                    depth,
-                    &path,
-                    &file,
-                    base,
-                    len,
-                    shard_shape.clone(),
-                    ctx,
-                    reads,
-                )?
+                let key = (item.key.clone(), path.clone());
+                self.decoder_or_read(&self.subshard_indexes, &key, reads, || {
+                    let input = Arc::new(ByteIntervalPartialDecoder::new(file.clone(), base, len));
+                    shard.level_decoder(depth, input, shard_shape.clone(), &ctx.codec_options)
+                })?
             };
 
             let Some(range) = decoder.subchunk_byte_range(&[index]).map_codec_err()? else {
@@ -575,60 +572,6 @@ impl CodecPipelineImpl {
             }
         }
         Ok(extent.map(|(base, len)| ByteRange::FromStart(base, Some(len))))
-    }
-
-    /// The outermost level's decoder, cached by store key alone.
-    fn decoder_at_depth_0(
-        &self,
-        shard: &ShardInfo,
-        item: &ChunkItem,
-        ctx: &JobContext,
-        reads: &mut usize,
-    ) -> PyResult<Arc<ShardingPartialDecoder>> {
-        if let Some(decoder) = self.cached_shard_decoder(&item.key) {
-            return Ok(decoder);
-        }
-        // The lock is NOT held across construction, which reads the index. Two callers can
-        // therefore read one shard's index at the same time and the second insert wins; that
-        // costs a duplicate read and cannot give a different answer. Holding it would
-        // serialise every caller behind one full-latency read.
-        let decoder = Arc::new(shard.level_decoder(
-            0,
-            key_partial_decoder(&self.store, &item.key),
-            item.shape.clone(),
-            &ctx.codec_options,
-        )?);
-        *reads += 1;
-        self.remember_shard_decoder(&item.key, decoder.clone());
-        Ok(decoder)
-    }
-
-    /// A deeper level's decoder, cached by store key AND the path of subchunk indices that
-    /// reaches it — a subshard's index is not the shard's.
-    #[allow(clippy::too_many_arguments)]
-    fn subshard_decoder(
-        &self,
-        shard: &ShardInfo,
-        item: &ChunkItem,
-        depth: usize,
-        path: &[u64],
-        file: &Arc<dyn BytesPartialDecoderTraits>,
-        base: u64,
-        len: u64,
-        shard_shape: ChunkShape,
-        ctx: &JobContext,
-        reads: &mut usize,
-    ) -> PyResult<Arc<ShardingPartialDecoder>> {
-        let key = (item.key.clone(), path.to_vec());
-        if let Some(decoder) = self.cached_subshard_decoder(&key) {
-            return Ok(decoder);
-        }
-        let input = Arc::new(ByteIntervalPartialDecoder::new(file.clone(), base, len));
-        let decoder =
-            Arc::new(shard.level_decoder(depth, input, shard_shape, &ctx.codec_options)?);
-        *reads += 1;
-        self.remember_subshard_decoder(key, decoder.clone());
-        Ok(decoder)
     }
 
     /// Where each item's innermost chunk lives, from its shard's own offset/size table.
