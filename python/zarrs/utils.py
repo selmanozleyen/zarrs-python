@@ -299,10 +299,28 @@ def _chunk_unit_items(
                 # million coordinates against 12.9, and this runs on EVERY chunk item
                 # before any of the Rust path, so on a dense request -- 8,192 rows is
                 # ~11.9M coordinates -- it was ~0.75 s of pure Python per call.
-                coords=(indices[a:b] - lo).tolist(),
+                **(
+                    {"coords_len": b - a}
+                    if _STUB_COORDS
+                    else {"coords": (indices[a:b] - lo).tolist()}
+                ),
             )
         )
     return items
+
+
+# Measurement stub. Produces WRONG data -- see ChunkItem::new -- and exists only to
+# price the Python-side coordinate pipeline against everything else in a read.
+_STUB_COORDS = bool(os.environ.get("ZARRS_STUB_COORDS"))
+if _STUB_COORDS:  # pragma: no cover
+    import warnings
+
+    warnings.warn(
+        "ZARRS_STUB_COORDS is set: chunk-unit reads will return WRONG DATA. "
+        "This is a timing stub, not a configuration.",
+        RuntimeWarning,
+        stacklevel=1,
+    )
 
 
 def make_chunk_info_for_rust_with_indices(

@@ -42,7 +42,7 @@ pub(crate) struct ChunkItem {
 #[pymethods]
 impl ChunkItem {
     #[new]
-    #[pyo3(signature = (key, chunk_subset, chunk_shape, subset, shape, coords=None))]
+    #[pyo3(signature = (key, chunk_subset, chunk_shape, subset, shape, coords=None, coords_len=None))]
     #[allow(clippy::needless_pass_by_value)]
     fn new(
         key: String,
@@ -51,7 +51,18 @@ impl ChunkItem {
         subset: Vec<Bound<'_, PySlice>>,
         shape: Vec<u64>,
         coords: Option<Vec<u64>>,
+        coords_len: Option<usize>,
     ) -> PyResult<Self> {
+        // MEASUREMENT STUB, wrong on purpose. `coords_len` synthesises 0..n in Rust
+        // instead of receiving n coordinates from Python, which removes both the
+        // `(arr - lo).tolist()` boxing and pyo3's Vec<u64> extraction while leaving the
+        // number of items, the reads and the gather volume exactly as they were. The
+        // data it produces is WRONG -- it gathers each chunk's first n elements. It
+        // exists to price the coordinate pipeline, nothing else.
+        let coords = match (coords, coords_len) {
+            (None, Some(n)) => Some((0..n as u64).collect::<Vec<u64>>()),
+            (c, _) => c,
+        };
         let num_elements = chunk_shape.iter().product();
         let shape_nonzero_u64 = to_nonzero_u64_vec(shape)?;
         let chunk_shape_nonzero_u64 = to_nonzero_u64_vec(chunk_shape)?;
