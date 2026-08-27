@@ -61,9 +61,9 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.chunk_concurrent_maximum", None
             ),
             num_threads=config.get("threading.max_workers", None),
-            # The reader-pool / decode-pool arm. Off by default: it changes which code
-            # reads the bytes, so it has to be asked for by name.
-            read_decode_pool=config.get("codec_pipeline.read_decode_pool", False),
+            # This branch IS the reader-pool / decode-pool arm. Not a knob: the widths
+            # below stay configurable, but which code reads the bytes is the branch.
+            read_decode_pool=True,
             read_concurrency=config.get("codec_pipeline.read_concurrency", None),
             decode_concurrency=config.get("codec_pipeline.decode_concurrency", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
@@ -207,9 +207,9 @@ class ZarrsCodecPipeline(CodecPipeline):
                 integer_array_indexing=config.get(
                     "codec_pipeline.integer_array_indexing", False
                 ),
-                chunk_unit_indexing=config.get(
-                    "codec_pipeline.chunk_unit_indexing", False
-                ),
+                # Not a knob: the pool only accepts chunk-unit items, so this branch
+                # cannot run without them.
+                chunk_unit_indexing=True,
                 inner_chunk_shape=self._inner_chunk_shape(),
             )
         except (
