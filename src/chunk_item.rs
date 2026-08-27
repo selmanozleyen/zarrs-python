@@ -58,7 +58,9 @@ impl ChunkItem {
         // `(arr - lo).tolist()` boxing and pyo3's Vec<u64> extraction while leaving the
         // number of items, the reads and the gather volume exactly as they were. The
         // data it produces is WRONG -- it gathers each chunk's first n elements. It
-        // exists to price the coordinate pipeline, nothing else.
+        // exists to price the coordinates, which are ~17% of what building an item
+        // costs. The remaining ~83% is constructing these objects, which this still
+        // does, so a flat result does not exonerate the item build.
         let coords = match (coords, coords_len) {
             (None, Some(n)) => Some((0..n as u64).collect::<Vec<u64>>()),
             (c, _) => c,

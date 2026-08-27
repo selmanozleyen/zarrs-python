@@ -309,8 +309,12 @@ def _chunk_unit_items(
     return items
 
 
-# Measurement stub. Produces WRONG data -- see ChunkItem::new -- and exists only to
-# price the Python-side coordinate pipeline against everything else in a read.
+# Measurement stub. Produces WRONG data -- see ChunkItem::new.
+#
+# It prices ONLY the coordinates, which are ~17% of what this function costs. The other
+# ~83% is constructing the ChunkItem objects themselves, and the stub still builds every
+# one of them. A flat result here therefore means "coordinates are not the cost", NOT
+# "the item build is cheap" -- a distinction that was read the wrong way once already.
 _STUB_COORDS = bool(os.environ.get("ZARRS_STUB_COORDS"))
 if _STUB_COORDS:  # pragma: no cover
     import warnings
