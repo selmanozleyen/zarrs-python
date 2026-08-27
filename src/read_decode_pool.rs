@@ -498,7 +498,8 @@ impl CodecPipelineImpl {
         // index count is the one that matters: those reads happen on the CALLING thread,
         // one after another, before any job reaches the reader pool -- so they are
         // full-latency and entirely serial, and if there are many of them per call they
-        // dominate no matter how many readers are waiting.
+        // dominate no matter how many readers are waiting. On this branch it counts
+        // MISSES, so it should fall to zero once every shard has been seen once.
         if std::env::var_os("ZARRS_POOL_STATS").is_some() {
             eprintln!(
                 "POOL call: {} chunks, {} decoded, {} absent, {} shard indexes read \
@@ -512,8 +513,10 @@ impl CodecPipelineImpl {
 
     /// Where each item's innermost chunk lives, from its shard's own offset/size table.
     ///
-    /// One index read per distinct shard, cached for the call, so N items sharing a shard
-    /// cost one index read rather than N.
+    /// Cached for the life of the array, not just the call. Per call was not enough: a
+    /// scattered row draw lands almost one row per shard, so 88 chunks needed 54 distinct
+    /// shard indexes, each a full-latency read plus decode on this thread before any job
+    /// reached the reader pool. Widening the reader pool cannot touch that.
     #[allow(clippy::type_complexity)]
     fn locate_chunks<'a>(
         &self,
@@ -521,9 +524,12 @@ impl CodecPipelineImpl {
         items: &'a [ChunkItem],
         ctx: &JobContext,
     ) -> PyResult<(Vec<(&'a ChunkItem, Option<ByteRange>)>, Vec<&'a ChunkItem>, usize)> {
-        let mut indexes: HashMap<StoreKey, Option<Vec<u64>>> = HashMap::new();
+        let mut indexes: HashMap<StoreKey, Option<Arc<Vec<u64>>>> = HashMap::new();
         let mut located = Vec::with_capacity(items.len());
         let mut declined = Vec::new();
+        // Reads that actually happened, not distinct shards touched. With the cache warm
+        // these differ, and the read count is the one that costs anything.
+        let mut index_reads = 0usize;
 
         for item in items {
             if item.coords.is_none() {
@@ -531,13 +537,31 @@ impl CodecPipelineImpl {
                 continue;
             }
             if !indexes.contains_key(&item.key) {
-                let chunks_per_shard = shard.chunks_per_shard(&item.shape)?;
-                let index = shard.read_index(
-                    &self.store,
-                    &item.key,
-                    &chunks_per_shard,
-                    &ctx.codec_options,
-                )?;
+                let cached = self
+                    .shard_index_cache
+                    .lock()
+                    .expect("shard index cache poisoned")
+                    .get(&item.key)
+                    .cloned();
+                let index = match cached {
+                    Some(hit) => hit,
+                    None => {
+                        let chunks_per_shard = shard.chunks_per_shard(&item.shape)?;
+                        let read = shard
+                            .read_index(&self.store, &item.key, &chunks_per_shard, &ctx.codec_options)?
+                            .map(Arc::new);
+                        index_reads += 1;
+                        // The lock is not held across the read above: two callers that both
+                        // miss do the work twice and store the same bytes, which costs one
+                        // repeated read and no correctness. Holding it across the I/O would
+                        // serialise every caller behind one shard's read.
+                        self.shard_index_cache
+                            .lock()
+                            .expect("shard index cache poisoned")
+                            .insert(item.key.clone(), read.clone());
+                        read
+                    }
+                };
                 indexes.insert(item.key.clone(), index);
             }
             let Some(index) = indexes.get(&item.key).expect("just inserted") else {
@@ -548,8 +572,7 @@ impl CodecPipelineImpl {
                 shard.linear_index_1d(item.chunk_subset.start().first().copied().unwrap_or(0));
             located.push((item, ShardInfo::chunk_range(index, linear)?));
         }
-        let shard_indexes = indexes.len();
-        Ok((located, declined, shard_indexes))
+        Ok((located, declined, index_reads))
     }
 }
 

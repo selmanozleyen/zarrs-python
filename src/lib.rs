@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chunk_item::ChunkItem;
 use itertools::Itertools;
@@ -63,6 +63,24 @@ pub struct CodecPipelineImpl {
     /// needs the shard's index codecs and the codecs inside a shard. `None` means this
     /// array cannot take the pool path at all.
     pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
+    /// Decoded shard indexes, kept for the life of this array's pipeline.
+    ///
+    /// `locate_chunks` read and decoded one of these per distinct shard PER CALL, on the
+    /// calling thread, one after another, before any job reached the reader pool -- 54 of
+    /// them for 88 chunks on the row draw, because a scattered draw lands almost one row
+    /// per shard. They are immutable for a read-only array, so re-reading them every call
+    /// was pure repeat work.
+    ///
+    /// Per array, not process-wide: a `StoreKey` is relative to its store, so the 14 stores
+    /// here all use the same keys and a shared map would serve one store's index for
+    /// another's. zarr builds one pipeline per array and the bench holds its arrays open,
+    /// so this lives as long as the run.
+    ///
+    /// ponytail: unbounded and never invalidated -- correct only because the store is
+    /// opened read-only. ~31 KB per shard, ~58 shards per array here, so ~1.8 MB per
+    /// array. Add an LRU if an array ever has enough shards to matter, and a write path
+    /// would have to evict on write.
+    pub(crate) shard_index_cache: Mutex<HashMap<StoreKey, Option<Arc<Vec<u64>>>>>,
 }
 
 impl CodecPipelineImpl {
@@ -332,6 +350,7 @@ impl CodecPipelineImpl {
             read_concurrency,
             decode_concurrency,
             read_decode_pool_enabled: read_decode_pool,
+            shard_index_cache: Mutex::new(HashMap::new()),
             shard,
         })
     }
