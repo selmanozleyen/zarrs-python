@@ -1085,8 +1085,11 @@ impl CodecPipelineImpl {
             // It polls rather than waiting on a release signal: a Condvar notified from
             // `Permit::drop` would be exact, and is the upgrade if this sleep ever shows up
             // in a profile. It cannot spin forever -- the queues drain either way.
-            while (live_readers < want_readers && !job_rx.is_empty())
-                || (live_decoders < want_decoders && !dec_rx.is_empty())
+            // Outstanding work in EITHER queue keeps this alive, not just the job queue:
+            // reads can drain while decode is still the bottleneck, and decoders that started
+            // narrow would then have no way to widen.
+            while (live_readers < want_readers || live_decoders < want_decoders)
+                && (!job_rx.is_empty() || !dec_rx.is_empty())
             {
                 let mut took = false;
                 if live_readers < want_readers && !job_rx.is_empty() {
