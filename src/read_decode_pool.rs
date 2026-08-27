@@ -592,6 +592,22 @@ impl CodecPipelineImpl {
             declined: declined_n,
             reads,
         };
+        // Experiment branch only: the merge rate is the whole question here, and a
+        // timing cannot answer it -- flat could mean "merged nothing" or "merged plenty
+        // and reads were never the cost". Behind an env var so a measured arm stays clean.
+        if std::env::var_os("ZARRS_MERGE_STATS").is_some() {
+            eprintln!(
+                "MERGE call: {} chunks -> {} reads ({:.1}% fewer), {} shard indexes",
+                counts.chunks,
+                counts.reads,
+                if counts.chunks > 0 {
+                    100.0 * (counts.chunks - counts.reads) as f64 / counts.chunks as f64
+                } else {
+                    0.0
+                },
+                counts.shard_indexes
+            );
+        }
         Ok((declined, counts))
     }
 
