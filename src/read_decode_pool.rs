@@ -96,6 +96,10 @@ unsafe impl Send for OutRegion {}
 impl OutRegion {
     /// # Safety
     /// Only one job may hold this region, and the output buffer must still be alive.
+    ///
+    /// Taking `&self` is the point: the regions are handed out from a shared slice and are
+    /// disjoint by construction (`verify_disjoint`), which is what makes the aliasing sound.
+    #[allow(clippy::mut_from_ref)]
     unsafe fn as_mut(&self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
@@ -165,6 +169,16 @@ static PIPELINE: OnceLock<Pipeline> = OnceLock::new();
 /// the `zarr.config.set` that caused it.
 static WIDTHS: OnceLock<(usize, usize)> = OnceLock::new();
 
+/// Bring the pool up now, rather than leaving it to whichever read reaches it first.
+///
+/// Spawning `4 * cpus` readers and `cpus` decoders measures ~1.3 ms once per process, so
+/// paying it when an array is opened takes it off the latency of every read. Called for
+/// every array, including ones the pool cannot serve today -- an unsharded array, or one
+/// only ever read with slices -- because the intent is for all reads to come through here.
+pub(crate) fn start(read_threads: usize, decode_threads: usize) -> PyResult<()> {
+    pipeline(read_threads, decode_threads).map(|_| ())
+}
+
 /// The process-wide widths, taking these as the process's if nothing has set them yet.
 pub(crate) fn resolve_widths(read_threads: usize, decode_threads: usize) -> (usize, usize) {
     *WIDTHS.get_or_init(|| (read_threads.max(1), decode_threads.max(1)))
@@ -176,11 +190,10 @@ pub(crate) fn resolve_widths(read_threads: usize, decode_threads: usize) -> (usi
 /// so concurrent first calls are ordinary, not hypothetical.
 static PIPELINE_INIT: Mutex<()> = Mutex::new(());
 
-/// Start the threads on the first read request, at the process's widths.
+/// The process's pool, starting its threads if they are not up yet.
 ///
-/// Sweeping a width therefore takes one process per point, which is what a ratio wants
-/// anyway: each job runs its own pool arm beside its own fallback arm, and the ratios are
-/// compared across points rather than the absolutes.
+/// A width can only be changed by restarting the process, which is what fixing them once
+/// implies: threads cannot be respawned underneath work already in flight.
 fn pipeline(read_threads: usize, decode_threads: usize) -> PyResult<&'static Pipeline> {
     let (read_threads, decode_threads) = resolve_widths(read_threads, decode_threads);
     if PIPELINE.get().is_none() {
@@ -227,7 +240,9 @@ fn read_loop(jobs: &Receiver<Job>, decodes: &Sender<(Job, MaybeBytes)>) {
             }
             Err(e) => {
                 let key = job.key.clone();
-                let _ = job.done.send(Outcome::Failed(format!("read {key} failed: {e}")));
+                let _ = job
+                    .done
+                    .send(Outcome::Failed(format!("read {key} failed: {e}")));
             }
         }
     }
@@ -302,6 +317,37 @@ fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Out
 
 /// The gather zarr-python does with one numpy fancy index, over an already-decoded buffer.
 ///
+/// Block until every job sent has replied, returning how many decoded.
+///
+/// Nothing may return before the last reply: the regions and coordinate slices the workers
+/// hold point into memory owned by the caller, and the caller frees it on the way out.
+fn await_replies(done_rx: &Receiver<Outcome>, sent: usize) -> PyResult<usize> {
+    let mut decoded = 0usize;
+    let mut first_error: Option<String> = None;
+    for _ in 0..sent {
+        match done_rx.recv() {
+            Ok(Outcome::Decoded) => decoded += 1,
+            Ok(Outcome::Failed(e)) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+            // A worker died without replying. Returning now would free memory the survivors
+            // still hold, so this is not recoverable.
+            Err(e) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "a pool worker stopped without replying after {decoded} of {sent} \
+                     chunks ({e}); the pool cannot be trusted for the rest of this run"
+                )));
+            }
+        }
+    }
+    if let Some(e) = first_error {
+        return Err(PyRuntimeError::new_err(e));
+    }
+    Ok(decoded)
+}
+
 /// `out` is exactly `coords.len()` elements and contiguous, because the indices reached us
 /// non-decreasing -- so this writes straight into the output. This is the one copy.
 fn gather(scratch: &[u8], coords: &[u64], out: &mut [u8], size: usize) -> Result<(), String> {
@@ -374,7 +420,7 @@ impl CodecPipelineImpl {
             store: self.store.clone(),
             data_type: self.data_type.clone(),
             fill_value: self.fill_value.clone(),
-            codec_options: codec_options.clone().with_concurrent_target(1),
+            codec_options: (*codec_options).with_concurrent_target(1),
             element_size,
         });
 
@@ -422,60 +468,33 @@ impl CodecPipelineImpl {
         let mut absent = 0usize;
         let mut sent = 0usize;
         for ((item, range), region) in located.iter().zip(regions) {
-            match range {
-                Some(range) => {
-                    pipeline
-                        .jobs
-                        .send(Job {
-                            key: item.key.clone(),
-                            range: *range,
-                            out: region,
-                            coords: CoordsRef {
-                                ptr: coords_of(item)?.as_ptr(),
-                                len: coords_of(item)?.len(),
-                            },
-                            ctx: ctx.clone(),
-                            done: done_tx.clone(),
-                        })
-                        .map_py_err::<PyRuntimeError>()?;
-                    sent += 1;
-                }
-                None => {
-                    absent += 1;
-                    // SAFETY: this region belongs to no job; nothing else can touch it.
-                    let out = unsafe { region.as_mut() };
-                    fill(out, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
-                }
+            if let Some(range) = range {
+                pipeline
+                    .jobs
+                    .send(Job {
+                        key: item.key.clone(),
+                        range: *range,
+                        out: region,
+                        coords: CoordsRef {
+                            ptr: coords_of(item)?.as_ptr(),
+                            len: coords_of(item)?.len(),
+                        },
+                        ctx: ctx.clone(),
+                        done: done_tx.clone(),
+                    })
+                    .map_py_err::<PyRuntimeError>()?;
+                sent += 1;
+            } else {
+                absent += 1;
+                // SAFETY: this region belongs to no job; nothing else can touch it.
+                let out = unsafe { region.as_mut() };
+                fill(out, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
             }
         }
         drop(done_tx);
 
         // ------------------------------------------------------------------ wait for all
-        // Every job must reply before this returns: the regions and coordinate slices the
-        // workers hold point into memory owned by the caller.
-        let mut decoded = 0usize;
-        let mut first_error: Option<String> = None;
-        for _ in 0..sent {
-            match done_rx.recv() {
-                Ok(Outcome::Decoded) => decoded += 1,
-                Ok(Outcome::Failed(e)) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-                // A worker died without replying. Returning now would free memory the
-                // survivors still hold, so this is not recoverable.
-                Err(e) => {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "a pool worker stopped without replying after {decoded} of {sent} \
-                         chunks ({e}); the pool cannot be trusted for the rest of this run"
-                    )));
-                }
-            }
-        }
-        if let Some(e) = first_error {
-            return Err(PyRuntimeError::new_err(e));
-        }
+        let decoded = await_replies(&done_rx, sent)?;
 
         let counts = PoolCounts {
             chunks: sent,
@@ -484,7 +503,7 @@ impl CodecPipelineImpl {
             shard_indexes,
             declined: declined_n,
         };
-        // Per-call stats, behind an env var so a measurement run stays clean. The shard
+        // Per-call stats, behind an env var so ordinary reads stay quiet. The shard
         // index count is the one that matters: those reads happen on the CALLING thread,
         // one after another, before any job reaches the reader pool -- so they are
         // full-latency and entirely serial, and if there are many of them per call they
@@ -493,8 +512,7 @@ impl CodecPipelineImpl {
             eprintln!(
                 "POOL call: {} chunks, {} decoded, {} absent, {} shard indexes read \
                  serially, {} declined",
-                counts.chunks, counts.decoded, counts.absent, counts.shard_indexes,
-                counts.declined
+                counts.chunks, counts.decoded, counts.absent, counts.shard_indexes, counts.declined
             );
         }
         Ok((declined, counts))
@@ -510,7 +528,11 @@ impl CodecPipelineImpl {
         shard: &ShardInfo,
         items: &'a [ChunkItem],
         ctx: &JobContext,
-    ) -> PyResult<(Vec<(&'a ChunkItem, Option<ByteRange>)>, Vec<&'a ChunkItem>, usize)> {
+    ) -> PyResult<(
+        Vec<(&'a ChunkItem, Option<ByteRange>)>,
+        Vec<&'a ChunkItem>,
+        usize,
+    )> {
         let mut indexes: HashMap<StoreKey, Option<Vec<u64>>> = HashMap::new();
         let mut located = Vec::with_capacity(items.len());
         let mut declined = Vec::new();
@@ -548,25 +570,28 @@ impl CodecPipelineImpl {
 /// The chunk-unit grouping emits non-decreasing index groups, so the regions should partition
 /// the part of the output this call owns. Checking it is the difference between a sound
 /// `unsafe` and an assertion in a comment.
-fn verify_disjoint(regions: &[OutRegion], located: &[(&ChunkItem, Option<ByteRange>)]) -> PyResult<()> {
+fn verify_disjoint(
+    regions: &[OutRegion],
+    located: &[(&ChunkItem, Option<ByteRange>)],
+) -> PyResult<()> {
     let mut order: Vec<usize> = (0..regions.len()).collect();
     order.sort_by_key(|&i| regions[i].offset);
     let mut prev_end = 0usize;
     let mut prev: Option<usize> = None;
     for &i in &order {
         let r = &regions[i];
-        if let Some(p) = prev {
-            if r.offset < prev_end {
-                return Err(PyRuntimeError::new_err(format!(
-                    "{} claims output bytes {}..{} which overlap {}'s {}..{}",
-                    located[i].0.key,
-                    r.offset,
-                    r.offset + r.len,
-                    located[p].0.key,
-                    regions[p].offset,
-                    prev_end
-                )));
-            }
+        if let Some(p) = prev
+            && r.offset < prev_end
+        {
+            return Err(PyRuntimeError::new_err(format!(
+                "{} claims output bytes {}..{} which overlap {}'s {}..{}",
+                located[i].0.key,
+                r.offset,
+                r.offset + r.len,
+                located[p].0.key,
+                regions[p].offset,
+                prev_end
+            )));
         }
         prev_end = r.offset + r.len;
         prev = Some(i);

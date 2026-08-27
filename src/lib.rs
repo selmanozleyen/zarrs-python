@@ -350,11 +350,10 @@ impl CodecPipelineImpl {
         // here, at open, because `zarr.config` is a context each array snapshots -- so two
         // arrays can hold different values, and the one that loses should hear about it next
         // to the config that set it rather than from a read much later.
-        // Only a sharded array can reach the pool, so only a sharded array gets to fix its
-        // widths -- otherwise opening any array at all would settle them for the process.
-        let (read_concurrency, decode_concurrency) = if shard.is_none() {
-            (read_concurrency, decode_concurrency)
-        } else {
+        // Opening an array is enough to bring the pool up: every opened array is a reader,
+        // and the pool is where reads are meant to go. So the first array to open settles
+        // the widths for the process and starts the threads, and no read pays for them.
+        let (read_concurrency, decode_concurrency) = {
             let effective = read_decode_pool::resolve_widths(read_concurrency, decode_concurrency);
             if effective != (read_concurrency, decode_concurrency) {
                 let message = std::ffi::CString::new(format!(
@@ -367,6 +366,7 @@ impl CodecPipelineImpl {
                 .map_py_err::<PyValueError>()?;
                 PyErr::warn(py, &py.get_type::<PyUserWarning>(), &message, 0)?;
             }
+            read_decode_pool::start(effective.0, effective.1)?;
             effective
         };
         let store: ReadableWritableListableStorage =

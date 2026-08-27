@@ -58,9 +58,8 @@ impl ShardInfo {
             if !is_sharding(codec) {
                 continue;
             }
-            let configuration: ShardingCodecConfiguration = codec
-                .to_configuration()
-                .map_py_err::<PyTypeError>()?;
+            let configuration: ShardingCodecConfiguration =
+                codec.to_configuration().map_py_err::<PyTypeError>()?;
             let ShardingCodecConfiguration::V1(configuration) = configuration else {
                 return Ok(None);
             };
@@ -69,14 +68,15 @@ impl ShardInfo {
             if configuration.codecs.iter().any(is_sharding) {
                 return Ok(None);
             }
-            let inner_chain =
-                Arc::new(CodecChain::from_metadata(&configuration.codecs).map_py_err::<PyTypeError>()?);
+            let inner_chain = Arc::new(
+                CodecChain::from_metadata(&configuration.codecs).map_py_err::<PyTypeError>()?,
+            );
             let index_chain = Arc::new(
                 CodecChain::from_metadata(&configuration.index_codecs)
                     .map_py_err::<PyTypeError>()?,
             );
             return Ok(Some(Self {
-                inner_shape: configuration.chunk_shape.to_vec(),
+                inner_shape: configuration.chunk_shape.clone(),
                 inner_chain,
                 index_chain,
                 index_location: configuration.index_location,
@@ -109,11 +109,7 @@ impl ShardInfo {
         index_shape.push(NonZeroU64::new(2).expect("2 is not zero"));
         let representation = self
             .index_chain
-            .encoded_representation(
-                &index_shape,
-                &uint64(),
-                &FillValue::from(ABSENT),
-            )
+            .encoded_representation(&index_shape, &uint64(), &FillValue::from(ABSENT))
             .map_codec_err()?;
         match representation {
             BytesRepresentation::FixedSize(size) => Ok(size),
@@ -141,7 +137,10 @@ impl ShardInfo {
             ShardingIndexLocation::Start => ByteRange::FromStart(0, Some(size)),
             ShardingIndexLocation::End => ByteRange::Suffix(size),
         };
-        let Some(encoded) = store.get_partial(key, range).map_py_err::<PyRuntimeError>()? else {
+        let Some(encoded) = store
+            .get_partial(key, range)
+            .map_py_err::<PyRuntimeError>()?
+        else {
             return Ok(None); // no shard at all: every chunk in it is absent
         };
 
@@ -158,7 +157,9 @@ impl ShardInfo {
             )
             .map_codec_err()?;
         let ArrayBytes::Fixed(raw) = decoded else {
-            return Err(PyTypeError::new_err("the shard index decoded as variable length"));
+            return Err(PyTypeError::new_err(
+                "the shard index decoded as variable length",
+            ));
         };
         if raw.len() % 8 != 0 {
             return Err(PyRuntimeError::new_err(
@@ -174,14 +175,12 @@ impl ShardInfo {
 
     /// Where innermost chunk `linear` lives in the shard, or `None` if it is absent.
     pub fn chunk_range(index: &[u64], linear: usize) -> PyResult<Option<ByteRange>> {
-        let (offset, size) = match (index.get(2 * linear), index.get(2 * linear + 1)) {
-            (Some(&offset), Some(&size)) => (offset, size),
-            _ => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "inner chunk {linear} is past the {} the shard index holds",
-                    index.len() / 2
-                )));
-            }
+        let (Some(&offset), Some(&size)) = (index.get(2 * linear), index.get(2 * linear + 1))
+        else {
+            return Err(PyRuntimeError::new_err(format!(
+                "inner chunk {linear} is past the {} the shard index holds",
+                index.len() / 2
+            )));
         };
         if offset == ABSENT && size == ABSENT {
             return Ok(None);
