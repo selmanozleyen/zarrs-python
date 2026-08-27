@@ -358,11 +358,20 @@ impl CodecPipelineImpl {
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
-        // Reads are latency-bound and decodes are CPU-bound, so the two widths are set
-        // independently rather than carved out of one budget by
-        // `calc_concurrency_outer_inner`. Above ~items-per-call, more readers do nothing:
-        // a call cannot have more reads outstanding than it has chunks.
-        let read_concurrency = read_concurrency.unwrap_or(4 * num_threads).max(1);
+        // Both default to the available parallelism, which is what rayon and
+        // `available_parallelism` do, and what a library should spend without being asked.
+        //
+        // Reads are latency-bound and decodes are CPU-bound, so the two are still set
+        // INDEPENDENTLY -- a caller who wants reads oversubscribed can raise
+        // `read_concurrency` alone. The default used to be `4 * num_threads` readers on the
+        // grounds that a blocked reader costs no CPU. True, but it is not a library's call to
+        // make: on a machine with no affinity mask (a login node, a bare box, a container
+        // without a cpuset) that is 4x every core in threads nobody asked for, and a sweep
+        // from 16 to 1024 readers measured FLAT on the strided shape anyway.
+        //
+        // Above ~items-per-call, more readers do nothing regardless: a call cannot have more
+        // reads outstanding than it has chunks.
+        let read_concurrency = read_concurrency.unwrap_or(num_threads).max(1);
         let decode_concurrency = decode_concurrency.unwrap_or(num_threads).max(1);
         // The pool is a process resource, so its widths are a PROCESS setting: whichever
         // array reaches it first sizes it, and every later array runs at those widths. Said
