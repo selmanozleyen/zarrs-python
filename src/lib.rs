@@ -10,7 +10,7 @@ use chunk_item::ChunkItem;
 use itertools::Itertools;
 use numpy::npyffi::PyArrayObject;
 use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -310,6 +310,7 @@ impl CodecPipelineImpl {
     ))]
     #[new]
     fn new(
+        py: Python<'_>,
         array_metadata: &str,
         mut store_config: StoreConfig,
         validate_checksums: bool,
@@ -346,8 +347,30 @@ impl CodecPipelineImpl {
         // independently rather than carved out of one budget by
         // `calc_concurrency_outer_inner`. Above ~items-per-call, more readers do nothing:
         // a call cannot have more reads outstanding than it has chunks.
-        let read_concurrency = read_concurrency.unwrap_or(4 * num_threads);
-        let decode_concurrency = decode_concurrency.unwrap_or(num_threads);
+        let read_concurrency = read_concurrency.unwrap_or(4 * num_threads).max(1);
+        let decode_concurrency = decode_concurrency.unwrap_or(num_threads).max(1);
+        // The pool is a process resource, so its widths are a PROCESS setting: whichever
+        // array reaches it first sizes it, and every later array runs at those widths. Said
+        // here, at open, because `zarr.config` is a context each array snapshots -- so two
+        // arrays can hold different values, and the one that loses should hear about it next
+        // to the config that set it rather than from a read much later.
+        let (read_concurrency, decode_concurrency) = if read_decode_pool {
+            let effective = read_decode_pool::resolve_widths(read_concurrency, decode_concurrency);
+            if effective != (read_concurrency, decode_concurrency) {
+                let message = std::ffi::CString::new(format!(
+                    "the read/decode pool is already running {} readers and {} decoders for \
+                     this process; this array asked for {} and {} and will use the running \
+                     widths. Set codec_pipeline.read_concurrency/decode_concurrency once, \
+                     before the first read, if you need different ones.",
+                    effective.0, effective.1, read_concurrency, decode_concurrency
+                ))
+                .map_py_err::<PyValueError>()?;
+                PyErr::warn(py, &py.get_type::<PyUserWarning>(), &message, 0)?;
+            }
+            effective
+        } else {
+            (read_concurrency, decode_concurrency)
+        };
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
 

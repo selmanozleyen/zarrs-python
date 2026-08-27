@@ -150,11 +150,25 @@ struct JobContext {
 /// The process-wide pipeline: R reader threads and D decode threads, parked between calls.
 struct Pipeline {
     jobs: Sender<Job>,
-    read_threads: usize,
-    decode_threads: usize,
 }
 
 static PIPELINE: OnceLock<Pipeline> = OnceLock::new();
+
+/// The pool widths, fixed by the first pipeline that asks for them.
+///
+/// The pool is a PROCESS resource -- R readers and D decoders for the process, not per
+/// array -- so its size is a process setting, the way `numba.set_num_threads`,
+/// `torch.set_num_threads` and `omp_set_num_threads` are process settings. `zarr.config`
+/// is a context that each array snapshots when it is opened, so two arrays can legitimately
+/// hold different widths while only one of them can size the pool. The first one wins and
+/// `CodecPipelineImpl::new` warns the others, instead of a later READ failing far away from
+/// the `zarr.config.set` that caused it.
+static WIDTHS: OnceLock<(usize, usize)> = OnceLock::new();
+
+/// The process-wide widths, taking these as the process's if nothing has set them yet.
+pub(crate) fn resolve_widths(read_threads: usize, decode_threads: usize) -> (usize, usize) {
+    *WIDTHS.get_or_init(|| (read_threads.max(1), decode_threads.max(1)))
+}
 /// Serialises construction. `OnceLock::get().is_none()` then `set()` is check-then-act: two
 /// first callers both spawn R + D threads and the loser's are thrown away -- and when they
 /// asked for different widths, which one gets the "fixed for the process" error is a coin
@@ -162,20 +176,18 @@ static PIPELINE: OnceLock<Pipeline> = OnceLock::new();
 /// so concurrent first calls are ordinary, not hypothetical.
 static PIPELINE_INIT: Mutex<()> = Mutex::new(());
 
-/// Start the threads on the first read request, at the configured widths.
+/// Start the threads on the first read request, at the process's widths.
 ///
-/// Fixed for the process: a later request for a different width is an error rather than a
-/// silent run at somebody else's width, which would put a number in the report under the
-/// wrong config. Sweeping `read_concurrency` therefore takes one job per point, which is
-/// what the ratios want anyway -- each job runs its own pool arm beside its own fallback arm
-/// and the ratios are compared across points, never the absolutes.
+/// Sweeping a width therefore takes one process per point, which is what a ratio wants
+/// anyway: each job runs its own pool arm beside its own fallback arm, and the ratios are
+/// compared across points rather than the absolutes.
 fn pipeline(read_threads: usize, decode_threads: usize) -> PyResult<&'static Pipeline> {
-    let (read_threads, decode_threads) = (read_threads.max(1), decode_threads.max(1));
+    let (read_threads, decode_threads) = resolve_widths(read_threads, decode_threads);
     if PIPELINE.get().is_none() {
         let _init = PIPELINE_INIT.lock().expect("pipeline init poisoned");
         // Re-check under the lock: whoever held it may have built it already.
-        if PIPELINE.get().is_some() {
-            return check_widths(PIPELINE.get().expect("just checked"), read_threads, decode_threads);
+        if let Some(existing) = PIPELINE.get() {
+            return Ok(existing);
         }
         let (job_tx, job_rx) = unbounded::<Job>();
         // Unbounded on purpose: a reader never waits for a decoder. Peak resident is
@@ -196,31 +208,9 @@ fn pipeline(read_threads: usize, decode_threads: usize) -> PyResult<&'static Pip
                 .spawn(move || decode_loop(&decode_rx))
                 .map_py_err::<PyRuntimeError>()?;
         }
-        let _ = PIPELINE.set(Pipeline {
-            jobs: job_tx,
-            read_threads,
-            decode_threads,
-        });
+        let _ = PIPELINE.set(Pipeline { jobs: job_tx });
     }
-    check_widths(PIPELINE.get().expect("set above"), read_threads, decode_threads)
-}
-
-/// The widths are fixed for the process, so a call asking for different ones is refused
-/// rather than run at somebody else's width -- which would put a number in the report under
-/// the wrong config.
-fn check_widths(
-    pipeline: &'static Pipeline,
-    read_threads: usize,
-    decode_threads: usize,
-) -> PyResult<&'static Pipeline> {
-    if pipeline.read_threads != read_threads || pipeline.decode_threads != decode_threads {
-        return Err(PyRuntimeError::new_err(format!(
-            "the pipeline is running {} readers and {} decoders and this call asked for {} \
-             and {}; the threads are fixed for the process, so sweep one job per point",
-            pipeline.read_threads, pipeline.decode_threads, read_threads, decode_threads
-        )));
-    }
-    Ok(pipeline)
+    Ok(PIPELINE.get().expect("set above"))
 }
 
 /// A reader: block on the filesystem, hand the bytes on, take the next job.
