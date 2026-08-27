@@ -41,3 +41,27 @@ pub fn is_whole_chunk(item: &ChunkItem) -> bool {
     item.chunk_subset.start().iter().all(|&o| o == 0)
         && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
 }
+
+/// `out` is exactly `coords.len()` elements and contiguous, because the indices reached us
+/// non-decreasing -- so this writes straight into the output. This is the one copy.
+pub(crate) fn gather(
+    scratch: &[u8],
+    coords: &[u64],
+    out: &mut [u8],
+    size: usize,
+) -> Result<(), String> {
+    if out.len() != coords.len() * size {
+        return Err("output region does not match the coordinate count".to_string());
+    }
+    for (n, &c) in coords.iter().enumerate() {
+        let src = usize::try_from(c).map_err(|e| e.to_string())? * size;
+        let Some(element) = scratch.get(src..src + size) else {
+            return Err(format!(
+                "coordinate {c} is outside the {} elements decoded",
+                scratch.len() / size
+            ));
+        };
+        out[n * size..(n + 1) * size].copy_from_slice(element);
+    }
+    Ok(())
+}

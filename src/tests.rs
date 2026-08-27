@@ -147,3 +147,22 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
         Ok(())
     })
 }
+
+/// One gather serves the pool and the fused path, so its two refusals are pinned here.
+/// Silently copying the wrong bytes is the failure mode; both callers rely on the check.
+#[test]
+fn test_gather_copies_by_coordinate_and_refuses_the_rest() {
+    let scratch: Vec<u8> = (0..12u8).collect(); // 6 elements of 2 bytes
+    let mut out = vec![0u8; 6];
+
+    crate::utils::gather(&scratch, &[0, 2, 5], &mut out, 2).expect("in bounds");
+    assert_eq!(out, vec![0, 1, 4, 5, 10, 11]);
+
+    // A coordinate past the decoded buffer must not read adjacent elements.
+    let mut out = vec![0u8; 2];
+    assert!(crate::utils::gather(&scratch, &[6], &mut out, 2).is_err());
+
+    // An output region that does not match the coordinate count would write short or over.
+    let mut out = vec![0u8; 4];
+    assert!(crate::utils::gather(&scratch, &[0, 1, 2], &mut out, 2).is_err());
+}

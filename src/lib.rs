@@ -40,7 +40,7 @@ mod utils;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::StoreConfig;
-use crate::utils::{PyCodecErrExt, PyErrExt as _};
+use crate::utils::{PyCodecErrExt, PyErrExt as _, gather};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
 #[gen_stub_pyclass]
@@ -527,17 +527,11 @@ impl CodecPipelineImpl {
                     // that is already decoded: a load and a store per element. The output
                     // side is contiguous because the indices reached us non-decreasing, so
                     // one chunk's elements are one run of the output.
+                    // The view takes one contiguous run, so the elements are gathered into
+                    // a buffer first; the pool writes into its own region and skips that.
                     let mut gathered = vec![0u8; coords.len() * size];
-                    for (n, &c) in coords.iter().enumerate() {
-                        let src = usize::try_from(c).map_py_err::<PyRuntimeError>()? * size;
-                        let Some(element) = raw.get(src..src + size) else {
-                            return Err(PyRuntimeError::new_err(format!(
-                                "coordinate {c} is outside the {} elements decoded for {key}",
-                                raw.len() / size
-                            )));
-                        };
-                        gathered[n * size..(n + 1) * size].copy_from_slice(element);
-                    }
+                    gather(&raw, coords, &mut gathered, size)
+                        .map_err(|e| PyRuntimeError::new_err(format!("{key}: {e}")))?;
                     output_view
                         .copy_from_slice(&gathered)
                         .map_py_err::<PyRuntimeError>()?;

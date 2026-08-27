@@ -74,7 +74,7 @@ use zarrs::storage::{MaybeBytes, ReadableWritableListableStorage, StoreKey};
 use crate::CodecPipelineImpl;
 use crate::chunk_item::ChunkItem;
 use crate::shard_index::ShardInfo;
-use crate::utils::PyErrExt as _;
+use crate::utils::{PyErrExt as _, gather};
 
 /// A disjoint region of the output, owned exclusively by one job.
 ///
@@ -347,26 +347,6 @@ fn await_replies(done_rx: &Receiver<Outcome>, sent: usize) -> PyResult<usize> {
     }
     Ok(decoded)
 }
-
-/// `out` is exactly `coords.len()` elements and contiguous, because the indices reached us
-/// non-decreasing -- so this writes straight into the output. This is the one copy.
-fn gather(scratch: &[u8], coords: &[u64], out: &mut [u8], size: usize) -> Result<(), String> {
-    if out.len() != coords.len() * size {
-        return Err("output region does not match the coordinate count".to_string());
-    }
-    for (n, &c) in coords.iter().enumerate() {
-        let src = usize::try_from(c).map_err(|e| e.to_string())? * size;
-        let Some(element) = scratch.get(src..src + size) else {
-            return Err(format!(
-                "coordinate {c} is outside the {} elements decoded",
-                scratch.len() / size
-            ));
-        };
-        out[n * size..(n + 1) * size].copy_from_slice(element);
-    }
-    Ok(())
-}
-
 /// An absent chunk contributes only fill value, repeated.
 fn fill(out: &mut [u8], fill_value: &FillValue, size: usize) -> Result<(), String> {
     let bytes = fill_value.as_ne_bytes();
