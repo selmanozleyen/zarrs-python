@@ -199,15 +199,27 @@ impl CodecPipelineImpl {
         array_object
     }
 
-    fn nparray_to_slice<'a>(value: &'a Bound<'_, PyUntypedArray>) -> Result<&'a [u8], PyErr> {
+    /// The buffer's pointer and length in bytes, once it is known to be C contiguous.
+    ///
+    /// The three `nparray_to_*` functions below differ only in what they hand back -- a
+    /// shared slice, an exclusive one, or an aliasing wrapper -- and each restated this
+    /// prologue. The pointer is returned unread; every caller dereferences it inside its own
+    /// `unsafe` block, with its own safety argument, which is where that argument belongs.
+    fn nparray_bytes(value: &Bound<'_, PyUntypedArray>) -> Result<(*mut u8, usize), PyErr> {
         if !value.is_c_contiguous() {
             return Err(PyErr::new::<PyValueError, _>(
                 "input array must be a C contiguous array".to_string(),
             ));
         }
         let array_object: &PyArrayObject = Self::py_untyped_array_to_array_object(value);
-        let array_data = array_object.data.cast::<u8>();
-        let array_len = value.len() * value.dtype().itemsize();
+        Ok((
+            array_object.data.cast::<u8>(),
+            value.len() * value.dtype().itemsize(),
+        ))
+    }
+
+    fn nparray_to_slice<'a>(value: &'a Bound<'_, PyUntypedArray>) -> Result<&'a [u8], PyErr> {
+        let (array_data, array_len) = Self::nparray_bytes(value)?;
         let slice = unsafe {
             // SAFETY: array_data is a valid pointer to a u8 array of length array_len
             debug_assert!(!array_data.is_null());
@@ -225,14 +237,7 @@ impl CodecPipelineImpl {
     fn nparray_to_mut_slice<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
     ) -> Result<&'a mut [u8], PyErr> {
-        if !value.is_c_contiguous() {
-            return Err(PyErr::new::<PyValueError, _>(
-                "input array must be a C contiguous array".to_string(),
-            ));
-        }
-        let array_object: &PyArrayObject = Self::py_untyped_array_to_array_object(value);
-        let array_data = array_object.data.cast::<u8>();
-        let array_len = value.len() * value.dtype().itemsize();
+        let (array_data, array_len) = Self::nparray_bytes(value)?;
         Ok(unsafe {
             // SAFETY: array_data is a valid pointer to a u8 array of length array_len, and
             // Python holds no other writer to it for the duration of this call.
@@ -244,14 +249,7 @@ impl CodecPipelineImpl {
     fn nparray_to_unsafe_cell_slice<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
     ) -> Result<UnsafeCellSlice<'a, u8>, PyErr> {
-        if !value.is_c_contiguous() {
-            return Err(PyErr::new::<PyValueError, _>(
-                "input array must be a C contiguous array".to_string(),
-            ));
-        }
-        let array_object: &PyArrayObject = Self::py_untyped_array_to_array_object(value);
-        let array_data = array_object.data.cast::<u8>();
-        let array_len = value.len() * value.dtype().itemsize();
+        let (array_data, array_len) = Self::nparray_bytes(value)?;
         let output = unsafe {
             // SAFETY: array_data is a valid pointer to a u8 array of length array_len
             debug_assert!(!array_data.is_null());
