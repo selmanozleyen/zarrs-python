@@ -61,9 +61,9 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.chunk_concurrent_maximum", None
             ),
             num_threads=config.get("threading.max_workers", None),
-            # The reader-pool / decode-pool arm. Off by default: it changes which code
-            # reads the bytes, so it has to be asked for by name.
-            read_decode_pool=config.get("codec_pipeline.read_decode_pool", False),
+            # This branch is the control: chunk-unit items, decoded down the fused path.
+            # Not a knob -- the arm IS the branch, so a run cannot report the wrong one.
+            read_decode_pool=False,
             read_concurrency=config.get("codec_pipeline.read_concurrency", None),
             decode_concurrency=config.get("codec_pipeline.decode_concurrency", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
@@ -207,9 +207,8 @@ class ZarrsCodecPipeline(CodecPipeline):
                 integer_array_indexing=config.get(
                     "codec_pipeline.integer_array_indexing", False
                 ),
-                chunk_unit_indexing=config.get(
-                    "codec_pipeline.chunk_unit_indexing", False
-                ),
+                # Not a knob: this branch exists to be the chunk-unit arm.
+                chunk_unit_indexing=True,
                 inner_chunk_shape=self._inner_chunk_shape(),
             )
         except (
