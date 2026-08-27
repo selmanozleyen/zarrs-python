@@ -88,3 +88,48 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
         Ok(())
     })
 }
+
+/// The handle must accumulate across entries exactly as the list path concatenates them,
+/// or a mixed-looking batch would silently lose items.
+#[test]
+fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        let a = PyArray1::from_slice(py, &[3i64, 20]);
+        let b = PyArray1::from_slice(py, &[41i64]);
+        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10)?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10)?;
+
+        let list_path: Vec<_> = crate::chunk_item::chunk_unit_items(
+            "c/0",
+            vec![95],
+            vec![100],
+            a.readonly(),
+            0,
+            10,
+        )?
+        .into_iter()
+        .chain(crate::chunk_item::chunk_unit_items(
+            "c/1",
+            vec![95],
+            vec![100],
+            b.readonly(),
+            2,
+            10,
+        )?)
+        .collect();
+
+        assert_eq!(handle.as_slice().len(), 3);
+        assert_eq!(handle.as_slice().len(), list_path.len());
+        for (got, want) in handle.as_slice().iter().zip(&list_path) {
+            assert_eq!(got.key, want.key);
+            assert_eq!(got.chunk_subset, want.chunk_subset);
+            assert_eq!(got.subset, want.subset);
+            assert_eq!(got.coords, want.coords);
+        }
+        Ok(())
+    })
+}

@@ -240,6 +240,55 @@ impl CodecPipelineImpl {
         };
         Ok(UnsafeCellSlice::new(output))
     }
+
+    fn retrieve_items_and_apply_index(
+        &self,
+        py: Python,
+        chunk_descriptions: &[chunk_item::ChunkItem],
+        value: &Bound<'_, PyUntypedArray>,
+    ) -> PyResult<()> {
+        // The read/decode pool, when it is on and every item is a chunk-unit item. It
+        // needs an exclusive output slice, so it cannot share the aliasing wrapper the
+        // fused path takes -- hence the dispatch here rather than inside the loop.
+        if let (true, Some(shard)) = (
+            self.read_decode_pool_enabled
+                && !chunk_descriptions.is_empty()
+                && chunk_descriptions.iter().all(|i| i.coords.is_some()),
+            self.shard.as_ref(),
+        ) {
+            let output = Self::nparray_to_mut_slice(value)?;
+            let (declined, counts) = py.detach(|| {
+                let Some((_, codec_options)) =
+                    chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
+                else {
+                    return Ok((Vec::new(), read_decode_pool::PoolCounts::default()));
+                };
+                self.retrieve_read_decode_pool(shard, chunk_descriptions, output, &codec_options)
+            })?;
+            // An arm that silently ran the other path is not a result. Every job sent was
+            // one innermost chunk, read once and decoded once, so the two counts must agree
+            // -- and a zero here means the pool never ran at all.
+            if counts.chunks != counts.decoded {
+                return Err(PyRuntimeError::new_err(format!(
+                    "read/decode pool accounting does not close: {} chunks sent, {} decoded \
+                     ({} absent, {} shard indexes read, {} items declined)",
+                    counts.chunks,
+                    counts.decoded,
+                    counts.absent,
+                    counts.shard_indexes,
+                    counts.declined
+                )));
+            }
+            if declined.is_empty() {
+                return Ok(());
+            }
+            // Whatever the pool could not take still has to be read, down the fused path.
+            let declined: Vec<chunk_item::ChunkItem> = declined.into_iter().cloned().collect();
+            return self.retrieve_chunks_and_apply_index_fused(py, declined, value);
+        }
+        // Not the hot path: the pool is off, or the batch is mixed and arrived as a list.
+        self.retrieve_chunks_and_apply_index_fused(py, chunk_descriptions.to_vec(), value)
+    }
 }
 
 #[gen_stub_pymethods]
@@ -342,46 +391,21 @@ impl CodecPipelineImpl {
         chunk_descriptions: Vec<chunk_item::ChunkItem>, // FIXME: Ref / iterable?
         value: &Bound<'_, PyUntypedArray>,
     ) -> PyResult<()> {
-        // The read/decode pool, when it is on and every item is a chunk-unit item. It
-        // needs an exclusive output slice, so it cannot share the aliasing wrapper the
-        // fused path takes -- hence the dispatch here rather than inside the loop.
-        if let (true, Some(shard)) = (
-            self.read_decode_pool_enabled
-                && !chunk_descriptions.is_empty()
-                && chunk_descriptions.iter().all(|i| i.coords.is_some()),
-            self.shard.as_ref(),
-        ) {
-            let output = Self::nparray_to_mut_slice(value)?;
-            let (declined, counts) = py.detach(|| {
-                let Some((_, codec_options)) =
-                    chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
-                else {
-                    return Ok((Vec::new(), read_decode_pool::PoolCounts::default()));
-                };
-                self.retrieve_read_decode_pool(shard, &chunk_descriptions, output, &codec_options)
-            })?;
-            // An arm that silently ran the other path is not a result. Every job sent was
-            // one innermost chunk, read once and decoded once, so the two counts must agree
-            // -- and a zero here means the pool never ran at all.
-            if counts.chunks != counts.decoded {
-                return Err(PyRuntimeError::new_err(format!(
-                    "read/decode pool accounting does not close: {} chunks sent, {} decoded \
-                     ({} absent, {} shard indexes read, {} items declined)",
-                    counts.chunks,
-                    counts.decoded,
-                    counts.absent,
-                    counts.shard_indexes,
-                    counts.declined
-                )));
-            }
-            if declined.is_empty() {
-                return Ok(());
-            }
-            // Whatever the pool could not take still has to be read, down the fused path.
-            let declined: Vec<chunk_item::ChunkItem> = declined.into_iter().cloned().collect();
-            return self.retrieve_chunks_and_apply_index_fused(py, declined, value);
-        }
-        self.retrieve_chunks_and_apply_index_fused(py, chunk_descriptions, value)
+        self.retrieve_items_and_apply_index(py, &chunk_descriptions, value)
+    }
+
+    /// The same read, from a batch that never became Python objects.
+    ///
+    /// A `Vec<ChunkItem>` argument costs one pyclass allocation per item leaving the
+    /// builder and one extraction per item arriving here. The handle costs one of each
+    /// per CALL.
+    fn retrieve_chunk_items_and_apply_index(
+        &self,
+        py: Python,
+        chunk_items: PyRef<'_, chunk_item::ChunkItems>,
+        value: &Bound<'_, PyUntypedArray>,
+    ) -> PyResult<()> {
+        self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value)
     }
 
     fn retrieve_chunks_and_apply_index_fused(
@@ -623,6 +647,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
     m.add_function(wrap_pyfunction!(chunk_item::chunk_unit_items, m)?)?;
+    m.add_class::<chunk_item::ChunkItems>()?;
     Ok(())
 }
 

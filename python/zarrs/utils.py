@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from zarr.core.indexing import is_integer
 
-from zarrs._internal import ChunkItem, chunk_unit_items
+from zarrs._internal import ChunkItem, ChunkItems, chunk_unit_items
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -231,14 +231,16 @@ def get_implicit_fill_value(dtype: ZDType, fill_value: Any) -> Any:
 
 @dataclass(frozen=True)
 class RustChunkInfo:
-    chunk_info_with_indices: list[ChunkItem]
+    # A ChunkItems handle when the batch is entirely chunk-unit; a list otherwise. The
+    # pipeline dispatches on which, because the two take different Rust entry points.
+    chunk_info_with_indices: list[ChunkItem] | ChunkItems
     write_empty_chunks: bool
 
 
-def _chunk_unit_items(
+def _chunk_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
-) -> list[ChunkItem] | None:
-    """One item per inner chunk, or None if this entry is not that shape.
+) -> tuple | None:
+    """Arguments for one item per inner chunk, or None if this entry is not that shape.
 
     The inner chunk is what the codec chain fetches and decodes; `chunk_spec.shape` is
     the SHARD. Grouping a selection by decode unit therefore needs the inner chunk
@@ -251,8 +253,10 @@ def _chunk_unit_items(
     run of consecutive indices and a strided scatter cost it the same.
 
     The checks here are vectorised numpy and cost nothing, so they stay in Python and
-    hold the semantics; `chunk_unit_items` does the grouping and the item construction
-    in Rust, taking `indices` as a view.
+    hold the semantics; Rust does the grouping and the item construction, taking
+    `indices` as a view. Returning the arguments rather than the items lets the caller
+    choose the container: a `ChunkItems` handle when the whole batch is chunk-unit, a
+    Python list when it has to meet entries that took another path.
 
     Narrow on purpose: one 1-D integer axis, non-negative and NON-DECREASING, with a
     contiguous output slice. Sorted is what makes it work -- each chunk's elements are
@@ -279,9 +283,7 @@ def _chunk_unit_items(
     if out_axis_sel.step not in (None, 1) or out_axis_sel.stop - start != indices.size:
         return None
 
-    # The grouping and every item is built in Rust: the loop that was here crossed pyo3
-    # once per item and boxed a PyInt per coordinate, which was 83% of a strided run.
-    return chunk_unit_items(
+    return (
         byte_getter.path,
         chunk_spec.shape,
         shape,
@@ -302,16 +304,27 @@ def make_chunk_info_for_rust_with_indices(
     inner_chunk_shape: tuple[int, ...] | None = None,
 ) -> RustChunkInfo:
     batch_info = _as_int64_batch_info(batch_info)
-    unit_items: list[ChunkItem] = []
+    unit_args: list[tuple] = []
     if chunk_unit_indexing:
         kept = []
         for entry in batch_info:
-            items = _chunk_unit_items(entry, shape, drop_axes, inner_chunk_shape)
-            if items is None:
+            args = _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
+            if args is None:
                 kept.append(entry)
             else:
-                unit_items.extend(items)
+                unit_args.append(args)
         batch_info = kept
+        # Every entry is chunk-unit, which is every call the read/decode pool can take:
+        # the whole batch goes to Rust as one object and no ChunkItem is ever made in
+        # Python. A mixed batch falls through to the list, where the two paths can meet.
+        if unit_args and not kept:
+            handle = ChunkItems()
+            for args in unit_args:
+                handle.push_entry(*args)
+            return RustChunkInfo(handle, True)
+    unit_items: list[ChunkItem] = [
+        item for args in unit_args for item in chunk_unit_items(*args)
+    ]
     if integer_array_indexing:
         batch_info = [
             (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)

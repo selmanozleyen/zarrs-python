@@ -133,12 +133,10 @@ fn selection_to_array_subset(
 /// contiguous output slice) because they are vectorised numpy and cost nothing. The
 /// checks repeated here are the ones whose failure would be silent: a negative index
 /// cast to `u64` becomes a wild chunk id, and `inner == 0` divides by zero.
-#[pyfunction]
-#[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner))]
 #[allow(clippy::needless_pass_by_value)]
 // One range per call is the point: this is the 1-D path.
 #[allow(clippy::single_range_in_vec_init)]
-pub(crate) fn chunk_unit_items(
+fn build_chunk_unit_items(
     key: &str,
     chunk_shape: Vec<u64>,
     shape: Vec<u64>,
@@ -216,4 +214,82 @@ pub(crate) fn chunk_unit_items(
         a = b;
     }
     Ok(items)
+}
+
+/// The items for one entry, as a Python list of `ChunkItem` objects.
+///
+/// Kept for the MIXED batch, where some entries take the chunk-unit path and some do
+/// not: those have to meet in one Python list. When every entry is chunk-unit -- which
+/// is every call the read/decode pool can take, since it requires coords on all of them
+/// -- `ChunkItems` carries them instead and no per-item Python object is made.
+#[pyfunction]
+#[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner))]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn chunk_unit_items(
+    key: &str,
+    chunk_shape: Vec<u64>,
+    shape: Vec<u64>,
+    indices: PyReadonlyArray1<'_, i64>,
+    out_start: u64,
+    inner: u64,
+) -> PyResult<Vec<ChunkItem>> {
+    build_chunk_unit_items(key, chunk_shape, shape, indices, out_start, inner)
+}
+
+/// A whole batch of items behind ONE Python object.
+///
+/// `Vec<ChunkItem>` returned to Python becomes one pyclass object per item -- ~1,000 heap
+/// allocations per call -- which `retrieve_chunks_and_apply_index` then extracts straight
+/// back into a `Vec`. The items were making a round trip through Python for nothing: 1.80 s
+/// of an 8.01 s strided run, measured once the build itself was in Rust.
+///
+/// So the batch never becomes Python objects at all. Python drives the eligibility guards
+/// and calls `push_entry` per ENTRY (~18 per call, not ~1,000), and the handle goes back
+/// to `retrieve_chunk_items_and_apply_index` as itself.
+#[gen_stub_pyclass]
+#[pyclass]
+pub(crate) struct ChunkItems {
+    items: Vec<ChunkItem>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl ChunkItems {
+    #[new]
+    pub(crate) fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Build one entry's items and append them. The caller's guards decide eligibility.
+    #[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn push_entry(
+        &mut self,
+        key: &str,
+        chunk_shape: Vec<u64>,
+        shape: Vec<u64>,
+        indices: PyReadonlyArray1<'_, i64>,
+        out_start: u64,
+        inner: u64,
+    ) -> PyResult<()> {
+        self.items.extend(build_chunk_unit_items(
+            key,
+            chunk_shape,
+            shape,
+            indices,
+            out_start,
+            inner,
+        )?);
+        Ok(())
+    }
+}
+
+impl ChunkItems {
+    pub(crate) fn as_slice(&self) -> &[ChunkItem] {
+        &self.items
+    }
 }
