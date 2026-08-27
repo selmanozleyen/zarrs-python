@@ -61,6 +61,12 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.chunk_concurrent_maximum", None
             ),
             num_threads=config.get("threading.max_workers", None),
+            # Off by default: it changes which code reads the bytes, so it has to be
+            # asked for by name. This one flag also selects the chunk-unit decomposition
+            # in `read` -- see the note there.
+            read_decode_pool=config.get("codec_pipeline.read_decode_pool", False),
+            read_concurrency=config.get("codec_pipeline.read_concurrency", None),
+            decode_concurrency=config.get("codec_pipeline.decode_concurrency", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
@@ -136,6 +142,19 @@ class ZarrsCodecPipeline(CodecPipeline):
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
 
+    def _inner_chunk_shape(self) -> tuple[int, ...] | None:
+        """The shape of the unit the codec chain decodes, or None if not sharded.
+
+        `chunk_spec.shape` in a batch entry is the SHARD extent, so nothing downstream
+        could tell which parts of a selection share a decode. The sharding codec knows,
+        and the pipeline holds the array metadata, so it is one lookup away.
+        """
+        for codec in getattr(self.metadata, "codecs", ()) or ():
+            chunk_shape = getattr(codec, "chunk_shape", None)
+            if chunk_shape is not None:
+                return tuple(int(s) for s in chunk_shape)
+        return None
+
     @property
     def supports_partial_decode(self) -> bool:
         return False
@@ -183,7 +202,22 @@ class ZarrsCodecPipeline(CodecPipeline):
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
             chunks_desc = make_chunk_info_for_rust_with_indices(
-                batch_info, drop_axes, out.shape
+                batch_info,
+                drop_axes,
+                out.shape,
+                integer_array_indexing=config.get(
+                    "codec_pipeline.integer_array_indexing", False
+                ),
+                # One flag, not two. The pool declines any item that is not a
+                # chunk-unit item, so of the four combinations these knobs could
+                # express, only two ever did anything and one of those was the
+                # default. Chunk-unit decomposition WITHOUT the pool is a real
+                # configuration and a measured one, but it is a different design
+                # rather than a setting of this one, so it belongs on its own branch.
+                chunk_unit_indexing=config.get(
+                    "codec_pipeline.read_decode_pool", False
+                ),
+                inner_chunk_shape=self._inner_chunk_shape(),
             )
         except (
             UnsupportedMetadataError,

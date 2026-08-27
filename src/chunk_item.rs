@@ -33,12 +33,16 @@ pub(crate) struct ChunkItem {
     pub shape: Vec<NonZeroU64>,
     pub num_elements: u64,
     pub array_shape: Vec<NonZeroU64>,
+    /// Indices within `chunk_subset`, when this item is a whole inner chunk plus the
+    /// elements wanted from it. The chunk is decoded once and these are gathered out.
+    pub coords: Option<Vec<u64>>,
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl ChunkItem {
     #[new]
+    #[pyo3(signature = (key, chunk_subset, chunk_shape, subset, shape, coords=None))]
     #[allow(clippy::needless_pass_by_value)]
     fn new(
         key: String,
@@ -46,6 +50,7 @@ impl ChunkItem {
         chunk_shape: Vec<u64>,
         subset: Vec<Bound<'_, PySlice>>,
         shape: Vec<u64>,
+        coords: Option<Vec<u64>>,
     ) -> PyResult<Self> {
         let num_elements = chunk_shape.iter().product();
         let shape_nonzero_u64 = to_nonzero_u64_vec(shape)?;
@@ -54,7 +59,12 @@ impl ChunkItem {
         let subset = selection_to_array_subset(&subset, &shape_nonzero_u64)?;
         // Check that subset and chunk_subset have the same number of elements.
         // This permits broadcasting of a constant input.
-        if subset.num_elements() != chunk_subset.num_elements() && subset.num_elements() > 1 {
+        // With coordinates the chunk subset is a whole inner chunk and the output holds
+        // only the elements wanted from it, so the two counts are not meant to agree.
+        if coords.is_none()
+            && subset.num_elements() != chunk_subset.num_elements()
+            && subset.num_elements() > 1
+        {
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "the size of the chunk subset {chunk_subset} and input/output subset {subset} are incompatible",
             )));
@@ -67,6 +77,7 @@ impl ChunkItem {
             shape: chunk_shape_nonzero_u64,
             num_elements,
             array_shape: shape_nonzero_u64,
+            coords,
         })
     }
 }

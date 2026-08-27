@@ -30,7 +30,9 @@ use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
 
 mod chunk_item;
 mod concurrency;
+mod read_decode_pool;
 mod runtime;
+mod shard_index;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -52,6 +54,15 @@ pub struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
+    /// Widths only. The pools themselves are process-wide statics in `read_decode_pool`:
+    /// zarr builds a pipeline per ARRAY, so pools owned here are built once per array.
+    pub(crate) read_concurrency: usize,
+    pub(crate) decode_concurrency: usize,
+    pub(crate) read_decode_pool_enabled: bool,
+    /// Present only for a singly-sharded array: the pool locates chunks itself, so it
+    /// needs the shard's index codecs and the codecs inside a shard. `None` means this
+    /// array cannot take the pool path at all.
+    pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
 }
 
 impl CodecPipelineImpl {
@@ -186,6 +197,31 @@ impl CodecPipelineImpl {
         Ok(slice)
     }
 
+    /// The output as one exclusive slice, for the path that sub-splits it safely.
+    ///
+    /// Same pointer and length as `nparray_to_unsafe_cell_slice`; the difference is what
+    /// the caller may do with it. One `&mut [u8]` that `split_at_mut` then divides is
+    /// checked by the compiler, where `UnsafeCellSlice` hands out aliasing views whose
+    /// disjointness is only asserted.
+    fn nparray_to_mut_slice<'a>(
+        value: &'a Bound<'_, PyUntypedArray>,
+    ) -> Result<&'a mut [u8], PyErr> {
+        if !value.is_c_contiguous() {
+            return Err(PyErr::new::<PyValueError, _>(
+                "input array must be a C contiguous array".to_string(),
+            ));
+        }
+        let array_object: &PyArrayObject = Self::py_untyped_array_to_array_object(value);
+        let array_data = array_object.data.cast::<u8>();
+        let array_len = value.len() * value.dtype().itemsize();
+        Ok(unsafe {
+            // SAFETY: array_data is a valid pointer to a u8 array of length array_len, and
+            // Python holds no other writer to it for the duration of this call.
+            debug_assert!(!array_data.is_null());
+            std::slice::from_raw_parts_mut(array_data, array_len)
+        })
+    }
+
     fn nparray_to_unsafe_cell_slice<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
     ) -> Result<UnsafeCellSlice<'a, u8>, PyErr> {
@@ -219,6 +255,9 @@ impl CodecPipelineImpl {
         num_threads=None,
         direct_io=false,
         file_handle_cache_size=0,
+        read_decode_pool=false,
+        read_concurrency=None,
+        decode_concurrency=None,
     ))]
     #[new]
     fn new(
@@ -230,6 +269,9 @@ impl CodecPipelineImpl {
         num_threads: Option<usize>,
         direct_io: bool,
         file_handle_cache_size: usize,
+        read_decode_pool: bool,
+        read_concurrency: Option<usize>,
+        decode_concurrency: Option<usize>,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
@@ -243,6 +285,7 @@ impl CodecPipelineImpl {
         let codec_chain =
             Arc::new(CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?);
         let codec_options = CodecOptions::default().with_validate_checksums(validate_checksums);
+        let shard = shard_index::ShardInfo::from_codecs(&metadata_v3.codecs)?.map(Arc::new);
 
         let chunk_concurrent_minimum =
             chunk_concurrent_minimum.unwrap_or(global_config().chunk_concurrent_minimum());
@@ -250,6 +293,12 @@ impl CodecPipelineImpl {
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
+        // Reads are latency-bound and decodes are CPU-bound, so the two widths are set
+        // independently rather than carved out of one budget by
+        // `calc_concurrency_outer_inner`. Above ~items-per-call, more readers do nothing:
+        // a call cannot have more reads outstanding than it has chunks.
+        let read_concurrency = read_concurrency.unwrap_or(4 * num_threads);
+        let decode_concurrency = decode_concurrency.unwrap_or(num_threads);
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
 
@@ -280,6 +329,10 @@ impl CodecPipelineImpl {
             num_threads,
             fill_value,
             data_type,
+            read_concurrency,
+            decode_concurrency,
+            read_decode_pool_enabled: read_decode_pool,
+            shard,
         })
     }
 
@@ -287,6 +340,54 @@ impl CodecPipelineImpl {
         &self,
         py: Python,
         chunk_descriptions: Vec<chunk_item::ChunkItem>, // FIXME: Ref / iterable?
+        value: &Bound<'_, PyUntypedArray>,
+    ) -> PyResult<()> {
+        // The read/decode pool, when it is on and every item is a chunk-unit item. It
+        // needs an exclusive output slice, so it cannot share the aliasing wrapper the
+        // fused path takes -- hence the dispatch here rather than inside the loop.
+        if let (true, Some(shard)) = (
+            self.read_decode_pool_enabled
+                && !chunk_descriptions.is_empty()
+                && chunk_descriptions.iter().all(|i| i.coords.is_some()),
+            self.shard.as_ref(),
+        ) {
+            let output = Self::nparray_to_mut_slice(value)?;
+            let (declined, counts) = py.detach(|| {
+                let Some((_, codec_options)) =
+                    chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
+                else {
+                    return Ok((Vec::new(), read_decode_pool::PoolCounts::default()));
+                };
+                self.retrieve_read_decode_pool(shard, &chunk_descriptions, output, &codec_options)
+            })?;
+            // An arm that silently ran the other path is not a result. Every job sent was
+            // one innermost chunk, read once and decoded once, so the two counts must agree
+            // -- and a zero here means the pool never ran at all.
+            if counts.chunks != counts.decoded {
+                return Err(PyRuntimeError::new_err(format!(
+                    "read/decode pool accounting does not close: {} chunks sent, {} decoded \
+                     ({} absent, {} shard indexes read, {} items declined)",
+                    counts.chunks,
+                    counts.decoded,
+                    counts.absent,
+                    counts.shard_indexes,
+                    counts.declined
+                )));
+            }
+            if declined.is_empty() {
+                return Ok(());
+            }
+            // Whatever the pool could not take still has to be read, down the fused path.
+            let declined: Vec<chunk_item::ChunkItem> = declined.into_iter().cloned().collect();
+            return self.retrieve_chunks_and_apply_index_fused(py, declined, value);
+        }
+        self.retrieve_chunks_and_apply_index_fused(py, chunk_descriptions, value)
+    }
+
+    fn retrieve_chunks_and_apply_index_fused(
+        &self,
+        py: Python,
+        chunk_descriptions: Vec<chunk_item::ChunkItem>,
         value: &Bound<'_, PyUntypedArray>,
     ) -> PyResult<()> {
         // Get input array
@@ -350,6 +451,54 @@ impl CodecPipelineImpl {
                     )
                     .map_py_err::<PyRuntimeError>()?
                 };
+                if let Some(coords) = &item.coords {
+                    // The chunk is the read and decode unit. `chunk_subset` is exactly one
+                    // inner chunk, and an ArraySubset indexer is what takes zarrs'
+                    // chunks-in-subset path, where the chunk is fetched and decoded once.
+                    //
+                    // Handing zarrs the coordinates instead reaches
+                    // `partial_decode_fixed_indexer`, which walks them one at a time: two
+                    // ArrayIndices allocations, a subchunk-decoder cache lookup and a
+                    // `partial_decode` call PER ELEMENT. `partial_decode_into` is not usable
+                    // here either -- it requires indexer.len() == output elements, and a
+                    // whole chunk is deliberately larger than what is wanted from it.
+                    let key = &item.key;
+                    let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
+                        PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
+                    })?;
+                    let decoded = partial_decoder
+                        .partial_decode(&item.chunk_subset, &codec_options)
+                        .map_codec_err()?;
+                    let ArrayBytes::Fixed(raw) = decoded else {
+                        return Err(PyTypeError::new_err(
+                            "variable length data type not supported",
+                        ));
+                    };
+                    let size = self
+                        .data_type
+                        .fixed_size()
+                        .ok_or("variable length data type not supported")
+                        .map_py_err::<PyTypeError>()?;
+                    // The gather zarr-python does with one numpy fancy index, over a buffer
+                    // that is already decoded: a load and a store per element. The output
+                    // side is contiguous because the indices reached us non-decreasing, so
+                    // one chunk's elements are one run of the output.
+                    let mut gathered = vec![0u8; coords.len() * size];
+                    for (n, &c) in coords.iter().enumerate() {
+                        let src = usize::try_from(c).map_py_err::<PyRuntimeError>()? * size;
+                        let Some(element) = raw.get(src..src + size) else {
+                            return Err(PyRuntimeError::new_err(format!(
+                                "coordinate {c} is outside the {} elements decoded for {key}",
+                                raw.len() / size
+                            )));
+                        };
+                        gathered[n * size..(n + 1) * size].copy_from_slice(element);
+                    }
+                    output_view
+                        .copy_from_slice(&gathered)
+                        .map_py_err::<PyRuntimeError>()?;
+                    return Ok(());
+                }
                 let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
                 // See zarrs::array::Array::retrieve_chunk_subset_into
                 if is_whole_chunk(&item) {
