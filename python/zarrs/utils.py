@@ -294,7 +294,12 @@ def _chunk_unit_items(
                 subset=[slice(start + a, start + b)],
                 shape=shape,
                 # Relative to the chunk subset, because that is the buffer gathered from.
-                coords=[int(i) - lo for i in indices[a:b]],
+                # numpy does the subtraction and tolist() the boxing, both in C. The
+                # comprehension this replaces called int() per element: 62.9 ms per
+                # million coordinates against 12.9, and this runs on EVERY chunk item
+                # before any of the Rust path, so on a dense request -- 8,192 rows is
+                # ~11.9M coordinates -- it was ~0.75 s of pure Python per call.
+                coords=(indices[a:b] - lo).tolist(),
             )
         )
     return items
