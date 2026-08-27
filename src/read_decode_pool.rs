@@ -41,7 +41,9 @@ use zarrs::storage::{MaybeBytes, ReadableWritableListableStorage, StoreKey};
 use crate::CodecPipelineImpl;
 use crate::chunk_item::ChunkItem;
 use crate::shard_index::ShardInfo;
-use crate::utils::{PyErrExt as _, gather};
+use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
+
+use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather};
 
 /// A disjoint region of the output, owned exclusively by one job.
 ///
@@ -114,16 +116,6 @@ struct JobContext {
     store: ReadableWritableListableStorage,
     codec_options: CodecOptions,
     element_size: usize,
-}
-
-/// Whether this array has read a shard's index yet, and what it found.
-///
-/// Three states, not `Option<Option<_>>`: "not read" and "read, and the shard is not there"
-/// are different answers, and the second is worth remembering so it is not asked twice.
-enum ShardIndexState {
-    Unread,
-    Absent,
-    Known(Arc<Vec<u64>>),
 }
 
 /// The process-wide pipeline: R reader threads and D decode threads, parked between calls.
@@ -252,7 +244,7 @@ fn decode_one(job: &Job, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Result<Out
         return Err(format!("{} vanished between index and read", job.key));
     };
 
-    let shape = &ctx.shard.inner_shape;
+    let shape = &ctx.shard.subchunk_shape;
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
     scratch.clear();
@@ -467,30 +459,25 @@ impl CodecPipelineImpl {
     }
 
     /// What this array remembers about one shard's index.
-    fn cached_shard_index(&self, key: &StoreKey) -> ShardIndexState {
+    fn cached_shard_decoder(&self, key: &StoreKey) -> Option<Arc<ShardingPartialDecoder>> {
         if !self.cache_shard_indexes {
-            return ShardIndexState::Unread;
+            return None;
         }
-        match self
-            .shard_indexes
+        self.shard_indexes
             .lock()
             .expect("shard index cache poisoned")
             .get(key)
-        {
-            None => ShardIndexState::Unread,
-            Some(None) => ShardIndexState::Absent,
-            Some(Some(index)) => ShardIndexState::Known(index.clone()),
-        }
+            .cloned()
     }
 
-    fn remember_shard_index(&self, key: &StoreKey, index: Option<Arc<Vec<u64>>>) {
+    fn remember_shard_decoder(&self, key: &StoreKey, decoder: Arc<ShardingPartialDecoder>) {
         if !self.cache_shard_indexes {
             return;
         }
         self.shard_indexes
             .lock()
             .expect("shard index cache poisoned")
-            .insert(key.clone(), index);
+            .insert(key.clone(), decoder);
     }
 
     /// Where each item's innermost chunk lives, from its shard's own offset/size table.
@@ -517,35 +504,32 @@ impl CodecPipelineImpl {
                 declined.push(item);
                 continue;
             }
-            let index = match self.cached_shard_index(&item.key) {
-                ShardIndexState::Known(index) => Some(index),
-                ShardIndexState::Absent => None,
-                ShardIndexState::Unread => {
-                    // The lock is NOT held across the read. Two callers can therefore read
-                    // one shard's index at the same time and the second insert wins; that
-                    // costs a duplicate read and cannot give a different answer. Holding it
-                    // instead would serialise every caller behind one full-latency read.
-                    let chunks_per_shard = shard.chunks_per_shard(&item.shape)?;
-                    let read = shard
-                        .read_index(
-                            &self.store,
-                            &item.key,
-                            &chunks_per_shard,
-                            &ctx.codec_options,
-                        )?
-                        .map(Arc::new);
-                    reads += 1;
-                    self.remember_shard_index(&item.key, read.clone());
-                    read
-                }
+            let decoder = if let Some(decoder) = self.cached_shard_decoder(&item.key) {
+                decoder
+            } else {
+                // The lock is NOT held across construction, which reads the shard index.
+                // Two callers can therefore read one shard's index at the same time and
+                // the second insert wins; that costs a duplicate read and cannot give a
+                // different answer. Holding it would serialise every caller behind one
+                // full-latency read.
+                let decoder = Arc::new(shard.decoder(
+                    &self.store,
+                    &item.key,
+                    item.shape.clone(),
+                    &ctx.codec_options,
+                )?);
+                reads += 1;
+                self.remember_shard_decoder(&item.key, decoder.clone());
+                decoder
             };
-            let Some(index) = index else {
-                located.push((item, None)); // no shard at all: fill value
-                continue;
-            };
-            let linear =
-                shard.linear_index_1d(item.chunk_subset.start().first().copied().unwrap_or(0));
-            located.push((item, ShardInfo::chunk_range(&index, linear)?));
+            // One Option covers both absences: a shard that is not there at all, and a
+            // subchunk whose index entry is the never-written marker.
+            let subchunk =
+                shard.subchunk_index_1d(item.chunk_subset.start().first().copied().unwrap_or(0));
+            located.push((
+                item,
+                decoder.subchunk_byte_range(&[subchunk]).map_codec_err()?,
+            ));
         }
         // Reads, not distinct shards: what this counter is for is the serial, full-latency
         // work done on the calling thread, and a cache hit is none of that.

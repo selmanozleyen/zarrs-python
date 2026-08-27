@@ -18,6 +18,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
+use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
     ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound, CodecOptions,
@@ -65,17 +66,17 @@ pub struct CodecPipelineImpl {
     /// Shard indexes read so far, for the life of this pipeline -- which is the life of the
     /// array, since zarr builds one pipeline per array.
     ///
-    /// A shard index is 2 u64 per inner chunk (~31 KB for a 1,953-chunk shard here), and
-    /// reading one is a full-latency round trip on the CALLING thread, before any job
-    /// reaches the reader pool. Keeping them means a shard is paid for once per array
-    /// rather than once per call. `None` records a shard that is absent, which is also
-    /// worth not asking about twice.
+    /// A `ShardingPartialDecoder` holds one shard's decoded index, and reading that index
+    /// is a full-latency round trip on the CALLING thread before any job reaches the reader
+    /// pool. Keeping the decoder means a shard is paid for once per array rather than once
+    /// per call. A shard that does not exist is remembered too -- its decoder answers every
+    /// subchunk as absent, which is also not worth asking twice.
     ///
     /// Only populated when the store is READ-ONLY, which is the only state in which a
     /// remembered range cannot be invalidated behind our back by our own caller. A
     /// read-only store rejects writes, so nothing this process does can move the bytes a
     /// range addresses; an external writer still can, and no cache here can see that.
-    pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Option<Arc<Vec<u64>>>>>,
+    pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Arc<ShardingPartialDecoder>>>,
     /// Whether to remember shard indexes at all: true only for a read-only store.
     pub(crate) cache_shard_indexes: bool,
 }
@@ -408,13 +409,13 @@ impl CodecPipelineImpl {
         // work on; `decode`, `encode`, `partial_decoder` and `recommended_concurrency` all
         // live on the bound form. Bound once here, because it is the same for every chunk
         // this pipeline touches.
-        let shard =
-            shard_index::ShardInfo::from_codecs(&metadata_v3.codecs, &data_type, &fill_value)?
-                .map(Arc::new);
         let codec_chain = CodecChain::from_metadata(&metadata_v3.codecs)
             .map_py_err::<PyTypeError>()?
             .with_context(data_type.clone(), fill_value.clone())
             .map_py_err::<PyTypeError>()?;
+        // Read off the BOUND chain: it already holds the sharding codec with its inner and
+        // index chains bound, so nothing has to be re-derived from the metadata.
+        let shard = shard_index::ShardInfo::from_codec_chain(&codec_chain).map(Arc::new);
 
         Ok(Self {
             store,
