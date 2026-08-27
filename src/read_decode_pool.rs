@@ -34,6 +34,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use pyo3::PyResult;
@@ -748,20 +749,100 @@ fn worker_ceiling(per_call: usize) -> usize {
     })
 }
 
-fn take_permits(want: usize, ceiling: usize) -> usize {
-    let mut live = LIVE_WORKERS.load(Ordering::Relaxed);
-    loop {
-        let take = want.min(ceiling.saturating_sub(live)).max(1);
-        match LIVE_WORKERS.compare_exchange_weak(
-            live,
-            live + take,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return take,
-            Err(actual) => live = actual,
+/// Calls in flight, so a call can take a SHARE of the ceiling rather than race for it.
+///
+/// First-come-first-served is what makes the pathology reachable at the shipped default:
+/// eight calls at a width of 16 consume a ceiling of 128, and the ninth and tenth fall to
+/// the floor of one and run single-threaded for their whole duration.
+static ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one call for as long as it is in flight.
+///
+/// A guard rather than a pair of fetches: an early return or a panic between them leaves the
+/// count high for the life of the process, and every later call then computes a share of a
+/// crowd that is not there.
+struct ActiveCall;
+
+impl ActiveCall {
+    fn enter() -> Self {
+        ACTIVE_CALLS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+
+    /// What one call may hold if every in-flight call takes an equal share. Never zero: a
+    /// call always gets a worker, or nothing it queued would ever be read.
+    fn share(ceiling: usize) -> usize {
+        (ceiling / ACTIVE_CALLS.load(Ordering::Relaxed).max(1)).max(1)
+    }
+}
+
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        ACTIVE_CALLS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One worker's permit, released when THAT worker exits.
+///
+/// The previous shape released a call's whole allocation in one subtraction after the join,
+/// so a call held every thread it was given until it finished, long after the ones that had
+/// drained were idle. Per-worker release is what makes those threads available to the calls
+/// still working.
+struct Permit;
+
+impl Permit {
+    /// `None` when the ceiling is full, so the caller decides whether to insist or wait.
+    fn take(ceiling: usize) -> Option<Self> {
+        let mut live = LIVE_WORKERS.load(Ordering::Relaxed);
+        loop {
+            if live >= ceiling {
+                return None;
+            }
+            match LIVE_WORKERS.compare_exchange_weak(
+                live,
+                live + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(actual) => live = actual,
+            }
         }
     }
+
+    /// The floor of one, taken over the ceiling. Without it a call that finds nothing free
+    /// waits for a call that is itself waiting, and ten of them deadlock on each other.
+    fn insist() -> Self {
+        LIVE_WORKERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        LIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// What a call STARTS with: its equal share of the ceiling, capped by the work it has.
+///
+/// Capped by the work because three chunks give a fourth reader nothing to do, and shared
+/// rather than grabbed because a call that arrives second should not find the ceiling already
+/// spent. It grows from here -- see the widening loop in `retrieve_scoped` -- so a share that
+/// is small because ten calls were in flight is a starting point, not a sentence.
+fn initial_permits(want: usize, ceiling: usize) -> Vec<Permit> {
+    let target = want.min(ActiveCall::share(ceiling));
+    let mut held = Vec::with_capacity(target);
+    while held.len() < target {
+        match Permit::take(ceiling) {
+            Some(permit) => held.push(permit),
+            None => break,
+        }
+    }
+    if held.is_empty() {
+        held.push(Permit::insist());
+    }
+    held
 }
 
 /// One innermost chunk, and the slice of the output its elements belong in.
@@ -945,34 +1026,44 @@ impl CodecPipelineImpl {
         }
 
         // What this call WANTS is its configured width, capped by the work it has: three
-        // chunks give a fourth reader nothing to do. What it may HAVE is bounded by the global
-        // ceiling, which is a different and much larger number.
-        let readers = take_permits(
-            self.read_concurrency.min(jobs.len()),
-            worker_ceiling(self.read_concurrency),
-        );
-        let decoders = take_permits(
-            self.decode_concurrency.min(jobs.len()),
-            worker_ceiling(self.decode_concurrency),
-        );
+        // chunks give a fourth reader nothing to do. What it may HAVE at once is bounded by
+        // the global ceiling, which is a different and much larger number.
+        let read_ceiling = worker_ceiling(self.read_concurrency);
+        let decode_ceiling = worker_ceiling(self.decode_concurrency);
+        let want_readers = self.read_concurrency.min(jobs.len());
+        let want_decoders = self.decode_concurrency.min(jobs.len());
+        let _call = ActiveCall::enter();
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
         std::thread::scope(|scope| {
             let (job_tx, job_rx) = unbounded::<ScopedJob<'_>>();
             let (dec_tx, dec_rx) = unbounded::<(ScopedJob<'_>, MaybeBytes)>();
-            for _ in 0..readers {
-                let (job_rx, dec_tx, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
-                scope.spawn(move || scoped_read_loop(&job_rx, &dec_tx, failure));
+            let spawn_reader = |permit: Permit| {
+                let (jobs, decodes, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
+                scope.spawn(move || {
+                    // Held for the life of the thread and released as it returns, so the
+                    // permit is free the moment this worker stops using it.
+                    let _permit = permit;
+                    scoped_read_loop(&jobs, &decodes, failure);
+                });
+            };
+            let spawn_decoder = |permit: Permit| {
+                let (decodes, failure) = (dec_rx.clone(), &failure);
+                scope.spawn(move || {
+                    let _permit = permit;
+                    scoped_decode_loop(&decodes, failure);
+                });
+            };
+
+            let mut readers = initial_permits(want_readers, read_ceiling);
+            let mut decoders = initial_permits(want_decoders, decode_ceiling);
+            let (mut live_readers, mut live_decoders) = (readers.len(), decoders.len());
+            for permit in readers.drain(..) {
+                spawn_reader(permit);
             }
-            for _ in 0..decoders {
-                let (dec_rx, failure) = (dec_rx.clone(), &failure);
-                scope.spawn(move || scoped_decode_loop(&dec_rx, failure));
+            for permit in decoders.drain(..) {
+                spawn_decoder(permit);
             }
-            // The clones held here would keep every worker waiting on a channel that will
-            // never deliver again, and the scope cannot exit until they return.
-            drop(job_rx);
-            drop(dec_tx);
-            drop(dec_rx);
 
             for job in jobs {
                 if job_tx.send(job).is_err() {
@@ -981,13 +1072,93 @@ impl CodecPipelineImpl {
                 }
             }
             drop(job_tx);
-        });
 
-        LIVE_WORKERS.fetch_sub(readers + decoders, Ordering::AcqRel);
+            // Widen the call while it still has queued work.
+            //
+            // This is what stops a narrow start from being a narrow call. A call that arrived
+            // when the ceiling was full begins at the floor of one, and without this it keeps
+            // that one worker for its whole duration however many permits later free up --
+            // which is the pathology, just further down the queue.
+            //
+            // Run from the calling thread, which is otherwise doing nothing until the join,
+            // so no worker has to spawn a sibling and no per-call counter has to be shared.
+            // It polls rather than waiting on a release signal: a Condvar notified from
+            // `Permit::drop` would be exact, and is the upgrade if this sleep ever shows up
+            // in a profile. It cannot spin forever -- the queues drain either way.
+            while (live_readers < want_readers && !job_rx.is_empty())
+                || (live_decoders < want_decoders && !dec_rx.is_empty())
+            {
+                let mut took = false;
+                if live_readers < want_readers && !job_rx.is_empty() {
+                    if let Some(permit) = Permit::take(read_ceiling) {
+                        spawn_reader(permit);
+                        live_readers += 1;
+                        took = true;
+                    }
+                }
+                if live_decoders < want_decoders && !dec_rx.is_empty() {
+                    if let Some(permit) = Permit::take(decode_ceiling) {
+                        spawn_decoder(permit);
+                        live_decoders += 1;
+                        took = true;
+                    }
+                }
+                if !took {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            }
+
+            // The clones held here would keep every worker waiting on a channel that will
+            // never deliver again, and the scope cannot exit until they return.
+            drop(job_rx);
+            drop(dec_tx);
+            drop(dec_rx);
+        });
 
         if let Some(e) = failure.lock().expect("failure slot poisoned").take() {
             return Err(PyRuntimeError::new_err(e));
         }
         Ok(declined)
+    }
+}
+
+#[cfg(test)]
+mod scoped_tests {
+    use super::*;
+
+    /// One test rather than several: `LIVE_WORKERS` and `ACTIVE_CALLS` are process-wide, and
+    /// separate `#[test]` functions run concurrently in one process, so they would race.
+    #[test]
+    fn a_call_takes_a_share_and_releases_per_worker() {
+        let ceiling = 16;
+        let first = ActiveCall::enter();
+
+        // Alone, a call may have the whole ceiling -- capped by the work it has.
+        assert_eq!(initial_permits(4, ceiling).len(), 4);
+        assert_eq!(
+            LIVE_WORKERS.load(Ordering::Relaxed),
+            0,
+            "a permit is released when its worker drops it, not when the call ends"
+        );
+
+        // A second call in flight halves the share rather than finding it already spent.
+        let second = ActiveCall::enter();
+        assert_eq!(ActiveCall::share(ceiling), 8);
+        drop(second);
+        assert_eq!(ActiveCall::share(ceiling), ceiling);
+
+        // With every permit held, a call still gets a worker: the floor of one is what stops
+        // calls from waiting on each other.
+        let held = initial_permits(ceiling, ceiling);
+        assert_eq!(held.len(), ceiling);
+        let starved = initial_permits(4, ceiling);
+        assert_eq!(starved.len(), 1);
+        assert_eq!(LIVE_WORKERS.load(Ordering::Relaxed), ceiling + 1);
+
+        drop(held);
+        drop(starved);
+        drop(first);
+        assert_eq!(LIVE_WORKERS.load(Ordering::Relaxed), 0);
+        assert_eq!(ACTIVE_CALLS.load(Ordering::Relaxed), 0);
     }
 }
