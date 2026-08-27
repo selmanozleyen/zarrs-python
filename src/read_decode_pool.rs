@@ -726,29 +726,26 @@ pub(crate) fn use_scoped() -> bool {
     *SCOPED.get_or_init(|| std::env::var_os("ZARRS_SCOPED").is_some())
 }
 
-/// Calls currently inside a scope, so each can take a FAIR share rather than whatever it
-/// finds free.
+/// The global ceiling on live scoped workers, distinct from how many a CALL wants.
 ///
-/// Without this the first call in flight takes the whole ceiling and the rest fall to the
-/// floor of one, which is not a tuning detail: measured, it cost 10% on the strided shape and
-/// 17% on the random one, visible as fewer cores busy rather than slower cores.
-static ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// Increments while a call is in a scope, decrements on every exit path.
-struct ActiveCall;
-
-impl ActiveCall {
-    /// The share of `ceiling` this call may take, counting itself.
-    fn enter(ceiling: usize) -> (Self, usize) {
-        let active = ACTIVE_CALLS.fetch_add(1, Ordering::AcqRel) + 1;
-        (Self, (ceiling / active).max(1))
-    }
-}
-
-impl Drop for ActiveCall {
-    fn drop(&mut self) {
-        ACTIVE_CALLS.fetch_sub(1, Ordering::AcqRel);
-    }
+/// Conflating the two is what round 1 measured: `want == ceiling` meant the first call in
+/// flight took every permit and the rest ran single-threaded. `read_concurrency` is what one
+/// call wants; this is how many may exist at once across all of them.
+///
+/// Defaults to eight times the per-call width because the concurrency arrives from ABOVE --
+/// zarr's event loop issues several reads at once -- and a persistent pool flattens that into
+/// one queue while per-call scopes cannot. Over-provisioning is the only lever scopes have,
+/// and it is a cheap one: a thread parked on a storage round trip costs a stack and a
+/// scheduler entry, not a core.
+fn worker_ceiling(per_call: usize) -> usize {
+    static CEILING: OnceLock<usize> = OnceLock::new();
+    *CEILING.get_or_init(|| {
+        std::env::var("ZARRS_SCOPED_CEILING")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(per_call.saturating_mul(8))
+    })
 }
 
 fn take_permits(want: usize, ceiling: usize) -> usize {
@@ -947,13 +944,17 @@ impl CodecPipelineImpl {
             return Ok(declined);
         }
 
-        // A fair share of the ceiling, not whatever is free: ten concurrent calls each get a
-        // tenth rather than the first taking everything. And never more threads than there is
-        // work -- a call with three chunks has nothing for a fourth reader to do.
-        let (_active, read_share) = ActiveCall::enter(self.read_concurrency);
-        let decode_share = (self.decode_concurrency / ACTIVE_CALLS.load(Ordering::Relaxed)).max(1);
-        let readers = take_permits(read_share.min(jobs.len()), self.read_concurrency);
-        let decoders = take_permits(decode_share.min(jobs.len()), self.decode_concurrency);
+        // What this call WANTS is its configured width, capped by the work it has: three
+        // chunks give a fourth reader nothing to do. What it may HAVE is bounded by the global
+        // ceiling, which is a different and much larger number.
+        let readers = take_permits(
+            self.read_concurrency.min(jobs.len()),
+            worker_ceiling(self.read_concurrency),
+        );
+        let decoders = take_permits(
+            self.decode_concurrency.min(jobs.len()),
+            worker_ceiling(self.decode_concurrency),
+        );
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
         std::thread::scope(|scope| {
