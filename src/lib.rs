@@ -356,13 +356,22 @@ impl CodecPipelineImpl {
         chunk_descriptions: Vec<chunk_item::ChunkItem>, // FIXME: Ref / iterable?
         value: &Bound<'_, PyUntypedArray>,
     ) -> PyResult<()> {
-        // The read/decode pool, when it is on and every item is a chunk-unit item. It
-        // needs an exclusive output slice, so it cannot share the aliasing wrapper the
-        // fused path takes -- hence the dispatch here rather than inside the loop.
+        // The read/decode pool, when it is on and ANY item is a chunk-unit item. It needs
+        // an exclusive output slice, so it cannot share the aliasing wrapper the fused
+        // path takes -- hence the dispatch here rather than inside the loop.
+        //
+        // `any`, not `all`. Requiring all of them meant one entry the chunk-unit path
+        // cannot describe took the whole call off this path, and there is always exactly
+        // one such entry per store: `X/indptr` is read as a plain slice, so it has no
+        // integer-array axis and is declined by shape. Measured on 14 plates, that
+        // refused 14 of 18 calls on a contiguous read and 14 of 70 on a random draw.
+        //
+        // Nothing was needed to make the mixed case work -- `retrieve_read_decode_pool`
+        // already returns what it could not take and the fused path already runs it
+        // below. The gate was simply stricter than the code behind it.
         if let (true, Some(shard)) = (
             self.read_decode_pool_enabled
-                && !chunk_descriptions.is_empty()
-                && chunk_descriptions.iter().all(|i| i.coords.is_some()),
+                && chunk_descriptions.iter().any(|i| i.coords.is_some()),
             self.shard.as_ref(),
         ) {
             let output = Self::nparray_to_mut_slice(value)?;
