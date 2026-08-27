@@ -9,16 +9,20 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from zarr.core.indexing import is_integer
 
-from zarrs._internal import ChunkItem
+from zarrs._internal import ChunkItem, ChunkItems, chunk_unit_items
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
     from types import EllipsisType
 
     from zarr.abc.store import ByteGetter, ByteSetter
     from zarr.core.array_spec import ArraySpec
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
+
+    BatchInfo = Iterable[
+        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
+    ]
 
 
 # adapted from https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
@@ -38,6 +42,22 @@ class FillValueNoneError(Exception):
     pass
 
 
+def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
+    """Normalise the batch's integer-array indices to int64, lazily."""
+
+    def cast(sel: SelectorTuple) -> SelectorTuple:
+        if isinstance(sel, np.ndarray):
+            return sel.astype(np.int64, copy=False)
+        if isinstance(sel, tuple) and any(isinstance(s, np.ndarray) for s in sel):
+            return tuple(map(cast, sel))
+        return sel
+
+    return (
+        (byte_getter, chunk_spec, cast(chunk_sel), cast(out_sel), is_complete)
+        for byte_getter, chunk_spec, chunk_sel, out_sel, is_complete in batch_info
+    )
+
+
 # This is a (mostly) copy of the function from zarr.core.indexing that fixes:
 #   DeprecationWarning: Conversion of an array with ndim > 0 to a scalar is deprecated
 # TODO: Upstream this fix
@@ -53,10 +73,11 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                diff = np.diff(dim_selection)
-                if (diff != 1).any() and (diff != 0).any():
-                    raise DiscontiguousArrayError(diff)
-                ls.append(slice(dim_selection[0], dim_selection[-1] + 1, 1))
+                # int64 (see `_as_int64`): an unsigned diff wraps a decrease into +1.
+                steps = dim_selection[1:] - dim_selection[:-1]
+                if (steps != 1).any() and (steps != 0).any():
+                    raise DiscontiguousArrayError(steps)
+                ls.append(slice(int(dim_selection[0]), int(dim_selection[-1]) + 1, 1))
         else:
             ls.append(dim_selection)
     return ls
@@ -68,6 +89,67 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
     if all(isinstance(s, slice) for s in selector_tuple):
         return list(selector_tuple)
     return make_slice_selection(selector_tuple)
+
+
+def split_selection_runs(
+    chunk_selection: SelectorTuple, out_selection: SelectorTuple
+) -> Iterator[tuple[SelectorTuple, SelectorTuple]]:
+    """Split a selection with one non-consecutive integer-array axis into contiguous boxes.
+
+    zarrs describes a chunk read as a rectangular subset, so ``z[[3, 7, 8], :]`` has no
+    single-box description -- but it is a *stack* of boxes, one per run of consecutive
+    indices. Only one array axis is split: with two, outer and coordinate indexing disagree
+    on what the selection means. Anything not splittable is yielded unchanged.
+    """
+    chunk_sel = (
+        chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,)
+    )
+    out_sel = out_selection if isinstance(out_selection, tuple) else (out_selection,)
+    unsplit = ((chunk_selection, out_selection),)
+
+    array_axes = [
+        axis for axis, sel in enumerate(chunk_sel) if isinstance(sel, np.ndarray)
+    ]
+    # Equal arity means no axis was dropped, so chunk axis `axis` is output axis `axis`.
+    if len(array_axes) != 1 or len(chunk_sel) != len(out_sel):
+        yield from unsplit
+        return
+    (axis,) = array_axes
+    indices = chunk_sel[axis]
+    out_axis_sel = out_sel[axis]
+    if (
+        indices.ndim != 1
+        # Non-decreasing only: any decrease would mean one box per element, a decode each.
+        or (indices[1:] < indices[:-1]).any()
+        or not isinstance(out_axis_sel, slice)
+        or out_axis_sel.step not in (None, 1)
+        or not all(isinstance(sel, slice) for sel in out_sel)
+    ):
+        yield from unsplit
+        return
+    # this line can be removed once https://github.com/zarr-developers/zarr-python/issues/4285 is fixed
+    if (indices < 0).any():
+        raise DiscontiguousArrayError(indices)
+    out_start = out_axis_sel.start or 0
+    if out_axis_sel.stop - out_start != indices.size:
+        yield from unsplit
+        return
+
+    # Always slices, even for one run: `resulting_shape_from_index` mis-orders a non-leading
+    # advanced index, and the caller's element-count check then rejects the selection.
+    boundaries = np.flatnonzero(indices[1:] != indices[:-1] + 1) + 1
+
+    for start, stop in zip(
+        np.concatenate(([0], boundaries)),
+        np.concatenate((boundaries, [indices.size])),
+        strict=True,
+    ):
+        rows = indices[start:stop]
+        box_chunk_sel = list(chunk_sel)
+        box_chunk_sel[axis] = slice(int(rows[0]), int(rows[-1]) + 1)
+        box_out_sel = list(out_sel)
+        box_out_sel[axis] = slice(out_start + int(start), out_start + int(stop))
+        yield tuple(box_chunk_sel), tuple(box_out_sel)
 
 
 def resulting_shape_from_index(
@@ -149,19 +231,118 @@ def get_implicit_fill_value(dtype: ZDType, fill_value: Any) -> Any:
 
 @dataclass(frozen=True)
 class RustChunkInfo:
-    chunk_info_with_indices: list[ChunkItem]
+    # A ChunkItems handle when the batch is entirely chunk-unit; a list otherwise. The
+    # pipeline dispatches on which, because the two take different Rust entry points.
+    chunk_info_with_indices: list[ChunkItem] | ChunkItems
     write_empty_chunks: bool
 
 
+def _chunk_unit_args(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> tuple | None:
+    """Arguments for one item per inner chunk, or None if this entry is not that shape.
+
+    The inner chunk is what the codec chain fetches and decodes; `chunk_spec.shape` is
+    the SHARD. Grouping a selection by decode unit therefore needs the inner chunk
+    shape, which the pipeline reads off the array metadata and passes in -- it was
+    never unreachable, only never passed.
+
+    Each group becomes a whole-inner-chunk subset plus the indices wanted from it, so
+    the chunk is read once, decoded once and gathered once, however many of its
+    elements the selection asks for. That is what zarr-python does, and it is why a
+    run of consecutive indices and a strided scatter cost it the same.
+
+    The checks here are vectorised numpy and cost nothing, so they stay in Python and
+    hold the semantics; Rust does the grouping and the item construction, taking
+    `indices` as a view. Returning the arguments rather than the items lets the caller
+    choose the container: a `ChunkItems` handle when the whole batch is chunk-unit, a
+    Python list when it has to meet entries that took another path.
+
+    Narrow on purpose: one 1-D integer axis, non-negative and NON-DECREASING, with a
+    contiguous output slice. Sorted is what makes it work -- each chunk's elements are
+    then one contiguous run of the output, the only output shape a ChunkItem can
+    describe.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if drop_axes or inner_shape is None or len(inner_shape) != 1:
+        return None
+    chunk_sel = (
+        chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,)
+    )
+    out_sel = out_selection if isinstance(out_selection, tuple) else (out_selection,)
+    if len(chunk_sel) != 1 or len(out_sel) != 1 or len(chunk_spec.shape) != 1:
+        return None
+    (indices,) = chunk_sel
+    (out_axis_sel,) = out_sel
+    if not isinstance(indices, np.ndarray) or indices.ndim != 1 or indices.size == 0:
+        return None
+    if not isinstance(out_axis_sel, slice):
+        return None
+    indices = indices.astype(np.int64, copy=False)
+    if (indices < 0).any() or (indices[1:] < indices[:-1]).any():
+        return None
+    start = out_axis_sel.start or 0
+    if out_axis_sel.step not in (None, 1) or out_axis_sel.stop - start != indices.size:
+        return None
+
+    return (
+        byte_getter.path,
+        chunk_spec.shape,
+        shape,
+        indices,
+        start,
+        int(inner_shape[0]),
+    )
+
+
 def make_chunk_info_for_rust_with_indices(
-    batch_info: Iterable[
-        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
-    ],
+    batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
+    *,
+    # Reads only: items sharing a chunk key would race in the write path's read-modify-write.
+    integer_array_indexing: bool = False,
+    chunk_unit_indexing: bool = False,
+    inner_chunk_shape: tuple[int, ...] | None = None,
 ) -> RustChunkInfo:
+    batch_info = _as_int64_batch_info(batch_info)
+    unit_args: list[tuple] = []
+    if chunk_unit_indexing:
+        kept = []
+        for entry in batch_info:
+            args = _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
+            if args is None:
+                kept.append(entry)
+            else:
+                unit_args.append(args)
+        batch_info = kept
+        # Every entry is chunk-unit, which is every call the read/decode pool can take:
+        # the whole batch goes to Rust as one object and no ChunkItem is ever made in
+        # Python. A mixed batch falls through to the list, where the two paths can meet.
+        if unit_args and not kept:
+            handle = ChunkItems()
+            for args in unit_args:
+                handle.push_entry(*args)
+            return RustChunkInfo(handle, write_empty_chunks=True)
+    unit_items: list[ChunkItem] = [
+        item for args in unit_args for item in chunk_unit_items(*args)
+    ]
+    if integer_array_indexing:
+        batch_info = [
+            (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
+            for (
+                byte_getter,
+                chunk_spec,
+                chunk_selection,
+                out_selection,
+                is_complete,
+            ) in batch_info
+            for box_chunk_sel, box_out_sel in split_selection_runs(
+                chunk_selection, out_selection
+            )
+        ]
     is_constant = shape == ()
-    chunk_info_with_indices: list[ChunkItem] = []
+    chunk_info_with_indices: list[ChunkItem] = list(unit_items)
     write_empty_chunks: bool = True
     for (
         byte_getter,

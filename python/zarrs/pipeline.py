@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
 
-from ._internal import CodecPipelineImpl
+from ._internal import ChunkItems, CodecPipelineImpl
 from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
@@ -61,6 +61,11 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.chunk_concurrent_maximum", None
             ),
             num_threads=config.get("threading.max_workers", None),
+            # The reader-pool / decode-pool arm. Off by default: it changes which code
+            # reads the bytes, so it has to be asked for by name.
+            read_decode_pool=config.get("codec_pipeline.read_decode_pool", False),
+            read_concurrency=config.get("codec_pipeline.read_concurrency", None),
+            decode_concurrency=config.get("codec_pipeline.decode_concurrency", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
@@ -136,6 +141,19 @@ class ZarrsCodecPipeline(CodecPipeline):
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
 
+    def _inner_chunk_shape(self) -> tuple[int, ...] | None:
+        """The shape of the unit the codec chain decodes, or None if not sharded.
+
+        `chunk_spec.shape` in a batch entry is the SHARD extent, so nothing downstream
+        could tell which parts of a selection share a decode. The sharding codec knows,
+        and the pipeline holds the array metadata, so it is one lookup away.
+        """
+        for codec in getattr(self.metadata, "codecs", ()) or ():
+            chunk_shape = getattr(codec, "chunk_shape", None)
+            if chunk_shape is not None:
+                return tuple(int(s) for s in chunk_shape)
+        return None
+
     @property
     def supports_partial_decode(self) -> bool:
         return False
@@ -183,7 +201,16 @@ class ZarrsCodecPipeline(CodecPipeline):
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
             chunks_desc = make_chunk_info_for_rust_with_indices(
-                batch_info, drop_axes, out.shape
+                batch_info,
+                drop_axes,
+                out.shape,
+                integer_array_indexing=config.get(
+                    "codec_pipeline.integer_array_indexing", False
+                ),
+                chunk_unit_indexing=config.get(
+                    "codec_pipeline.chunk_unit_indexing", False
+                ),
+                inner_chunk_shape=self._inner_chunk_shape(),
             )
         except (
             UnsupportedMetadataError,
@@ -198,11 +225,15 @@ class ZarrsCodecPipeline(CodecPipeline):
             return None
         else:
             out: NDArrayLike = out.as_ndarray_like()
-            await asyncio.to_thread(
-                self.impl.retrieve_chunks_and_apply_index,
-                chunks_desc.chunk_info_with_indices,
-                out,
+            desc = chunks_desc.chunk_info_with_indices
+            # A handle means the batch never became Python objects; it has its own entry
+            # point because the list one takes `Vec<ChunkItem>` and would extract per item.
+            retrieve = (
+                self.impl.retrieve_chunk_items_and_apply_index
+                if isinstance(desc, ChunkItems)
+                else self.impl.retrieve_chunks_and_apply_index
             )
+            await asyncio.to_thread(retrieve, desc, out)
             return None
 
     async def write(
