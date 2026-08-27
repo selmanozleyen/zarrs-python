@@ -20,9 +20,9 @@ use zarrs::array::codec::array_to_bytes::sharding::{
 };
 use zarrs::array::{ChunkShape, CodecChainBound, CodecOptions};
 use zarrs::metadata_ext::codec::sharding::ShardingIndexLocation;
-use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
+use zarrs::storage::{ReadableWritableListableStorage, StoreKey};
 
-use crate::utils::PyCodecErrExt as _;
+use crate::utils::{PyCodecErrExt as _, key_partial_decoder};
 
 /// What the pool needs to know about a sharded array to fetch one inner chunk at a time.
 pub(crate) struct ShardInfo {
@@ -79,11 +79,10 @@ impl ShardInfo {
         shard_shape: ChunkShape,
         options: &CodecOptions,
     ) -> PyResult<ShardingPartialDecoder> {
-        // `(storage, key)` is the store-backed `BytesPartialDecoderTraits` impl. This is the
-        // whole reason the deletion above was possible: no `Array`, so no node path.
-        let input_handle = Arc::new((StorageHandle::new(store.clone()), key.clone()));
+        // Reads the key directly: no `Array`, hence no node path, which is the whole reason
+        // the deletion described above was possible.
         ShardingPartialDecoder::new(
-            input_handle,
+            key_partial_decoder(store, key),
             shard_shape,
             self.subchunk_shape.clone(),
             self.inner_chain.clone(),

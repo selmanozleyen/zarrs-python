@@ -27,7 +27,7 @@ use zarrs::array::{
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
-use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
+use zarrs::storage::{ReadableWritableListableStorage, StoreKey};
 
 mod chunk_item;
 mod concurrency;
@@ -41,7 +41,7 @@ mod utils;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::StoreConfig;
-use crate::utils::{PyCodecErrExt, PyErrExt as _, gather};
+use crate::utils::{PyCodecErrExt, PyErrExt as _, gather, key_partial_decoder};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
 #[gen_stub_pyclass]
@@ -484,8 +484,7 @@ impl CodecPipelineImpl {
         if !partial_chunk_items.is_empty() {
             let key_decoder_pairs =
                 iter_concurrent_limit!(chunk_concurrent_limit, partial_chunk_items, map, |item| {
-                    let input_handle =
-                        Arc::new((StorageHandle::new(self.store.clone()), item.key.clone()));
+                    let input_handle = key_partial_decoder(&self.store, &item.key);
                     let partial_decoder = self
                         .codec_chain
                         .clone()

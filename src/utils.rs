@@ -1,7 +1,10 @@
 use std::fmt::Display;
+use std::sync::Arc;
 
 use pyo3::{PyErr, PyResult, PyTypeInfo};
+use zarrs::array::BytesPartialDecoderTraits;
 use zarrs::array::CodecError;
+use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
 
 use crate::ChunkItem;
 
@@ -64,4 +67,17 @@ pub(crate) fn gather(
         out[n * size..(n + 1) * size].copy_from_slice(element);
     }
     Ok(())
+}
+
+/// A partial decoder that reads one store key.
+///
+/// The `(storage, key)` TUPLE is the store-backed `BytesPartialDecoderTraits` implementation
+/// in zarrs 0.24 — `StoragePartialDecoder` was removed and nothing named replaced it. Written
+/// once here so both callers can say what they mean instead of restating the idiom, and so
+/// there is one place to change if upstream gives it a name again.
+pub(crate) fn key_partial_decoder(
+    store: &ReadableWritableListableStorage,
+    key: &StoreKey,
+) -> Arc<dyn BytesPartialDecoderTraits> {
+    Arc::new((StorageHandle::new(store.clone()), key.clone()))
 }
