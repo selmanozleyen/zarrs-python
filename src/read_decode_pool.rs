@@ -506,6 +506,9 @@ impl CodecPipelineImpl {
 
     /// What this array remembers about one shard's index.
     fn cached_shard_index(&self, key: &StoreKey) -> ShardIndexState {
+        if !self.cache_shard_indexes {
+            return ShardIndexState::Unread;
+        }
         match self
             .shard_indexes
             .lock()
@@ -519,6 +522,9 @@ impl CodecPipelineImpl {
     }
 
     fn remember_shard_index(&self, key: &StoreKey, index: Option<Arc<Vec<u64>>>) {
+        if !self.cache_shard_indexes {
+            return;
+        }
         self.shard_indexes
             .lock()
             .expect("shard index cache poisoned")

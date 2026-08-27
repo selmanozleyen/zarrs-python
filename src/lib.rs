@@ -71,10 +71,13 @@ pub struct CodecPipelineImpl {
     /// rather than once per call. `None` records a shard that is absent, which is also
     /// worth not asking about twice.
     ///
-    /// Invalidated by writes through this pipeline. NOT by writes from anywhere else --
-    /// including `zarr-python` itself, whose `resize`/`delete_dir`/metadata writes go
-    /// through its own store, the same caveat `file_handle_cache_size` carries.
+    /// Only populated when the store is READ-ONLY, which is the only state in which a
+    /// remembered range cannot be invalidated behind our back by our own caller. A
+    /// read-only store rejects writes, so nothing this process does can move the bytes a
+    /// range addresses; an external writer still can, and no cache here can see that.
     pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Option<Arc<Vec<u64>>>>>,
+    /// Whether to remember shard indexes at all: true only for a read-only store.
+    pub(crate) cache_shard_indexes: bool,
 }
 
 impl CodecPipelineImpl {
@@ -328,6 +331,7 @@ impl CodecPipelineImpl {
         file_handle_cache_size=0,
         read_concurrency=None,
         decode_concurrency=None,
+        store_is_read_only=false,
     ))]
     #[new]
     fn new(
@@ -342,6 +346,7 @@ impl CodecPipelineImpl {
         file_handle_cache_size: usize,
         read_concurrency: Option<usize>,
         decode_concurrency: Option<usize>,
+        store_is_read_only: bool,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
@@ -427,6 +432,7 @@ impl CodecPipelineImpl {
             decode_concurrency,
             shard,
             shard_indexes: Mutex::new(HashMap::new()),
+            cache_shard_indexes: store_is_read_only,
         })
     }
 
@@ -604,12 +610,6 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         write_empty_chunks: bool,
     ) -> PyResult<()> {
-        // Writing a chunk rewrites its shard's index, so every range we remember for this
-        // array is now a guess. Cheaper to forget them than to work out which moved.
-        self.shard_indexes
-            .lock()
-            .expect("shard index cache poisoned")
-            .clear();
         enum InputValue<'a> {
             Array(ArrayBytes<'a>),
             Constant(FillValue),

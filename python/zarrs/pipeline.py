@@ -68,6 +68,11 @@ def get_codec_pipeline_impl(
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
             ),
+            # Shard indexes are only remembered for a read-only store. Writes through this
+            # pipeline would move the bytes a remembered range addresses, and a stale range
+            # returns plausible wrong data rather than raising, so the cache is not offered
+            # where a write is possible at all.
+            store_is_read_only=store.read_only,
         )
     except TypeError as e:
         if strict:
