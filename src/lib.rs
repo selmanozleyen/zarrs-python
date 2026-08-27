@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chunk_item::ChunkItem;
 use itertools::Itertools;
@@ -62,6 +62,19 @@ pub struct CodecPipelineImpl {
     /// needs the shard's index codecs and the codecs inside a shard. `None` means this
     /// array cannot take the pool path at all.
     pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
+    /// Shard indexes read so far, for the life of this pipeline -- which is the life of the
+    /// array, since zarr builds one pipeline per array.
+    ///
+    /// A shard index is 2 u64 per inner chunk (~31 KB for a 1,953-chunk shard here), and
+    /// reading one is a full-latency round trip on the CALLING thread, before any job
+    /// reaches the reader pool. Keeping them means a shard is paid for once per array
+    /// rather than once per call. `None` records a shard that is absent, which is also
+    /// worth not asking about twice.
+    ///
+    /// Invalidated by writes through this pipeline. NOT by writes from anywhere else --
+    /// including `zarr-python` itself, whose `resize`/`delete_dir`/metadata writes go
+    /// through its own store, the same caveat `file_handle_cache_size` carries.
+    pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Option<Arc<Vec<u64>>>>>,
 }
 
 impl CodecPipelineImpl {
@@ -413,6 +426,7 @@ impl CodecPipelineImpl {
             read_concurrency,
             decode_concurrency,
             shard,
+            shard_indexes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -590,6 +604,12 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         write_empty_chunks: bool,
     ) -> PyResult<()> {
+        // Writing a chunk rewrites its shard's index, so every range we remember for this
+        // array is now a guess. Cheaper to forget them than to work out which moved.
+        self.shard_indexes
+            .lock()
+            .expect("shard index cache poisoned")
+            .clear();
         enum InputValue<'a> {
             Array(ArrayBytes<'a>),
             Constant(FillValue),

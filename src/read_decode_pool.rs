@@ -57,7 +57,6 @@
 //! one selection at a time.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -149,6 +148,16 @@ struct JobContext {
     fill_value: FillValue,
     codec_options: CodecOptions,
     element_size: usize,
+}
+
+/// Whether this array has read a shard's index yet, and what it found.
+///
+/// Three states, not `Option<Option<_>>`: "not read" and "read, and the shard is not there"
+/// are different answers, and the second is worth remembering so it is not asked twice.
+enum ShardIndexState {
+    Unread,
+    Absent,
+    Known(Arc<Vec<u64>>),
 }
 
 /// The process-wide pipeline: R reader threads and D decode threads, parked between calls.
@@ -495,6 +504,27 @@ impl CodecPipelineImpl {
         Ok((declined, counts))
     }
 
+    /// What this array remembers about one shard's index.
+    fn cached_shard_index(&self, key: &StoreKey) -> ShardIndexState {
+        match self
+            .shard_indexes
+            .lock()
+            .expect("shard index cache poisoned")
+            .get(key)
+        {
+            None => ShardIndexState::Unread,
+            Some(None) => ShardIndexState::Absent,
+            Some(Some(index)) => ShardIndexState::Known(index.clone()),
+        }
+    }
+
+    fn remember_shard_index(&self, key: &StoreKey, index: Option<Arc<Vec<u64>>>) {
+        self.shard_indexes
+            .lock()
+            .expect("shard index cache poisoned")
+            .insert(key.clone(), index);
+    }
+
     /// Where each item's innermost chunk lives, from its shard's own offset/size table.
     ///
     /// One index read per distinct shard, cached for the call, so N items sharing a shard
@@ -510,35 +540,48 @@ impl CodecPipelineImpl {
         Vec<&'a ChunkItem>,
         usize,
     )> {
-        let mut indexes: HashMap<StoreKey, Option<Vec<u64>>> = HashMap::new();
         let mut located = Vec::with_capacity(items.len());
         let mut declined = Vec::new();
+        let mut reads = 0usize;
 
         for item in items {
             if item.coords.is_none() {
                 declined.push(item);
                 continue;
             }
-            if !indexes.contains_key(&item.key) {
-                let chunks_per_shard = shard.chunks_per_shard(&item.shape)?;
-                let index = shard.read_index(
-                    &self.store,
-                    &item.key,
-                    &chunks_per_shard,
-                    &ctx.codec_options,
-                )?;
-                indexes.insert(item.key.clone(), index);
-            }
-            let Some(index) = indexes.get(&item.key).expect("just inserted") else {
+            let index = match self.cached_shard_index(&item.key) {
+                ShardIndexState::Known(index) => Some(index),
+                ShardIndexState::Absent => None,
+                ShardIndexState::Unread => {
+                    // The lock is NOT held across the read. Two callers can therefore read
+                    // one shard's index at the same time and the second insert wins; that
+                    // costs a duplicate read and cannot give a different answer. Holding it
+                    // instead would serialise every caller behind one full-latency read.
+                    let chunks_per_shard = shard.chunks_per_shard(&item.shape)?;
+                    let read = shard
+                        .read_index(
+                            &self.store,
+                            &item.key,
+                            &chunks_per_shard,
+                            &ctx.codec_options,
+                        )?
+                        .map(Arc::new);
+                    reads += 1;
+                    self.remember_shard_index(&item.key, read.clone());
+                    read
+                }
+            };
+            let Some(index) = index else {
                 located.push((item, None)); // no shard at all: fill value
                 continue;
             };
             let linear =
                 shard.linear_index_1d(item.chunk_subset.start().first().copied().unwrap_or(0));
-            located.push((item, ShardInfo::chunk_range(index, linear)?));
+            located.push((item, ShardInfo::chunk_range(&index, linear)?));
         }
-        let shard_indexes = indexes.len();
-        Ok((located, declined, shard_indexes))
+        // Reads, not distinct shards: what this counter is for is the serial, full-latency
+        // work done on the calling thread, and a cache hit is none of that.
+        Ok((located, declined, reads))
     }
 }
 
