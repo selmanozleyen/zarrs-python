@@ -18,7 +18,6 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
-use zarrs::array::codec::api::BytesPartialDecoderTraits;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
     ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound, CodecOptions,
@@ -27,7 +26,7 @@ use zarrs::array::{
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
-use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
+use zarrs::storage::{ReadableWritableListableStorage, StoreKey};
 
 mod chunk_item;
 mod concurrency;
@@ -39,7 +38,7 @@ mod utils;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::StoreConfig;
-use crate::utils::{PyCodecErrExt, PyErrExt as _};
+use crate::utils::{PyCodecErrExt, PyErrExt as _, gather, key_partial_decoder};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
 #[gen_stub_pyclass]
@@ -61,6 +60,14 @@ pub struct CodecPipelineImpl {
 }
 
 impl CodecPipelineImpl {
+    /// The array's element size in bytes; errors for a variable-length data type.
+    fn element_size(&self) -> PyResult<usize> {
+        self.data_type
+            .fixed_size()
+            .ok_or("variable length data type not supported")
+            .map_py_err::<PyTypeError>()
+    }
+
     fn retrieve_chunk_bytes<'a>(
         &self,
         item: &ChunkItem,
@@ -286,6 +293,16 @@ impl CodecPipelineImpl {
         })
     }
 
+    /// As `retrieve_chunks_and_apply_index`, taking the items as a handle.
+    fn retrieve_chunk_items_and_apply_index(
+        &self,
+        py: Python,
+        chunk_items: PyRef<'_, chunk_item::ChunkItems>,
+        value: &Bound<'_, PyUntypedArray>,
+    ) -> PyResult<()> {
+        self.retrieve_chunks_and_apply_index(py, chunk_items.as_slice().to_vec(), value)
+    }
+
     fn retrieve_chunks_and_apply_index(
         &self,
         py: Python,
@@ -305,7 +322,10 @@ impl CodecPipelineImpl {
         // Assemble partial decoders ahead of time and in parallel
         let partial_chunk_items = chunk_descriptions
             .iter()
-            .filter(|item| !(is_whole_chunk(item)))
+            // A coords item always needs a partial decoder: its branch decodes the chunk
+            // subset. With `shards == chunks` that subset IS the whole chunk, so
+            // `is_whole_chunk` alone would filter it out.
+            .filter(|item| item.coords.is_some() || !is_whole_chunk(item))
             .unique_by(|item| item.key.clone())
             .collect::<Vec<_>>();
         let mut partial_decoder_cache: HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>> =
@@ -313,9 +333,7 @@ impl CodecPipelineImpl {
         if !partial_chunk_items.is_empty() {
             let key_decoder_pairs =
                 iter_concurrent_limit!(chunk_concurrent_limit, partial_chunk_items, map, |item| {
-                    // The (storage, key) tuple IS the store-backed `BytesPartialDecoderTraits`.
-                    let input_handle: Arc<dyn BytesPartialDecoderTraits> =
-                        Arc::new((StorageHandle::new(self.store.clone()), item.key.clone()));
+                    let input_handle = key_partial_decoder(&self.store, &item.key);
                     let partial_decoder = self
                         .codec_chain
                         .clone()
@@ -339,15 +357,37 @@ impl CodecPipelineImpl {
                     ArrayBytesFixedDisjointView::new(
                         output,
                         // TODO: why is data_type in `item`, it should be derived from `output`, no?
-                        self.data_type
-                            .fixed_size()
-                            .ok_or("variable length data type not supported")
-                            .map_py_err::<PyTypeError>()?,
+                        self.element_size()?,
                         bytemuck::must_cast_slice(&item.array_shape),
                         item.subset.clone(),
                     )
                     .map_py_err::<PyRuntimeError>()?
                 };
+                if let Some(coords) = &item.coords {
+                    // `chunk_subset` is exactly one inner chunk: zarrs fetches and decodes
+                    // it once, however many elements `coords` wants.
+                    let partial_decoder =
+                        cached_partial_decoder(&partial_decoder_cache, &item.key)?;
+                    let decoded = partial_decoder
+                        .partial_decode(&item.chunk_subset, &codec_options)
+                        .map_codec_err()?;
+                    let ArrayBytes::Fixed(raw) = decoded else {
+                        return Err(PyTypeError::new_err(
+                            "variable length data type not supported",
+                        ));
+                    };
+                    let size = self.element_size()?;
+                    // The output side is one contiguous run because the indices arrived
+                    // non-decreasing. The view takes one run, so gather into a buffer and
+                    // copy that in.
+                    let mut gathered = vec![0u8; coords.len() * size];
+                    gather(&raw, coords, &mut gathered, size)
+                        .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", item.key)))?;
+                    output_view
+                        .copy_from_slice(&gathered)
+                        .map_py_err::<PyRuntimeError>()?;
+                    return Ok(());
+                }
                 let target = ArrayBytesDecodeIntoTarget::Fixed(&mut output_view);
                 // See zarrs::array::Array::retrieve_chunk_subset_into
                 if is_whole_chunk(&item) {
@@ -368,10 +408,8 @@ impl CodecPipelineImpl {
                         copy_fill_value_into(&self.data_type, &self.fill_value, target)
                     }
                 } else {
-                    let key = &item.key;
-                    let partial_decoder = partial_decoder_cache.get(key).ok_or_else(|| {
-                        PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}"))
-                    })?;
+                    let partial_decoder =
+                        cached_partial_decoder(&partial_decoder_cache, &item.key)?;
                     partial_decoder.partial_decode_into(&item.chunk_subset, target, &codec_options)
                 }
                 .map_codec_err()
@@ -468,12 +506,23 @@ impl CodecPipelineImpl {
     }
 }
 
+/// The partial decoder assembled for this key earlier in the call.
+fn cached_partial_decoder<'a>(
+    cache: &'a HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
+    key: &StoreKey,
+) -> PyResult<&'a Arc<dyn ArrayPartialDecoderTraits>> {
+    cache
+        .get(key)
+        .ok_or_else(|| PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}")))
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
+    m.add_class::<chunk_item::ChunkItems>()?;
     Ok(())
 }
 

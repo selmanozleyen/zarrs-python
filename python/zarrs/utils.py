@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from zarr.core.indexing import is_integer
 
-from zarrs._internal import ChunkItem
+from zarrs._internal import ChunkItem, ChunkItems
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -282,8 +282,44 @@ def get_implicit_fill_value(dtype: ZDType, fill_value: Any) -> Any:
 
 @dataclass(frozen=True)
 class RustChunkInfo:
-    chunk_info_with_indices: list[ChunkItem]
+    # A ChunkItems handle when the batch is entirely chunk-unit; a list otherwise.
+    chunk_info_with_indices: list[ChunkItem] | ChunkItems
     write_empty_chunks: bool
+
+
+def _chunk_unit_args(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> tuple | None:
+    """Args for `ChunkItems.push_entry`, or None if this entry is not that shape.
+
+    Eligible: one 1-D integer axis, non-negative and non-decreasing, against a contiguous
+    output slice. `chunk_spec.shape` is the SHARD, so `inner_shape` is passed in separately.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if drop_axes or inner_shape is None or len(inner_shape) != 1:
+        return None
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
+    if len(chunk_sel) != 1 or len(out_sel) != 1 or len(chunk_spec.shape) != 1:
+        return None
+    (indices,) = chunk_sel
+    (out_axis_sel,) = out_sel
+    if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
+        return None
+    indices = indices.astype(np.int64, copy=False)
+    if (indices < 0).any():
+        return None
+    start = out_axis_sel.start or 0
+    if not _output_run_matches(indices, out_axis_sel):
+        return None
+
+    return (
+        byte_getter.path,
+        chunk_spec.shape,
+        shape,
+        indices,
+        start,
+        int(inner_shape[0]),
+    )
 
 
 def chunk_info_for_write(
@@ -302,8 +338,28 @@ def chunk_info_for_read(
     batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
+    inner_chunk_shape: tuple[int, ...] | None,
 ) -> RustChunkInfo:
-    """Describe a read batch to Rust, one box per run of consecutive indices."""
+    """Describe a read batch to Rust, grouped by decode unit where the selection allows.
+
+    One item per inner chunk if every entry is eligible; otherwise one box per run of
+    consecutive indices, falling back to one item per entry.
+    """
+    # A generator would be consumed by the eligibility test, and the ordinary route needs
+    # to read the same entries again if that test fails.
+    entries = list(_as_int64_batch_info(batch_info))
+
+    # All or nothing: one ineligible entry sends the whole batch down the ordinary route.
+    unit_args = [
+        _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
+        for entry in entries
+    ]
+    if unit_args and all(args is not None for args in unit_args):
+        handle = ChunkItems()
+        for args in unit_args:
+            handle.push_entry(*args)
+        return RustChunkInfo(handle, write_empty_chunks=True)
+
     return _chunk_items(
         [
             (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
@@ -313,7 +369,7 @@ def chunk_info_for_read(
                 chunk_selection,
                 out_selection,
                 is_complete,
-            ) in _as_int64_batch_info(batch_info)
+            ) in entries
             for box_chunk_sel, box_out_sel in split_selection_runs(
                 chunk_selection, out_selection, chunk_spec.shape
             )
