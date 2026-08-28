@@ -10,7 +10,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.27.1", features = ["abi3-py311"] }
-zarrs = { version = "0.23.6", features = ["async", "zlib", "pcodec", "bz2"] }
+# ON THE 0.24 RELEASE: replace this line with
+#     zarrs = { version = "0.24", features = ["async", "zlib", "pcodec", "bz2"] }
+# and delete the [patch.crates-io] block at the end of this file. Nothing in src/ changes:
+# it already compiles against 0.24's API. The rev is pinned rather than tracking a branch so
+# that a build is reproducible from the manifest alone.
+zarrs = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7", features = ["async", "zlib", "pcodec", "bz2"] }
 rayon_iter_concurrent_limit = "0.2.0"
 rayon = "1.10.0"
 # fix for https://stackoverflow.com/questions/76593417/package-openssl-was-not-found-in-the-pkg-config-search-path
@@ -29,3 +34,15 @@ zarrs_object_store = "0.5.0" # object_store 0.12
 
 [profile.release]
 lto = true
+
+# ON THE 0.24 RELEASE: delete this whole block, once zarrs_opendal and zarrs_object_store
+# have been tagged against zarrs 0.24. Until then it is load-bearing, not cosmetic.
+#
+# Those two crates track RELEASED zarrs, so they pull zarrs_storage from crates.io while
+# zarrs itself comes from git. Two copies of zarrs_storage means two distinct
+# AsyncReadableStorageTraits, and the trait bounds on the async stores cannot be satisfied.
+# Patching that one crate to the same rev collapses the graph: every other zarrs crate
+# already resolves through the git checkout. Pinned by rev rather than path, because a path
+# resolves to whatever a directory happens to hold and no commit records that.
+[patch.crates-io]
+zarrs_storage = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7" }
