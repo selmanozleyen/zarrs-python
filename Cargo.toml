@@ -17,6 +17,7 @@ pyo3 = { version = "0.27.1", features = ["abi3-py311"] }
 # that a build is reproducible from the manifest alone.
 zarrs = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7", features = ["async", "zlib", "pcodec", "bz2"] }
 rayon_iter_concurrent_limit = "0.2.0"
+crossbeam-channel = "0.5"  # MPMC: readers drain the job queue, decoders the decode queue
 rayon = "1.10.0"
 # fix for https://stackoverflow.com/questions/76593417/package-openssl-was-not-found-in-the-pkg-config-search-path
 openssl = { version = "0.10", features = ["vendored"] }

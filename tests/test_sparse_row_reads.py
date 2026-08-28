@@ -28,7 +28,21 @@ N_VAR = 5000
 CHUNK = 4096
 SHARD = 16384
 
-CONFIGS = {"default": {}}
+# The array is opened inside the `zarr.config.set` block below, and both widths are read at
+# open, so these reach the pipeline. A one-worker arm is the interesting one: it is the
+# narrowest a call can get, exercising the floor and the widening loop, and the answer must
+# not depend on how many workers happened to be available.
+CONFIGS = {
+    "default": {},
+    "one worker": {
+        "codec_pipeline.read_concurrency": 1,
+        "codec_pipeline.decode_concurrency": 1,
+    },
+    "wider than the machine": {
+        "codec_pipeline.read_concurrency": 64,
+        "codec_pipeline.decode_concurrency": 4,
+    },
+}
 
 
 @pytest.fixture(params=["zstd", "none"])
