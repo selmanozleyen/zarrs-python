@@ -264,26 +264,14 @@ def _chunk_unit_args(
 ) -> tuple | None:
     """Arguments for one item per inner chunk, or None if this entry is not that shape.
 
-    The inner chunk is what the codec chain fetches and decodes; `chunk_spec.shape` is
-    the SHARD. Grouping a selection by decode unit therefore needs the inner chunk
-    shape, which the pipeline reads off the array metadata and passes in -- it was
-    never unreachable, only never passed.
+    Each group becomes a whole-inner-chunk subset plus the indices wanted from it, so the
+    chunk is read once and decoded once however many of its elements are asked for.
+    `chunk_spec.shape` is the SHARD, so the inner chunk shape has to be passed in.
 
-    Each group becomes a whole-inner-chunk subset plus the indices wanted from it, so
-    the chunk is read once, decoded once and gathered once, however many of its
-    elements the selection asks for. That is what zarr-python does, and it is why a
-    run of consecutive indices and a strided scatter cost it the same.
-
-    The checks here are vectorised numpy and cost nothing, so they stay in Python and
-    hold the semantics; Rust does the grouping and the item construction, taking
-    `indices` as a view. Returning the arguments rather than the items lets the caller
-    choose the container: a `ChunkItems` handle when the whole batch is chunk-unit, a
-    Python list when it has to meet entries that took another path.
-
-    Narrow on purpose: one 1-D integer axis, non-negative and NON-DECREASING, with a
-    contiguous output slice. Sorted is what makes it work -- each chunk's elements are
-    then one contiguous run of the output, the only output shape a ChunkItem can
-    describe.
+    Narrow on purpose: one 1-D integer axis, non-negative and NON-DECREASING, against a
+    contiguous output slice -- sorted is what makes each chunk's elements one run of the
+    output. The checks stay in Python because they are vectorised numpy and cost nothing;
+    Rust does the grouping, taking `indices` as a view.
     """
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
     if drop_axes or inner_shape is None or len(inner_shape) != 1:

@@ -1,21 +1,13 @@
 //! Where an innermost chunk lives inside its shard, however many levels of sharding are
 //! between them.
 //!
-//! This module used to parse the shard index by hand: derive the encoded index size from the
-//! index codecs, read it from the start or end per `index_location`, decode it, and pick the
-//! offset/size pair out — including the `u64::MAX, u64::MAX` marker for a chunk never written.
-//! All of that duplicated zarrs and existed only because the public API hung off `Array`,
-//! which needs a node path `CodecPipeline.from_array_metadata_and_store` is never given.
-//! zarrs 0.24 made `ShardingPartialDecoder` public with a `(storage, key)` handle instead.
+//! zarrs decodes the shard index itself; what is ours is the LEVELS of sharding an array has
+//! and how an element offset becomes a subchunk index at each one.
 //!
-//! What is left is what is genuinely ours: the LEVELS of sharding an array has, and how an
-//! element offset becomes a subchunk index at each one.
-//!
-//! Nested sharding puts a shard inside a shard. The innermost chunk stays the decode unit —
-//! treating a subshard as the unit would decode many innermost chunks to keep the elements of
-//! one, which is the amplification this whole path exists to avoid. So locating one chunk
-//! walks one index per level: the outer index gives the subshard's extent, and the subshard's
-//! own index, which lives inside that extent, gives the chunk's.
+//! Nested sharding puts a shard inside a shard, and the INNERMOST chunk stays the decode unit
+//! -- treating a subshard as the unit would decode many chunks to keep the elements of one,
+//! the amplification this path exists to avoid. So locating a chunk walks one index per
+//! level.
 
 use std::sync::Arc;
 

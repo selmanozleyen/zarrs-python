@@ -1,44 +1,17 @@
 //! Reading and decoding the innermost chunks of one call, concurrently.
 //!
-//! One job per innermost chunk. A reader does the blocking byte-range read and hands the
-//! bytes to a decode worker; the worker decodes the chunk once and copies out the elements
-//! the selection wants.
+//! One job per innermost chunk: a reader does the blocking byte-range read, a decode worker
+//! decodes the chunk and copies out the elements the selection wants. The two are separate
+//! because a read waits on storage and a decode occupies a core, so the useful number of
+//! each is different -- hence `read_concurrency` and `decode_concurrency`.
 //!
-//! The two are split because they are bounded by different things: a read waits on storage
-//! and a decode occupies a core, so the useful number of readers is however many reads a
-//! store will answer at once, which is not the core count. Hence `read_concurrency` and
-//! `decode_concurrency` are separate knobs. On networked or high-latency storage a read can
-//! cost an order of magnitude more than a decode, which is the case this arrangement exists
-//! for; on a local `NVMe` drive it may not, and then the widths should be equal, which is
-//! what they default to.
+//! Workers belong to the CALL. `std::thread::scope` cannot exit until they finish, so a job
+//! can hold `&mut [u8]` into the caller's output rather than a raw pointer, and the join is
+//! the barrier. The output is carved once in offset order by `split_at_mut`, so two jobs
+//! cannot name the same bytes -- not checked, unrepresentable.
 //!
-//! # Workers
-//!
-//! The workers belong to the CALL, not to the process: `std::thread::scope` spawns them and
-//! cannot exit until every one has finished. That is what lets a job hold `&mut [u8]` into
-//! the caller's output buffer instead of a raw pointer, and it is why there is no reply
-//! channel and no drop guard -- the scope's join is the barrier.
-//!
-//! A process-wide ceiling bounds how many workers may exist at once across every in-flight
-//! call, and a call takes a fair share of it rather than whatever earlier callers left
-//! behind. See [`ActiveCall`] and [`Permit`].
-//!
-//! # Data movement
-//!
-//! Exactly one copy, and it is the gather:
-//!
-//! 1. `get_partial` -> `Bytes`: allocated by the store, **moved** through the channel.
-//! 2. decode -> scratch: a write, into a buffer each worker keeps and reuses for the call.
-//! 3. gather scratch -> output: the one copy, scattered to contiguous, straight into the
-//!    numpy buffer. No intermediate `Vec`, no assembly pass.
-//!
-//! # Disjointness
-//!
-//! Two jobs cannot name the same output bytes, and this is not checked -- it cannot be
-//! expressed. The output is carved once, in offset order, by successive `split_at_mut`, so
-//! the bytes a job holds have already been moved out of every other job's reach. The fused
-//! path makes the same aliasing argument in a comment and never checks it.
-
+//! There is exactly one copy of the data, the gather from the decoded chunk into the numpy
+//! buffer; the bytes are moved, not copied, between reader and decoder.
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -121,15 +94,9 @@ impl CodecPipelineImpl {
 
         std::thread::scope(|scope| {
             let (job_tx, job_rx) = unbounded::<Job<'_>>();
-            // Unbounded, and the bound that matters is elsewhere: nothing can ever be sent
-            // here but this call's own jobs, so the queue cannot exceed `jobs.len()` -- which
-            // is how many chunks the caller asked for in one batch. Peak resident is that
-            // many compressed chunks, and it is the caller's batch size that sets it.
-            //
-            // A tighter bound was tried, at eight chunks per decoder, to stop a fast store
-            // running far ahead of a slow decode. It cost 12% on the scattered read: readers
-            // running ahead IS the prefetch on high-latency storage, and blocking them to
-            // save memory the caller had already agreed to spend is the wrong trade.
+            // Unbounded, but only this call's own jobs are ever sent, so peak resident is
+            // the batch the caller asked for. A tighter bound cost 12%: readers running
+            // ahead is the prefetch on high-latency storage.
             let (dec_tx, dec_rx) = unbounded::<(Job<'_>, MaybeBytes)>();
             let spawn_reader = |permit: Permit| {
                 debug_assert_eq!(permit.0, Kind::Read);
@@ -173,28 +140,18 @@ impl CodecPipelineImpl {
             }
             drop(job_tx);
 
-            // Widen the call while it still has queued work.
-            //
-            // This is what stops a narrow start from being a narrow call. A call that arrived
-            // when the ceiling was full begins at the floor of one, and without this it keeps
-            // that one worker for its whole duration however many permits later free up --
-            // which is the pathology, just further down the queue.
-            //
-            // Run from the calling thread, which is otherwise doing nothing until the join,
-            // so no worker has to spawn a sibling and no per-call counter has to be shared.
-            // It polls rather than waiting on a release signal: a Condvar notified from
-            // `Permit::drop` would be exact, and is the upgrade if this sleep ever shows up
-            // in a profile.
+            // Widen while there is still queued work, so a call that started at the floor
+            // does not keep one worker for its whole duration. Run from the calling thread,
+            // which is idle until the join. Polls; a Condvar in `Permit::drop` is the upgrade
+            // if this ever shows up in a profile.
             //
             // Outstanding work in EITHER queue keeps this alive, not just the job queue:
             // reads can drain while decode is still the bottleneck, and decoders that started
             // narrow would then have no way to widen.
             //
-            // It stops for exactly one reason: nothing is left alive to drain the queues.
-            // Not a busy ceiling -- that is the normal case with several calls in flight, and
-            // stopping for it costs 34%. Not a stretch of time without a chunk completing --
-            // that is what slow storage looks like, and this path is FOR slow storage. See
-            // `Alive`, which is the only signal here that is not a guess about timing.
+            // Stops for one reason only: nothing is left alive to drain the queues. Not a
+            // busy ceiling, which is normal with several calls in flight, and not elapsed
+            // time, which is what slow storage looks like.
             while (live_readers < want_readers || live_decoders < want_decoders)
                 && (!job_rx.is_empty() || !dec_rx.is_empty())
                 && alive.load(Ordering::Relaxed) > 0
@@ -502,17 +459,11 @@ fn output_offset(item: &ChunkItem) -> usize {
     usize::try_from(item.subset.start().first().copied().unwrap_or(0)).unwrap_or(usize::MAX)
 }
 
-/// Live workers across every in-flight call, counted separately for the two kinds.
+/// Live workers across every in-flight call, counted separately per kind.
 ///
-/// Separately because the two are bounded by different ceilings, and one counter for both
-/// means a wide decode width spends the readers' budget: at `read_concurrency = 4` and
-/// `decode_concurrency = 32` the first call's decoders alone fill the readers' ceiling, and
-/// every later call falls to the floor of one reader for its whole life -- exactly the
-/// starvation [`ActiveCall`] exists to prevent, reintroduced through a shared counter.
-///
-/// A call takes what is free rather than waiting for a full set: three permits available
-/// means three threads and get on with it. The floor of one is what stops a call that finds
-/// none from waiting forever.
+/// One counter for both would let a wide decode width spend the readers' budget, starving
+/// every later call's readers. A call takes what is free rather than waiting for a full set,
+/// with a floor of one so it never waits forever.
 static LIVE_READERS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_DECODERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -534,10 +485,8 @@ impl Kind {
 
 /// Workers of one kind per core, at the process-wide ceiling.
 ///
-/// Eight because the concurrency arrives from ABOVE -- zarr's event loop issues several
-/// reads at once -- and because over-providing is cheap on this side: a thread parked on a
-/// storage round trip costs a stack and a scheduler entry, not a core. Measured on a 16-core
-/// allocation over a sharded store, 8x was the best of 1x / 8x / 32x, and 32x bought nothing.
+/// Over-providing is cheap here: a thread parked on a storage round trip costs a stack, not
+/// a core. Measured on 16 cores over a sharded store, 8x beat 1x and 32x bought nothing.
 const CEILING_WORKERS_PER_CORE: usize = 8;
 
 /// How long the widening loop waits between attempts when no permit is free.
@@ -545,23 +494,13 @@ const WIDEN_POLL: Duration = Duration::from_micros(200);
 
 /// Workers alive in ONE call, raised before a thread starts and lowered when it returns.
 ///
-/// This is what lets the widening loop tell a slow storage round trip from a queue that
-/// nothing is left alive to drain -- and every attempt to tell those apart by TIMING has
-/// been wrong. Counting failed permit attempts gave up on a busy ceiling, which is the
-/// normal case with several calls in flight, and cost 34%. Counting time without a chunk
-/// completing gives up on slow storage, which is the case this module exists for: at 50 ms
-/// a chunk, a call holding one reader sees nothing move for 50 ms and would quit after 13.
-/// That watchdog was anti-correlated with need -- the fewer workers a call had, the slower
-/// its queue moved, and the sooner it stopped asking for more.
-///
-/// Alive is exact and needs no clock. While a worker lives the queue has someone to drain
-/// it, however slowly; when the last one dies with work still queued, nothing has to be
-/// inferred from a duration.
+/// The widening loop below needs to tell "everything is busy" from "nothing is left to drain
+/// this queue". Do not infer that from elapsed time: on slow storage, which is what this
+/// module is for, no progress for a while is normal.
 struct Alive<'a>(&'a AtomicUsize);
 
 impl<'a> Alive<'a> {
-    /// Taken on the SPAWNING thread, so the count is up before the worker starts and the
-    /// loop cannot read zero in the gap between spawning and running.
+    /// Taken on the spawning thread, so the loop cannot read zero between spawn and run.
     fn enter(count: &'a AtomicUsize) -> Self {
         count.fetch_add(1, Ordering::AcqRel);
         Self(count)
@@ -576,15 +515,9 @@ impl Drop for Alive<'_> {
 
 /// How many workers of one kind may exist at once across every in-flight call.
 ///
-/// A PROCESS number, taken from the machine, and deliberately NOT from any one array's
-/// width. Deriving it from the caller's width while enforcing it against a process-wide
-/// count is incoherent: two arrays opened with different `read_concurrency` -- which zarr
-/// permits, since each snapshots the config when it is opened -- would enforce two different
-/// ceilings on one counter, and the array that asked for less would find it permanently full
-/// and run every call at the floor of one. That is the starvation [`ActiveCall`] exists to
-/// prevent, arriving through the ceiling instead of through the counter.
-///
-/// What a CALL wants is still `read_concurrency`. This is only how many may exist together.
+/// Taken from the machine, not from any array's width: two arrays may be opened with
+/// different `read_concurrency`, and deriving a process-wide ceiling from one of them would
+/// leave the other permanently locked out.
 fn worker_ceiling() -> usize {
     static CEILING: OnceLock<usize> = OnceLock::new();
     *CEILING.get_or_init(|| {
@@ -594,19 +527,14 @@ fn worker_ceiling() -> usize {
     })
 }
 
-/// Calls in flight, so a call can take a SHARE of the ceiling rather than race for it.
+/// Calls in flight, so a call takes a SHARE of the ceiling rather than racing for it.
 ///
-/// Without this the ceiling is first-come-first-served, and a late call finds it spent:
-/// eight calls at a width of 16 consume a ceiling of 128, and the ninth and tenth fall to
-/// the floor of one and run single-threaded for their whole duration. Measured, that cost
-/// 13% on a sequential read and put half the cores to sleep.
+/// First-come-first-served leaves a late call with nothing: eight calls at a width of 16
+/// spend a ceiling of 128, and the ninth runs single-threaded for its whole duration.
 static ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-/// Counts one call for as long as it is in flight.
-///
-/// A guard rather than a pair of fetches: an early return or a panic between them leaves the
-/// count high for the life of the process, and every later call then computes a share of a
-/// crowd that is not there.
+/// Counts one call for as long as it is in flight. A guard, so an early return or a panic
+/// cannot leave the count high for the life of the process.
 struct ActiveCall;
 
 impl ActiveCall {
@@ -615,8 +543,7 @@ impl ActiveCall {
         Self
     }
 
-    /// What one call may hold if every in-flight call takes an equal share. Never zero: a
-    /// call always gets a worker, or nothing it queued would ever be read.
+    /// An equal share of the ceiling. Never zero, or a call's queue would never be read.
     fn share(ceiling: usize) -> usize {
         (ceiling / ACTIVE_CALLS.load(Ordering::Relaxed).max(1)).max(1)
     }

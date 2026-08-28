@@ -164,17 +164,10 @@ class ZarrsCodecPipeline(CodecPipeline):
     def _inner_chunk_shape(self) -> tuple[int, ...] | None:
         """The shape of the INNERMOST unit the codec chain decodes, or None if not sharded.
 
-        Cached: it is fixed for the array, and this walked the codec metadata on every read.
-
-        `chunk_spec.shape` in a batch entry is the SHARD extent, so nothing downstream could
-        tell which parts of a selection share a decode. The sharding codec knows, and the
-        pipeline holds the array metadata, so it is one lookup away.
-
-        Descends through nested sharding. Taking the first `chunk_shape` found would name a
-        SUBSHARD on a nested array, and the grouping would then treat a subshard as the decode
-        unit -- decoding many innermost chunks to keep the elements of one, which is the
-        amplification this path exists to avoid. Rust descends the same way when it locates
-        the chunk, so the two have to agree about which level is innermost.
+        Cached; it is fixed for the array. Descends through nested sharding: the first
+        `chunk_shape` found would be a SUBSHARD, and grouping by that would decode many
+        innermost chunks to keep the elements of one. Rust descends the same way, so the two
+        must agree about which level is innermost.
         """
         codecs = getattr(self.metadata, "codecs", ()) or ()
         shape = None

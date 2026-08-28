@@ -64,19 +64,12 @@ pub struct CodecPipelineImpl {
     /// so it needs the shard's index codecs and the codecs inside a shard. `None` means this
     /// array cannot take that path at all.
     pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
-    /// Shard indexes read so far, for the life of this pipeline -- which is the life of the
-    /// array, since zarr builds one pipeline per array.
+    /// Shard indexes read so far, for the life of the array. Reading one is a full-latency
+    /// round trip on the CALLING thread, so keeping the decoder costs a shard once per array
+    /// rather than once per call; a shard that does not exist is remembered too.
     ///
-    /// A `ShardingPartialDecoder` holds one shard's decoded index, and reading that index
-    /// is a full-latency round trip on the CALLING thread before any job reaches a reader.
-    /// Keeping the decoder means a shard is paid for once per array rather than once
-    /// per call. A shard that does not exist is remembered too -- its decoder answers every
-    /// subchunk as absent, which is also not worth asking twice.
-    ///
-    /// Only populated when the store is READ-ONLY, which is the only state in which a
-    /// remembered range cannot be invalidated behind our back by our own caller. A
-    /// read-only store rejects writes, so nothing this process does can move the bytes a
-    /// range addresses; an external writer still can, and no cache here can see that.
+    /// Only for a READ-ONLY store: a write through this pipeline would move the bytes a
+    /// remembered range addresses. An external writer still can, and no cache here sees it.
     pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Arc<ShardingPartialDecoder>>>,
     /// The same, for levels BELOW the outermost, keyed by the path of subchunk indices that
     /// reaches them. Empty and untouched unless the array is nested-sharded, which keeps the
@@ -200,20 +193,13 @@ impl CodecPipelineImpl {
         array_object
     }
 
-    /// The buffer's pointer and length in bytes, once it is known to be C contiguous.
+    /// The buffer's pointer and length in bytes, shared by the three `nparray_to_*`
+    /// functions. The pointer is returned unread; each caller dereferences it in its own
+    /// `unsafe` block, where its safety argument belongs.
     ///
-    /// The three `nparray_to_*` functions below differ only in what they hand back -- a
-    /// shared slice, an exclusive one, or an aliasing wrapper -- and each restated this
-    /// prologue. The pointer is returned unread; every caller dereferences it inside its own
-    /// `unsafe` block, with its own safety argument, which is where that argument belongs.
-    /// The output buffer's base pointer and its length in bytes.
-    ///
-    /// `element_size` is the array's, and is checked against numpy's rather than assumed:
-    /// the length here is sized in NUMPY's element size while both read paths stride the
-    /// same buffer in ZARR's, so a mismatch scales every offset wrongly and still lands in
-    /// bounds -- silently wrong data rather than an error. Nothing should be able to produce
-    /// it, since zarr allocates the output from the array's own dtype, which is exactly why
-    /// it is worth one comparison to learn if that ever stops being true.
+    /// The length is sized in NUMPY's element size while both read paths stride the buffer in
+    /// ZARR's, so the two are compared here: a mismatch scales every offset wrongly and still
+    /// lands in bounds, which is silently wrong data rather than an error.
     fn nparray_bytes(
         value: &Bound<'_, PyUntypedArray>,
         element_size: usize,
@@ -247,35 +233,21 @@ impl CodecPipelineImpl {
         Ok(slice)
     }
 
-    /// The output as one exclusive slice, for the path that sub-splits it safely.
-    ///
-    /// Same pointer and length as `nparray_to_unsafe_cell_slice`; the difference is what
-    /// the caller may do with it. One `&mut [u8]` that `split_at_mut` then divides is
-    /// checked by the compiler, where `UnsafeCellSlice` hands out aliasing views whose
-    /// disjointness is only asserted.
+    /// The output as one exclusive slice, so `split_at_mut` can partition it and the
+    /// compiler checks the disjointness `UnsafeCellSlice` only asserts.
     ///
     /// # Safety
     ///
-    /// Produces a `&mut` from a `&`, so for the lifetime of the slice the caller must be the
-    /// only accessor of the array's buffer:
+    /// For the lifetime of the slice the caller must be the buffer's only accessor:
     ///
-    /// - no second view of the same array, from this or from
-    ///   [`Self::nparray_to_unsafe_cell_slice`];
-    /// - nothing else reading or writing the buffer, on any thread. Note that a `&mut` makes
-    ///   even a concurrent READ undefined, and that **the GIL does not provide this**: the
-    ///   caller releases it with `Python::detach` for the whole duration of the read, so
-    ///   Python threads do run alongside. What actually holds is zarr-python's own contract,
-    ///   that the array it hands the pipeline is not touched by anything else until the read
-    ///   returns.
-    ///
-    /// That is the same assumption the fused path makes, which relies on it more weakly:
-    /// `UnsafeCellSlice` permits aliasing by construction, so a concurrent read there is
-    /// merely a data race on the values and not immediate UB. This path asks for more, and
-    /// gets a compiler-checked partition of the output in exchange.
-    // A `&mut` from a `&` is exactly what this does, and the lint is right that it cannot be
-    // checked. The numpy buffer is owned by Python and reached through a shared handle, so
-    // there is no `&mut Bound` to take; the contract above is what makes it sound, and the
-    // one call site holds the GIL and takes no other view.
+    /// - no second view of the same array, here or via `nparray_to_unsafe_cell_slice`;
+    /// - nothing else reading or writing it on any thread. A `&mut` makes even a concurrent
+    ///   READ undefined, and **the GIL does not provide this** -- it is released for the
+    ///   whole read. What holds is zarr-python's contract that the output array it hands the
+    ///   pipeline is untouched until the read returns. The fused path assumes the same, more
+    ///   weakly, since `UnsafeCellSlice` permits aliasing by construction.
+    // No `&mut Bound` exists to take -- the buffer is Python's, reached through a shared
+    // handle -- so the contract above is what makes this sound, not the type.
     #[allow(clippy::mut_from_ref)]
     unsafe fn nparray_to_mut_slice<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
@@ -316,17 +288,10 @@ impl CodecPipelineImpl {
             !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.coords.is_some()),
             self.shard.as_ref(),
         ) {
-            // The slice is confined to this block so that no live `&mut` into the buffer
-            // exists when the fallback below takes its own view of the same array.
-            //
-            // Note what is and is not enforcing that. `nparray_to_mut_slice` takes a SHARED
-            // reference and conjures the `&mut` from a raw pointer, so the borrow checker
-            // never had an exclusive borrow to end and would not complain if this were
-            // written the other way. The block is a lexical guarantee, made here on purpose,
-            // because the alternative is relying on the fallback being unreachable -- which
-            // it is today, since `locate_chunks` only declines items without coords and the
-            // guard above admits only items with them, but which is an invariant in another
-            // function and one edit away from not holding.
+            // Confined to this block so no live `&mut` exists when the fallback below takes
+            // its own view of the same array. The borrow checker will not catch that -- the
+            // `&mut` comes from a raw pointer -- so the block is a deliberate lexical
+            // guarantee rather than relying on the fallback staying unreachable.
             let element_size = self.element_size()?;
             let declined = {
                 // SAFETY: the only view of `value` taken while this borrow is live, and the
@@ -417,16 +382,10 @@ impl CodecPipelineImpl {
                     .map_py_err::<PyRuntimeError>()?
                 };
                 if let Some(coords) = &item.coords {
-                    // The chunk is the read and decode unit. `chunk_subset` is exactly one
-                    // inner chunk, and an ArraySubset indexer is what takes zarrs'
-                    // chunks-in-subset path, where the chunk is fetched and decoded once.
-                    //
-                    // Handing zarrs the coordinates instead reaches
-                    // `partial_decode_fixed_indexer`, which walks them one at a time: two
-                    // ArrayIndices allocations, a subchunk-decoder cache lookup and a
-                    // `partial_decode` call PER ELEMENT. `partial_decode_into` is not usable
-                    // here either -- it requires indexer.len() == output elements, and a
-                    // whole chunk is deliberately larger than what is wanted from it.
+                    // `chunk_subset` is exactly one inner chunk, and an ArraySubset indexer
+                    // takes zarrs' chunks-in-subset path: fetched and decoded once. Handing
+                    // over the coordinates instead costs two allocations, a cache lookup and
+                    // a `partial_decode` call PER ELEMENT.
                     let partial_decoder =
                         cached_partial_decoder(&partial_decoder_cache, &item.key)?;
                     let decoded = partial_decoder
@@ -539,19 +498,10 @@ impl CodecPipelineImpl {
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
-        // Both default to the available parallelism, which is what rayon and
-        // `available_parallelism` do, and what a library should spend without being asked.
-        //
-        // Reads are latency-bound and decodes are CPU-bound, so the two are still set
-        // INDEPENDENTLY -- a caller who wants reads oversubscribed can raise
-        // `read_concurrency` alone. The default used to be `4 * num_threads` readers on the
-        // grounds that a blocked reader costs no CPU. True, but it is not a library's call to
-        // make: on a machine with no affinity mask (a login node, a bare box, a container
-        // without a cpuset) that is 4x every core in threads nobody asked for, and a sweep
-        // from 16 to 1024 readers measured FLAT on the strided shape anyway.
-        //
-        // Above ~items-per-call, more readers do nothing regardless: a call cannot have more
-        // reads outstanding than it has chunks.
+        // Both default to the available parallelism -- more readers than that is defensible
+        // (a blocked reader costs no CPU) but not a library's call to make unasked, and a
+        // sweep from 16 to 1024 readers measured flat. Set independently, so a caller who
+        // wants reads oversubscribed can raise one alone.
         let read_concurrency = read_concurrency.unwrap_or(num_threads).max(1);
         let decode_concurrency = decode_concurrency.unwrap_or(num_threads).max(1);
         let store: ReadableWritableListableStorage =

@@ -125,19 +125,13 @@ fn selection_to_array_subset(
 
 /// Build one item per inner chunk for a whole entry, without crossing pyo3 per item.
 ///
-/// The Python loop this replaces paid, per item, a pyo3 call with keyword parsing, two
-/// `slice` objects, two `PySlice::indices` calls, a fresh `StoreKey` allocation for a key
-/// that never changes, and -- per ELEMENT -- a boxed `PyInt` for `coords` that pyo3 then
-/// unboxed again -- the dominant cost of such a read, and serial under the GIL.
-///
 /// Everything an item needs is identical across the entry except two index pairs, so the
-/// batch crosses once: the key is validated once, `indices` arrives as a numpy view, and
-/// the grouping runs here in one pass.
+/// batch crosses once and `indices` arrives as a numpy view. The Python loop this replaces
+/// paid a pyo3 call per item and a boxed int per ELEMENT, serial under the GIL.
 ///
-/// The caller's guards still hold the semantics (1-D, non-negative, non-decreasing,
-/// contiguous output slice) because they are vectorised numpy and cost nothing. The
-/// checks repeated here are the ones whose failure would be silent: a negative index
-/// cast to `u64` becomes a wild chunk id, and `inner == 0` divides by zero.
+/// The caller's numpy guards hold the semantics; what is rechecked here is only what would
+/// fail silently -- a negative index becomes a wild chunk id, and `inner == 0` divides by
+/// zero.
 #[allow(clippy::needless_pass_by_value)]
 // One range per call is the point: this is the 1-D path.
 #[allow(clippy::single_range_in_vec_init)]
@@ -263,16 +257,12 @@ pub(crate) fn build_chunk_unit_items(
     Ok(items)
 }
 
-/// A whole batch of chunk items, held on the Rust side.
+/// A whole batch of chunk items, held on the Rust side so they never become Python objects.
 ///
-/// Returning `Vec<ChunkItem>` to Python costs one pyclass object per item, which the read
-/// entry point then extracts straight back into a `Vec` -- a round trip through Python for
-/// a batch that both ends want as Rust values. A selection over a sharded array can reach
-/// a thousand items per call, so that cost is proportional to the selection.
-///
-/// Behind this handle the items never become Python objects. The caller drives the
-/// eligibility checks and calls `push_entry` once per batch ENTRY, then passes the handle
-/// to `CodecPipelineImpl.retrieve_chunk_items_and_apply_index`.
+/// `Vec<ChunkItem>` costs a pyclass object per item, which the read entry point extracts
+/// straight back into a `Vec` -- a round trip through Python for values both ends want in
+/// Rust, and a selection can reach a thousand items per call. The caller pushes one entry at
+/// a time and passes the handle to `retrieve_chunk_items_and_apply_index`.
 #[gen_stub_pyclass]
 #[pyclass]
 pub(crate) struct ChunkItems {
