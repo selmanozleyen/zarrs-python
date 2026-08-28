@@ -175,29 +175,41 @@ pub(crate) fn build_chunk_unit_items(
             .map_err(|_| PyErr::new::<PyValueError, _>(format!("index {} is negative", indices[i])))
     };
 
-    // NON-DECREASING is assumed by everything below -- the grouping walks a run of equal
-    // chunk ids, and the extent check trusts the last of a group to be the largest. Python's
+    // NON-DECREASING is assumed by everything below -- the grouping walks a run of equal chunk
+    // ids, and the extent check trusts the last of a group to be the largest. Python's
     // `_is_sorted_integer_axis` establishes it for the pipeline's own callers, but
-    // `ChunkItems::push_entry` is `#[pymethods]` and takes an arbitrary array, so the
-    // assumption has to hold on this side of the boundary too. Without it `[1010, 900]` with
-    // inner 256 and extent 1000 groups together, passes the extent check on 900, and gathers
-    // element 242 of the chunk as if it were data.
-    for i in 1..n {
-        if at(i)? < at(i - 1)? {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "indices must be non-decreasing: {} follows {}",
-                at(i)?,
-                at(i - 1)?
-            )));
-        }
-    }
-
+    // `ChunkItems::push_entry` is `#[pymethods]` and takes an arbitrary array, so it has to
+    // hold on this side of the boundary too: without it `[1010, 900]` with inner 256 and
+    // extent 1000 groups together, passes the extent check on 900, and gathers element 242 of
+    // the chunk as if it were data.
+    //
+    // Checked INSIDE the walk that already reads each index, not in a pass of its own. These
+    // are element indices, not row indices -- a batch of 1,024 rows at ~1,400 nnz each is 1.4M
+    // of them -- and a separate pass cost 12% on a sequential read.
     let mut items = Vec::new();
     let mut a = 0usize;
+    let mut previous = 0u64;
     while a < n {
-        let chunk_id = at(a)? / inner;
+        let first = at(a)?;
+        if a > 0 && first < previous {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "indices must be non-decreasing: {first} follows {previous}"
+            )));
+        }
+        previous = first;
+        let chunk_id = first / inner;
         let mut b = a + 1;
-        while b < n && at(b)? / inner == chunk_id {
+        while b < n {
+            let value = at(b)?;
+            if value < previous {
+                return Err(PyErr::new::<PyValueError, _>(format!(
+                    "indices must be non-decreasing: {value} follows {previous}"
+                )));
+            }
+            previous = value;
+            if value / inner != chunk_id {
+                break;
+            }
             b += 1;
         }
         let lo = chunk_id * inner;
