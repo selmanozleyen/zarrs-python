@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use pyo3::PyResult;
 use pyo3::exceptions::PyRuntimeError;
 use unsafe_cell_slice::UnsafeCellSlice;
@@ -120,7 +120,16 @@ impl CodecPipelineImpl {
 
         std::thread::scope(|scope| {
             let (job_tx, job_rx) = unbounded::<Job<'_>>();
-            let (dec_tx, dec_rx) = unbounded::<(Job<'_>, MaybeBytes)>();
+            // BOUNDED, unlike the job queue: every message here carries a chunk's compressed
+            // bytes, so an unbounded one lets a fast store hold the whole batch resident at
+            // once -- which is the local-NVMe case this module's widths exist for, decode
+            // being the bottleneck. A few chunks per decoder is enough to keep them fed.
+            //
+            // Safe to block on only because the widening loop below gives up: if every
+            // decoder dies, readers wait on a full queue until this thread drops `dec_rx`,
+            // which disconnects it and turns the wait into the error above. An unbounded
+            // widening loop would leave them waiting forever.
+            let (dec_tx, dec_rx) = bounded::<(Job<'_>, MaybeBytes)>((2 * want_decoders).max(4));
             let spawn_reader = |permit: Permit| {
                 let (jobs, decodes, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
                 scope.spawn(move || {
@@ -385,8 +394,42 @@ fn carve<'a>(
     let mut cursor = 0usize;
     for &i in &order {
         let (item, range) = &located[i];
-        let start = output_offset(item) * element_size;
-        let len = coords_of(item)?.len() * element_size;
+        let coords = coords_of(item)?;
+        // WHERE a piece starts comes from `subset`, and HOW LONG it is comes from `coords`.
+        // Nothing ties the two together: `ChunkItem` is constructible from Python and skips
+        // the element-count check when coords are present. If they disagree, every later
+        // piece is carved at the wrong offset and the read silently returns the right number
+        // of wrong elements. The shipped pipeline cannot produce that -- only
+        // `build_chunk_unit_items` sets coords, and it keeps the two the same length -- so
+        // this is the check that keeps "cannot" from meaning "has not been tried".
+        if item.subset.dimensionality() != 1 {
+            return Err(PyRuntimeError::new_err(format!(
+                "{} has a {}-dimensional subset; this path carves a 1-D output",
+                item.key,
+                item.subset.dimensionality()
+            )));
+        }
+        if coords.len() as u64 != item.subset.num_elements() {
+            return Err(PyRuntimeError::new_err(format!(
+                "{} wants {} coordinates but its output subset holds {} elements",
+                item.key,
+                coords.len(),
+                item.subset.num_elements()
+            )));
+        }
+        // Checked, because `output_offset` saturates to `usize::MAX` when a start does not
+        // fit. Unchecked, that multiplication wraps in release and the wrapped value then
+        // slips past the bounds test below, so the clean error turns into a panic inside
+        // `split_at_mut`.
+        let (Some(start), Some(len)) = (
+            output_offset(item).checked_mul(element_size),
+            coords.len().checked_mul(element_size),
+        ) else {
+            return Err(PyRuntimeError::new_err(format!(
+                "{} names an output offset or length too large to address",
+                item.key
+            )));
+        };
         if start < cursor {
             return Err(PyRuntimeError::new_err(format!(
                 "{} claims output bytes from {start}, behind the {cursor} already carved",
@@ -394,11 +437,10 @@ fn carve<'a>(
             )));
         }
         let skip = start - cursor;
-        if skip + len > rest.len() {
+        if skip.checked_add(len).is_none_or(|end| end > rest.len()) {
             return Err(PyRuntimeError::new_err(format!(
-                "{} names output bytes {start}..{} beyond the buffer",
-                item.key,
-                start + len
+                "{} names output bytes from {start} for {len}, beyond the buffer",
+                item.key
             )));
         }
         let (_gap, tail) = std::mem::take(&mut rest).split_at_mut(skip);
@@ -411,7 +453,7 @@ fn carve<'a>(
                 key: item.key.clone(),
                 range: *range,
                 out: piece,
-                coords: coords_of(item)?,
+                coords,
                 ctx,
             }),
             None => absent.push(piece),

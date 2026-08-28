@@ -238,10 +238,22 @@ impl CodecPipelineImpl {
     ///
     /// # Safety
     ///
-    /// Produces a `&mut` from a `&`, so the caller must be the array's only writer for the
-    /// lifetime of the slice: no second call to this or to `nparray_to_unsafe_cell_slice`
-    /// on the same array, and no Python code running that could write to it. Holding the
-    /// GIL for the duration is what makes the second part true.
+    /// Produces a `&mut` from a `&`, so for the lifetime of the slice the caller must be the
+    /// only accessor of the array's buffer:
+    ///
+    /// - no second view of the same array, from this or from
+    ///   [`Self::nparray_to_unsafe_cell_slice`];
+    /// - nothing else reading or writing the buffer, on any thread. Note that a `&mut` makes
+    ///   even a concurrent READ undefined, and that **the GIL does not provide this**: the
+    ///   caller releases it with `Python::detach` for the whole duration of the read, so
+    ///   Python threads do run alongside. What actually holds is zarr-python's own contract,
+    ///   that the array it hands the pipeline is not touched by anything else until the read
+    ///   returns.
+    ///
+    /// That is the same assumption the fused path makes, which relies on it more weakly:
+    /// `UnsafeCellSlice` permits aliasing by construction, so a concurrent read there is
+    /// merely a data race on the values and not immediate UB. This path asks for more, and
+    /// gets a compiler-checked partition of the output in exchange.
     // A `&mut` from a `&` is exactly what this does, and the lint is right that it cannot be
     // checked. The numpy buffer is owned by Python and reached through a shared handle, so
     // there is no `&mut Bound` to take; the contract above is what makes it sound, and the
@@ -284,17 +296,39 @@ impl CodecPipelineImpl {
             !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.coords.is_some()),
             self.shard.as_ref(),
         ) {
-            // SAFETY: this is the only view taken of `value` in this call, and the GIL is
-            // still held here -- `py.detach` is entered below, after the slice exists.
-            let output = unsafe { Self::nparray_to_mut_slice(value)? };
-            let declined = py.detach(|| {
-                let Some((_, codec_options)) =
-                    chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
-                else {
-                    return Ok(Vec::new());
-                };
-                self.retrieve_chunk_units(shard, chunk_descriptions, output, &codec_options)
-            })?;
+            // The buffer is sized in numpy's element size and carved in zarr's. A mismatch
+            // scales every offset wrongly and still lands in bounds, so it would be silently
+            // wrong data rather than an error. Nothing should be able to produce it -- zarr
+            // allocates the output from the array's own dtype -- which is why it is worth one
+            // comparison to find out if that ever stops being true.
+            let itemsize = value.dtype().itemsize();
+            if itemsize != self.element_size()? {
+                return Err(PyValueError::new_err(format!(
+                    "the output array's dtype is {itemsize} bytes per element but the array's \
+                     is {}",
+                    self.element_size()?
+                )));
+            }
+            // The slice is confined to this block so that its borrow of `value` has ENDED
+            // before the fallback below, which takes its own view of the same array. Today
+            // the fallback is unreachable -- `locate_chunks` only declines items without
+            // coords, and the guard above admitted only items with them -- but relying on
+            // an invariant in another function to keep two views apart is not a thing to
+            // rely on. A block is.
+            let declined = {
+                // SAFETY: the only view of `value` taken while this borrow is live, and the
+                // caller owns the buffer for the duration of the read -- see the contract on
+                // `nparray_to_mut_slice`.
+                let output = unsafe { Self::nparray_to_mut_slice(value)? };
+                py.detach(|| {
+                    let Some((_, codec_options)) =
+                        chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
+                    else {
+                        return Ok(Vec::new());
+                    };
+                    self.retrieve_chunk_units(shard, chunk_descriptions, output, &codec_options)
+                })?
+            };
             if declined.is_empty() {
                 return Ok(());
             }
