@@ -1,5 +1,7 @@
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
+use numpy::PyReadonlyArray1;
 use pyo3::{
     Bound, PyErr, PyResult,
     exceptions::{PyIndexError, PyValueError},
@@ -33,12 +35,26 @@ pub(crate) struct ChunkItem {
     pub shape: Vec<NonZeroU64>,
     pub num_elements: u64,
     pub array_shape: Vec<NonZeroU64>,
+    /// Indices within `chunk_subset`, when this item is a whole inner chunk plus the
+    /// elements wanted from it. The chunk is decoded once and these are gathered out.
+    /// Shared rather than owned so a job can hold one without copying the coordinates and
+    /// without borrowing: one allocation, same as the `Vec` it replaced, and every job of a
+    /// call that wants the same chunk points at the same coordinates.
+    pub coords: Option<Arc<[u64]>>,
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl ChunkItem {
+    /// Coordinates are deliberately NOT a parameter here.
+    ///
+    /// An item that carries them is one whole inner chunk plus the elements wanted from it,
+    /// and its `subset` and `chunk_subset` are then meant to hold different counts -- so
+    /// accepting coordinates here would mean accepting the pair unchecked, from Python, for
+    /// a shape only `build_chunk_unit_items` knows how to construct consistently. It builds
+    /// the struct directly instead, and this constructor keeps the check unconditional.
     #[new]
+    #[pyo3(signature = (key, chunk_subset, chunk_shape, subset, shape))]
     #[allow(clippy::needless_pass_by_value)]
     fn new(
         key: String,
@@ -67,6 +83,7 @@ impl ChunkItem {
             shape: chunk_shape_nonzero_u64,
             num_elements,
             array_shape: shape_nonzero_u64,
+            coords: None,
         })
     }
 }
@@ -103,5 +120,196 @@ fn selection_to_array_subset(
             .map(|(selection, &shape)| slice_to_range(selection, isize::try_from(shape.get())?))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(ArraySubset::new_with_ranges(&chunk_ranges))
+    }
+}
+
+/// Build one item per inner chunk for a whole entry, without crossing pyo3 per item.
+///
+/// Everything an item needs is identical across the entry except two index pairs, so the
+/// batch crosses once and `indices` arrives as a numpy view. The Python loop this replaces
+/// paid a pyo3 call per item and a boxed int per ELEMENT, serial under the GIL.
+///
+/// The caller's numpy guards hold the semantics; what is rechecked here is only what would
+/// fail silently -- a negative index becomes a wild chunk id, and `inner == 0` divides by
+/// zero.
+#[allow(clippy::needless_pass_by_value)]
+// One range per call is the point: this is the 1-D path.
+#[allow(clippy::single_range_in_vec_init)]
+pub(crate) fn build_chunk_unit_items(
+    key: &str,
+    chunk_shape: Vec<u64>,
+    shape: Vec<u64>,
+    indices: PyReadonlyArray1<'_, i64>,
+    out_start: u64,
+    inner: u64,
+) -> PyResult<Vec<ChunkItem>> {
+    let inner = NonZeroU64::new(inner)
+        .ok_or_else(|| PyErr::new::<PyValueError, _>("inner chunk shape must be non-zero"))?
+        .get();
+    // Strided views are legal here: an index array can be a slice of a larger one.
+    let indices = indices.as_array();
+    let n = indices.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if chunk_shape.len() != 1 || shape.is_empty() {
+        return Err(PyErr::new::<PyValueError, _>(
+            "chunk_unit_items is the 1-D path: chunk_shape must have one axis",
+        ));
+    }
+    let num_elements: u64 = chunk_shape.iter().product();
+    let chunk_shape = to_nonzero_u64_vec(chunk_shape)?;
+    let shape = to_nonzero_u64_vec(shape)?;
+    let extent = chunk_shape[0].get();
+    let out_extent = shape[0].get();
+    let key = StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?;
+
+    let at = |i: usize| -> PyResult<u64> {
+        u64::try_from(indices[i])
+            .map_err(|_| PyErr::new::<PyValueError, _>(format!("index {} is negative", indices[i])))
+    };
+
+    // NON-DECREASING is assumed by everything below -- the grouping walks a run of equal chunk
+    // ids, and the extent check trusts the last of a group to be the largest. Python's
+    // `_is_sorted_integer_axis` establishes it for the pipeline's own callers, but
+    // `ChunkItems::push_entry` is `#[pymethods]` and takes an arbitrary array, so it has to
+    // hold on this side of the boundary too: without it `[1010, 900]` with inner 256 and
+    // extent 1000 groups together, passes the extent check on 900, and gathers element 242 of
+    // the chunk as if it were data.
+    //
+    // Checked INSIDE the walk that already reads each index, not in a pass of its own. These
+    // are element indices, not row indices -- a batch of 1,024 rows at ~1,400 nnz each is 1.4M
+    // of them -- and a separate pass cost 12% on a sequential read.
+    let mut items = Vec::new();
+    let mut a = 0usize;
+    let mut previous = 0u64;
+    while a < n {
+        let first = at(a)?;
+        if a > 0 && first < previous {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "indices must be non-decreasing: {first} follows {previous}"
+            )));
+        }
+        previous = first;
+        let chunk_id = first / inner;
+        let mut b = a + 1;
+        while b < n {
+            let value = at(b)?;
+            if value < previous {
+                return Err(PyErr::new::<PyValueError, _>(format!(
+                    "indices must be non-decreasing: {value} follows {previous}"
+                )));
+            }
+            previous = value;
+            if value / inner != chunk_id {
+                break;
+            }
+            b += 1;
+        }
+        let lo = chunk_id * inner;
+        // Exactly one inner chunk, as a subset: zarrs decodes it once.
+        let hi = (lo + inner).min(extent);
+        if lo >= extent {
+            return Err(PyErr::new::<PyIndexError, _>(format!(
+                "index {} is past the chunk extent {extent}",
+                at(a)?
+            )));
+        }
+        // `lo >= extent` catches a chunk that STARTS past the end. It does not catch an index
+        // inside the last chunk that is past the array's own extent, where `lo + inner`
+        // overruns -- and there the two read paths would disagree: this one sizes its scratch
+        // to the whole inner chunk and would gather fill bytes, while the fused path decodes
+        // only `lo..hi` and errors. zarr clamps long before either sees it; the point is that
+        // if it ever stops, both paths say the same thing. Indices are non-decreasing, so the
+        // last of the group is the largest.
+        if at(b - 1)? >= extent {
+            return Err(PyErr::new::<PyIndexError, _>(format!(
+                "index {} is past the chunk extent {extent}",
+                at(b - 1)?
+            )));
+        }
+        let out_lo = out_start + a as u64;
+        let out_hi = out_start + b as u64;
+        // Python built these as slices, and `slice.indices()` would have CLAMPED an
+        // overrun to the shape instead of saying so.
+        if out_hi > out_extent {
+            return Err(PyErr::new::<PyIndexError, _>(format!(
+                "output subset {out_lo}..{out_hi} is past the output extent {out_extent}",
+            )));
+        }
+        items.push(ChunkItem {
+            key: key.clone(),
+            chunk_subset: ArraySubset::new_with_ranges(&[lo..hi]),
+            subset: ArraySubset::new_with_ranges(&[out_lo..out_hi]),
+            shape: chunk_shape.clone(),
+            num_elements,
+            array_shape: shape.clone(),
+            // Relative to the chunk subset, because that is the buffer gathered from.
+            coords: Some(
+                (a..b)
+                    .map(|i| at(i).map(|v| v - lo))
+                    .collect::<PyResult<Vec<u64>>>()?
+                    .into(),
+            ),
+        });
+        a = b;
+    }
+    Ok(items)
+}
+
+/// A whole batch of chunk items, held on the Rust side so they never become Python objects.
+///
+/// `Vec<ChunkItem>` costs a pyclass object per item, which the read entry point extracts
+/// straight back into a `Vec` -- a round trip through Python for values both ends want in
+/// Rust, and a selection can reach a thousand items per call. The caller pushes one entry at
+/// a time and passes the handle to `retrieve_chunk_items_and_apply_index`.
+#[gen_stub_pyclass]
+#[pyclass]
+pub(crate) struct ChunkItems {
+    items: Vec<ChunkItem>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl ChunkItems {
+    #[new]
+    pub(crate) fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Build one batch entry's items and append them.
+    ///
+    /// `indices` must be non-negative and non-decreasing, and `out_start` is where this
+    /// entry's elements begin in the output. The caller checks eligibility.
+    #[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn push_entry(
+        &mut self,
+        key: &str,
+        chunk_shape: Vec<u64>,
+        shape: Vec<u64>,
+        indices: PyReadonlyArray1<'_, i64>,
+        out_start: u64,
+        inner: u64,
+    ) -> PyResult<()> {
+        self.items.extend(build_chunk_unit_items(
+            key,
+            chunk_shape,
+            shape,
+            indices,
+            out_start,
+            inner,
+        )?);
+        Ok(())
+    }
+}
+
+impl ChunkItems {
+    pub(crate) fn as_slice(&self) -> &[ChunkItem] {
+        &self.items
     }
 }

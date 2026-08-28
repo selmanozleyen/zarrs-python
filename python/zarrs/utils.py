@@ -9,16 +9,20 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from zarr.core.indexing import is_integer
 
-from zarrs._internal import ChunkItem
+from zarrs._internal import ChunkItem, ChunkItems
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
     from types import EllipsisType
 
     from zarr.abc.store import ByteGetter, ByteSetter
     from zarr.core.array_spec import ArraySpec
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
+
+    BatchInfo = Iterable[
+        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
+    ]
 
 
 # adapted from https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
@@ -38,6 +42,22 @@ class FillValueNoneError(Exception):
     pass
 
 
+def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
+    """Normalise the batch's integer-array indices to int64, lazily."""
+
+    def cast(sel: SelectorTuple) -> SelectorTuple:
+        if isinstance(sel, np.ndarray):
+            return sel.astype(np.int64, copy=False)
+        if isinstance(sel, tuple) and any(isinstance(s, np.ndarray) for s in sel):
+            return tuple(map(cast, sel))
+        return sel
+
+    return (
+        (byte_getter, chunk_spec, cast(chunk_sel), cast(out_sel), is_complete)
+        for byte_getter, chunk_spec, chunk_sel, out_sel, is_complete in batch_info
+    )
+
+
 # This is a (mostly) copy of the function from zarr.core.indexing that fixes:
 #   DeprecationWarning: Conversion of an array with ndim > 0 to a scalar is deprecated
 # TODO: Upstream this fix
@@ -53,10 +73,11 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                diff = np.diff(dim_selection)
-                if (diff != 1).any() and (diff != 0).any():
-                    raise DiscontiguousArrayError(diff)
-                ls.append(slice(dim_selection[0], dim_selection[-1] + 1, 1))
+                # int64 (see `_as_int64`): an unsigned diff wraps a decrease into +1.
+                steps = dim_selection[1:] - dim_selection[:-1]
+                if (steps != 1).any() and (steps != 0).any():
+                    raise DiscontiguousArrayError(steps)
+                ls.append(slice(int(dim_selection[0]), int(dim_selection[-1]) + 1, 1))
         else:
             ls.append(dim_selection)
     return ls
@@ -68,6 +89,89 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
     if all(isinstance(s, slice) for s in selector_tuple):
         return list(selector_tuple)
     return make_slice_selection(selector_tuple)
+
+
+def _as_selector_tuples(
+    chunk_selection: SelectorTuple, out_selection: SelectorTuple
+) -> tuple[tuple, tuple]:
+    """Both selections as tuples, so an axis can be addressed by position."""
+    return (
+        chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,),
+        out_selection if isinstance(out_selection, tuple) else (out_selection,),
+    )
+
+
+def _is_sorted_integer_axis(indices: Any, out_axis_sel: Any) -> bool:
+    """Is this one sorted 1-D integer axis written to a contiguous output slice?"""
+    # Negative indices and the output length are the caller's to judge: one raises where the
+    # other declines, so the order of those checks belongs at the call site.
+    return (
+        isinstance(indices, np.ndarray)
+        and indices.ndim == 1
+        # Non-decreasing only: any decrease would mean one box per element, a decode each.
+        and not (indices[1:] < indices[:-1]).any()
+        and isinstance(out_axis_sel, slice)
+        and out_axis_sel.step in (None, 1)
+    )
+
+
+def _output_run_matches(indices: np.ndarray, out_axis_sel: slice) -> bool:
+    """Does the output slice hold exactly one element per index."""
+    start = out_axis_sel.start or 0
+    return out_axis_sel.stop - start == indices.size
+
+
+def split_selection_runs(
+    chunk_selection: SelectorTuple, out_selection: SelectorTuple
+) -> Iterator[tuple[SelectorTuple, SelectorTuple]]:
+    """Split a selection with one non-consecutive integer-array axis into contiguous boxes.
+
+    zarrs describes a chunk read as a rectangular subset, so ``z[[3, 7, 8], :]`` has no
+    single-box description -- but it is a *stack* of boxes, one per run of consecutive
+    indices. Only one array axis is split: with two, outer and coordinate indexing disagree
+    on what the selection means. Anything not splittable is yielded unchanged.
+    """
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
+    unsplit = ((chunk_selection, out_selection),)
+
+    array_axes = [
+        axis for axis, sel in enumerate(chunk_sel) if isinstance(sel, np.ndarray)
+    ]
+    # Equal arity means no axis was dropped, so chunk axis `axis` is output axis `axis`.
+    if len(array_axes) != 1 or len(chunk_sel) != len(out_sel):
+        yield from unsplit
+        return
+    (axis,) = array_axes
+    indices = chunk_sel[axis]
+    out_axis_sel = out_sel[axis]
+    if not _is_sorted_integer_axis(indices, out_axis_sel) or not all(
+        isinstance(sel, slice) for sel in out_sel
+    ):
+        yield from unsplit
+        return
+    # this line can be removed once https://github.com/zarr-developers/zarr-python/issues/4285 is fixed
+    if (indices < 0).any():
+        raise DiscontiguousArrayError(indices)
+    out_start = out_axis_sel.start or 0
+    if not _output_run_matches(indices, out_axis_sel):
+        yield from unsplit
+        return
+
+    # Always slices, even for one run: `resulting_shape_from_index` mis-orders a non-leading
+    # advanced index, and the caller's element-count check then rejects the selection.
+    boundaries = np.flatnonzero(indices[1:] != indices[:-1] + 1) + 1
+
+    for start, stop in zip(
+        np.concatenate(([0], boundaries)),
+        np.concatenate((boundaries, [indices.size])),
+        strict=True,
+    ):
+        rows = indices[start:stop]
+        box_chunk_sel = list(chunk_sel)
+        box_chunk_sel[axis] = slice(int(rows[0]), int(rows[-1]) + 1)
+        box_out_sel = list(out_sel)
+        box_out_sel[axis] = slice(out_start + int(start), out_start + int(stop))
+        yield tuple(box_chunk_sel), tuple(box_out_sel)
 
 
 def resulting_shape_from_index(
@@ -149,17 +253,124 @@ def get_implicit_fill_value(dtype: ZDType, fill_value: Any) -> Any:
 
 @dataclass(frozen=True)
 class RustChunkInfo:
-    chunk_info_with_indices: list[ChunkItem]
+    # A ChunkItems handle when the batch is entirely chunk-unit; a list otherwise. The
+    # pipeline dispatches on which, because the two take different Rust entry points.
+    chunk_info_with_indices: list[ChunkItem] | ChunkItems
     write_empty_chunks: bool
 
 
-def make_chunk_info_for_rust_with_indices(
-    batch_info: Iterable[
-        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
-    ],
+def _chunk_unit_args(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> tuple | None:
+    """Arguments for one item per inner chunk, or None if this entry is not that shape.
+
+    Each group becomes a whole-inner-chunk subset plus the indices wanted from it, so the
+    chunk is read once and decoded once however many of its elements are asked for.
+    `chunk_spec.shape` is the SHARD, so the inner chunk shape has to be passed in.
+
+    Narrow on purpose: one 1-D integer axis, non-negative and NON-DECREASING, against a
+    contiguous output slice -- sorted is what makes each chunk's elements one run of the
+    output. The checks stay in Python because they are vectorised numpy and cost nothing;
+    Rust does the grouping, taking `indices` as a view.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if drop_axes or inner_shape is None or len(inner_shape) != 1:
+        return None
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
+    if len(chunk_sel) != 1 or len(out_sel) != 1 or len(chunk_spec.shape) != 1:
+        return None
+    (indices,) = chunk_sel
+    (out_axis_sel,) = out_sel
+    if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
+        return None
+    indices = indices.astype(np.int64, copy=False)
+    if (indices < 0).any():
+        return None
+    start = out_axis_sel.start or 0
+    if not _output_run_matches(indices, out_axis_sel):
+        return None
+
+    return (
+        byte_getter.path,
+        chunk_spec.shape,
+        shape,
+        indices,
+        start,
+        int(inner_shape[0]),
+    )
+
+
+def chunk_info_for_write(
+    batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
 ) -> RustChunkInfo:
+    """Describe a write batch to Rust, one item per entry.
+
+    Neither the chunk-unit grouping nor the run splitting a READ gets: both can put two
+    items on one chunk key, and the write path is a read-modify-write, so two items on one
+    key race. A write therefore describes exactly what it was given.
+    """
+    return _chunk_items(_as_int64_batch_info(batch_info), drop_axes, shape)
+
+
+def chunk_info_for_read(
+    batch_info: BatchInfo,
+    drop_axes: tuple[int, ...],
+    shape: tuple[int, ...],
+    inner_chunk_shape: tuple[int, ...] | None,
+) -> RustChunkInfo:
+    """Describe a read batch to Rust, grouped by decode unit where the selection allows.
+
+    Tried in order: one item per inner chunk for the whole batch, which is the cheapest
+    shape and the only one the concurrent read path can take; then one box per run of
+    consecutive indices; then one item per entry, as a write does.
+    """
+    # A generator would be consumed by the eligibility test, and the ordinary route needs
+    # to read the same entries again if that test fails.
+    entries = list(_as_int64_batch_info(batch_info))
+
+    # All or nothing. Eligibility turns almost entirely on per-array facts -- one 1-D axis,
+    # no dropped axes, a known inner chunk shape -- so the entries of a batch come out
+    # uniform in practice. Rather than carry a path for mixing grouped and ungrouped items,
+    # which nothing has been able to produce, one ineligible entry sends the whole batch on:
+    # slower for that read, and one less untested branch.
+    unit_args = [
+        _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
+        for entry in entries
+    ]
+    if unit_args and all(args is not None for args in unit_args):
+        # The whole batch crosses as one object; no ChunkItem is made in Python.
+        handle = ChunkItems()
+        for args in unit_args:
+            handle.push_entry(*args)
+        return RustChunkInfo(handle, write_empty_chunks=True)
+
+    return _chunk_items(
+        [
+            (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
+            for (
+                byte_getter,
+                chunk_spec,
+                chunk_selection,
+                out_selection,
+                is_complete,
+            ) in entries
+            for box_chunk_sel, box_out_sel in split_selection_runs(
+                chunk_selection, out_selection
+            )
+        ],
+        drop_axes,
+        shape,
+    )
+
+
+def _chunk_items(
+    batch_info: BatchInfo,
+    drop_axes: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> RustChunkInfo:
+    """One ChunkItem per batch entry, the description both paths end at."""
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True
