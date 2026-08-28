@@ -138,8 +138,8 @@ impl CodecPipelineImpl {
                 });
             };
 
-            let mut readers = initial_permits(want_readers, read_ceiling);
-            let mut decoders = initial_permits(want_decoders, decode_ceiling);
+            let mut readers = initial_permits(Kind::Read, want_readers, read_ceiling);
+            let mut decoders = initial_permits(Kind::Decode, want_decoders, decode_ceiling);
             let (mut live_readers, mut live_decoders) = (readers.len(), decoders.len());
             for permit in readers.drain(..) {
                 spawn_reader(permit);
@@ -167,30 +167,43 @@ impl CodecPipelineImpl {
             // so no worker has to spawn a sibling and no per-call counter has to be shared.
             // It polls rather than waiting on a release signal: a Condvar notified from
             // `Permit::drop` would be exact, and is the upgrade if this sleep ever shows up
-            // in a profile. It cannot spin forever -- the queues drain either way.
+            // in a profile.
+            //
             // Outstanding work in EITHER queue keeps this alive, not just the job queue:
             // reads can drain while decode is still the bottleneck, and decoders that started
             // narrow would then have no way to widen.
+            //
+            // GIVING UP IS PART OF THE DESIGN. The counts here are of workers SPAWNED, so
+            // this loop cannot tell "every permit is busy" from "every worker died and the
+            // queue will never drain again" -- a panicking decode leaves items in `dec_rx`
+            // forever. Unbounded, that second case spins here with the GIL released: a hang
+            // with no traceback and no interrupt. Bounded, the call simply proceeds at the
+            // width it already has, and the scope's join re-raises the panic.
+            let mut idle = 0;
             while (live_readers < want_readers || live_decoders < want_decoders)
                 && (!job_rx.is_empty() || !dec_rx.is_empty())
+                && idle < WIDEN_ATTEMPTS
             {
                 let mut took = false;
                 if live_readers < want_readers && !job_rx.is_empty() {
-                    if let Some(permit) = Permit::take(read_ceiling) {
+                    if let Some(permit) = Permit::take(Kind::Read, read_ceiling) {
                         spawn_reader(permit);
                         live_readers += 1;
                         took = true;
                     }
                 }
                 if live_decoders < want_decoders && !dec_rx.is_empty() {
-                    if let Some(permit) = Permit::take(decode_ceiling) {
+                    if let Some(permit) = Permit::take(Kind::Decode, decode_ceiling) {
                         spawn_decoder(permit);
                         live_decoders += 1;
                         took = true;
                     }
                 }
-                if !took {
-                    std::thread::sleep(Duration::from_micros(200));
+                if took {
+                    idle = 0;
+                } else {
+                    idle += 1;
+                    std::thread::sleep(WIDEN_POLL);
                 }
             }
 
@@ -434,12 +447,35 @@ fn output_offset(item: &ChunkItem) -> usize {
     usize::try_from(item.subset.start().first().copied().unwrap_or(0)).unwrap_or(usize::MAX)
 }
 
-/// Live workers across every in-flight call.
+/// Live workers across every in-flight call, counted separately for the two kinds.
+///
+/// Separately because the two are bounded by different ceilings, and one counter for both
+/// means a wide decode width spends the readers' budget: at `read_concurrency = 4` and
+/// `decode_concurrency = 32` the first call's decoders alone fill the readers' ceiling, and
+/// every later call falls to the floor of one reader for its whole life -- exactly the
+/// starvation [`ActiveCall`] exists to prevent, reintroduced through a shared counter.
 ///
 /// A call takes what is free rather than waiting for a full set: three permits available
 /// means three threads and get on with it. The floor of one is what stops a call that finds
 /// none from waiting forever.
-static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static LIVE_READERS: AtomicUsize = AtomicUsize::new(0);
+static LIVE_DECODERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Which budget a worker is drawn from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Read,
+    Decode,
+}
+
+impl Kind {
+    fn live(self) -> &'static AtomicUsize {
+        match self {
+            Self::Read => &LIVE_READERS,
+            Self::Decode => &LIVE_DECODERS,
+        }
+    }
+}
 
 /// How many per-call widths of workers may exist at once, across every in-flight call.
 ///
@@ -453,6 +489,13 @@ static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// storage round trip costs a stack and a scheduler entry, not a core. Measured on a 16-core
 /// allocation over a sharded store, 8x was the best of 1x / 8x / 32x, and 32x bought nothing.
 const CEILING_PER_CALL_WIDTHS: usize = 8;
+
+/// How long to wait between attempts to widen a call, and how many attempts in a row may
+/// fail before it stops trying. Together they bound the widening loop at ~13 ms of polling,
+/// which is short against a call that is worth widening and finite against one that will
+/// never make progress.
+const WIDEN_POLL: Duration = Duration::from_micros(200);
+const WIDEN_ATTEMPTS: usize = 64;
 
 /// The ceiling in workers, for a call of the given width.
 fn worker_ceiling(per_call: usize) -> usize {
@@ -499,23 +542,20 @@ impl Drop for ActiveCall {
 /// so a call held every thread it was given until it finished, long after the ones that had
 /// drained were idle. Per-worker release is what makes those threads available to the calls
 /// still working.
-struct Permit;
+struct Permit(Kind);
 
 impl Permit {
     /// `None` when the ceiling is full, so the caller decides whether to insist or wait.
-    fn take(ceiling: usize) -> Option<Self> {
-        let mut live = LIVE_WORKERS.load(Ordering::Relaxed);
+    fn take(kind: Kind, ceiling: usize) -> Option<Self> {
+        let counter = kind.live();
+        let mut live = counter.load(Ordering::Relaxed);
         loop {
             if live >= ceiling {
                 return None;
             }
-            match LIVE_WORKERS.compare_exchange_weak(
-                live,
-                live + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(Self),
+            match counter.compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(Self(kind)),
                 Err(actual) => live = actual,
             }
         }
@@ -523,15 +563,15 @@ impl Permit {
 
     /// The floor of one, taken over the ceiling. Without it a call that finds nothing free
     /// waits for a call that is itself waiting, and ten of them deadlock on each other.
-    fn insist() -> Self {
-        LIVE_WORKERS.fetch_add(1, Ordering::AcqRel);
-        Self
+    fn insist(kind: Kind) -> Self {
+        kind.live().fetch_add(1, Ordering::AcqRel);
+        Self(kind)
     }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        LIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        self.0.live().fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -541,17 +581,17 @@ impl Drop for Permit {
 /// rather than grabbed because a call that arrives second should not find the ceiling already
 /// spent. It grows from here -- see the widening loop in `retrieve_chunk_units` -- so a share that
 /// is small because ten calls were in flight is a starting point, not a sentence.
-fn initial_permits(want: usize, ceiling: usize) -> Vec<Permit> {
+fn initial_permits(kind: Kind, want: usize, ceiling: usize) -> Vec<Permit> {
     let target = want.min(ActiveCall::share(ceiling));
     let mut held = Vec::with_capacity(target);
     while held.len() < target {
-        match Permit::take(ceiling) {
+        match Permit::take(kind, ceiling) {
             Some(permit) => held.push(permit),
             None => break,
         }
     }
     if held.is_empty() {
-        held.push(Permit::insist());
+        held.push(Permit::insist(kind));
     }
     held
 }
@@ -585,8 +625,19 @@ fn read_loop<'a>(
         match job.ctx.store.get_partial(&job.key, job.range) {
             // The bytes are MOVED to a decoder, not copied.
             Ok(bytes) => {
-                if decodes.send((job, bytes)).is_err() {
-                    return; // no decoders left
+                if let Err(returned) = decodes.send((job, bytes)) {
+                    // Every decoder is gone. Today that only happens when they panicked, and
+                    // the scope re-raises that -- but returning in silence would leave this
+                    // job's bytes of the output buffer at whatever `np.empty` left, and the
+                    // call would report success. Say so instead of trusting the panic.
+                    // The channel hands the job back rather than dropping it, so the key
+                    // is still available to name in the error.
+                    let (job, _) = returned.into_inner();
+                    record(
+                        failure,
+                        format!("{}: no decoder left to take the chunk", job.key),
+                    );
+                    return;
                 }
             }
             Err(e) => record(failure, format!("read {} failed: {e}", job.key)),
@@ -648,17 +699,18 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
 mod tests {
     use super::*;
 
-    /// One test rather than several: `LIVE_WORKERS` and `ACTIVE_CALLS` are process-wide, and
-    /// separate `#[test]` functions run concurrently in one process, so they would race.
+    /// One test rather than several: `LIVE_READERS`, `LIVE_DECODERS` and `ACTIVE_CALLS` are
+    /// process-wide, and separate `#[test]` functions run concurrently in one process, so
+    /// they would race each other.
     #[test]
     fn a_call_takes_a_share_and_releases_per_worker() {
         let ceiling = 16;
         let first = ActiveCall::enter();
 
         // Alone, a call may have the whole ceiling -- capped by the work it has.
-        assert_eq!(initial_permits(4, ceiling).len(), 4);
+        assert_eq!(initial_permits(Kind::Read, 4, ceiling).len(), 4);
         assert_eq!(
-            LIVE_WORKERS.load(Ordering::Relaxed),
+            LIVE_READERS.load(Ordering::Relaxed),
             0,
             "a permit is released when its worker drops it, not when the call ends"
         );
@@ -671,16 +723,29 @@ mod tests {
 
         // With every permit held, a call still gets a worker: the floor of one is what stops
         // calls from waiting on each other.
-        let held = initial_permits(ceiling, ceiling);
+        let held = initial_permits(Kind::Read, ceiling, ceiling);
         assert_eq!(held.len(), ceiling);
-        let starved = initial_permits(4, ceiling);
+        let starved = initial_permits(Kind::Read, 4, ceiling);
         assert_eq!(starved.len(), 1);
-        assert_eq!(LIVE_WORKERS.load(Ordering::Relaxed), ceiling + 1);
+        assert_eq!(LIVE_READERS.load(Ordering::Relaxed), ceiling + 1);
+
+        // THE TWO BUDGETS ARE SEPARATE. One counter for both meant a wide decode width spent
+        // the readers' ceiling, and every later call fell to the floor of one reader for its
+        // whole life. Readers are exhausted here; decoders must not notice.
+        assert_eq!(LIVE_DECODERS.load(Ordering::Relaxed), 0);
+        let decoders = initial_permits(Kind::Decode, 4, ceiling);
+        assert_eq!(
+            decoders.len(),
+            4,
+            "decoders were charged the readers' ceiling"
+        );
 
         drop(held);
         drop(starved);
+        drop(decoders);
         drop(first);
-        assert_eq!(LIVE_WORKERS.load(Ordering::Relaxed), 0);
+        assert_eq!(LIVE_READERS.load(Ordering::Relaxed), 0);
+        assert_eq!(LIVE_DECODERS.load(Ordering::Relaxed), 0);
         assert_eq!(ACTIVE_CALLS.load(Ordering::Relaxed), 0);
     }
 }
