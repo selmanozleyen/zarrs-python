@@ -1,7 +1,10 @@
 use std::fmt::Display;
+use std::sync::Arc;
 
 use pyo3::{PyErr, PyResult, PyTypeInfo};
+use zarrs::array::BytesPartialDecoderTraits;
 use zarrs::array::CodecError;
+use zarrs::storage::{ReadableWritableListableStorage, StorageHandle, StoreKey};
 
 use crate::ChunkItem;
 
@@ -40,4 +43,40 @@ impl<T> PyCodecErrExt<T> for Result<T, CodecError> {
 pub fn is_whole_chunk(item: &ChunkItem) -> bool {
     item.chunk_subset.start().iter().all(|&o| o == 0)
         && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
+}
+
+/// Copy `coords.len()` elements out of `scratch` into `out`, in coordinate order.
+///
+/// `out` must be exactly `coords.len() * size` bytes.
+pub(crate) fn gather(
+    scratch: &[u8],
+    coords: &[u64],
+    out: &mut [u8],
+    size: usize,
+) -> Result<(), String> {
+    if out.len() != coords.len() * size {
+        return Err("output region does not match the coordinate count".to_string());
+    }
+    for (n, &c) in coords.iter().enumerate() {
+        let src = usize::try_from(c).map_err(|e| e.to_string())? * size;
+        let Some(element) = scratch.get(src..src + size) else {
+            return Err(format!(
+                "coordinate {c} is outside the {} elements decoded",
+                scratch.len() / size
+            ));
+        };
+        out[n * size..(n + 1) * size].copy_from_slice(element);
+    }
+    Ok(())
+}
+
+/// A partial decoder that reads one store key.
+///
+/// The `(storage, key)` tuple is zarrs 0.24's store-backed `BytesPartialDecoderTraits`
+/// implementation.
+pub(crate) fn key_partial_decoder(
+    store: &ReadableWritableListableStorage,
+    key: &StoreKey,
+) -> Arc<dyn BytesPartialDecoderTraits> {
+    Arc::new((StorageHandle::new(store.clone()), key.clone()))
 }

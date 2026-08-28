@@ -9,6 +9,8 @@ import pytest
 from zarr import config
 from zarr.storage import FsspecStore, LocalStore, MemoryStore, ZipStore
 
+from zarrs._internal import CodecPipelineImpl
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
@@ -23,6 +25,24 @@ class ArrayRequest:
     shape: tuple[int, ...]
     dtype: str
     order: MemoryOrder
+
+
+@pytest.fixture
+def entries(monkeypatch) -> dict[str, int]:
+    """Counts of batches served by each Rust entry point: "handle" and "list"."""
+    counts = {"handle": 0, "list": 0}
+    for name, key in (
+        ("retrieve_chunk_items_and_apply_index", "handle"),
+        ("retrieve_chunks_and_apply_index", "list"),
+    ):
+        original = getattr(CodecPipelineImpl, name)
+
+        def wrapper(self, *args, _original=original, _key=key, **kwargs):
+            counts[_key] += 1
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(CodecPipelineImpl, name, wrapper)
+    return counts
 
 
 @pytest.fixture(autouse=True)

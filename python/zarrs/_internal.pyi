@@ -4,6 +4,7 @@
 import builtins
 import typing
 
+import numpy
 import numpy.typing
 import zarr.abc.store
 
@@ -16,7 +17,39 @@ class ChunkItem:
         chunk_shape: typing.Sequence[builtins.int],
         subset: typing.Sequence[slice],
         shape: typing.Sequence[builtins.int],
-    ) -> ChunkItem: ...
+    ) -> ChunkItem:
+        r"""
+        Python cannot build a coords item: its `subset` and `chunk_subset` hold different
+        counts, which the check below rejects. `build_chunk_unit_items` builds those.
+        """
+
+@typing.final
+class ChunkItems:
+    r"""
+    A batch of chunk items, built and held in Rust.
+
+    Push one entry at a time, then pass the handle to
+    `retrieve_chunk_items_and_apply_index`.
+    """
+    def __new__(cls) -> ChunkItems: ...
+    def __len__(self) -> builtins.int: ...
+    def push_entry(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Build one batch entry's items and append them.
+
+        `indices` must be non-negative and non-decreasing, and `out_start` is where this
+        entry's elements begin in the output. Entries must be pushed in increasing `out_start`;
+        one that would reuse output another entry already owns is refused. The caller checks
+        the rest of eligibility.
+        """
 
 @typing.final
 class CodecPipelineImpl:
@@ -33,6 +66,12 @@ class CodecPipelineImpl:
         file_handle_cache_size: builtins.int = 0,
         store_is_read_only: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
+    def retrieve_chunk_items_and_apply_index(
+        self, chunk_items: ChunkItems, value: numpy.typing.NDArray[typing.Any]
+    ) -> None:
+        r"""
+        As `retrieve_chunks_and_apply_index`, taking the items as a handle.
+        """
     def retrieve_chunks_and_apply_index(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
