@@ -235,7 +235,19 @@ impl CodecPipelineImpl {
     /// the caller may do with it. One `&mut [u8]` that `split_at_mut` then divides is
     /// checked by the compiler, where `UnsafeCellSlice` hands out aliasing views whose
     /// disjointness is only asserted.
-    fn nparray_to_mut_slice<'a>(
+    ///
+    /// # Safety
+    ///
+    /// Produces a `&mut` from a `&`, so the caller must be the array's only writer for the
+    /// lifetime of the slice: no second call to this or to `nparray_to_unsafe_cell_slice`
+    /// on the same array, and no Python code running that could write to it. Holding the
+    /// GIL for the duration is what makes the second part true.
+    // A `&mut` from a `&` is exactly what this does, and the lint is right that it cannot be
+    // checked. The numpy buffer is owned by Python and reached through a shared handle, so
+    // there is no `&mut Bound` to take; the contract above is what makes it sound, and the
+    // one call site holds the GIL and takes no other view.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn nparray_to_mut_slice<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
     ) -> Result<&'a mut [u8], PyErr> {
         let (array_data, array_len) = Self::nparray_bytes(value)?;
@@ -272,7 +284,9 @@ impl CodecPipelineImpl {
             !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.coords.is_some()),
             self.shard.as_ref(),
         ) {
-            let output = Self::nparray_to_mut_slice(value)?;
+            // SAFETY: this is the only view taken of `value` in this call, and the GIL is
+            // still held here -- `py.detach` is entered below, after the slice exists.
+            let output = unsafe { Self::nparray_to_mut_slice(value)? };
             let declined = py.detach(|| {
                 let Some((_, codec_options)) =
                     chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
