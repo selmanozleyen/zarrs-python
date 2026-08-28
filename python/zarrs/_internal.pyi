@@ -17,7 +17,6 @@ class ChunkItem:
         chunk_shape: typing.Sequence[builtins.int],
         subset: typing.Sequence[slice],
         shape: typing.Sequence[builtins.int],
-        coords: typing.Sequence[builtins.int] | None = None,
     ) -> ChunkItem: ...
 
 @typing.final
@@ -84,11 +83,6 @@ class CodecPipelineImpl:
         of the builder and one extraction per item on the way in here. A handle costs one
         of each per call, whatever the selection.
         """
-    def retrieve_chunks_and_apply_index_fused(
-        self,
-        chunk_descriptions: typing.Sequence[ChunkItem],
-        value: numpy.typing.NDArray[typing.Any],
-    ) -> None: ...
     def store_chunks_with_indices(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],

@@ -117,6 +117,52 @@ def test_a_plain_slice_is_untouched(
     assert entries["handle"] == 0
 
 
+@pytest.mark.parametrize(
+    ("written", "name"),
+    [
+        # A shard written in part: some inner chunks of it exist, others never do.
+        (slice(0, CHUNK), "partial shard"),
+        # Whole shards written, whole shards missing.
+        (slice(0, SHARD), "whole shard"),
+    ],
+)
+def test_unwritten_chunks_read_as_fill(
+    tmp_path: Path, entries: dict[str, int], written: slice, name: str
+) -> None:
+    """Chunks that were never written must read back as the fill value.
+
+    Every other test here writes the array in full, so the branch that produces fill for a
+    missing inner chunk -- no read, no decode, no worker -- is never taken. A partially
+    written sharded array is not an edge case for this path, it is the shape a sparse dataset
+    has, and the selection below deliberately spans both sides of the boundary."""
+    values = np.arange(N, dtype=np.float32)
+    path = tmp_path / f"sparse-{name.replace(' ', '-')}"
+    z = zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape, chunks=(CHUNK,), shards=(SHARD,),
+        fill_value=np.float32(-7),
+    )
+    z[written] = values[written]
+
+    expected = np.full(N, -7, dtype=np.float32)
+    expected[written] = values[written]
+
+    # Straddles the boundary: elements from written chunks, from unwritten ones, and from
+    # the chunk containing the boundary itself.
+    rows = np.sort(
+        np.concatenate(
+            [
+                np.arange(written.stop - 200, written.stop + 200),
+                np.arange(N - 300, N - 100),
+            ]
+        )
+    )
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows]
+
+    np.testing.assert_array_equal(got, expected[rows])
+    assert entries["handle"] > 0, "this selection should have taken the chunk-unit path"
+
+
 def test_two_dimensional_selection_falls_back(tmp_path: Path, entries: dict[str, int]) -> None:
     """The grouping is the 1-D path. A 2-D array must decline rather than mis-group.
 

@@ -46,8 +46,15 @@ pub(crate) struct ChunkItem {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ChunkItem {
+    /// Coordinates are deliberately NOT a parameter here.
+    ///
+    /// An item that carries them is one whole inner chunk plus the elements wanted from it,
+    /// and its `subset` and `chunk_subset` are then meant to hold different counts -- so
+    /// accepting coordinates here would mean accepting the pair unchecked, from Python, for
+    /// a shape only `build_chunk_unit_items` knows how to construct consistently. It builds
+    /// the struct directly instead, and this constructor keeps the check unconditional.
     #[new]
-    #[pyo3(signature = (key, chunk_subset, chunk_shape, subset, shape, coords=None))]
+    #[pyo3(signature = (key, chunk_subset, chunk_shape, subset, shape))]
     #[allow(clippy::needless_pass_by_value)]
     fn new(
         key: String,
@@ -55,7 +62,6 @@ impl ChunkItem {
         chunk_shape: Vec<u64>,
         subset: Vec<Bound<'_, PySlice>>,
         shape: Vec<u64>,
-        coords: Option<Vec<u64>>,
     ) -> PyResult<Self> {
         let num_elements = chunk_shape.iter().product();
         let shape_nonzero_u64 = to_nonzero_u64_vec(shape)?;
@@ -64,12 +70,7 @@ impl ChunkItem {
         let subset = selection_to_array_subset(&subset, &shape_nonzero_u64)?;
         // Check that subset and chunk_subset have the same number of elements.
         // This permits broadcasting of a constant input.
-        // With coordinates the chunk subset is a whole inner chunk and the output holds
-        // only the elements wanted from it, so the two counts are not meant to agree.
-        if coords.is_none()
-            && subset.num_elements() != chunk_subset.num_elements()
-            && subset.num_elements() > 1
-        {
+        if subset.num_elements() != chunk_subset.num_elements() && subset.num_elements() > 1 {
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "the size of the chunk subset {chunk_subset} and input/output subset {subset} are incompatible",
             )));
@@ -82,7 +83,7 @@ impl ChunkItem {
             shape: chunk_shape_nonzero_u64,
             num_elements,
             array_shape: shape_nonzero_u64,
-            coords: coords.map(Arc::from),
+            coords: None,
         })
     }
 }
@@ -189,6 +190,19 @@ pub(crate) fn build_chunk_unit_items(
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "index {} is past the chunk extent {extent}",
                 at(a)?
+            )));
+        }
+        // `lo >= extent` catches a chunk that STARTS past the end. It does not catch an index
+        // inside the last chunk that is past the array's own extent, where `lo + inner`
+        // overruns -- and there the two read paths would disagree: this one sizes its scratch
+        // to the whole inner chunk and would gather fill bytes, while the fused path decodes
+        // only `lo..hi` and errors. zarr clamps long before either sees it; the point is that
+        // if it ever stops, both paths say the same thing. Indices are non-decreasing, so the
+        // last of the group is the largest.
+        if at(b - 1)? >= extent {
+            return Err(PyErr::new::<PyIndexError, _>(format!(
+                "index {} is past the array extent {extent}",
+                at(b - 1)?
             )));
         }
         let out_lo = out_start + a as u64;
