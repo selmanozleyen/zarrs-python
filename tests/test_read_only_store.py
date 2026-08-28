@@ -23,7 +23,9 @@ if TYPE_CHECKING:
 def array(tmp_path: Path) -> tuple[Path, np.ndarray]:
     values = np.arange(64, dtype=np.float32)
     path = tmp_path / "a"
-    zarr.create_array(path, dtype=values.dtype, shape=values.shape, chunks=(16,))[:] = values
+    zarr.create_array(path, dtype=values.dtype, shape=values.shape, chunks=(16,))[:] = (
+        values
+    )
     return path, values
 
 
