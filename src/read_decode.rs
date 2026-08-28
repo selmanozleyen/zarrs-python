@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use pyo3::PyResult;
 use pyo3::exceptions::PyRuntimeError;
 use unsafe_cell_slice::UnsafeCellSlice;
@@ -120,18 +120,16 @@ impl CodecPipelineImpl {
 
         std::thread::scope(|scope| {
             let (job_tx, job_rx) = unbounded::<Job<'_>>();
-            // BOUNDED, unlike the job queue: every message here carries a chunk's compressed
-            // bytes, so an unbounded one lets a fast store hold the whole batch resident at
-            // once -- which is the local-NVMe case this module's widths exist for, decode
-            // being the bottleneck. A few chunks per decoder is enough to keep them fed.
+            // Unbounded, and the bound that matters is elsewhere: nothing can ever be sent
+            // here but this call's own jobs, so the queue cannot exceed `jobs.len()` -- which
+            // is how many chunks the caller asked for in one batch. Peak resident is that
+            // many compressed chunks, and it is the caller's batch size that sets it.
             //
-            // Safe to block on only because the widening loop below gives up: if every
-            // decoder dies, readers wait on a full queue until this thread drops `dec_rx`,
-            // which disconnects it and turns the wait into the error above. An unbounded
-            // widening loop would leave them waiting forever.
-            let (dec_tx, dec_rx) = bounded::<(Job<'_>, MaybeBytes)>(
-                (DECODE_QUEUE_PER_DECODER * want_decoders).max(32),
-            );
+            // A tighter bound was tried, at eight chunks per decoder, to stop a fast store
+            // running far ahead of a slow decode. It cost 12% on the scattered read: readers
+            // running ahead IS the prefetch on high-latency storage, and blocking them to
+            // save memory the caller had already agreed to spend is the wrong trade.
+            let (dec_tx, dec_rx) = unbounded::<(Job<'_>, MaybeBytes)>();
             let spawn_reader = |permit: Permit| {
                 let (jobs, decodes, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
                 scope.spawn(move || {
@@ -550,11 +548,6 @@ const CEILING_PER_CALL_WIDTHS: usize = 8;
 /// a queue that will never drain again.
 const WIDEN_POLL: Duration = Duration::from_micros(200);
 
-/// How many chunks may sit read-but-not-decoded, per decoder. The queue has to be bounded --
-/// each message holds a chunk's compressed bytes, and unbounded a fast store puts the whole
-/// batch in memory at once -- but the bound is a memory cap, not a throttle, so it sits well
-/// above anything a working decoder falls behind by.
-const DECODE_QUEUE_PER_DECODER: usize = 8;
 const WIDEN_ATTEMPTS: usize = 64;
 
 /// The ceiling in workers, for a call of the given width.
