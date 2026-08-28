@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from zarr.core.indexing import is_integer
 
-from zarrs._internal import ChunkItem
+from zarrs._internal import ChunkItem, ChunkItems
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -253,8 +253,51 @@ def get_implicit_fill_value(dtype: ZDType, fill_value: Any) -> Any:
 
 @dataclass(frozen=True)
 class RustChunkInfo:
-    chunk_info_with_indices: list[ChunkItem]
+    # A ChunkItems handle when the batch is entirely chunk-unit; a list otherwise. The
+    # pipeline dispatches on which, because the two take different Rust entry points.
+    chunk_info_with_indices: list[ChunkItem] | ChunkItems
     write_empty_chunks: bool
+
+
+def _chunk_unit_args(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> tuple | None:
+    """Arguments for one item per inner chunk, or None if this entry is not that shape.
+
+    Each group becomes a whole-inner-chunk subset plus the indices wanted from it, so the
+    chunk is read once and decoded once however many of its elements are asked for.
+    `chunk_spec.shape` is the SHARD, so the inner chunk shape has to be passed in.
+
+    Narrow on purpose: one 1-D integer axis, non-negative and NON-DECREASING, against a
+    contiguous output slice -- sorted is what makes each chunk's elements one run of the
+    output. The checks stay in Python because they are vectorised numpy and cost nothing;
+    Rust does the grouping, taking `indices` as a view.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if drop_axes or inner_shape is None or len(inner_shape) != 1:
+        return None
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
+    if len(chunk_sel) != 1 or len(out_sel) != 1 or len(chunk_spec.shape) != 1:
+        return None
+    (indices,) = chunk_sel
+    (out_axis_sel,) = out_sel
+    if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
+        return None
+    indices = indices.astype(np.int64, copy=False)
+    if (indices < 0).any():
+        return None
+    start = out_axis_sel.start or 0
+    if not _output_run_matches(indices, out_axis_sel):
+        return None
+
+    return (
+        byte_getter.path,
+        chunk_spec.shape,
+        shape,
+        indices,
+        start,
+        int(inner_shape[0]),
+    )
 
 
 def chunk_info_for_write(
@@ -275,13 +318,34 @@ def chunk_info_for_read(
     batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
+    inner_chunk_shape: tuple[int, ...] | None,
 ) -> RustChunkInfo:
-    """Describe a read batch to Rust, one box per RUN of consecutive indices.
+    """Describe a read batch to Rust, grouped by decode unit where the selection allows.
 
-    A sorted integer selection is mostly runs, and a run is a slice. Handing each run over
-    as a slice is what lets the read reach zarrs at all: a fancy index that is not
-    contiguous is otherwise declined, and the whole read falls back to zarr-python.
+    Tried in order: one item per inner chunk for the whole batch, which is the cheapest
+    shape and the only one the concurrent read path can take; then one box per run of
+    consecutive indices; then one item per entry, as a write does.
     """
+    # A generator would be consumed by the eligibility test, and the ordinary route needs
+    # to read the same entries again if that test fails.
+    entries = list(_as_int64_batch_info(batch_info))
+
+    # All or nothing. Eligibility turns almost entirely on per-array facts -- one 1-D axis,
+    # no dropped axes, a known inner chunk shape -- so the entries of a batch come out
+    # uniform in practice. Rather than carry a path for mixing grouped and ungrouped items,
+    # which nothing has been able to produce, one ineligible entry sends the whole batch on:
+    # slower for that read, and one less untested branch.
+    unit_args = [
+        _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
+        for entry in entries
+    ]
+    if unit_args and all(args is not None for args in unit_args):
+        # The whole batch crosses as one object; no ChunkItem is made in Python.
+        handle = ChunkItems()
+        for args in unit_args:
+            handle.push_entry(*args)
+        return RustChunkInfo(handle, write_empty_chunks=True)
+
     return _chunk_items(
         [
             (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
@@ -291,7 +355,7 @@ def chunk_info_for_read(
                 chunk_selection,
                 out_selection,
                 is_complete,
-            ) in _as_int64_batch_info(batch_info)
+            ) in entries
             for box_chunk_sel, box_out_sel in split_selection_runs(
                 chunk_selection, out_selection
             )

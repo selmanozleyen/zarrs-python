@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, TypedDict
 from warnings import warn
 
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
 
-from ._internal import CodecPipelineImpl
+from ._internal import ChunkItems, CodecPipelineImpl
 from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
@@ -40,6 +41,21 @@ class UnsupportedDataTypeError(Exception):
 
 class UnsupportedMetadataError(Exception):
     pass
+
+
+#: What sends a batch to zarr-python's pipeline instead of this one.
+#:
+#: Every one of these means "zarrs cannot describe this", not "the read failed": an
+#: unsupported dtype, a selection with no rectangular description, metadata zarrs will not
+#: take. `read` and `write` must agree on the set exactly -- a member listed in one and not
+#: the other would make a selection fall back on read and raise on write.
+FALLBACK_TO_ZARR_PYTHON = (
+    UnsupportedMetadataError,
+    DiscontiguousArrayError,
+    UnsupportedVIndexingError,
+    UnsupportedDataTypeError,
+    FillValueNoneError,
+)
 
 
 def get_codec_pipeline_impl(
@@ -138,6 +154,29 @@ class ZarrsCodecPipeline(CodecPipeline):
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
 
+    @cached_property
+    def _inner_chunk_shape(self) -> tuple[int, ...] | None:
+        """The shape of the INNERMOST unit the codec chain decodes, or None if not sharded.
+
+        Cached; it is fixed for the array. Descends through nested sharding: the first
+        `chunk_shape` found would be a SUBSHARD, and grouping by that would decode many
+        innermost chunks to keep the elements of one. Rust descends the same way, so the two
+        must agree about which level is innermost.
+        """
+        codecs = getattr(self.metadata, "codecs", ()) or ()
+        shape = None
+        while True:
+            nested = None
+            for codec in codecs:
+                chunk_shape = getattr(codec, "chunk_shape", None)
+                if chunk_shape is not None:
+                    shape = tuple(int(s) for s in chunk_shape)
+                    nested = getattr(codec, "codecs", ()) or ()
+                    break
+            if nested is None:
+                return shape
+            codecs = nested
+
     @property
     def supports_partial_decode(self) -> bool:
         return False
@@ -184,25 +223,25 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = chunk_info_for_read(batch_info, drop_axes, out.shape)
-        except (
-            UnsupportedMetadataError,
-            DiscontiguousArrayError,
-            UnsupportedVIndexingError,
-            UnsupportedDataTypeError,
-            FillValueNoneError,
-        ):
+            chunks_desc = chunk_info_for_read(
+                batch_info, drop_axes, out.shape, self._inner_chunk_shape
+            )
+        except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
             await self.python_impl.read(batch_info, out, drop_axes)
             return None
         else:
             out: NDArrayLike = out.as_ndarray_like()
-            await asyncio.to_thread(
-                self.impl.retrieve_chunks_and_apply_index,
-                chunks_desc.chunk_info_with_indices,
-                out,
+            desc = chunks_desc.chunk_info_with_indices
+            # A handle means the batch never became Python objects; it has its own entry
+            # point because the list one takes `Vec<ChunkItem>` and would extract per item.
+            retrieve = (
+                self.impl.retrieve_chunk_items_and_apply_index
+                if isinstance(desc, ChunkItems)
+                else self.impl.retrieve_chunks_and_apply_index
             )
+            await asyncio.to_thread(retrieve, desc, out)
             return None
 
     async def write(
@@ -218,13 +257,7 @@ class ZarrsCodecPipeline(CodecPipeline):
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
             chunks_desc = chunk_info_for_write(batch_info, drop_axes, value.shape)
-        except (
-            UnsupportedMetadataError,
-            DiscontiguousArrayError,
-            UnsupportedVIndexingError,
-            UnsupportedDataTypeError,
-            FillValueNoneError,
-        ):
+        except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
             await self.python_impl.write(batch_info, value, drop_axes)

@@ -4,6 +4,7 @@
 import builtins
 import typing
 
+import numpy
 import numpy.typing
 import zarr.abc.store
 
@@ -19,6 +20,38 @@ class ChunkItem:
     ) -> ChunkItem: ...
 
 @typing.final
+class ChunkItems:
+    r"""
+    A whole batch of chunk items, held on the Rust side.
+
+    Returning `Vec<ChunkItem>` to Python costs one pyclass object per item, which the read
+    entry point then extracts straight back into a `Vec` -- a round trip through Python for
+    a batch that both ends want as Rust values. A selection over a sharded array can reach
+    a thousand items per call, so that cost is proportional to the selection.
+
+    Behind this handle the items never become Python objects. The caller drives the
+    eligibility checks and calls `push_entry` once per batch ENTRY, then passes the handle
+    to `CodecPipelineImpl.retrieve_chunk_items_and_apply_index`.
+    """
+    def __new__(cls) -> ChunkItems: ...
+    def __len__(self) -> builtins.int: ...
+    def push_entry(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Build one batch entry's items and append them.
+
+        `indices` must be non-negative and non-decreasing, and `out_start` is where this
+        entry's elements begin in the output. The caller checks eligibility.
+        """
+
+@typing.final
 class CodecPipelineImpl:
     def __new__(
         cls,
@@ -31,12 +64,25 @@ class CodecPipelineImpl:
         num_threads: builtins.int | None = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
+        read_concurrency: builtins.int | None = None,
+        decode_concurrency: builtins.int | None = None,
+        store_is_read_only: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
     def retrieve_chunks_and_apply_index(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
         value: numpy.typing.NDArray[typing.Any],
     ) -> None: ...
+    def retrieve_chunk_items_and_apply_index(
+        self, chunk_items: ChunkItems, value: numpy.typing.NDArray[typing.Any]
+    ) -> None:
+        r"""
+        The same read as `retrieve_chunks_and_apply_index`, from a `ChunkItems` handle.
+
+        A `Vec<ChunkItem>` argument costs one pyclass allocation per item on the way out
+        of the builder and one extraction per item on the way in here. A handle costs one
+        of each per call, whatever the selection.
+        """
     def store_chunks_with_indices(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
