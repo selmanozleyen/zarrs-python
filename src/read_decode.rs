@@ -129,7 +129,9 @@ impl CodecPipelineImpl {
             // decoder dies, readers wait on a full queue until this thread drops `dec_rx`,
             // which disconnects it and turns the wait into the error above. An unbounded
             // widening loop would leave them waiting forever.
-            let (dec_tx, dec_rx) = bounded::<(Job<'_>, MaybeBytes)>((2 * want_decoders).max(4));
+            let (dec_tx, dec_rx) = bounded::<(Job<'_>, MaybeBytes)>(
+                (DECODE_QUEUE_PER_DECODER * want_decoders).max(32),
+            );
             let spawn_reader = |permit: Permit| {
                 let (jobs, decodes, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
                 scope.spawn(move || {
@@ -182,13 +184,21 @@ impl CodecPipelineImpl {
             // reads can drain while decode is still the bottleneck, and decoders that started
             // narrow would then have no way to widen.
             //
-            // GIVING UP IS PART OF THE DESIGN. The counts here are of workers SPAWNED, so
-            // this loop cannot tell "every permit is busy" from "every worker died and the
-            // queue will never drain again" -- a panicking decode leaves items in `dec_rx`
-            // forever. Unbounded, that second case spins here with the GIL released: a hang
-            // with no traceback and no interrupt. Bounded, the call simply proceeds at the
-            // width it already has, and the scope's join re-raises the panic.
+            // GIVING UP IS PART OF THE DESIGN, and what it watches for matters. The counts
+            // here are of workers SPAWNED, so this loop cannot tell "every permit is busy"
+            // from "every worker died and the queue will never drain again" -- a panicking
+            // decode leaves items in `dec_rx` forever, and unbounded that spins here with
+            // the GIL released: a hang with no traceback and no interrupt.
+            //
+            // So the thing to give up on is a lack of PROGRESS, not a lack of permits. A busy
+            // ceiling is the normal case when several calls are in flight, and a call that
+            // stopped widening for that reason would stay narrow for the rest of its life --
+            // the very pathology this loop exists to prevent, and which counting failed
+            // attempts alone reintroduced (measured: -34% on a scattered read, with the cores
+            // to match). While either queue is draining, someone is working and this keeps
+            // trying; only when nothing has moved AND no permit came free does it stop.
             let mut idle = 0;
+            let mut outstanding = job_rx.len() + dec_rx.len();
             while (live_readers < want_readers || live_decoders < want_decoders)
                 && (!job_rx.is_empty() || !dec_rx.is_empty())
                 && idle < WIDEN_ATTEMPTS
@@ -208,8 +218,10 @@ impl CodecPipelineImpl {
                         took = true;
                     }
                 }
-                if took {
+                let now = job_rx.len() + dec_rx.len();
+                if took || now != outstanding {
                     idle = 0;
+                    outstanding = now;
                 } else {
                     idle += 1;
                     std::thread::sleep(WIDEN_POLL);
@@ -532,11 +544,17 @@ impl Kind {
 /// allocation over a sharded store, 8x was the best of 1x / 8x / 32x, and 32x bought nothing.
 const CEILING_PER_CALL_WIDTHS: usize = 8;
 
-/// How long to wait between attempts to widen a call, and how many attempts in a row may
-/// fail before it stops trying. Together they bound the widening loop at ~13 ms of polling,
-/// which is short against a call that is worth widening and finite against one that will
-/// never make progress.
+/// How long to wait between attempts to widen a call, and how many attempts may pass with
+/// NOTHING MOVING before it stops trying. Together they bound the loop at ~13 ms of nothing
+/// happening -- long enough to wait out a busy ceiling, short enough not to wait forever on
+/// a queue that will never drain again.
 const WIDEN_POLL: Duration = Duration::from_micros(200);
+
+/// How many chunks may sit read-but-not-decoded, per decoder. The queue has to be bounded --
+/// each message holds a chunk's compressed bytes, and unbounded a fast store puts the whole
+/// batch in memory at once -- but the bound is a memory cap, not a throttle, so it sits well
+/// above anything a working decoder falls behind by.
+const DECODE_QUEUE_PER_DECODER: usize = 8;
 const WIDEN_ATTEMPTS: usize = 64;
 
 /// The ceiling in workers, for a call of the given width.
