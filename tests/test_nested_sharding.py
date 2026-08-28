@@ -24,7 +24,6 @@ import numpy as np
 import pytest
 import zarr
 
-from zarrs._internal import CodecPipelineImpl
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -35,25 +34,6 @@ SUB = 1_024
 INNER = 256
 
 ZARRS = {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}
-
-
-@pytest.fixture
-def entries(monkeypatch) -> dict[str, int]:
-    """How many batches took each Rust entry point, so "which path served this" is asserted
-    rather than assumed."""
-    counts = {"handle": 0, "list": 0}
-    for name, key in (
-        ("retrieve_chunk_items_and_apply_index", "handle"),
-        ("retrieve_chunks_and_apply_index", "list"),
-    ):
-        original = getattr(CodecPipelineImpl, name)
-
-        def wrapper(self, *args, _original=original, _key=key, **kwargs):
-            counts[_key] += 1
-            return _original(self, *args, **kwargs)
-
-        monkeypatch.setattr(CodecPipelineImpl, name, wrapper)
-    return counts
 
 
 @pytest.fixture

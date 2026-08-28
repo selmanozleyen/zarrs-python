@@ -37,9 +37,9 @@ pub(crate) struct ChunkItem {
     pub array_shape: Vec<NonZeroU64>,
     /// Indices within `chunk_subset`, when this item is a whole inner chunk plus the
     /// elements wanted from it. The chunk is decoded once and these are gathered out.
-    /// Shared rather than owned so a pool job can hold one without copying the coordinates
-    /// and without borrowing: an `Arc<[u64]>` is `Send`, so no raw pointer and no lifetime
-    /// argument spanning two functions. One allocation, same as the `Vec` it replaced.
+    /// Shared rather than owned so a job can hold one without copying the coordinates and
+    /// without borrowing: one allocation, same as the `Vec` it replaced, and every job of a
+    /// call that wants the same chunk points at the same coordinates.
     pub coords: Option<Arc<[u64]>>,
 }
 

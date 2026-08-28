@@ -22,7 +22,6 @@ import numpy as np
 import pytest
 import zarr
 
-from zarrs._internal import CodecPipelineImpl
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -55,24 +54,6 @@ def array(tmp_path: Path, compressors) -> tuple[Path, np.ndarray]:
     )
     z[:] = values
     return path, values
-
-
-@pytest.fixture
-def entries(monkeypatch) -> dict[str, int]:
-    """How many batches took each Rust entry point."""
-    counts = {"handle": 0, "list": 0}
-    for name, key in (
-        ("retrieve_chunk_items_and_apply_index", "handle"),
-        ("retrieve_chunks_and_apply_index", "list"),
-    ):
-        original = getattr(CodecPipelineImpl, name)
-
-        def wrapper(self, *args, _original=original, _key=key, **kwargs):
-            counts[_key] += 1
-            return _original(self, *args, **kwargs)
-
-        monkeypatch.setattr(CodecPipelineImpl, name, wrapper)
-    return counts
 
 
 def selections() -> dict[str, np.ndarray]:
@@ -136,8 +117,11 @@ def test_a_plain_slice_is_untouched(
     assert entries["handle"] == 0
 
 
-def test_two_dimensional_selection_falls_back(tmp_path: Path) -> None:
-    """The grouping is the 1-D path. A 2-D array must decline rather than mis-group."""
+def test_two_dimensional_selection_falls_back(tmp_path: Path, entries: dict[str, int]) -> None:
+    """The grouping is the 1-D path. A 2-D array must decline rather than mis-group.
+
+    Asserting the values alone would pass for a version that mis-grouped and happened to be
+    right, so the entry point is asserted too: none of these batches may take the handle."""
     values = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
     path = tmp_path / "two_d"
     z = zarr.create_array(
@@ -150,6 +134,7 @@ def test_two_dimensional_selection_falls_back(tmp_path: Path) -> None:
         got = zarr.open_array(path, mode="r")[rows, :]
 
     np.testing.assert_array_equal(got, values[rows, :])
+    assert entries["handle"] == 0, "a 2-D selection reached the chunk-unit path"
 
 
 # zarr warns that this layout disables partial reads. That IS the layout under test.

@@ -68,8 +68,8 @@ pub struct CodecPipelineImpl {
     /// array, since zarr builds one pipeline per array.
     ///
     /// A `ShardingPartialDecoder` holds one shard's decoded index, and reading that index
-    /// is a full-latency round trip on the CALLING thread before any job reaches the reader
-    /// pool. Keeping the decoder means a shard is paid for once per array rather than once
+    /// is a full-latency round trip on the CALLING thread before any job reaches a reader.
+    /// Keeping the decoder means a shard is paid for once per array rather than once
     /// per call. A shard that does not exist is remembered too -- its decoder answers every
     /// subchunk as absent, which is also not worth asking twice.
     ///
