@@ -300,6 +300,7 @@ def chunk_info_for_read(
         shape,
     )
 
+
 def _chunk_items(
     batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
