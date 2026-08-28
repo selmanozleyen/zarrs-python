@@ -1,6 +1,6 @@
 use pyo3::ffi::c_str;
 
-use numpy::PyUntypedArray;
+use numpy::{PyArrayDescrMethods as _, PyUntypedArray, PyUntypedArrayMethods as _};
 use pyo3::prelude::*;
 
 use crate::CodecPipelineImpl;
@@ -23,7 +23,10 @@ fn test_nparray_to_unsafe_cell_slice_empty() -> PyResult<()> {
         .call0()?
         .extract()?;
 
-        let slice = CodecPipelineImpl::nparray_to_unsafe_cell_slice(&arr)?;
+        // The size the array actually holds, so the new mismatch check passes rather than
+        // being the thing under test here.
+        let element_size = arr.dtype().itemsize();
+        let slice = CodecPipelineImpl::nparray_to_unsafe_cell_slice(&arr, element_size)?;
         assert!(slice.is_empty());
         Ok(())
     })

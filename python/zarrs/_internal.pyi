@@ -45,10 +45,13 @@ class ChunkItems:
         r"""
         Build one batch entry's items and append them.
 
-        `indices` must be non-negative and non-decreasing, and `out_start` is where this
-        entry's elements begin in the output. Entries must be pushed in increasing `out_start`;
-        one that would reuse output another entry already owns is refused. The caller checks
-        the rest of eligibility.
+        `indices` are checked here: non-negative, non-decreasing, and inside the chunk extent.
+        So is `out_start` -- entries must be pushed in increasing order, and one that would
+        reuse output another entry already owns is refused.
+
+        One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
+        since the output subset is bounded against it. A larger one describes bytes the buffer
+        does not have, and that produces wrong data rather than an error.
         """
 
 @typing.final
@@ -66,17 +69,31 @@ class CodecPipelineImpl:
         file_handle_cache_size: builtins.int = 0,
         store_is_read_only: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
-    def retrieve_chunk_items_and_apply_index(
-        self, chunk_items: ChunkItems, value: numpy.typing.NDArray[typing.Any]
-    ) -> None:
-        r"""
-        As `retrieve_chunks_and_apply_index`, taking the items as a handle.
-        """
     def retrieve_chunks_and_apply_index(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
         value: numpy.typing.NDArray[typing.Any],
+        read_concurrency: builtins.int | None = None,
+        decode_concurrency: builtins.int | None = None,
+        read_worker_ceiling: builtins.int | None = None,
+        decode_worker_ceiling: builtins.int | None = None,
     ) -> None: ...
+    def retrieve_chunk_items_and_apply_index(
+        self,
+        chunk_items: ChunkItems,
+        value: numpy.typing.NDArray[typing.Any],
+        read_concurrency: builtins.int | None = None,
+        decode_concurrency: builtins.int | None = None,
+        read_worker_ceiling: builtins.int | None = None,
+        decode_worker_ceiling: builtins.int | None = None,
+    ) -> None:
+        r"""
+        The same read as `retrieve_chunks_and_apply_index`, from a `ChunkItems` handle.
+
+        A `Vec<ChunkItem>` argument costs one pyclass allocation per item on the way out
+        of the builder and one extraction per item on the way in here. A handle costs one
+        of each per call, whatever the selection.
+        """
     def store_chunks_with_indices(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],

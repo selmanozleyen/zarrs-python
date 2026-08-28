@@ -241,7 +241,20 @@ class ZarrsCodecPipeline(CodecPipeline):
                 if isinstance(desc, ChunkItems)
                 else self.impl.retrieve_chunks_and_apply_index
             )
-            await asyncio.to_thread(retrieve, desc, out)
+            # Read HERE, per call, not at array open, so `with zarr.config.set(...)` scopes
+            # them to the reads inside the block the way a caller expects. Read at open they
+            # would be frozen for the array's life and a context manager around a read would
+            # silently do nothing -- and a process-wide ceiling owned by whichever array
+            # opened first has no coherent meaning once a second array wants another.
+            await asyncio.to_thread(
+                retrieve,
+                desc,
+                out,
+                config.get("codec_pipeline.read_concurrency", None),
+                config.get("codec_pipeline.decode_concurrency", None),
+                config.get("codec_pipeline.read_worker_ceiling", None),
+                config.get("codec_pipeline.decode_worker_ceiling", None),
+            )
             return None
 
     async def write(

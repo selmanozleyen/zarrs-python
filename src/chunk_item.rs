@@ -267,10 +267,13 @@ impl ChunkItems {
 
     /// Build one batch entry's items and append them.
     ///
-    /// `indices` must be non-negative and non-decreasing, and `out_start` is where this
-    /// entry's elements begin in the output. Entries must be pushed in increasing `out_start`;
-    /// one that would reuse output another entry already owns is refused. The caller checks
-    /// the rest of eligibility.
+    /// `indices` are checked here: non-negative, non-decreasing, and inside the chunk extent.
+    /// So is `out_start` -- entries must be pushed in increasing order, and one that would
+    /// reuse output another entry already owns is refused.
+    ///
+    /// One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
+    /// since the output subset is bounded against it. A larger one describes bytes the buffer
+    /// does not have, and that produces wrong data rather than an error.
     #[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner))]
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn push_entry(
