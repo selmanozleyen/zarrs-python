@@ -206,21 +206,39 @@ impl CodecPipelineImpl {
     /// shared slice, an exclusive one, or an aliasing wrapper -- and each restated this
     /// prologue. The pointer is returned unread; every caller dereferences it inside its own
     /// `unsafe` block, with its own safety argument, which is where that argument belongs.
-    fn nparray_bytes(value: &Bound<'_, PyUntypedArray>) -> Result<(*mut u8, usize), PyErr> {
+    /// The output buffer's base pointer and its length in bytes.
+    ///
+    /// `element_size` is the array's, and is checked against numpy's rather than assumed:
+    /// the length here is sized in NUMPY's element size while both read paths stride the
+    /// same buffer in ZARR's, so a mismatch scales every offset wrongly and still lands in
+    /// bounds -- silently wrong data rather than an error. Nothing should be able to produce
+    /// it, since zarr allocates the output from the array's own dtype, which is exactly why
+    /// it is worth one comparison to learn if that ever stops being true.
+    fn nparray_bytes(
+        value: &Bound<'_, PyUntypedArray>,
+        element_size: usize,
+    ) -> Result<(*mut u8, usize), PyErr> {
         if !value.is_c_contiguous() {
             return Err(PyErr::new::<PyValueError, _>(
                 "input array must be a C contiguous array".to_string(),
             ));
         }
+        let itemsize = value.dtype().itemsize();
+        if itemsize != element_size {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "the output array holds {itemsize} bytes per element but the zarr array holds \
+                 {element_size}"
+            )));
+        }
         let array_object: &PyArrayObject = Self::py_untyped_array_to_array_object(value);
-        Ok((
-            array_object.data.cast::<u8>(),
-            value.len() * value.dtype().itemsize(),
-        ))
+        Ok((array_object.data.cast::<u8>(), value.len() * itemsize))
     }
 
-    fn nparray_to_slice<'a>(value: &'a Bound<'_, PyUntypedArray>) -> Result<&'a [u8], PyErr> {
-        let (array_data, array_len) = Self::nparray_bytes(value)?;
+    fn nparray_to_slice<'a>(
+        value: &'a Bound<'_, PyUntypedArray>,
+        element_size: usize,
+    ) -> Result<&'a [u8], PyErr> {
+        let (array_data, array_len) = Self::nparray_bytes(value, element_size)?;
         let slice = unsafe {
             // SAFETY: array_data is a valid pointer to a u8 array of length array_len
             debug_assert!(!array_data.is_null());
@@ -261,8 +279,9 @@ impl CodecPipelineImpl {
     #[allow(clippy::mut_from_ref)]
     unsafe fn nparray_to_mut_slice<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
+        element_size: usize,
     ) -> Result<&'a mut [u8], PyErr> {
-        let (array_data, array_len) = Self::nparray_bytes(value)?;
+        let (array_data, array_len) = Self::nparray_bytes(value, element_size)?;
         Ok(unsafe {
             // SAFETY: array_data is a valid pointer to a u8 array of length array_len, and
             // Python holds no other writer to it for the duration of this call.
@@ -273,8 +292,9 @@ impl CodecPipelineImpl {
 
     fn nparray_to_unsafe_cell_slice<'a>(
         value: &'a Bound<'_, PyUntypedArray>,
+        element_size: usize,
     ) -> Result<UnsafeCellSlice<'a, u8>, PyErr> {
-        let (array_data, array_len) = Self::nparray_bytes(value)?;
+        let (array_data, array_len) = Self::nparray_bytes(value, element_size)?;
         let output = unsafe {
             // SAFETY: array_data is a valid pointer to a u8 array of length array_len
             debug_assert!(!array_data.is_null());
@@ -296,30 +316,23 @@ impl CodecPipelineImpl {
             !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.coords.is_some()),
             self.shard.as_ref(),
         ) {
-            // The buffer is sized in numpy's element size and carved in zarr's. A mismatch
-            // scales every offset wrongly and still lands in bounds, so it would be silently
-            // wrong data rather than an error. Nothing should be able to produce it -- zarr
-            // allocates the output from the array's own dtype -- which is why it is worth one
-            // comparison to find out if that ever stops being true.
-            let itemsize = value.dtype().itemsize();
-            if itemsize != self.element_size()? {
-                return Err(PyValueError::new_err(format!(
-                    "the output array's dtype is {itemsize} bytes per element but the array's \
-                     is {}",
-                    self.element_size()?
-                )));
-            }
-            // The slice is confined to this block so that its borrow of `value` has ENDED
-            // before the fallback below, which takes its own view of the same array. Today
-            // the fallback is unreachable -- `locate_chunks` only declines items without
-            // coords, and the guard above admitted only items with them -- but relying on
-            // an invariant in another function to keep two views apart is not a thing to
-            // rely on. A block is.
+            // The slice is confined to this block so that no live `&mut` into the buffer
+            // exists when the fallback below takes its own view of the same array.
+            //
+            // Note what is and is not enforcing that. `nparray_to_mut_slice` takes a SHARED
+            // reference and conjures the `&mut` from a raw pointer, so the borrow checker
+            // never had an exclusive borrow to end and would not complain if this were
+            // written the other way. The block is a lexical guarantee, made here on purpose,
+            // because the alternative is relying on the fallback being unreachable -- which
+            // it is today, since `locate_chunks` only declines items without coords and the
+            // guard above admits only items with them, but which is an invariant in another
+            // function and one edit away from not holding.
+            let element_size = self.element_size()?;
             let declined = {
                 // SAFETY: the only view of `value` taken while this borrow is live, and the
                 // caller owns the buffer for the duration of the read -- see the contract on
                 // `nparray_to_mut_slice`.
-                let output = unsafe { Self::nparray_to_mut_slice(value)? };
+                let output = unsafe { Self::nparray_to_mut_slice(value, element_size)? };
                 py.detach(|| {
                     let Some((_, codec_options)) =
                         chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
@@ -353,7 +366,7 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
     ) -> PyResult<()> {
         // Get input array
-        let output = Self::nparray_to_unsafe_cell_slice(value)?;
+        let output = Self::nparray_to_unsafe_cell_slice(value, self.element_size()?)?;
 
         // Adjust the concurrency based on the codec chain and the first chunk description
         let Some((chunk_concurrent_limit, codec_options)) =
@@ -628,7 +641,7 @@ impl CodecPipelineImpl {
         }
 
         // Get input array
-        let input_slice = Self::nparray_to_slice(value)?;
+        let input_slice = Self::nparray_to_slice(value, self.element_size()?)?;
         let input = if value.ndim() > 0 {
             // FIXME: Handle variable length data types, convert value to bytes and offsets
             InputValue::Array(ArrayBytes::new_flen(Cow::Borrowed(input_slice)))

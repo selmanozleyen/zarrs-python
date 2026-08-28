@@ -42,7 +42,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -111,12 +111,13 @@ impl CodecPipelineImpl {
         // What this call WANTS is its configured width, capped by the work it has: three
         // chunks give a fourth reader nothing to do. What it may HAVE at once is bounded by
         // the global ceiling, which is a different and much larger number.
-        let read_ceiling = worker_ceiling(self.read_concurrency);
-        let decode_ceiling = worker_ceiling(self.decode_concurrency);
+        // One ceiling, two counters: each kind gets its own budget of this size.
+        let ceiling = worker_ceiling();
         let want_readers = self.read_concurrency.min(jobs.len());
         let want_decoders = self.decode_concurrency.min(jobs.len());
         let _call = ActiveCall::enter();
         let failure: Mutex<Option<String>> = Mutex::new(None);
+        let alive = AtomicUsize::new(0);
 
         std::thread::scope(|scope| {
             let (job_tx, job_rx) = unbounded::<Job<'_>>();
@@ -131,24 +132,31 @@ impl CodecPipelineImpl {
             // save memory the caller had already agreed to spend is the wrong trade.
             let (dec_tx, dec_rx) = unbounded::<(Job<'_>, MaybeBytes)>();
             let spawn_reader = |permit: Permit| {
+                debug_assert_eq!(permit.0, Kind::Read);
                 let (jobs, decodes, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
+                let alive = Alive::enter(&alive);
                 scope.spawn(move || {
-                    // Held for the life of the thread and released as it returns, so the
-                    // permit is free the moment this worker stops using it.
+                    // Both held for the life of the thread and released as it returns: the
+                    // permit is free the moment this worker stops using it, and the count
+                    // falls the moment it stops existing.
                     let _permit = permit;
+                    let _alive = alive;
                     read_loop(&jobs, &decodes, failure);
                 });
             };
             let spawn_decoder = |permit: Permit| {
+                debug_assert_eq!(permit.0, Kind::Decode);
                 let (decodes, failure) = (dec_rx.clone(), &failure);
+                let alive = Alive::enter(&alive);
                 scope.spawn(move || {
                     let _permit = permit;
+                    let _alive = alive;
                     decode_loop(&decodes, failure);
                 });
             };
 
-            let mut readers = initial_permits(Kind::Read, want_readers, read_ceiling);
-            let mut decoders = initial_permits(Kind::Decode, want_decoders, decode_ceiling);
+            let mut readers = initial_permits(Kind::Read, want_readers, ceiling);
+            let mut decoders = initial_permits(Kind::Decode, want_decoders, ceiling);
             let (mut live_readers, mut live_decoders) = (readers.len(), decoders.len());
             for permit in readers.drain(..) {
                 spawn_reader(permit);
@@ -182,46 +190,31 @@ impl CodecPipelineImpl {
             // reads can drain while decode is still the bottleneck, and decoders that started
             // narrow would then have no way to widen.
             //
-            // GIVING UP IS PART OF THE DESIGN, and what it watches for matters. The counts
-            // here are of workers SPAWNED, so this loop cannot tell "every permit is busy"
-            // from "every worker died and the queue will never drain again" -- a panicking
-            // decode leaves items in `dec_rx` forever, and unbounded that spins here with
-            // the GIL released: a hang with no traceback and no interrupt.
-            //
-            // So the thing to give up on is a lack of PROGRESS, not a lack of permits. A busy
-            // ceiling is the normal case when several calls are in flight, and a call that
-            // stopped widening for that reason would stay narrow for the rest of its life --
-            // the very pathology this loop exists to prevent, and which counting failed
-            // attempts alone reintroduced (measured: -34% on a scattered read, with the cores
-            // to match). While either queue is draining, someone is working and this keeps
-            // trying; only when nothing has moved AND no permit came free does it stop.
-            let mut idle = 0;
-            let mut outstanding = job_rx.len() + dec_rx.len();
+            // It stops for exactly one reason: nothing is left alive to drain the queues.
+            // Not a busy ceiling -- that is the normal case with several calls in flight, and
+            // stopping for it costs 34%. Not a stretch of time without a chunk completing --
+            // that is what slow storage looks like, and this path is FOR slow storage. See
+            // `Alive`, which is the only signal here that is not a guess about timing.
             while (live_readers < want_readers || live_decoders < want_decoders)
                 && (!job_rx.is_empty() || !dec_rx.is_empty())
-                && idle < WIDEN_ATTEMPTS
+                && alive.load(Ordering::Relaxed) > 0
             {
                 let mut took = false;
                 if live_readers < want_readers && !job_rx.is_empty() {
-                    if let Some(permit) = Permit::take(Kind::Read, read_ceiling) {
+                    if let Some(permit) = Permit::take(Kind::Read, ceiling) {
                         spawn_reader(permit);
                         live_readers += 1;
                         took = true;
                     }
                 }
                 if live_decoders < want_decoders && !dec_rx.is_empty() {
-                    if let Some(permit) = Permit::take(Kind::Decode, decode_ceiling) {
+                    if let Some(permit) = Permit::take(Kind::Decode, ceiling) {
                         spawn_decoder(permit);
                         live_decoders += 1;
                         took = true;
                     }
                 }
-                let now = job_rx.len() + dec_rx.len();
-                if took || now != outstanding {
-                    idle = 0;
-                    outstanding = now;
-                } else {
-                    idle += 1;
+                if !took {
                     std::thread::sleep(WIDEN_POLL);
                 }
             }
@@ -368,6 +361,16 @@ impl CodecPipelineImpl {
             if item.coords.is_none() {
                 declined.push(item);
                 continue;
+            }
+            // Same silent 1-D assumption `output_offset` makes about `subset`, and checked
+            // for the same reason: a multi-dimensional `chunk_subset` would locate the wrong
+            // inner chunk here and report success.
+            if item.chunk_subset.dimensionality() != 1 {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{} has a {}-dimensional chunk subset; this path reads 1-D chunks",
+                    item.key,
+                    item.chunk_subset.dimensionality()
+                )));
             }
             let start = item.chunk_subset.start().first().copied().unwrap_or(0);
             located.push((item, self.locate(shard, item, start, ctx)?));
@@ -529,30 +532,66 @@ impl Kind {
     }
 }
 
-/// How many per-call widths of workers may exist at once, across every in-flight call.
-///
-/// The two numbers are deliberately different. `read_concurrency` is what ONE call wants;
-/// this multiple is how many calls' worth may be alive together. Conflating them is a real
-/// failure mode and not a hypothetical one: with the ceiling equal to the width, the first
-/// call in flight takes every permit and the rest run single-threaded.
+/// Workers of one kind per core, at the process-wide ceiling.
 ///
 /// Eight because the concurrency arrives from ABOVE -- zarr's event loop issues several
 /// reads at once -- and because over-providing is cheap on this side: a thread parked on a
 /// storage round trip costs a stack and a scheduler entry, not a core. Measured on a 16-core
 /// allocation over a sharded store, 8x was the best of 1x / 8x / 32x, and 32x bought nothing.
-const CEILING_PER_CALL_WIDTHS: usize = 8;
+const CEILING_WORKERS_PER_CORE: usize = 8;
 
-/// How long to wait between attempts to widen a call, and how many attempts may pass with
-/// NOTHING MOVING before it stops trying. Together they bound the loop at ~13 ms of nothing
-/// happening -- long enough to wait out a busy ceiling, short enough not to wait forever on
-/// a queue that will never drain again.
+/// How long the widening loop waits between attempts when no permit is free.
 const WIDEN_POLL: Duration = Duration::from_micros(200);
 
-const WIDEN_ATTEMPTS: usize = 64;
+/// Workers alive in ONE call, raised before a thread starts and lowered when it returns.
+///
+/// This is what lets the widening loop tell a slow storage round trip from a queue that
+/// nothing is left alive to drain -- and every attempt to tell those apart by TIMING has
+/// been wrong. Counting failed permit attempts gave up on a busy ceiling, which is the
+/// normal case with several calls in flight, and cost 34%. Counting time without a chunk
+/// completing gives up on slow storage, which is the case this module exists for: at 50 ms
+/// a chunk, a call holding one reader sees nothing move for 50 ms and would quit after 13.
+/// That watchdog was anti-correlated with need -- the fewer workers a call had, the slower
+/// its queue moved, and the sooner it stopped asking for more.
+///
+/// Alive is exact and needs no clock. While a worker lives the queue has someone to drain
+/// it, however slowly; when the last one dies with work still queued, nothing has to be
+/// inferred from a duration.
+struct Alive<'a>(&'a AtomicUsize);
 
-/// The ceiling in workers, for a call of the given width.
-fn worker_ceiling(per_call: usize) -> usize {
-    per_call.saturating_mul(CEILING_PER_CALL_WIDTHS)
+impl<'a> Alive<'a> {
+    /// Taken on the SPAWNING thread, so the count is up before the worker starts and the
+    /// loop cannot read zero in the gap between spawning and running.
+    fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
+    }
+}
+
+impl Drop for Alive<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// How many workers of one kind may exist at once across every in-flight call.
+///
+/// A PROCESS number, taken from the machine, and deliberately NOT from any one array's
+/// width. Deriving it from the caller's width while enforcing it against a process-wide
+/// count is incoherent: two arrays opened with different `read_concurrency` -- which zarr
+/// permits, since each snapshots the config when it is opened -- would enforce two different
+/// ceilings on one counter, and the array that asked for less would find it permanently full
+/// and run every call at the floor of one. That is the starvation [`ActiveCall`] exists to
+/// prevent, arriving through the ceiling instead of through the counter.
+///
+/// What a CALL wants is still `read_concurrency`. This is only how many may exist together.
+fn worker_ceiling() -> usize {
+    static CEILING: OnceLock<usize> = OnceLock::new();
+    *CEILING.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(8, std::num::NonZeroUsize::get)
+            .saturating_mul(CEILING_WORKERS_PER_CORE)
+    })
 }
 
 /// Calls in flight, so a call can take a SHARE of the ceiling rather than race for it.
