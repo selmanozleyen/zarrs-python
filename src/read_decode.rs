@@ -98,52 +98,7 @@ impl CodecPipelineImpl {
             return Ok(declined);
         }
 
-        // Carve the output in ONE pass, in offset order, so each piece is split off the tail
-        // of the last. Overlap is not checked here -- it cannot be expressed: two overlapping
-        // items would need the same bytes twice, and `split_at_mut` has already moved them.
-        // A backwards offset is the one thing to reject, since it means the sort did not
-        // produce a partition.
-        let mut order: Vec<usize> = (0..located.len()).collect();
-        order.sort_by_key(|&i| output_offset(located[i].0));
-
-        let mut jobs: Vec<Job<'_>> = Vec::with_capacity(order.len());
-        let mut absent: Vec<&mut [u8]> = Vec::new();
-        let mut rest: &mut [u8] = output;
-        let mut cursor = 0usize;
-        for &i in &order {
-            let (item, range) = &located[i];
-            let start = output_offset(item) * element_size;
-            let len = coords_of(item)?.len() * element_size;
-            if start < cursor {
-                return Err(PyRuntimeError::new_err(format!(
-                    "{} claims output bytes from {start}, behind the {cursor} already carved",
-                    item.key
-                )));
-            }
-            let skip = start - cursor;
-            if skip + len > rest.len() {
-                return Err(PyRuntimeError::new_err(format!(
-                    "{} names output bytes {start}..{} beyond the buffer",
-                    item.key,
-                    start + len
-                )));
-            }
-            let (_gap, tail) = std::mem::take(&mut rest).split_at_mut(skip);
-            let (piece, tail) = tail.split_at_mut(len);
-            rest = tail;
-            cursor = start + len;
-
-            match range {
-                Some(range) => jobs.push(Job {
-                    key: item.key.clone(),
-                    range: *range,
-                    out: piece,
-                    coords: coords_of(item)?,
-                    ctx: &ctx,
-                }),
-                None => absent.push(piece),
-            }
-        }
+        let (jobs, absent) = carve(output, &located, element_size, &ctx)?;
 
         // No read, no decode, no thread.
         for piece in absent {
@@ -393,6 +348,65 @@ impl CodecPipelineImpl {
 ///
 /// The chunk-unit grouping emits non-decreasing index groups, so the regions should partition
 /// the part of the output this call owns. Checking it is the difference between a sound
+/// Split the output into the disjoint piece each located chunk writes, in offset order.
+///
+/// This is where disjointness comes from, and why nothing downstream has to check it: each
+/// piece is split off the tail of the last, so two overlapping items would need the same
+/// bytes twice and `split_at_mut` has already moved them out of reach. A backwards offset is
+/// the one thing to reject -- it means the sort did not produce a partition.
+///
+/// Returns the jobs to read, and the pieces of chunks that were never written, which need
+/// only the fill value.
+fn carve<'a>(
+    output: &'a mut [u8],
+    located: &[(&'a ChunkItem, Option<ByteRange>)],
+    element_size: usize,
+    ctx: &'a JobContext,
+) -> PyResult<(Vec<Job<'a>>, Vec<&'a mut [u8]>)> {
+    let mut order: Vec<usize> = (0..located.len()).collect();
+    order.sort_by_key(|&i| output_offset(located[i].0));
+
+    let mut jobs: Vec<Job<'a>> = Vec::with_capacity(order.len());
+    let mut absent: Vec<&mut [u8]> = Vec::new();
+    let mut rest: &mut [u8] = output;
+    let mut cursor = 0usize;
+    for &i in &order {
+        let (item, range) = &located[i];
+        let start = output_offset(item) * element_size;
+        let len = coords_of(item)?.len() * element_size;
+        if start < cursor {
+            return Err(PyRuntimeError::new_err(format!(
+                "{} claims output bytes from {start}, behind the {cursor} already carved",
+                item.key
+            )));
+        }
+        let skip = start - cursor;
+        if skip + len > rest.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "{} names output bytes {start}..{} beyond the buffer",
+                item.key,
+                start + len
+            )));
+        }
+        let (_gap, tail) = std::mem::take(&mut rest).split_at_mut(skip);
+        let (piece, tail) = tail.split_at_mut(len);
+        rest = tail;
+        cursor = start + len;
+
+        match range {
+            Some(range) => jobs.push(Job {
+                key: item.key.clone(),
+                range: *range,
+                out: piece,
+                coords: coords_of(item)?,
+                ctx,
+            }),
+            None => absent.push(piece),
+        }
+    }
+    Ok((jobs, absent))
+}
+
 /// An absent chunk contributes only fill value, repeated.
 fn fill(out: &mut [u8], fill_value: &FillValue, size: usize) -> Result<(), String> {
     let bytes = fill_value.as_ne_bytes();
