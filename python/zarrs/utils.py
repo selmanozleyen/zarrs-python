@@ -94,12 +94,7 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
 def _as_selector_tuples(
     chunk_selection: SelectorTuple, out_selection: SelectorTuple
 ) -> tuple[tuple, tuple]:
-    """Both selections as tuples, so an axis can be addressed by position.
-
-    zarr hands a bare slice or array for a one-axis selection and a tuple for anything else.
-    The two eligibility tests below both need positional access, and both must agree about
-    which axis is which, so they ask this once rather than each normalising for itself.
-    """
+    """Both selections as tuples, so an axis can be addressed by position."""
     return (
         chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,),
         out_selection if isinstance(out_selection, tuple) else (out_selection,),
@@ -107,14 +102,9 @@ def _as_selector_tuples(
 
 
 def _is_sorted_integer_axis(indices: Any, out_axis_sel: Any) -> bool:
-    """Is this one sorted 1-D integer axis written to a contiguous output slice?
-
-    The shared half of the two eligibility tests below, which ask the same question in two
-    styles. Deliberately does NOT judge negative indices or the output length: on a negative
-    index `split_selection_runs` raises and `_chunk_unit_args` declines, and the raise comes
-    before the length check, so the order of those two decisions is part of each caller's
-    behaviour. They stay at the call sites for that reason.
-    """
+    """Is this one sorted 1-D integer axis written to a contiguous output slice?"""
+    # Negative indices and the output length are the caller's to judge: one raises where the
+    # other declines, so the order of those checks belongs at the call site.
     return (
         isinstance(indices, np.ndarray)
         and indices.ndim == 1
@@ -126,13 +116,7 @@ def _is_sorted_integer_axis(indices: Any, out_axis_sel: Any) -> bool:
 
 
 def _output_run_matches(indices: np.ndarray, out_axis_sel: slice) -> bool:
-    """Does the output slice hold exactly one element per index?
-
-    Separate from `_is_sorted_integer_axis` rather than folded into it, because the callers
-    disagree about what comes FIRST -- one raises on a negative index before asking this and
-    the other declines -- and folding it in would silently reorder those two decisions.
-    Shared as a predicate so at least the arithmetic is written once.
-    """
+    """Does the output slice hold exactly one element per index."""
     start = out_axis_sel.start or 0
     return out_axis_sel.stop - start == indices.size
 
