@@ -1,7 +1,7 @@
 """Shard indexes are remembered for the life of a READ-ONLY array, and not otherwise.
 
 Reading a shard index is a full-latency round trip taken on the calling thread, before any
-job reaches the reader pool, so a shard is worth paying for once per array rather than once
+job reaches a reader, so a shard is worth paying for once per array rather than once
 per call. The pipeline is built per array, so its lifetime is the array's.
 
 Gated on the store being read-only rather than invalidated on write, because a remembered

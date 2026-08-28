@@ -10,7 +10,7 @@ use chunk_item::ChunkItem;
 use itertools::Itertools;
 use numpy::npyffi::PyArrayObject;
 use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -31,7 +31,7 @@ use zarrs::storage::{ReadableWritableListableStorage, StoreKey};
 
 mod chunk_item;
 mod concurrency;
-mod read_decode_pool;
+mod read_decode;
 mod runtime;
 mod shard_index;
 mod store;
@@ -55,13 +55,14 @@ pub struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
-    /// Widths only. The pools themselves are process-wide statics in `read_decode_pool`:
-    /// zarr builds a pipeline per ARRAY, so pools owned here are built once per array.
+    /// How many readers and decoders ONE call of this array's may run at once. A per-array
+    /// setting, because the workers belong to the call: nothing here is shared with another
+    /// array, and the only process-wide bound is the worker ceiling in `read_decode`.
     pub(crate) read_concurrency: usize,
     pub(crate) decode_concurrency: usize,
-    /// Present only for a singly-sharded array: the pool locates chunks itself, so it
-    /// needs the shard's index codecs and the codecs inside a shard. `None` means this
-    /// array cannot take the pool path at all.
+    /// Present only for a singly-sharded array: the concurrent path locates chunks itself,
+    /// so it needs the shard's index codecs and the codecs inside a shard. `None` means this
+    /// array cannot take that path at all.
     pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
     /// Shard indexes read so far, for the life of this pipeline -- which is the life of the
     /// array, since zarr builds one pipeline per array.
@@ -264,9 +265,9 @@ impl CodecPipelineImpl {
         chunk_descriptions: &[chunk_item::ChunkItem],
         value: &Bound<'_, PyUntypedArray>,
     ) -> PyResult<()> {
-        // The read/decode pool, when it is on and every item is a chunk-unit item. It
-        // needs an exclusive output slice, so it cannot share the aliasing wrapper the
-        // fused path takes -- hence the dispatch here rather than inside the loop.
+        // The concurrent path, when every item is a chunk-unit item. It needs an exclusive
+        // output slice, so it cannot share the aliasing wrapper the fused path takes --
+        // hence the dispatch here rather than inside the loop.
         if let (true, Some(shard)) = (
             !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.coords.is_some()),
             self.shard.as_ref(),
@@ -278,25 +279,16 @@ impl CodecPipelineImpl {
                 else {
                     return Ok(Vec::new());
                 };
-                if read_decode_pool::use_scoped() {
-                    self.retrieve_scoped(shard, chunk_descriptions, output, &codec_options)
-                } else {
-                    self.retrieve_read_decode_pool(
-                        shard,
-                        chunk_descriptions,
-                        output,
-                        &codec_options,
-                    )
-                }
+                self.retrieve_chunk_units(shard, chunk_descriptions, output, &codec_options)
             })?;
             if declined.is_empty() {
                 return Ok(());
             }
-            // Whatever the pool could not take still has to be read, down the fused path.
+            // Whatever that path could not take still has to be read, down the fused one.
             let declined: Vec<chunk_item::ChunkItem> = declined.into_iter().cloned().collect();
             return self.retrieve_chunks_and_apply_index_fused(py, declined, value);
         }
-        // Not the hot path: the pool is off, or the batch is mixed and arrived as a list.
+        // Not the hot path: the batch is mixed, or arrived as a list.
         self.retrieve_chunks_and_apply_index_fused(py, chunk_descriptions.to_vec(), value)
     }
 }
@@ -320,7 +312,6 @@ impl CodecPipelineImpl {
     ))]
     #[new]
     fn new(
-        py: Python<'_>,
         array_metadata: &str,
         mut store_config: StoreConfig,
         validate_checksums: bool,
@@ -365,34 +356,6 @@ impl CodecPipelineImpl {
         // reads outstanding than it has chunks.
         let read_concurrency = read_concurrency.unwrap_or(num_threads).max(1);
         let decode_concurrency = decode_concurrency.unwrap_or(num_threads).max(1);
-        // The pool is a process resource, so its widths are a PROCESS setting: whichever
-        // array reaches it first sizes it, and every later array runs at those widths. Said
-        // here, at open, because `zarr.config` is a context each array snapshots -- so two
-        // arrays can hold different values, and the one that loses should hear about it next
-        // to the config that set it rather than from a read much later.
-        // Opening an array is enough to bring the pool up: every opened array is a reader,
-        // and the pool is where reads are meant to go. So the first array to open settles
-        // the widths for the process and starts the threads, and no read pays for them.
-        let (read_concurrency, decode_concurrency) = {
-            let effective = read_decode_pool::resolve_widths(read_concurrency, decode_concurrency);
-            if effective != (read_concurrency, decode_concurrency) {
-                let message = std::ffi::CString::new(format!(
-                    "the read/decode pool is already running {} readers and {} decoders for \
-                     this process; this array asked for {} and {} and will use the running \
-                     widths. Set codec_pipeline.read_concurrency/decode_concurrency once, \
-                     before the first read, if you need different ones.",
-                    effective.0, effective.1, read_concurrency, decode_concurrency
-                ))
-                .map_py_err::<PyValueError>()?;
-                PyErr::warn(py, &py.get_type::<PyUserWarning>(), &message, 0)?;
-            }
-            // The scoped arm spawns per call, so starting a pool it never uses would put a
-            // cost on one arm and not the other.
-            if !read_decode_pool::use_scoped() {
-                read_decode_pool::start(effective.0, effective.1)?;
-            }
-            effective
-        };
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
 
@@ -551,7 +514,7 @@ impl CodecPipelineImpl {
                     // side is contiguous because the indices reached us non-decreasing, so
                     // one chunk's elements are one run of the output.
                     // The view takes one contiguous run, so the elements are gathered into
-                    // a buffer first; the pool writes into its own region and skips that.
+                    // a buffer first; a job writes into its own slice and skips that.
                     let mut gathered = vec![0u8; coords.len() * size];
                     gather(&raw, coords, &mut gathered, size)
                         .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", item.key)))?;

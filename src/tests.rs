@@ -148,7 +148,8 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
     })
 }
 
-/// One gather serves the pool and the fused path, so its two refusals are pinned here.
+/// One gather serves the concurrent path and the fused one, so its two refusals are pinned
+/// here.
 /// Silently copying the wrong bytes is the failure mode; both callers rely on the check.
 #[test]
 fn test_gather_copies_by_coordinate_and_refuses_the_rest() {

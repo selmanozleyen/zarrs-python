@@ -339,7 +339,7 @@ def chunk_info_for_read(
     """Describe a read batch to Rust, grouped by decode unit where the selection allows.
 
     Tried in order: one item per inner chunk for the whole batch, which is the cheapest
-    shape and the only one the read/decode pool can take; then one box per run of
+    shape and the only one the concurrent read path can take; then one box per run of
     consecutive indices; then one item per entry, as a write does.
     """
     # A generator would be consumed by the eligibility test, and the ordinary route needs

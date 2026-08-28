@@ -36,12 +36,13 @@ struct Level {
     sharding_options: ShardingCodecOptions,
 }
 
-/// What the pool needs to know about a sharded array to fetch one innermost chunk at a time.
+/// What the read path needs to know about a sharded array to fetch one innermost chunk at
+/// a time.
 pub(crate) struct ShardInfo {
     /// Outermost first. Exactly one entry for a singly sharded array, which is the case the
     /// hot path is tuned for: one iteration, one index, one cache lookup.
     levels: Vec<Level>,
-    /// The INNERMOST chunk shape — the unit the codec chain decodes, and what the pool sizes
+    /// The INNERMOST chunk shape — the unit the codec chain decodes, and what a job sizes
     /// its scratch buffer by.
     pub subchunk_shape: ChunkShape,
     /// The codecs that decode an innermost chunk, bound to the array's data type and fill
