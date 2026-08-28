@@ -125,6 +125,18 @@ def _is_sorted_integer_axis(indices: Any, out_axis_sel: Any) -> bool:
     )
 
 
+def _output_run_matches(indices: np.ndarray, out_axis_sel: slice) -> bool:
+    """Does the output slice hold exactly one element per index?
+
+    Separate from `_is_sorted_integer_axis` rather than folded into it, because the callers
+    disagree about what comes FIRST -- one raises on a negative index before asking this and
+    the other declines -- and folding it in would silently reorder those two decisions.
+    Shared as a predicate so at least the arithmetic is written once.
+    """
+    start = out_axis_sel.start or 0
+    return out_axis_sel.stop - start == indices.size
+
+
 def split_selection_runs(
     chunk_selection: SelectorTuple, out_selection: SelectorTuple
 ) -> Iterator[tuple[SelectorTuple, SelectorTuple]]:
@@ -157,7 +169,7 @@ def split_selection_runs(
     if (indices < 0).any():
         raise DiscontiguousArrayError(indices)
     out_start = out_axis_sel.start or 0
-    if out_axis_sel.stop - out_start != indices.size:
+    if not _output_run_matches(indices, out_axis_sel):
         yield from unsplit
         return
 
@@ -303,7 +315,7 @@ def _chunk_unit_args(
     if (indices < 0).any():
         return None
     start = out_axis_sel.start or 0
-    if out_axis_sel.stop - start != indices.size:
+    if not _output_run_matches(indices, out_axis_sel):
         return None
 
     return (

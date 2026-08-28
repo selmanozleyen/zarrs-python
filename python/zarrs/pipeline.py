@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, TypedDict
 from warnings import warn
 
@@ -159,8 +160,11 @@ class ZarrsCodecPipeline(CodecPipeline):
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
 
+    @cached_property
     def _inner_chunk_shape(self) -> tuple[int, ...] | None:
         """The shape of the INNERMOST unit the codec chain decodes, or None if not sharded.
+
+        Cached: it is fixed for the array, and this walked the codec metadata on every read.
 
         `chunk_spec.shape` in a batch entry is the SHARD extent, so nothing downstream could
         tell which parts of a selection share a decode. The sharding codec knows, and the
@@ -233,7 +237,7 @@ class ZarrsCodecPipeline(CodecPipeline):
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
             chunks_desc = chunk_info_for_read(
-                batch_info, drop_axes, out.shape, self._inner_chunk_shape()
+                batch_info, drop_axes, out.shape, self._inner_chunk_shape
             )
         except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
