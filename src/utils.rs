@@ -54,12 +54,18 @@ pub(crate) fn gather(
     out: &mut [u8],
     size: usize,
 ) -> Result<(), String> {
-    if out.len() != coords.len() * size {
+    if coords.len().checked_mul(size) != Some(out.len()) {
         return Err("output region does not match the coordinate count".to_string());
     }
     for (n, &c) in coords.iter().enumerate() {
-        let src = usize::try_from(c).map_err(|e| e.to_string())? * size;
-        let Some(element) = scratch.get(src..src + size) else {
+        // Checked, and not because a coordinate can be that large today -- they are all
+        // below the inner chunk extent. Unchecked, a large one wraps in release and can land
+        // back INSIDE scratch, so `get` succeeds and the wrong element is copied: exactly
+        // the silent-wrong-data mode this function's bounds check exists to refuse.
+        let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
+            return Err(format!("coordinate {c} is too large to address"));
+        };
+        let Some(element) = src.checked_add(size).and_then(|end| scratch.get(src..end)) else {
             return Err(format!(
                 "coordinate {c} is outside the {} elements decoded",
                 scratch.len() / size

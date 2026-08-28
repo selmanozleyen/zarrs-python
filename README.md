@@ -51,6 +51,27 @@ The `ZarrsCodecPipeline` specific options are:
   - Defaults to `0` (disabled). Only applies to filesystem stores, and has no effect when `direct_io` is enabled.
   - Cached handles are invalidated on writes through this pipeline, but not on modification from anywhere else — and `zarr-python` itself is such a writer, since `resize`, `delete_dir` and metadata writes go through its own store. A cached handle can then still read a chunk file that has been deleted. Only enable this while nothing is modifying the array.
   - The cache is per `Array` object, not per process, so compare `file_handle_cache_size` times the number of open arrays against `ulimit -n`. See [here](https://docs.rs/zarrs_filesystem/latest/zarrs_filesystem/struct.FilesystemStoreOptions.html#method.file_handle_cache_size) for more info.
+
+A read of a sharded array **remembers each shard's decoded index** for the duration of that read, so a shard whose index was already read is not read again per item. This is automatic and has no option. An array opened `mode="r"` keeps them for the life of the array instead, which assumes nothing else is rewriting it while it is open -- the same caveat as `file_handle_cache_size` above, for the same reason.
+
+- `codec_pipeline.read_concurrency`: how many byte-range reads one retrieval of a sharded array may have outstanding at once. Reads of the innermost chunks a selection touches are issued concurrently by threads scoped to that one call, so this bounds one call, not the process.
+  - Defaults to `threading.max_workers`. A reader waits on storage rather than occupying a core, so the useful value is however many reads the store will answer at once, which is not the CPU count — on high-latency storage more is usually better, up to the number of chunks a call touches, above which extra readers have nothing to do.
+  - Across concurrent calls the number of live readers is capped by `codec_pipeline.read_worker_ceiling`, and each in-flight call takes an equal share of that budget.
+- `codec_pipeline.decode_concurrency`: how many innermost chunks one retrieval may decode at once.
+  - Defaults to `threading.max_workers`. A decode occupies a core, so unlike `read_concurrency` there is nothing to gain above the CPU count.
+- `codec_pipeline.read_worker_ceiling` / `codec_pipeline.decode_worker_ceiling`: how many live readers, and how many live decoders, may exist at once across every in-flight read in the process.
+  - Both default to the available parallelism, the same number `rayon` would spend. These are what the two options above are shared out of: a call takes an equal share rather than whatever earlier callers left, and never fewer than one worker.
+  - Separate, because a reader parked on a storage round trip costs a stack and a decoder costs a core, so a ceiling above the core count is defensible for readers and not for decoders.
+
+All four are read when a read STARTS, not when the array is opened, so a context manager scopes them to the reads inside it:
+
+```python
+with zarr.config.set({
+    "codec_pipeline.read_concurrency": 64,
+    "codec_pipeline.read_worker_ceiling": 512,
+}):
+    values = array[indices]      # up to 64 readers for this read
+```
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -67,6 +88,8 @@ zarr.config.set({
         "chunk_concurrent_maximum": None,
         "chunk_concurrent_minimum": 4,
         "file_handle_cache_size": 0,
+        "read_concurrency": None,
+        "decode_concurrency": None,
         "direct_io": False,
         "strict": False
     }

@@ -22,6 +22,21 @@ N_VAR = 5000
 CHUNK = 4096
 SHARD = 16384
 
+# Read per CALL, not at array open, so a `zarr.config.set` block around the read is what
+# scopes them. One worker is the interesting arm: the floor and the widening loop, and the
+# answer must not depend on width.
+CONFIGS = {
+    "default": {},
+    "one worker": {
+        "codec_pipeline.read_concurrency": 1,
+        "codec_pipeline.decode_concurrency": 1,
+    },
+    "wider than the machine": {
+        "codec_pipeline.read_concurrency": 64,
+        "codec_pipeline.decode_concurrency": 4,
+    },
+}
+
 
 @pytest.fixture(params=["zstd", "none"])
 def compressors(request):
@@ -63,6 +78,7 @@ def row_span_selection(indptr: np.ndarray, rows: np.ndarray) -> np.ndarray:
     return np.concatenate([np.arange(indptr[r], indptr[r + 1]) for r in rows])
 
 
+@pytest.mark.parametrize("config", list(CONFIGS), ids=list(CONFIGS))
 @pytest.mark.parametrize(
     "n_rows",
     # 1 row is a single run; 256 of 400 is dense enough that runs share inner chunks. Values
@@ -70,14 +86,19 @@ def row_span_selection(indptr: np.ndarray, rows: np.ndarray) -> np.ndarray:
     [1, 256],
 )
 def test_sampled_rows_match(
-    csr: tuple[Path, dict[str, np.ndarray]], entries: dict[str, int], n_rows: int
+    csr: tuple[Path, dict[str, np.ndarray]],
+    entries: dict[str, int],
+    config: str,
+    n_rows: int,
 ) -> None:
     path, truth = csr
     rng = np.random.default_rng(n_rows)
     rows = np.sort(rng.choice(N_OBS, size=n_rows, replace=False))
     selection = row_span_selection(truth["indptr"], rows)
 
-    with zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}):
+    with zarr.config.set(
+        {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"} | CONFIGS[config]
+    ):
         for name in ("indices", "data"):
             got = zarr.open_array(path / name, mode="r")[selection]
             np.testing.assert_array_equal(got, truth[name][selection])
