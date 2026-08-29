@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -477,7 +478,7 @@ fn carve<'a>(
             //
             // The pieces are taken in coordinate order, which is ascending, so
             // `DisjointBytes` still vends each byte once and coverage is still checked.
-            Some(range) if ctx.raw => {
+            Some(range) if ctx.raw && coords.len() <= raw_max_rows_per_chunk() => {
                 raw_row_jobs(item, *range, piece, coords, element_size, ctx, &mut jobs)?;
             }
             Some(range) => jobs.push(Job {
@@ -493,6 +494,33 @@ fn carve<'a>(
         }
     }
     Ok((jobs, absent))
+}
+
+/// Rows in one chunk above which reading the CHUNK beats reading the rows.
+///
+/// The two units cost very differently, and which wins is a property of the selection rather
+/// than of the array. Reading `k` rows out of a chunk costs `k` requests; reading the chunk
+/// costs one request plus a decode and a gather over the whole thing. Requests are the scarce
+/// resource -- this filesystem serves ~16k IOPS almost regardless of request size -- so rows
+/// win while `k` is small and lose once `k` is large enough that one chunk request would have
+/// covered them all.
+///
+/// At `chunk_size=1`, the workload this is for, `k` is 1: one row per chunk, and the row is
+/// obviously right. At `chunk_size=64` a run IS a whole inner chunk, `k` is 64, and reading it
+/// as 64 separate requests is 64x the IOPS for identical bytes.
+///
+/// Decided PER ITEM, not per call: one selection can be dense in some chunks and sparse in
+/// others, and each chunk's own count is already known here.
+///
+/// `ZARRS_RAW_MAX_ROWS_PER_CHUNK=0` disables the raw path entirely.
+fn raw_max_rows_per_chunk() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("ZARRS_RAW_MAX_ROWS_PER_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
 }
 
 /// One job per ROW, each reading exactly its own bytes, for a chunk that is a plain byte
