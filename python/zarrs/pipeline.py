@@ -56,34 +56,6 @@ FALLBACK_TO_ZARR_PYTHON = (
 )
 
 
-def _inner_chunk_is_raw(metadata: ArrayMetadata) -> bool:
-    """Is an innermost chunk a plain byte tiling of its elements?
-
-    True only when nothing sits between an element and its bytes: the sharding codec's inner
-    chain is exactly `bytes`, with no filters and no compressor. Then a chunk's bytes are its
-    elements in C order, the offset of any row inside it is arithmetic, and a row can be read
-    WITHOUT reading the chunk it lives in.
-
-    Decided here rather than in Rust because the metadata is already parsed here, and every
-    other eligibility test for the fast path lives on this side too.
-
-    Conservative by construction: anything not recognised returns False and the read takes
-    the ordinary chunk path, which is always correct.
-    """
-    if not isinstance(metadata, ArrayV3Metadata):
-        return False
-    for codec in metadata.codecs:
-        config = codec.to_dict() if hasattr(codec, "to_dict") else {}
-        if config.get("name") != "sharding_indexed":
-            continue
-        inner = config.get("configuration", {}).get("codecs", [])
-        names = [c.get("name") for c in inner if isinstance(c, dict)]
-        # Exactly the byte reinterpretation, nothing else. A `crc32c` or `blosc` here means
-        # the chunk cannot be entered part-way.
-        return names == ["bytes"]
-    return False
-
-
 def get_codec_pipeline_impl(
     metadata: ArrayMetadata, store: Store, *, strict: bool
 ) -> CodecPipelineImpl | None:
