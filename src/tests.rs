@@ -245,6 +245,33 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
     })
 }
 
+/// Consecutive rows are ONE read; a gap or a repeat starts another.
+///
+/// This is what decides whether the raw path is worth taking: 64 adjacent rows are one
+/// request, 64 scattered ones are 64, and the filesystem charges per request. Getting it
+/// wrong is not a wrong answer, it is a 64x IOPS bill -- measured at 0.092x against the
+/// chunk path before coalescing existed.
+#[test]
+fn test_raw_runs_counts_reads_not_rows() {
+    let run_len = 2048;
+    let c = |rows: &[u64]| -> Vec<u64> { rows.iter().map(|r| r * run_len).collect() };
+
+    // One row, one read.
+    assert_eq!(crate::read_decode::raw_runs(&c(&[7]), run_len), 1);
+    // A whole 64-row chunk, consecutive: still ONE read, which is the point.
+    let dense: Vec<u64> = c(&(0..64).collect::<Vec<_>>());
+    assert_eq!(crate::read_decode::raw_runs(&dense, run_len), 1);
+    // Every other row: adjacent to nothing, so one read each.
+    let strided: Vec<u64> = c(&(0..64).step_by(2).collect::<Vec<_>>());
+    assert_eq!(crate::read_decode::raw_runs(&strided, run_len), 32);
+    // Two blocks with a hole between them.
+    assert_eq!(crate::read_decode::raw_runs(&c(&[0, 1, 2, 10, 11]), run_len), 2);
+    // A REPEAT steps by 0, not by run_len, so it cannot join the run: the same row twice is
+    // two output pieces and cannot be served by one read.
+    assert_eq!(crate::read_decode::raw_runs(&c(&[3, 3, 4]), run_len), 2);
+    assert_eq!(crate::read_decode::raw_runs(&[], run_len), 0);
+}
+
 /// `gather` copies by coordinate, and refuses an out-of-range coord or a mismatched output.
 #[test]
 fn test_gather_copies_by_coordinate_and_refuses_the_rest() {
