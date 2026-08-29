@@ -2,10 +2,9 @@
 # ruff: noqa: E501, F401
 
 import builtins
-import typing
-
 import numpy
 import numpy.typing
+import typing
 import zarr.abc.store
 
 @typing.final
@@ -41,6 +40,7 @@ class ChunkItems:
         indices: numpy.typing.NDArray[numpy.int64],
         out_start: builtins.int,
         inner: builtins.int,
+        elem_starts: typing.Sequence[builtins.int] = [],
     ) -> None:
         r"""
         Build one batch entry's items and append them.
@@ -66,9 +66,9 @@ class CodecPipelineImpl:
         store_config: zarr.abc.store.Store,
         *,
         validate_checksums: builtins.bool = False,
-        chunk_concurrent_minimum: builtins.int | None = None,
-        chunk_concurrent_maximum: builtins.int | None = None,
-        num_threads: builtins.int | None = None,
+        chunk_concurrent_minimum: typing.Optional[builtins.int] = None,
+        chunk_concurrent_maximum: typing.Optional[builtins.int] = None,
+        num_threads: typing.Optional[builtins.int] = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
         store_is_read_only: builtins.bool = False,
@@ -77,19 +77,19 @@ class CodecPipelineImpl:
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
         value: numpy.typing.NDArray[typing.Any],
-        read_concurrency: builtins.int | None = None,
-        decode_concurrency: builtins.int | None = None,
-        read_worker_ceiling: builtins.int | None = None,
-        decode_worker_ceiling: builtins.int | None = None,
+        read_concurrency: typing.Optional[builtins.int] = None,
+        decode_concurrency: typing.Optional[builtins.int] = None,
+        read_worker_ceiling: typing.Optional[builtins.int] = None,
+        decode_worker_ceiling: typing.Optional[builtins.int] = None,
     ) -> None: ...
     def retrieve_chunk_items_and_apply_index(
         self,
         chunk_items: ChunkItems,
         value: numpy.typing.NDArray[typing.Any],
-        read_concurrency: builtins.int | None = None,
-        decode_concurrency: builtins.int | None = None,
-        read_worker_ceiling: builtins.int | None = None,
-        decode_worker_ceiling: builtins.int | None = None,
+        read_concurrency: typing.Optional[builtins.int] = None,
+        decode_concurrency: typing.Optional[builtins.int] = None,
+        read_worker_ceiling: typing.Optional[builtins.int] = None,
+        decode_worker_ceiling: typing.Optional[builtins.int] = None,
     ) -> None:
         r"""
         The same read as `retrieve_chunks_and_apply_index`, from a `ChunkItems` handle.

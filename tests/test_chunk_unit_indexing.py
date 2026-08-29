@@ -213,18 +213,74 @@ def test_full_width_two_dimensional_takes_the_path(
     assert entries["list"] == 0
 
 
-def test_a_partial_column_slice_falls_back(
+def test_a_partial_column_slice_takes_the_path(
     full_width: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
-    """Same array, but only some columns: the output rows are then STRIDED, and the output
-    piece is handed out as one contiguous byte range. Declining is the only correct answer."""
+    """A column subset runs here too, which it did not used to.
+
+    The inner chunk is decoded WHOLE either way -- it is the decode unit -- so a column
+    subset narrows only which elements of each decoded row are copied out. That lives in the
+    coordinates and the run length, not in the chunk subset.
+
+    The rows deliberately share inner chunks and repeat one: a coordinate left unstepped by
+    the column offset, or scaled by the output width instead of the chunk's own row, lands on
+    the wrong elements and shows up here as wrong values rather than as an error.
+    """
     path, values = full_width
-    rows = np.array([1, 3, 9, 200])
+    rows = np.array([1, 3, 3, 9, 60, 61, 200])
     with zarr.config.set(CHUNK_UNIT):
         got = zarr.open_array(path, mode="r")[rows, 8:24]
 
     np.testing.assert_array_equal(got, values[rows, 8:24])
-    assert entries["handle"] == 0, "a partial column slice reached the chunk-unit path"
+    assert entries["handle"] > 0, "a partial column slice did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_a_strided_column_slice_still_falls_back(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """Step 2 is not one contiguous run per row, and an item's output is vended as a single
+    range. Declining is still the only correct answer -- widening took the contiguous case
+    only."""
+    path, values = full_width
+    rows = np.array([1, 3, 9, 200])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, 8:24:2]
+
+    np.testing.assert_array_equal(got, values[rows, 8:24:2])
+    assert entries["handle"] == 0, "a strided column slice reached the chunk-unit path"
+
+
+def test_a_column_slice_matches_zarr_python(
+    full_width: tuple[Path, np.ndarray],
+) -> None:
+    """The widened case, byte for byte against the reference pipeline on the same store."""
+    path, _ = full_width
+    rows = np.sort(np.random.default_rng(0).choice(256, size=64, replace=False))
+    with zarr.config.set(CHUNK_UNIT):
+        mine = zarr.open_array(path, mode="r")[rows, 8:24]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r")[rows, 8:24]
+    np.testing.assert_array_equal(mine, theirs)
+
+
+def test_the_contiguity_rule() -> None:
+    """A sub-box of one row is a single run only when every axis before the last PARTIAL one
+    takes exactly one element. Getting this wrong copies strided data as if it were
+    contiguous, which is silently wrong output rather than an error -- so it is asserted
+    directly rather than only through the shapes the fixtures happen to build.
+    """
+    from zarrs.utils import _contiguous_offset
+
+    # One trailing axis: any sub-range of it is contiguous.
+    assert _contiguous_offset([8], [16], (48,)) == 8
+    assert _contiguous_offset([0], [48], (48,)) == 0
+    # Partial middle axis, last axis whole: still one run, offset in whole last-axis rows.
+    assert _contiguous_offset([2, 0], [3, 10], (5, 10)) == 20
+    # Partial LAST axis with a wider axis ahead of it: 5 blocks of 4, strided. Decline.
+    assert _contiguous_offset([0, 2], [5, 4], (5, 10)) is None
+    # The same partial last axis is fine once the axis ahead of it takes exactly one.
+    assert _contiguous_offset([3, 2], [1, 4], (5, 10)) == 32
 
 
 def test_full_width_matches_zarr_python(
@@ -288,3 +344,28 @@ def test_a_shard_holding_one_inner_chunk(
 
     np.testing.assert_array_equal(got, values[rows])
     assert entries["handle"] > 0, "this selection should have taken the chunk-unit path"
+
+
+def test_an_array_narrower_than_its_chunk_takes_the_path(
+    tmp_path: Path, entries: dict[str, int]
+) -> None:
+    """The other case this widening admits, and probably the commoner one in real stores.
+
+    The array is 30 columns wide but its chunk is 48, so the last column of every chunk is
+    fill. `X[rows, :]` asks for the whole ARRAY and still selects only part of each decoded
+    row -- which used to decline, because the test compared the selection against the chunk
+    rather than against the array.
+    """
+    values = np.arange(256 * 30, dtype=np.float32).reshape(256, 30)
+    path = tmp_path / "narrow"
+    z = zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape, chunks=(8, 48), shards=(64, 48)
+    )
+    z[:] = values
+    rows = np.array([1, 3, 3, 9, 60, 200])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, :]
+
+    np.testing.assert_array_equal(got, values[rows, :])
+    assert entries["handle"] > 0, "a narrow array did not take the chunk-unit path"
+    assert entries["list"] == 0

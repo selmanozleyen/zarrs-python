@@ -50,6 +50,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
             indices.readonly(),
             7,
             inner,
+            &[],
         )?;
 
         let got: Vec<_> = items
@@ -83,7 +84,8 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 vec![100],
                 bad.readonly(),
                 0,
-                inner
+                inner,
+                &[]
             )
             .is_err()
         );
@@ -96,7 +98,8 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 vec![1],
                 over.readonly(),
                 0,
-                inner
+                inner,
+                &[]
             )
             .is_err()
         );
@@ -115,8 +118,8 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10)?;
-        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10)?;
+        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10, vec![])?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10, vec![])?;
 
         let got: Vec<_> = handle
             .as_slice()
@@ -143,18 +146,18 @@ fn test_push_entry_refuses_output_another_entry_owns() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10)?;
+        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10, vec![])?;
 
         // `a` produced two items covering output 0..2, so an entry starting at 1 would give
         // two items the same byte.
         assert!(
             handle
-                .push_entry("c/1", vec![95], vec![100], b.readonly(), 1, 10)
+                .push_entry("c/1", vec![95], vec![100], b.readonly(), 1, 10, vec![])
                 .is_err(),
             "an out_start inside an entry already pushed"
         );
         // Starting where the last one ended is exactly what zarr produces, and is allowed.
-        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10)?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10, vec![])?;
         assert_eq!(handle.as_slice().len(), 3);
         Ok(())
     })
@@ -183,6 +186,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
             indices.readonly(),
             2,
             inner,
+            &[0],
         )?;
 
         let got: Vec<_> = items
@@ -212,8 +216,12 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
     })
 }
 
-/// Trailing axes that disagree between chunk and output are refused, not silently trusted:
-/// `run_len` would then describe one buffer and be used to address the other.
+/// A trailing selection that is STRIDED within one index is refused, not silently trusted:
+/// `gather` copies one contiguous run per coordinate, so a strided box would be filled with
+/// whatever happened to sit consecutively after its start.
+///
+/// A merely NARROWER trailing axis is legal now -- 2 columns of a 3-column chunk is
+/// `X[rows, 0:2]` -- so this no longer asserts that, and checks the shape rule instead.
 #[test]
 fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
@@ -221,16 +229,40 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
     Python::initialize();
     Python::attach(|py| {
         let indices = PyArray1::from_slice(py, &[0i64, 1]);
-        // 3 columns in the chunk against 2 in the output.
-        let mismatched = crate::chunk_item::build_chunk_unit_items(
+        // A narrower trailing axis alone is fine: 2 of 3 columns from 0 is `X[rows, 0:2]`.
+        let narrower = crate::chunk_item::build_chunk_unit_items(
             "c/0/0",
             vec![10, 3],
             vec![10, 2],
             indices.readonly(),
             0,
             4,
+            &[0],
         );
-        assert!(mismatched.is_err());
+        assert!(narrower.is_ok(), "a contiguous column subset is served, not refused");
+        // 2 of 4 rows by 5 of 10 columns is 2 runs of 5 at a stride of 10 -- not one range.
+        // A fused offset could not see this; the per-axis starts can.
+        let strided = crate::chunk_item::build_chunk_unit_items(
+            "c/0/0/0",
+            vec![10, 4, 10],
+            vec![10, 2, 5],
+            indices.readonly(),
+            0,
+            4,
+            &[0, 0],
+        );
+        assert!(strided.is_err(), "a strided trailing box must be refused");
+        // A run that starts inside its own sub-row and walks off the end of it, likewise.
+        let wraps = crate::chunk_item::build_chunk_unit_items(
+            "c/0/0/0",
+            vec![10, 4, 10],
+            vec![10, 1, 4],
+            indices.readonly(),
+            0,
+            4,
+            &[0, 8],
+        );
+        assert!(wraps.is_err(), "a run leaving its own sub-row must be refused");
         // Differing ARITY is refused too -- a 1-D chunk against a 2-D output.
         let ranks = crate::chunk_item::build_chunk_unit_items(
             "c/0",
@@ -239,6 +271,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             0,
             4,
+            &[0],
         );
         assert!(ranks.is_err());
         Ok(())

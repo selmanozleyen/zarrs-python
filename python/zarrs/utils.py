@@ -297,21 +297,63 @@ def _is_whole_axis(sel: Any, extent: int) -> bool:
     )
 
 
+def _step1_span(sel: Any, extent: int) -> tuple[int, int] | None:
+    """A step-1 slice as (start, stop) within `extent`, or None if it is not one.
+
+    Rejects rather than clamps: a stop past the extent means the caller and this path disagree
+    about the array, and guessing which is right is how wrong data gets returned.
+    """
+    if not isinstance(sel, slice) or sel.step not in (None, 1):
+        return None
+    lo = sel.start or 0
+    hi = extent if sel.stop is None else sel.stop
+    if not 0 <= lo < hi <= extent:
+        return None
+    return lo, hi
+
+
+def _contiguous_offset(
+    starts: list[int], widths: list[int], extents: tuple[int, ...]
+) -> int | None:
+    """Element offset of a sub-box within ONE row, or None if that box is not contiguous.
+
+    Row-major, the box is one unbroken range exactly when every axis before the last partial
+    one selects a single element. Give a partial axis a wider axis ahead of it and the box
+    takes `widths[k]` elements, skips the rest of that axis, and takes them again -- strided,
+    and an item's output is vended as ONE range, which cannot express that.
+
+    So `X[rows, a:b]` on a 2-D array is always contiguous (there is nothing before axis 1),
+    which is the case this exists for; `X[rows, :, a:b]` on a rank-3 array is not.
+    """
+    last_partial = -1
+    for axis, (width, extent) in enumerate(zip(widths, extents, strict=True)):
+        if width != extent:
+            last_partial = axis
+    if last_partial > 0 and any(width != 1 for width in widths[:last_partial]):
+        return None
+    offset = 0
+    stride = 1
+    for axis in reversed(range(len(widths))):
+        offset += starts[axis] * stride
+        stride *= extents[axis]
+    return offset
+
+
 def _chunk_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
 ) -> tuple | None:
     """Args for `ChunkItems.push_entry`, or None if this entry is not that shape.
 
     Eligible: an integer axis at AXIS 0 -- non-negative, non-decreasing, against a contiguous
-    output slice -- with every axis after it taken WHOLE, at the same extent in the chunk, in
-    the inner chunk and in the output.
+    output slice -- with every axis after it taken whole OR as a contiguous sub-box, on a
+    shard grid that holds a single subchunk on each of those axes.
 
-    That last condition is what makes the rank-N case the 1-D case with a run length. With
-    the trailing axes complete, one selected index is one contiguous run of elements, the
-    output rows of an item are contiguous, and the shard grid holds a single subchunk on
-    every axis but the split -- so the descent can keep walking axis 0 alone. Take a partial
-    column slice instead and all three stop being true: the runs are strided in the output,
-    which `DisjointBytes` hands out as one range and cannot express.
+    The GRID condition is what makes the rank-N case the 1-D case with a run length: with a
+    single subchunk on every axis but the split, the descent can keep walking axis 0 alone.
+    The SELECTION is free to be narrower, because the inner chunk is decoded whole either way
+    -- it is the decode unit -- so a sub-box changes only which of each decoded index's
+    elements are copied out. What it may not be is strided, since an item's output is vended
+    as one range.
 
     `chunk_spec.shape` is the SHARD, so `inner_shape` is passed in separately.
     """
@@ -322,15 +364,39 @@ def _chunk_unit_args(
     rank = len(chunk_spec.shape)
     if not (rank == len(chunk_sel) == len(out_sel) == len(inner_shape) == len(shape)):
         return None
-    # Every axis after the split, taken whole and agreeing on all four sides. Unequal, the
-    # run length would describe one buffer and be used to address another.
+    # Every axis after the split: a contiguous step-1 slice of the chunk, held WHOLE in the
+    # output, on a shard grid that keeps one subchunk there.
+    #
+    # The chunk slice no longer has to be the whole axis. A column subset still decodes the
+    # entire inner chunk -- that is the decode unit either way -- so what narrows is only
+    # which elements of each decoded row get copied out. That lives entirely in `coords` and
+    # the run length, so the chunk subset handed to Rust stays whole. Note that Rust's two
+    # `trailing_axes_are_whole` guards are TAUTOLOGIES for these items -- their trailing ranges
+    # are built as `0..extent` -- so they are not evidence for any of this; `trailing_layout`
+    # is what actually rechecks the shape.
+    #
+    # `inner_shape[axis] == chunk_spec.shape[axis]` is the one that must stay: it is the
+    # shard GRID, not the selection, and it is what lets `locate` descend on axis 0 alone.
+    starts: list[int] = []
+    widths: list[int] = []
     for axis in range(1, rank):
-        if not _is_whole_axis(chunk_sel[axis], chunk_spec.shape[axis]):
+        span = _step1_span(chunk_sel[axis], chunk_spec.shape[axis])
+        if span is None:
             return None
-        if not _is_whole_axis(out_sel[axis], shape[axis]):
+        lo, hi = span
+        # The output holds exactly what was selected -- so an item filling all of it is one
+        # contiguous output range, which is what the carve hands out.
+        if not _is_whole_axis(out_sel[axis], shape[axis]) or shape[axis] != hi - lo:
             return None
-        if inner_shape[axis] != chunk_spec.shape[axis] or shape[axis] != chunk_spec.shape[axis]:
+        if inner_shape[axis] != chunk_spec.shape[axis]:
             return None
+        starts.append(lo)
+        widths.append(hi - lo)
+    # Gate only. Rust re-derives the offset from these same starts and rechecks the shape,
+    # because `push_entry` is reachable from Python with arbitrary arguments and a single
+    # fused offset is not a checkable thing.
+    if _contiguous_offset(starts, widths, tuple(chunk_spec.shape[1:])) is None:
+        return None
     indices = chunk_sel[0]
     out_axis_sel = out_sel[0]
     if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
@@ -349,6 +415,7 @@ def _chunk_unit_args(
         indices,
         start,
         int(inner_shape[0]),
+        tuple(int(v) for v in starts),
     )
 
 
