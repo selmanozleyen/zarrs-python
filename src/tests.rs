@@ -194,9 +194,9 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
             .map(|i| {
                 (
                     i.chunk_subset.start().to_vec(),
-                    i.chunk_subset.end_exc().to_vec(),
+                    i.chunk_subset.end_exc(),
                     i.subset.start().to_vec(),
-                    i.subset.end_exc().to_vec(),
+                    i.subset.end_exc(),
                     i.coords.as_ref().unwrap().to_vec(),
                     i.run_len,
                 )
