@@ -399,6 +399,15 @@ def _chunk_unit_args(
         return None
     indices = chunk_sel[0]
     out_axis_sel = out_sel[0]
+    if isinstance(indices, slice):
+        # A contiguous slice IS a sorted integer axis, spelled differently -- so a sequential
+        # read gets the same grouped, scoped-worker path a scattered one does instead of
+        # falling to the fused one. The arange costs an allocation proportional to the read
+        # it serves, against a decode of that many rows.
+        span = _step1_span(indices, chunk_spec.shape[0])
+        if span is None:
+            return None
+        indices = np.arange(span[0], span[1], dtype=np.int64)
     if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
         return None
     indices = indices.astype(np.int64, copy=False)

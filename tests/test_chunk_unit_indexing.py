@@ -88,14 +88,18 @@ def test_selection_matches_and_takes_the_handle(
     [
         # A backward step would mean one item per element, so the path declines it.
         pytest.param(np.array([9_000, 40, 8_000, 39]), id="decreasing"),
-        # Only integer arrays are grouped; a slice is already one subset.
-        pytest.param(slice(CHUNK - 10, 2 * CHUNK + 10), id="slice"),
+        # A STEP is not a contiguous run, so it stays on the ordinary route.
+        pytest.param(slice(0, 4 * CHUNK, 3), id="strided slice"),
     ],
 )
 def test_ineligible_selections_decline_and_are_still_right(
     array: tuple[Path, np.ndarray], entries: dict[str, int], selection
 ) -> None:
-    """Declined selections must still return the right data, down whichever path takes them."""
+    """Declined selections must still return the right data, down whichever path takes them.
+
+    A contiguous slice is NOT here any more -- it is a sorted integer axis spelled
+    differently, and it is served. Only a stepped one still declines.
+    """
     path, truth = array
 
     with zarr.config.set(CHUNK_UNIT):
@@ -368,4 +372,30 @@ def test_an_array_narrower_than_its_chunk_takes_the_path(
 
     np.testing.assert_array_equal(got, values[rows, :])
     assert entries["handle"] > 0, "a narrow array did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        pytest.param(slice(CHUNK - 10, 2 * CHUNK + 10), id="spanning chunks"),
+        pytest.param(slice(None), id="everything"),
+        pytest.param(slice(N - 100, N), id="partly covered last shard"),
+    ],
+)
+def test_a_contiguous_slice_takes_the_path(
+    array: tuple[Path, np.ndarray], entries: dict[str, int], selection
+) -> None:
+    """A sequential read is grouped like a scattered one, rather than falling to the fused path.
+
+    It used to decline for a spelling reason -- axis 0 was a `slice` rather than an integer
+    array -- not because anything about it is unservable.
+    """
+    path, truth = array
+
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[selection]
+
+    np.testing.assert_array_equal(got, truth[selection])
+    assert entries["handle"] > 0, "a contiguous slice did not take the chunk-unit path"
     assert entries["list"] == 0
