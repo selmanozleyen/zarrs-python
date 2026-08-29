@@ -45,16 +45,29 @@ pub fn is_whole_chunk(item: &ChunkItem) -> bool {
         && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
 }
 
-/// Copy `coords.len()` elements out of `scratch` into `out`, in coordinate order.
+/// Copy one RUN of `run_len` elements per coordinate out of `scratch` into `out`, in
+/// coordinate order.
 ///
-/// `out` must be exactly `coords.len() * size` bytes.
+/// `run_len` is 1 on the 1-D path, where a coordinate is one element. On a rank-N selection
+/// taken whole after axis 0 it is the row length, and then this moves a row per coordinate
+/// -- one `copy_from_slice` of `run_len * size` bytes instead of `run_len` of `size`, which
+/// is the whole reason grouping a wide read pays.
+///
+/// `out` must be exactly `coords.len() * run_len * size` bytes.
 pub(crate) fn gather(
     scratch: &[u8],
     coords: &[u64],
+    run_len: u64,
     out: &mut [u8],
     size: usize,
 ) -> Result<(), String> {
-    if coords.len().checked_mul(size) != Some(out.len()) {
+    let Some(run) = usize::try_from(run_len).ok().and_then(|r| r.checked_mul(size)) else {
+        return Err(format!("run length {run_len} is too large to address"));
+    };
+    if run == 0 {
+        return Err("run length must be greater than zero".to_string());
+    }
+    if coords.len().checked_mul(run) != Some(out.len()) {
         return Err("output region does not match the coordinate count".to_string());
     }
     for (n, &c) in coords.iter().enumerate() {
@@ -65,13 +78,15 @@ pub(crate) fn gather(
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
-        let Some(element) = src.checked_add(size).and_then(|end| scratch.get(src..end)) else {
+        // The END of the run is what has to be in bounds, not its start: a coordinate inside
+        // `scratch` whose run walks off the end would otherwise read past the decode.
+        let Some(element) = src.checked_add(run).and_then(|end| scratch.get(src..end)) else {
             return Err(format!(
-                "coordinate {c} is outside the {} elements decoded",
+                "coordinate {c} plus {run_len} elements is outside the {} decoded",
                 scratch.len() / size
             ));
         };
-        out[n * size..(n + 1) * size].copy_from_slice(element);
+        out[n * run..(n + 1) * run].copy_from_slice(element);
     }
     Ok(())
 }

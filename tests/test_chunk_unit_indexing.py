@@ -151,11 +151,18 @@ def test_unwritten_chunks_read_as_fill(
     assert entries["handle"] > 0, "this selection should have taken the chunk-unit path"
 
 
-def test_two_dimensional_selection_falls_back(
+def test_a_column_split_inner_chunk_falls_back(
     tmp_path: Path, entries: dict[str, int]
 ) -> None:
-    """The grouping is the 1-D path: a 2-D array must decline rather than mis-group, and values
-    alone would pass a version that mis-grouped and got lucky -- hence the entry-point check."""
+    """A 2-D array whose inner chunk is NARROWER than the array declines.
+
+    The rank-N path takes axes after the first whole, and that is not a formality: with the
+    columns divided, one selected row is no longer one contiguous run in the decoded chunk,
+    its output rows are no longer one contiguous range, and the shard grid no longer holds a
+    single subchunk on the column axis -- so the descent along axis 0 would address the wrong
+    subchunk. Values alone would pass a version that mis-grouped and got lucky, hence the
+    entry-point check.
+    """
     values = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
     path = tmp_path / "two_d"
     z = zarr.create_array(
@@ -168,7 +175,69 @@ def test_two_dimensional_selection_falls_back(
         got = zarr.open_array(path, mode="r")[rows, :]
 
     np.testing.assert_array_equal(got, values[rows, :])
-    assert entries["handle"] == 0, "a 2-D selection reached the chunk-unit path"
+    assert entries["handle"] == 0, "a column-split 2-D selection reached the chunk-unit path"
+
+
+@pytest.fixture
+def full_width(tmp_path: Path) -> tuple[Path, np.ndarray]:
+    """A 2-D array whose inner chunk spans every column -- the dense-rep layout.
+
+    64 rows per inner chunk, full width, is what `annbatch.write_sharded` produces for an
+    obsm rep, and it is the only 2-D shape the rank-N path accepts.
+    """
+    values = np.arange(256 * 48, dtype=np.float32).reshape(256, 48)
+    path = tmp_path / "full_width"
+    z = zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape, chunks=(8, 48), shards=(64, 48)
+    )
+    z[:] = values
+    return path, values
+
+
+def test_full_width_two_dimensional_takes_the_path(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """The point of the rank-N change: rows grouped by inner chunk, one item per chunk.
+
+    The rows are chosen so several share an inner chunk (8 rows each) and one repeats -- the
+    axis only has to be non-DECREASING -- so a run length that addressed the wrong buffer, or
+    a coordinate that was not scaled by it, would show up as wrong values rather than an error.
+    """
+    path, values = full_width
+    rows = np.array([1, 3, 3, 9, 60, 61, 200])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, :]
+
+    np.testing.assert_array_equal(got, values[rows, :])
+    assert entries["handle"] > 0, "a full-width 2-D selection did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_a_partial_column_slice_falls_back(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """Same array, but only some columns: the output rows are then STRIDED, and the output
+    piece is handed out as one contiguous byte range. Declining is the only correct answer."""
+    path, values = full_width
+    rows = np.array([1, 3, 9, 200])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, 8:24]
+
+    np.testing.assert_array_equal(got, values[rows, 8:24])
+    assert entries["handle"] == 0, "a partial column slice reached the chunk-unit path"
+
+
+def test_full_width_matches_zarr_python(
+    full_width: tuple[Path, np.ndarray],
+) -> None:
+    """Byte for byte against the reference pipeline, on the same store."""
+    path, _ = full_width
+    rows = np.sort(np.random.default_rng(0).choice(256, size=64, replace=False))
+    with zarr.config.set(CHUNK_UNIT):
+        mine = zarr.open_array(path, mode="r")[rows, :]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r")[rows, :]
+    np.testing.assert_array_equal(mine, theirs)
 
 
 # zarr warns that this layout disables partial reads. That IS the layout under test.

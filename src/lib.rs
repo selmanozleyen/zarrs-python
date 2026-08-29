@@ -375,8 +375,11 @@ impl CodecPipelineImpl {
                     // The output side is one contiguous run because the indices arrived
                     // non-decreasing. The view takes one run, so gather into a buffer and
                     // copy that in.
-                    let mut gathered = vec![0u8; coords.len() * size];
-                    gather(&raw, coords, &mut gathered, size)
+                    let run = usize::try_from(item.run_len).map_err(|_| {
+                        PyRuntimeError::new_err(format!("{}: run length too large", item.key))
+                    })?;
+                    let mut gathered = vec![0u8; coords.len() * run * size];
+                    gather(&raw, coords, item.run_len, &mut gathered, size)
                         .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", item.key)))?;
                     output_view
                         .copy_from_slice(&gathered)

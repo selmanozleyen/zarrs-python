@@ -12,6 +12,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -279,9 +280,34 @@ impl CodecPipelineImpl {
         let mut path: Vec<u64> = Vec::new();
 
         for depth in 0..shard.depth() {
-            let subchunk = shard.subchunk_shape_at(depth)[0].get();
+            let level_shape = shard.subchunk_shape_at(depth);
+            // The descent walks axis 0 and asks for `&[index, 0, 0, ...]`, which addresses
+            // the right subchunk only if every other axis holds exactly ONE at this level.
+            // Rechecked per level rather than assumed from the item: the grid can divide at
+            // one depth and not another, and getting it wrong returns a WRONG chunk's bytes
+            // rather than an error.
+            if level_shape.len() != shard_shape.len()
+                || level_shape
+                    .iter()
+                    .zip(shard_shape.iter())
+                    .skip(1)
+                    .any(|(sub, whole)| sub.get() != whole.get())
+            {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{}: level {depth} divides an axis after the first ({:?} within {:?}); \
+                     this path descends on axis 0 alone",
+                    item.key,
+                    level_shape.iter().map(|d| d.get()).collect::<Vec<_>>(),
+                    shard_shape.iter().map(|d| d.get()).collect::<Vec<_>>()
+                )));
+            }
+            let subchunk = level_shape[0].get();
             let index = offset / subchunk;
             offset %= subchunk;
+            // One entry per axis; zero everywhere but the split, because those axes hold a
+            // single subchunk -- just checked.
+            let mut grid_index = vec![0u64; level_shape.len()];
+            grid_index[0] = index;
 
             let decoder = if depth == 0 {
                 self.decoder_or_read(&self.shard_indexes, &mut decoders.shards, &item.key, || {
@@ -309,7 +335,7 @@ impl CodecPipelineImpl {
                 )?
             };
 
-            let Some(range) = decoder.subchunk_byte_range(&[index]).map_codec_err()? else {
+            let Some(range) = decoder.subchunk_byte_range(&grid_index).map_codec_err()? else {
                 // Absent at this level: the shard is not there, or the entry is the
                 // never-written marker. Either way there is nothing below it.
                 return Ok(None);
@@ -343,14 +369,16 @@ impl CodecPipelineImpl {
                 declined.push(item);
                 continue;
             }
-            // Same silent 1-D assumption `output_offset` makes about `subset`, and checked
-            // for the same reason: a multi-dimensional `chunk_subset` would locate the wrong
-            // inner chunk here and report success.
-            if item.chunk_subset.dimensionality() != 1 {
+            // `locate` descends on axis 0 alone, so every other axis must hold the chunk
+            // whole -- otherwise it would locate a different subchunk and report success.
+            // Checked here as well as in Python, because `push_entry` is `#[pymethods]`.
+            if !trailing_axes_are_whole(&item.chunk_subset, &item.shape) {
                 return Err(PyRuntimeError::new_err(format!(
-                    "{} has a {}-dimensional chunk subset; this path reads 1-D chunks",
+                    "{}: this path splits axis 0 and takes the rest whole, but the chunk \
+                     subset is {} against a chunk of {:?}",
                     item.key,
-                    item.chunk_subset.dimensionality()
+                    item.chunk_subset,
+                    item.shape.iter().map(|d| d.get()).collect::<Vec<_>>()
                 )));
             }
             let start = item.chunk_subset.start().first().copied().unwrap_or(0);
@@ -386,18 +414,28 @@ fn carve<'a>(
         // the element-count check when coords are present. If they disagree, every later
         // piece is carved at the wrong offset and the read silently returns the right number
         // of wrong elements.
-        if item.subset.dimensionality() != 1 {
+        // The output piece is handed out as ONE contiguous byte range, so the item's rows
+        // must be contiguous in the output -- which they are exactly when every axis after
+        // the first is taken whole. Anything else would carve a range that is not the item's.
+        if !trailing_axes_are_whole(&item.subset, &item.array_shape) {
             return Err(PyRuntimeError::new_err(format!(
-                "{} has a {}-dimensional subset; this path carves a 1-D output",
+                "{}: this path carves one contiguous output range, so axes after the first \
+                 must be whole, but the subset is {} against an output of {:?}",
                 item.key,
-                item.subset.dimensionality()
+                item.subset,
+                item.array_shape.iter().map(|d| d.get()).collect::<Vec<_>>()
             )));
         }
-        if coords.len() as u64 != item.subset.num_elements() {
+        // A coordinate stands for `run_len` elements now, so it is the PRODUCT that has to
+        // match the output subset. Nothing ties `coords` to `subset` otherwise: `ChunkItem`
+        // is constructible from Python and skips the element-count check when coords are
+        // present, and a disagreement carves every later piece at the wrong offset.
+        if (coords.len() as u64).checked_mul(item.run_len) != Some(item.subset.num_elements()) {
             return Err(PyRuntimeError::new_err(format!(
-                "{} wants {} coordinates but its output subset holds {} elements",
+                "{} wants {} coordinates of {} elements but its output subset holds {}",
                 item.key,
                 coords.len(),
+                item.run_len,
                 item.subset.num_elements()
             )));
         }
@@ -405,7 +443,10 @@ fn carve<'a>(
         // release and the wrapped value then slips past `take`'s bounds test.
         let (Some(start), Some(len)) = (
             output_offset(item).checked_mul(element_size),
-            coords.len().checked_mul(element_size),
+            usize::try_from(item.run_len)
+                .ok()
+                .and_then(|run| coords.len().checked_mul(run))
+                .and_then(|elements| elements.checked_mul(element_size)),
         ) else {
             return Err(PyRuntimeError::new_err(format!(
                 "{} names an output offset or length too large to address",
@@ -427,6 +468,7 @@ fn carve<'a>(
                 range: *range,
                 out: piece,
                 coords,
+                run_len: item.run_len,
                 ctx,
             }),
             None => absent.push(piece),
@@ -513,12 +555,37 @@ fn coords_of(item: &ChunkItem) -> PyResult<&Arc<[u64]>> {
         .map_py_err::<PyRuntimeError>()
 }
 
-/// Where an item's elements land in the output, in elements.
+/// Where an item's elements land in the output, as a FLAT element offset.
 ///
-/// 1-D only: `_chunk_unit_args` declines any selection whose chunk subset, chunk selection
-/// or output selection is not one-dimensional.
+/// The subset starts at 0 on every axis after the first and spans it whole -- `carve`
+/// rechecks that -- so the output rows of one item are contiguous and the offset is just
+/// the row index times the row length.
 fn output_offset(item: &ChunkItem) -> usize {
-    usize::try_from(item.subset.start().first().copied().unwrap_or(0)).unwrap_or(usize::MAX)
+    let row = usize::try_from(item.subset.start().first().copied().unwrap_or(0))
+        .unwrap_or(usize::MAX);
+    let run: usize = item.array_shape[1..]
+        .iter()
+        .try_fold(1usize, |acc, d| {
+            usize::try_from(d.get()).ok().and_then(|d| acc.checked_mul(d))
+        })
+        .unwrap_or(usize::MAX);
+    row.saturating_mul(run)
+}
+
+/// Is every axis after the first taken WHOLE, against `shape`?
+///
+/// The premise of the rank-N chunk-unit path: with the trailing axes complete, one selected
+/// index is one contiguous run, the output piece of an item is one contiguous range, and
+/// `locate`'s descent along axis 0 alone addresses the right subchunk.
+fn trailing_axes_are_whole(subset: &zarrs::array::ArraySubset, shape: &[NonZeroU64]) -> bool {
+    subset.dimensionality() == shape.len()
+        && subset
+            .start()
+            .iter()
+            .zip(subset.shape())
+            .zip(shape)
+            .skip(1)
+            .all(|((&start, &extent), whole)| start == 0 && extent == whole.get())
 }
 
 /// Live workers across every in-flight call, counted separately per kind.
@@ -696,6 +763,8 @@ struct Job<'a> {
     range: ByteRange,
     out: &'a mut [u8],
     coords: &'a [u64],
+    /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
+    run_len: u64,
     ctx: &'a JobContext,
 }
 
@@ -778,7 +847,8 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             )
             .map_err(|e| e.to_string())?;
     }
-    gather(scratch, job.coords, job.out, size).map_err(|e| format!("{}: {e}", job.key))
+    gather(scratch, job.coords, job.run_len, job.out, size)
+        .map_err(|e| format!("{}: {e}", job.key))
 }
 
 #[cfg(test)]

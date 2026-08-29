@@ -38,6 +38,12 @@ pub(crate) struct ChunkItem {
     /// Indices within `chunk_subset`, when this item is a whole inner chunk plus the
     /// elements wanted from it. The chunk is decoded once and these are gathered out.
     pub coords: Option<Arc<[u64]>>,
+    /// How many CONSECUTIVE elements each coordinate stands for. 1 on the 1-D path, where a
+    /// coordinate is one element. On a rank-N selection whose split axis is 0 and whose
+    /// trailing axes are taken whole, one coordinate is the start of a whole row, and this
+    /// is the row's length -- so `gather` moves a row per coordinate instead of an element,
+    /// which is the only reason grouping a wide 2-D read is worth doing.
+    pub run_len: u64,
 }
 
 #[gen_stub_pymethods]
@@ -76,6 +82,7 @@ impl ChunkItem {
             num_elements,
             array_shape: shape_nonzero_u64,
             coords: None,
+            run_len: 1,
         })
     }
 }
@@ -115,13 +122,49 @@ fn selection_to_array_subset(
     }
 }
 
+/// Elements per selected index: the product of every axis after the split.
+///
+/// Those axes are taken whole on BOTH sides, so one coordinate stands for the same run in
+/// the decoded chunk and in the output. Unequal, `run_len` would describe one buffer and be
+/// used to address the other.
+fn run_length(chunk_shape: &[u64], shape: &[u64]) -> PyResult<u64> {
+    if chunk_shape.is_empty() || chunk_shape.len() != shape.len() {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "chunk_unit_items splits axis 0 and needs matching arity: chunk_shape has {} \
+             axes, the output shape has {}",
+            chunk_shape.len(),
+            shape.len()
+        )));
+    }
+    if chunk_shape[1..] != shape[1..] {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "chunk_unit_items takes axes after the first whole, so they must match: \
+             chunk {:?} against output {:?}",
+            &chunk_shape[1..],
+            &shape[1..]
+        )));
+    }
+    let run_len: u64 = chunk_shape[1..].iter().product();
+    if run_len == 0 {
+        return Err(PyErr::new::<PyValueError, _>(
+            "a trailing axis of extent zero selects nothing",
+        ));
+    }
+    Ok(run_len)
+}
+
 /// Build one item per inner chunk for a whole entry.
 ///
-/// `indices` must be non-negative and non-decreasing. Both are rechecked here: a negative
-/// index becomes a wild chunk id, and `inner == 0` divides by zero.
+/// `indices` selects along AXIS 0 and must be non-negative and non-decreasing. Both are
+/// rechecked here: a negative index becomes a wild chunk id, and `inner == 0` divides by
+/// zero.
+///
+/// Axes after the first are taken WHOLE, and must be the same extent in the chunk and in
+/// the output -- so one selected index is one contiguous run of `run_len` elements, and the
+/// whole rank-N case reduces to the 1-D one with a run length. That restriction is what
+/// lets `locate` keep descending on axis 0 alone: with a single subchunk on every other
+/// axis, the raveled chunk-grid index IS the axis-0 index. `locate` rechecks it per level.
 #[allow(clippy::needless_pass_by_value)]
-// One range per call is the point: this is the 1-D path.
-#[allow(clippy::single_range_in_vec_init)]
 pub(crate) fn build_chunk_unit_items(
     key: &str,
     chunk_shape: Vec<u64>,
@@ -139,11 +182,7 @@ pub(crate) fn build_chunk_unit_items(
     if n == 0 {
         return Ok(Vec::new());
     }
-    if chunk_shape.len() != 1 || shape.is_empty() {
-        return Err(PyErr::new::<PyValueError, _>(
-            "chunk_unit_items is the 1-D path: chunk_shape must have one axis",
-        ));
-    }
+    let run_len = run_length(&chunk_shape, &shape)?;
     let num_elements: u64 = chunk_shape.iter().product();
     let chunk_shape = to_nonzero_u64_vec(chunk_shape)?;
     let shape = to_nonzero_u64_vec(shape)?;
@@ -214,20 +253,29 @@ pub(crate) fn build_chunk_unit_items(
                 "output subset {out_lo}..{out_hi} is past the output extent {out_extent}",
             )));
         }
+        // Axis 0 is the split; every axis after it is taken whole on both sides.
+        let mut chunk_ranges = Vec::with_capacity(chunk_shape.len());
+        chunk_ranges.push(lo..hi);
+        chunk_ranges.extend(chunk_shape[1..].iter().map(|d| 0..d.get()));
+        let mut out_ranges = Vec::with_capacity(shape.len());
+        out_ranges.push(out_lo..out_hi);
+        out_ranges.extend(shape[1..].iter().map(|d| 0..d.get()));
         items.push(ChunkItem {
             key: key.clone(),
-            chunk_subset: ArraySubset::new_with_ranges(&[lo..hi]),
-            subset: ArraySubset::new_with_ranges(&[out_lo..out_hi]),
+            chunk_subset: ArraySubset::new_with_ranges(&chunk_ranges),
+            subset: ArraySubset::new_with_ranges(&out_ranges),
             shape: chunk_shape.clone(),
             num_elements,
             array_shape: shape.clone(),
-            // Relative to the chunk subset, because that is the buffer gathered from.
+            // Relative to the chunk subset, because that is the buffer gathered from, and
+            // scaled by `run_len` because a coordinate addresses the START of a run there.
             coords: Some(
                 (a..b)
-                    .map(|i| at(i).map(|v| v - lo))
+                    .map(|i| at(i).map(|v| (v - lo) * run_len))
                     .collect::<PyResult<Vec<u64>>>()?
                     .into(),
             ),
+            run_len,
         });
         a = b;
     }
@@ -267,9 +315,13 @@ impl ChunkItems {
 
     /// Build one batch entry's items and append them.
     ///
-    /// `indices` are checked here: non-negative, non-decreasing, and inside the chunk extent.
-    /// So is `out_start` -- entries must be pushed in increasing order, and one that would
-    /// reuse output another entry already owns is refused.
+    /// `indices` select along AXIS 0 and are checked here: non-negative, non-decreasing, and
+    /// inside the chunk extent. So is `out_start` -- entries must be pushed in increasing
+    /// order, and one that would reuse output another entry already owns is refused.
+    ///
+    /// Axes after the first are taken WHOLE and must be the same extent in `chunk_shape` and
+    /// in `shape`; that is checked too. It is what makes one index one contiguous run, and
+    /// the rank-N case the 1-D case with a run length.
     ///
     /// One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
     /// since the output subset is bounded against it. A larger one describes bytes the buffer

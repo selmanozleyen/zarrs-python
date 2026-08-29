@@ -287,22 +287,52 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
+def _is_whole_axis(sel: Any, extent: int) -> bool:
+    """Does this selector take the axis whole, start to finish, step 1?"""
+    return (
+        isinstance(sel, slice)
+        and sel.step in (None, 1)
+        and (sel.start or 0) == 0
+        and sel.stop in (None, extent)
+    )
+
+
 def _chunk_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
 ) -> tuple | None:
     """Args for `ChunkItems.push_entry`, or None if this entry is not that shape.
 
-    Eligible: one 1-D integer axis, non-negative and non-decreasing, against a contiguous
-    output slice. `chunk_spec.shape` is the SHARD, so `inner_shape` is passed in separately.
+    Eligible: an integer axis at AXIS 0 -- non-negative, non-decreasing, against a contiguous
+    output slice -- with every axis after it taken WHOLE, at the same extent in the chunk, in
+    the inner chunk and in the output.
+
+    That last condition is what makes the rank-N case the 1-D case with a run length. With
+    the trailing axes complete, one selected index is one contiguous run of elements, the
+    output rows of an item are contiguous, and the shard grid holds a single subchunk on
+    every axis but the split -- so the descent can keep walking axis 0 alone. Take a partial
+    column slice instead and all three stop being true: the runs are strided in the output,
+    which `DisjointBytes` hands out as one range and cannot express.
+
+    `chunk_spec.shape` is the SHARD, so `inner_shape` is passed in separately.
     """
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
-    if drop_axes or inner_shape is None or len(inner_shape) != 1:
+    if drop_axes or inner_shape is None:
         return None
     chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
-    if len(chunk_sel) != 1 or len(out_sel) != 1 or len(chunk_spec.shape) != 1:
+    rank = len(chunk_spec.shape)
+    if not (rank == len(chunk_sel) == len(out_sel) == len(inner_shape) == len(shape)):
         return None
-    (indices,) = chunk_sel
-    (out_axis_sel,) = out_sel
+    # Every axis after the split, taken whole and agreeing on all four sides. Unequal, the
+    # run length would describe one buffer and be used to address another.
+    for axis in range(1, rank):
+        if not _is_whole_axis(chunk_sel[axis], chunk_spec.shape[axis]):
+            return None
+        if not _is_whole_axis(out_sel[axis], shape[axis]):
+            return None
+        if inner_shape[axis] != chunk_spec.shape[axis] or shape[axis] != chunk_spec.shape[axis]:
+            return None
+    indices = chunk_sel[0]
+    out_axis_sel = out_sel[0]
     if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
         return None
     indices = indices.astype(np.int64, copy=False)

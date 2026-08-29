@@ -19,8 +19,8 @@ class ChunkItem:
         shape: typing.Sequence[builtins.int],
     ) -> ChunkItem:
         r"""
-        Python cannot build a coords item: its `subset` and `chunk_subset` hold different
-        counts, which the check below rejects. `build_chunk_unit_items` builds those.
+        `coords` is always `None` here -- it is not a parameter, so this constructor cannot
+        build a chunk-unit item. `ChunkItems::push_entry` builds those.
         """
 
 @typing.final
@@ -45,9 +45,13 @@ class ChunkItems:
         r"""
         Build one batch entry's items and append them.
 
-        `indices` are checked here: non-negative, non-decreasing, and inside the chunk extent.
-        So is `out_start` -- entries must be pushed in increasing order, and one that would
-        reuse output another entry already owns is refused.
+        `indices` select along AXIS 0 and are checked here: non-negative, non-decreasing, and
+        inside the chunk extent. So is `out_start` -- entries must be pushed in increasing
+        order, and one that would reuse output another entry already owns is refused.
+
+        Axes after the first are taken WHOLE and must be the same extent in `chunk_shape` and
+        in `shape`; that is checked too. It is what makes one index one contiguous run, and
+        the rank-N case the 1-D case with a run length.
 
         One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
         since the output subset is bounded against it. A larger one describes bytes the buffer

@@ -160,20 +160,131 @@ fn test_push_entry_refuses_output_another_entry_owns() -> PyResult<()> {
     })
 }
 
+/// The rank-2 case: the same grouping, with every column taken whole.
+///
+/// What is different from the 1-D test above and has to be pinned: the subsets carry the
+/// full column range on axis 1, and the coordinates are SCALED by the row length -- a
+/// coordinate addresses the start of a row inside the decoded chunk, not an element. Get
+/// that scaling wrong and the read returns the right shape full of the wrong rows.
+#[test]
+fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let inner = 4u64;
+        let cols = 3u64;
+        // Chunk 0: rows 1 and 1 (a duplicate) and 3. Chunk 2: row 9.
+        let indices = PyArray1::from_slice(py, &[1i64, 1, 3, 9]);
+        let items = crate::chunk_item::build_chunk_unit_items(
+            "c/0/0",
+            vec![10, cols],
+            vec![12, cols],
+            indices.readonly(),
+            2,
+            inner,
+        )?;
+
+        let got: Vec<_> = items
+            .iter()
+            .map(|i| {
+                (
+                    i.chunk_subset.start().to_vec(),
+                    i.chunk_subset.end_exc().to_vec(),
+                    i.subset.start().to_vec(),
+                    i.subset.end_exc().to_vec(),
+                    i.coords.as_ref().unwrap().to_vec(),
+                    i.run_len,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                // rows 0..4 of the chunk, all 3 columns; output rows 2..5, all 3 columns.
+                // Rows 1, 1, 3 within the chunk are element offsets 3, 3, 9.
+                (vec![0, 0], vec![4, 3], vec![2, 0], vec![5, 3], vec![3, 3, 9], 3),
+                // hi is min(lo + inner, extent), so the last chunk is short: rows 8..10.
+                (vec![8, 0], vec![10, 3], vec![5, 0], vec![6, 3], vec![3], 3),
+            ]
+        );
+        Ok(())
+    })
+}
+
+/// Trailing axes that disagree between chunk and output are refused, not silently trusted:
+/// `run_len` would then describe one buffer and be used to address the other.
+#[test]
+fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let indices = PyArray1::from_slice(py, &[0i64, 1]);
+        // 3 columns in the chunk against 2 in the output.
+        let mismatched = crate::chunk_item::build_chunk_unit_items(
+            "c/0/0",
+            vec![10, 3],
+            vec![10, 2],
+            indices.readonly(),
+            0,
+            4,
+        );
+        assert!(mismatched.is_err());
+        // Differing ARITY is refused too -- a 1-D chunk against a 2-D output.
+        let ranks = crate::chunk_item::build_chunk_unit_items(
+            "c/0",
+            vec![10],
+            vec![10, 2],
+            indices.readonly(),
+            0,
+            4,
+        );
+        assert!(ranks.is_err());
+        Ok(())
+    })
+}
+
 /// `gather` copies by coordinate, and refuses an out-of-range coord or a mismatched output.
 #[test]
 fn test_gather_copies_by_coordinate_and_refuses_the_rest() {
     let scratch: Vec<u8> = (0..12u8).collect(); // 6 elements of 2 bytes
     let mut out = vec![0u8; 6];
 
-    crate::utils::gather(&scratch, &[0, 2, 5], &mut out, 2).expect("in bounds");
+    crate::utils::gather(&scratch, &[0, 2, 5], 1, &mut out, 2).expect("in bounds");
     assert_eq!(out, vec![0, 1, 4, 5, 10, 11]);
 
     // A coordinate past the decoded buffer must not read adjacent elements.
     let mut out = vec![0u8; 2];
-    assert!(crate::utils::gather(&scratch, &[6], &mut out, 2).is_err());
+    assert!(crate::utils::gather(&scratch, &[6], 1, &mut out, 2).is_err());
 
     // An output region that does not match the coordinate count would write short or over.
     let mut out = vec![0u8; 4];
-    assert!(crate::utils::gather(&scratch, &[0, 1, 2], &mut out, 2).is_err());
+    assert!(crate::utils::gather(&scratch, &[0, 1, 2], 1, &mut out, 2).is_err());
+}
+
+/// With a run length, one coordinate is a whole row -- and the END of the run is what has to
+/// be in bounds, which a start-only check would miss.
+#[test]
+fn test_gather_copies_a_run_per_coordinate() {
+    let scratch: Vec<u8> = (0..12u8).collect(); // 6 elements of 2 bytes, as 2 rows of 3
+    let mut out = vec![0u8; 6];
+
+    // Row 1 of the chunk: coordinate 3 (element offset), 3 elements long.
+    crate::utils::gather(&scratch, &[3], 3, &mut out, 2).expect("in bounds");
+    assert_eq!(out, vec![6, 7, 8, 9, 10, 11]);
+
+    // Both rows, in order.
+    let mut out = vec![0u8; 12];
+    crate::utils::gather(&scratch, &[0, 3], 3, &mut out, 2).expect("in bounds");
+    assert_eq!(out, (0..12u8).collect::<Vec<_>>());
+
+    // A coordinate INSIDE the buffer whose run walks off the end. The start alone is fine,
+    // which is exactly why the check is on the end.
+    let mut out = vec![0u8; 6];
+    assert!(crate::utils::gather(&scratch, &[4], 3, &mut out, 2).is_err());
+
+    // A zero run length would make the output region match at every coordinate count.
+    let mut out = vec![0u8; 0];
+    assert!(crate::utils::gather(&scratch, &[0], 0, &mut out, 2).is_err());
 }
