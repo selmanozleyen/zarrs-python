@@ -391,8 +391,16 @@ def _chunk_unit_args(
         # measured at 98 ms to build and 112 ms to hand over against a ~317 ms preload. The
         # runs were already there -- anndata derives them from `indptr` and zarr carries them
         # through as slices -- and this is where they were being thrown away.
-        if all(v == 0 for v in starts) and all(
-            int(shape[axis]) == int(chunk_spec.shape[axis]) for axis in range(1, rank)
+        # The span form has nowhere to put a trailing start or width: it says "the whole
+        # trailing extent", on both sides, and Rust rechecks only `chunk_shape[1:] ==
+        # shape[1:]` -- which is about the two EXTENTS and says nothing about this entry's
+        # box within them. `starts == 0` was not the property needed: an entry whose chunk box
+        # begins at column 0 and stops short of the extent passes it, and `X[a:b, 1:13]` on a
+        # 12-wide shard grid builds exactly that -- one column of chunk, described as twelve.
+        # The WIDTH is what has to be whole; a start of 0 then follows from it.
+        if all(
+            int(widths[axis - 1]) == int(shape[axis]) == int(chunk_spec.shape[axis])
+            for axis in range(1, rank)
         ):
             out_span = _step1_span(out_axis_sel, shape[0])
             count = span[1] - span[0]

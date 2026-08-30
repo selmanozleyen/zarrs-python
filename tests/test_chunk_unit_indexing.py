@@ -10,6 +10,7 @@ point served the read, since a silent fall back passes every values-only check.
 
 from __future__ import annotations
 
+from math import prod
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -758,3 +759,181 @@ def test_every_shape_works_through_two_shard_levels(
     np.testing.assert_array_equal(got, theirs)
     assert entries["handle"] > 0, f"{name} did not take the chunk-unit path through two levels"
     assert entries["list"] == 0
+
+
+# --- The description, checked against the bytes it claims -------------------------------
+#
+# Everything above reads a real array and compares values. That catches a description that is
+# wrong AND reaches Rust; it does not catch one that is wrong and raises there, and it says
+# nothing about which of the two forms `_chunk_unit_args` chose. Both regressions this exists
+# for were in the description: an entry whose OUTPUT sub-box was strided, described as one
+# run per index, and a `span` covering one column of a shard, described as all twelve. So the
+# tuple itself is expanded here -- the way `build_chunk_unit_items` and `output_pieces` read
+# it back -- and compared against the selection it came from, with no store and no Rust.
+
+
+def _fold(starts, extents) -> int:
+    """A coordinate as a row-major element offset."""
+    offset, stride = 0, 1
+    for axis in reversed(range(len(starts))):
+        offset += int(starts[axis]) * stride
+        stride *= int(extents[axis])
+    return offset
+
+
+def _batch(shard: tuple[int, ...], rows, boxes: list[tuple[int, int]]):
+    """The entries zarr builds for `X[rows, lo:hi, ...]`, and the output shape.
+
+    `rows` is either `(lo, hi)` -- a slice, which is what reaches the span form -- or a list
+    of indices. The trailing axes are half-open ranges over the ARRAY, split across the shard
+    grid exactly as zarr splits them, which is what produces a band when a range straddles a
+    shard boundary.
+    """
+    import itertools
+    import types
+
+    sliced = isinstance(rows, tuple)
+    row_list = list(range(*rows)) if sliced else list(rows)
+    out_shape = (len(row_list), *[hi - lo for lo, hi in boxes])
+    grids = [
+        range(row_list[0] // shard[0], row_list[-1] // shard[0] + 1),
+        *[range(lo // s, (hi - 1) // s + 1) for (lo, hi), s in zip(boxes, shard[1:])],
+    ]
+    entries = []
+    for coord in itertools.product(*grids):
+        take = [i for i, r in enumerate(row_list) if r // shard[0] == coord[0]]
+        if not take:
+            continue
+        local = [row_list[i] - coord[0] * shard[0] for i in take]
+        chunk_sel = [
+            slice(local[0], local[-1] + 1) if sliced else np.array(local, dtype=np.int64)
+        ]
+        out_sel = [slice(take[0], take[-1] + 1)]
+        for axis, ((lo, hi), extent) in enumerate(zip(boxes, shard[1:]), start=1):
+            base = coord[axis] * extent
+            a, b = max(lo, base), min(hi, base + extent)
+            if a >= b:
+                break
+            chunk_sel.append(slice(a - base, b - base))
+            out_sel.append(slice(a - lo, b - lo))
+        else:
+            entries.append(
+                (
+                    types.SimpleNamespace(path="c/" + "/".join(map(str, coord))),
+                    types.SimpleNamespace(shape=tuple(shard)),
+                    tuple(chunk_sel),
+                    tuple(out_sel),
+                    False,
+                )
+            )
+    return entries, out_shape
+
+
+def _wanted(entry, out_shape) -> list[tuple[int, int]]:
+    """(shard element, output element) pairs the SELECTION asks for, paired in order."""
+    import itertools
+
+    _, spec, chunk_sel, out_sel, _ = entry
+    axes = [
+        list(s) if isinstance(s, np.ndarray) else list(range(s.start, s.stop))
+        for s in chunk_sel
+    ]
+    src = [_fold(c, spec.shape) for c in itertools.product(*axes)]
+    dst = [
+        _fold(c, out_shape)
+        for c in itertools.product(*[range(s.start, s.stop) for s in out_sel])
+    ]
+    assert len(src) == len(dst)
+    return list(zip(src, dst))
+
+
+def _described(args) -> list[tuple[int, int]]:
+    """The same pairs, expanded the way Rust reads the description back.
+
+    `span`: the trailing axes WHOLE on both sides -- `push_span` has nowhere to put anything
+    else. `entry`: one run of `prod(out_widths[1:])` per index, at `starts` into the chunk row
+    and at `out_starts[1:]` into the output row, which is `coords`/`run_len` and
+    `output_pieces` respectively.
+    """
+    if args[0] == "span":
+        _, _key, chunk_shape, shape, first, count, out_start, _inner = args
+        row, out_row = prod(chunk_shape[1:]), prod(shape[1:])
+        return [
+            ((first + k) * row + j, (out_start + k) * out_row + j)
+            for k in range(count)
+            for j in range(row)
+        ]
+    _, _key, chunk_shape, shape, indices, out_starts, out_widths, _inner, starts = args
+    row, out_row = prod(chunk_shape[1:]), prod(shape[1:])
+    src_offset = _fold(starts, chunk_shape[1:])
+    dst_offset = _fold(out_starts[1:], shape[1:])
+    run = prod(out_widths[1:])
+    return [
+        (int(index) * row + src_offset + j, (out_starts[0] + i) * out_row + dst_offset + j)
+        for i, index in enumerate(indices)
+        for j in range(run)
+    ]
+
+
+@pytest.mark.parametrize(
+    "shard", [(4, 5), (2, 3, 4)], ids=["rank-2", "rank-3"]
+)
+@pytest.mark.parametrize(
+    "rows", [(0, 8), (1, 9), [0, 1, 3, 6], [5]], ids=["slice", "unaligned-slice", "list", "one"]
+)
+def test_a_description_names_exactly_its_own_bytes(shard, rows) -> None:
+    """Every column range over a shard grid, described and expanded back.
+
+    Three things at once, and each has already been wrong: the pairs must match the selection
+    (a `span` that covers one column of a shard fails here), the descriptions of one read must
+    not claim a byte twice, and together they must cover the output exactly. A read that
+    declines is fine -- this is about what is SAID, not about coverage of the fast path.
+    """
+    import itertools
+
+    from zarrs.utils import _chunk_unit_args
+
+    width = shard[1] * 3
+    checked = 0
+    for lo, hi in itertools.combinations(range(width + 1), 2):
+        boxes = [(lo, hi), *[(0, shard[axis]) for axis in range(2, len(shard))]]
+        entries, out_shape = _batch(shard, rows, boxes)
+        pairs: list[tuple[int, int]] = []
+        for entry in entries:
+            args = _chunk_unit_args(entry, out_shape, (), tuple(shard))
+            if args is None:
+                break
+            assert sorted(_described(args)) == sorted(_wanted(entry, out_shape)), (
+                f"{args[0]} for {entry[0].path} names bytes the selection did not ask for: "
+                f"{entry[2]} -> {entry[3]} of {out_shape}"
+            )
+            pairs += _described(args)
+        else:
+            got = sorted(d for _, d in pairs)
+            assert got == list(range(prod(out_shape))), (
+                f"X[{rows}, {lo}:{hi}] of {shard}: the descriptions do not tile {out_shape}"
+            )
+            checked += 1
+    assert checked, "every column range declined; this asserted nothing"
+
+
+def test_a_strided_output_box_is_declined() -> None:
+    """A partial LAST axis with a wider axis ahead of it is not one run per index.
+
+    `output_pieces` models an item's output as ONE run per axis-0 index, so this must never be
+    described -- it is the shape that failed 633 tests as "claims output bytes which run
+    backwards". The chunk side of the same rule has its own test above; this is the OUTPUT
+    side, which is a different question as soon as an entry stops spanning the whole extent.
+    """
+    import types
+
+    from zarrs.utils import _chunk_unit_args
+
+    entry = (
+        types.SimpleNamespace(path="c/0/0/0"),
+        types.SimpleNamespace(shape=(4, 5, 10)),
+        (slice(0, 4), slice(0, 5), slice(0, 4)),
+        (slice(0, 4), slice(0, 5), slice(0, 4)),
+        False,
+    )
+    assert _chunk_unit_args(entry, (4, 5, 10), (), (4, 5, 10)) is None
