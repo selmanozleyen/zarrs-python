@@ -80,8 +80,9 @@ impl CodecPipelineImpl {
     /// Read and decode `items`, one job per innermost chunk, on workers scoped to this call.
     ///
     /// `items` must be chunk-unit items: one whole innermost chunk each, carrying the
-    /// coordinates wanted from it. Returns the items this path could not take, for the caller
-    /// to run down the fused path.
+    /// coordinates wanted from it. Returns the items this path could not take -- there is no
+    /// second path to hand them to, so the caller turns them into an error rather than leave
+    /// their output bytes unwritten.
     pub(crate) fn retrieve_chunk_units<'a>(
         &self,
         shard: &Arc<ShardInfo>,

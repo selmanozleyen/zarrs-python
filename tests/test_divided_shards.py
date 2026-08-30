@@ -1,18 +1,24 @@
 """Arrays whose shard holds more than one inner chunk on a trailing axis.
 
-This is an ordinary way to shard and the chunk-unit path refuses it, because that path
-descends on one axis and vends each item's output as a single contiguous range. It used to be
-served by the fused read path; removing that path in `38bfbed` left it with no fast path at
-all, and 15 tests have failed since.
+An ordinary way to shard, and the one that needs a selection split into BANDS: the inner chunk
+is the decode unit, so a trailing range crossing one of its boundaries is not a wide read but
+one read per inner chunk.
 
-Declining is not wrong -- `pipeline.read` catches `DiscontiguousArrayError` and falls back to
-zarr-python, which returns correct values. `open_strict` turns the decline into an error, so
-these tests fail loudly on a geometry that merely reads slowly in normal use. That is the
-point: they say whether the fast path serves it, not whether the answer is right.
+Every test here uses `open_strict`, which turns a decline into an error. In normal use a
+decline is not wrong -- `pipeline.read` catches `DiscontiguousArrayError` and falls back to
+zarr-python, which returns correct values, slowly. Strict is what makes these tests say
+whether the fast path SERVES the geometry rather than whether the answer is right.
 
-Two geometries, and the rank-3 one is not decoration. An earlier attempt at this got rank 2
-right and rank 3 wrong -- the coordinate stride ignored the axes BELOW the split -- and no
-test in the suite had a third axis, so the suite said nothing.
+The fixtures are chosen to separate defects rather than to cover shapes:
+
+  banded_output_only  only the output is a sub-box; no shard divides
+  divided_2d          both at once
+  divided_3d          an axis BELOW the split -- an earlier attempt got rank 2 right and rank
+                      3 wrong, because the coordinate stride ignored those axes
+  short_final_band    a band NARROWER than its inner chunk. In the other three every band
+                      fills a whole inner chunk, so a stride taken from the band width and one
+                      taken from the inner chunk are the same number, and fourteen cases agree
+                      with each other while both are wrong.
 """
 
 from __future__ import annotations

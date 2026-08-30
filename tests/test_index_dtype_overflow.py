@@ -90,12 +90,10 @@ def test_unsigned_descending_rows_are_refused(dtype: str, sharded) -> None:
         zarr.open_array(path, mode="r")[np.array([27, 3], dtype=dtype), :]
 
 
-# `test_negative_chunk_relative_index_is_refused` was here. It called `split_selection_runs`
-# directly, and that function went with the fused read path -- reads no longer split, and
-# writes never did. The invariant it guarded is still guarded, on the live path and in two
-# places: `_chunk_unit_args` declines a negative index (`utils.py`, `(indices < 0).any()`) and
-# `build_chunk_unit_items` errors on one (`chunk_item.rs`, "index {} is negative"). What is
-# gone is a test of how a deleted function spelled the refusal.
+# A negative index is refused in two places on the live path: `_chunk_unit_args` declines one
+# (`utils.py`, `(indices < 0).any()`) and `build_chunk_unit_items` errors on one
+# (`chunk_item.rs`, "index {} is negative"). Tested through the read below rather than by
+# calling either directly, so the test survives a change of spelling.
 
 def test_sorted_selections_never_produce_a_negative_bound(sharded) -> None:
     """The guard above must not be firing on ordinary reads."""

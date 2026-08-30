@@ -161,10 +161,9 @@ def test_contiguous_output_does_not_imply_sorted_input(
     np.testing.assert_array_equal(got, expected[index])
 
 
-# `test_a_split_read_is_rejected_without_the_splitter` was here -- a meta-test asserting the
-# tests above really did exercise `split_selection_runs`. That function went with the fused
-# read path, so the assertion has nothing left to make. The tests above now prove their own
-# point directly, through `entries["handle"]`, which says which Rust path actually ran.
+# The tests above prove they reached the fast path through `entries["handle"]`, which counts
+# the Rust entry point that actually ran -- values alone cannot tell a served read from one
+# that quietly fell back to zarr-python and got the same answer.
 
 @pytest.mark.parametrize(
     "mask",

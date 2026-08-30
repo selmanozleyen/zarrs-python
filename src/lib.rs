@@ -7,7 +7,6 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
 use chunk_item::ChunkItem;
-use itertools::Itertools;
 use numpy::npyffi::PyArrayObject;
 use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -20,9 +19,8 @@ use unsafe_cell_slice::UnsafeCellSlice;
 use utils::is_whole_chunk;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 use zarrs::array::{
-    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
-    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecChainBound, CodecOptions,
-    DataType, FillValue, copy_fill_value_into, update_array_bytes,
+    ArrayBytes, ArrayMetadata, ArrayToBytesCodecTraits, CodecChain,
+    CodecChainBound, CodecOptions, DataType, FillValue, update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
@@ -41,7 +39,7 @@ mod utils;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::StoreConfig;
-use crate::utils::{PyCodecErrExt, PyErrExt as _, gather, key_partial_decoder};
+use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
 #[gen_stub_pyclass]
@@ -248,9 +246,11 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         widths: read_decode::CallWidths,
     ) -> PyResult<()> {
-        // The concurrent path, when every item is a chunk-unit item. It needs an exclusive
-        // output slice, so it cannot share the aliasing wrapper the fused path takes --
-        // hence the dispatch here rather than inside the loop.
+        // Every item must be a chunk-unit item and the array must present a sharding codec.
+        // Both are guaranteed by `chunk_info_for_read`, which is the only route to a
+        // `ChunkItems` handle; anything it cannot describe raises and falls back to
+        // zarr-python in Python. The check stays because this is a `#[pymethods]` boundary,
+        // and what it guards is an exclusive output slice.
         if let (true, Some(shard)) = (
             !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.coords.is_some()),
             self.shard.as_ref(),
@@ -261,8 +261,9 @@ impl CodecPipelineImpl {
             // guarantee rather than relying on the fallback staying unreachable.
             let element_size = self.element_size()?;
             let declined = {
-                // The aliasing wrapper, as the fused path takes -- no `&mut` is claimed over
-                // the whole buffer. `DisjointBytes` vends the pieces from it, one range each.
+                // An aliasing wrapper: no `&mut` is claimed over the whole buffer.
+                // `DisjointBytes` vends the pieces from it, one range each, so each piece
+                // becomes a `&mut [u8]` the compiler can check.
                 let output = Self::nparray_to_unsafe_cell_slice(value, element_size)?;
                 let output_len = output.len();
                 py.detach(|| {
@@ -296,8 +297,23 @@ impl CodecPipelineImpl {
                 declined.len()
             )));
         }
-        // Not the hot path: the batch is mixed, or arrived as a list.
-        Ok(())
+        // No second path to fall through to. Reaching here means either the batch was
+        // empty, or an item arrived without coordinates, or the array does not present a
+        // sharding codec -- and in every one of those cases the output buffer is exactly as
+        // `np.empty` left it, so returning Ok would hand the caller uninitialised memory and
+        // call it data. Python declines all three before they get here; this is the assertion
+        // that says so, rather than a silence that looks like success.
+        Err(PyRuntimeError::new_err(format!(
+            "a batch of {} items could not be served: {}",
+            chunk_descriptions.len(),
+            if chunk_descriptions.is_empty() {
+                "it is empty"
+            } else if self.shard.is_none() {
+                "this array presents no sharding codec, so there is no decode unit to group by"
+            } else {
+                "an item arrived without coordinates"
+            }
+        )))
     }
 
 }
@@ -505,16 +521,6 @@ impl CodecPipelineImpl {
             Ok(())
         })
     }
-}
-
-/// The partial decoder assembled for this key earlier in the call.
-fn cached_partial_decoder<'a>(
-    cache: &'a HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>>,
-    key: &StoreKey,
-) -> PyResult<&'a Arc<dyn ArrayPartialDecoderTraits>> {
-    cache
-        .get(key)
-        .ok_or_else(|| PyRuntimeError::new_err(format!("Partial decoder not found for key: {key}")))
 }
 
 /// A Python module implemented in Rust.

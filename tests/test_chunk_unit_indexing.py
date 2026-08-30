@@ -389,7 +389,7 @@ def test_an_array_narrower_than_its_chunk_takes_the_path(
 def test_a_contiguous_slice_takes_the_path(
     array: tuple[Path, np.ndarray], entries: dict[str, int], selection
 ) -> None:
-    """A sequential read is grouped like a scattered one, rather than falling to the fused path.
+    """A sequential read is grouped like a scattered one, rather than declining.
 
     It used to decline for a spelling reason -- axis 0 was a `slice` rather than an integer
     array -- not because anything about it is unservable.
