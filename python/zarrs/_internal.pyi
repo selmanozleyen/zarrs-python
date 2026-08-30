@@ -63,17 +63,18 @@ class ChunkItems:
         chunk_shape: typing.Sequence[builtins.int],
         shape: typing.Sequence[builtins.int],
         indices: numpy.typing.NDArray[numpy.int64],
-        cols: numpy.typing.NDArray[numpy.uint64],
+        starts: numpy.typing.NDArray[numpy.uint64],
+        run: builtins.int,
         out_start: builtins.int,
         inner: builtins.int,
     ) -> None:
         r"""
         Push a GRID selection: the same columns taken from every selected index.
 
-        `oindex[rows, cols]` -- a gene panel across cells -- and `X[:, cols]`. zarr broadcasts
-        the two axes, so rows arrive shaped (n,1) and columns (1,m); Python flattens both
-        before they get here. Each row contributes `cols.len()` SCATTERED elements which land
-        contiguously in the output, so the item is still one output range.
+        `oindex[rows, cols]`, `X[:, cols]`, and any rank-N grid. Each selected index gives up
+        the same sub-box, described as `starts.len()` runs of `run` elements -- because in
+        row-major order a sub-box IS a set of runs. A fully scattered selection is `run == 1`.
+        The runs land back to back in the output, so the item is still one output range.
         """
     def push_points(
         self,

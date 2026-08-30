@@ -91,52 +91,60 @@ pub(crate) fn gather(
     Ok(())
 }
 
-/// Gather `cols.len()` SCATTERED elements per coordinate, rather than a contiguous run.
+/// Gather `starts.len()` RUNS of `run` elements per coordinate, rather than one contiguous
+/// span.
 ///
-/// `oindex[rows, cols]` takes the same columns from every selected row, so one shared list
-/// serves the whole item and each coordinate is the start of its own row. The output stays
-/// contiguous -- a row of the result is those columns in order -- which is what lets an item
-/// still be vended as one range.
+/// A grid takes the same sub-box out of every selected index, and in row-major order that box
+/// is a set of runs, not a set of elements: `X[rows, 2:5, 4:12]` of a (8,16) row is three runs
+/// of eight, at 36, 52 and 68. Representing it as twenty-four separate offsets and copying
+/// them one at a time throws away structure that is actually there -- which is why a box of
+/// pure slices used to be left to the ordinary route.
 ///
-/// Element at a time, where the contiguous gather is one memcpy per coordinate. That is the
-/// price of the case: the alternative is the ordinary route, which pays a partial-decode call
-/// per element instead.
-pub(crate) fn gather_columns(
+/// A fully scattered selection degenerates to `run == 1`, one element per start, so this is
+/// never worse than the element-at-a-time version it replaces.
+///
+/// The output stays contiguous -- the runs land back to back, which is what the output row is
+/// -- so an item is still vended as a single range.
+pub(crate) fn gather_runs(
     scratch: &[u8],
     coords: &[u64],
-    cols: &[u64],
+    starts: &[u64],
+    run: u64,
     out: &mut [u8],
     size: usize,
 ) -> Result<(), String> {
-    if cols.is_empty() {
-        return Err("a column list must select at least one element".to_string());
+    if starts.is_empty() || run == 0 {
+        return Err("a grid must select at least one element".to_string());
     }
-    let Some(row) = cols.len().checked_mul(size) else {
-        return Err("the column list is too long to address".to_string());
+    let Some(span) = usize::try_from(run).ok().and_then(|r| r.checked_mul(size)) else {
+        return Err(format!("a run of {run} elements is too large to address"));
+    };
+    let Some(row) = starts.len().checked_mul(span) else {
+        return Err("the gathered rows are too large to address".to_string());
     };
     if coords.len().checked_mul(row) != Some(out.len()) {
         return Err("output region does not match the coordinate count".to_string());
     }
     for (n, &c) in coords.iter().enumerate() {
-        for (j, &col) in cols.iter().enumerate() {
-            // Checked for the same reason the contiguous gather checks: unchecked, a large
-            // value wraps in release and can land back INSIDE scratch, so the read succeeds
-            // and returns the wrong element rather than failing.
+        for (j, &start) in starts.iter().enumerate() {
+            // Checked for the reason the contiguous gather checks: unchecked, a large value
+            // wraps in release and can land back INSIDE scratch, so the read succeeds and
+            // returns the wrong elements rather than failing.
             let Some(src) = c
-                .checked_add(col)
+                .checked_add(start)
                 .and_then(|e| usize::try_from(e).ok())
                 .and_then(|e| e.checked_mul(size))
             else {
-                return Err(format!("coordinate {c} plus column {col} is too large to address"));
+                return Err(format!("coordinate {c} plus {start} is too large to address"));
             };
-            let Some(element) = src.checked_add(size).and_then(|end| scratch.get(src..end)) else {
+            let Some(piece) = src.checked_add(span).and_then(|end| scratch.get(src..end)) else {
                 return Err(format!(
-                    "coordinate {c} column {col} is outside the {} elements decoded",
+                    "coordinate {c} run at {start} leaves the {} elements decoded",
                     scratch.len() / size
                 ));
             };
-            let at = n * row + j * size;
-            out[at..at + size].copy_from_slice(element);
+            let at = n * row + j * span;
+            out[at..at + span].copy_from_slice(piece);
         }
     }
     Ok(())

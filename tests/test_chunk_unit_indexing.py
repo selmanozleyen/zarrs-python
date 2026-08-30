@@ -644,21 +644,42 @@ def test_rank_three_grids_take_the_path(
     assert entries["list"] == 0
 
 
-def test_a_pure_slice_box_still_falls_back(
+def test_a_pure_slice_box_takes_the_path_as_runs(
     volume: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
-    """A box of pure slices is a contiguous n-D block, which the ordinary route copies
-    blockwise where this path would gather it element by element. Declining is deliberate and
-    is the answer that cannot regress; taking it is a measurement nobody has made."""
+    """A box of pure slices is served, because it is described as RUNS.
+
+    It used to decline on the grounds that the ordinary route copies a contiguous n-D block
+    blockwise where this path would gather element by element. That was true of the encoding,
+    not of the data: `[rows, 2:5, 4:12]` of an (8,16) row is three runs of eight, and saying so
+    turns twenty-four element copies into three memcpys.
+    """
     path, values = volume
     rows = np.array([1, 3, 9, 60])
     with zarr.config.set(CHUNK_UNIT):
         got = zarr.open_array(path, mode="r").oindex[rows, 2:5, 4:12]
 
     np.testing.assert_array_equal(got, values[np.ix_(rows, range(2, 5), range(4, 12))])
-    assert entries["handle"] == 0, "a pure-slice box reached the chunk-unit path"
+    assert entries["handle"] > 0, "a pure-slice box did not take the chunk-unit path"
+    assert entries["list"] == 0
 
 
+def test_the_run_decomposition() -> None:
+    """The runs a selection decomposes into, asserted directly.
+
+    Values-only tests pass whatever the decomposition, so the thing that makes this path worth
+    having is invisible to them: a box copied as one run per ELEMENT is correct and slow. Only
+    an axis taken WHOLE lets the absorption continue outward past it, because a partial axis
+    leaves a gap before the next one repeats.
+    """
+    from zarrs.utils import _as_contiguous
+
+    # A slice-shaped index array is recognised as contiguous; a scattered one is not.
+    assert _as_contiguous(np.array([4, 5, 6, 7])) == (4, 4)
+    assert _as_contiguous(np.array([4])) == (4, 1)
+    assert _as_contiguous(np.array([4, 6, 7])) is None
+    # Descending is not contiguous either, however tempting the endpoints look.
+    assert _as_contiguous(np.array([7, 6, 5, 4])) is None
 def test_rank_four_grid_takes_the_path(tmp_path: Path, entries: dict[str, int]) -> None:
     """Nothing in the offset arithmetic knows the rank, so rank 4 is not a separate case --
     asserted rather than assumed, because "it generalises" is exactly the kind of claim that

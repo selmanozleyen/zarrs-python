@@ -501,6 +501,21 @@ def _point_unit_args(
     )
 
 
+def _as_contiguous(idx: np.ndarray) -> tuple[int, int] | None:
+    """`(start, length)` if these indices are consecutive and ascending, else None.
+
+    A slice arrives already contiguous, but so does an index array that happens to be one --
+    and the caller cannot tell them apart by then, because both were normalised to index
+    arrays so the ranks could be handled uniformly.
+    """
+    if idx.size == 0:
+        return None
+    start = int(idx[0])
+    if idx.size > 1 and not np.array_equal(idx, np.arange(start, start + idx.size)):
+        return None
+    return start, int(idx.size)
+
+
 def _grid_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
 ) -> tuple | None:
@@ -520,10 +535,11 @@ def _grid_unit_args(
     exactly the order the output row wants -- one list, whatever the rank. An earlier version
     of this declined rank > 2 claiming the offsets "stop being a single list". They do not.
 
-    At least one trailing axis must be an ARRAY. A box of pure slices -- `X[rows, 2:5, 4:12]`
-    -- is a contiguous n-D block that the ordinary route copies blockwise, where this path
-    would gather it an element at a time. That may still be worth taking, but it is a
-    measurement nobody has made, and declining is the answer that cannot regress.
+    The box is described as RUNS, not as elements. `X[rows, 2:5, 4:12]` of an (8,16) row is
+    three runs of eight at 36, 52 and 68 -- three memcpys, not twenty-four element copies. A
+    fully scattered selection degenerates to runs of one, which is the worst case rather than
+    the only case, and a selection whose trailing axes are all whole collapses to a SINGLE run
+    covering the entire index.
     """
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
     if inner_shape is None:
@@ -564,10 +580,8 @@ def _grid_unit_args(
     if (rows < 0).any() or not _output_run_matches(rows, out_axis_sel):
         return None
 
-    sels, any_array = [], False
+    sels = []
     for axis in range(1, rank):
-        if isinstance(chunk_sel[axis], np.ndarray):
-            any_array = True
         idx = axis_indices(chunk_sel[axis], chunk_spec.shape[axis])
         if idx is None or idx.size == 0:
             return None
@@ -581,26 +595,51 @@ def _grid_unit_args(
         if inner_shape[axis] != chunk_spec.shape[axis]:
             return None
         sels.append(idx)
-    if not any_array:
-        return None
-
-    # Row-major over the trailing selections, which is the order the output row wants.
-    strides, stride = [0] * (rank - 1), 1
+    # A sub-box is a set of RUNS in row-major order, not a set of elements, and saying so is
+    # the difference between one memcpy per run and one copy per element. Absorb trailing axes
+    # into the run from the inside out: an axis contributes its length, and only an axis taken
+    # WHOLE lets the absorption continue past it, because a partial axis leaves a gap before
+    # the next one repeats.
+    extents = [int(e) for e in chunk_spec.shape]
+    strides, stride = [0] * rank, 1
     for axis in reversed(range(1, rank)):
-        strides[axis - 1] = stride
-        stride *= int(chunk_spec.shape[axis])
-    offsets = np.zeros([sel.size for sel in sels], dtype=np.uint64)
-    for k, sel in enumerate(sels):
-        bshape = [1] * len(sels)
-        bshape[k] = sel.size
-        offsets = offsets + (sel.astype(np.uint64) * np.uint64(strides[k])).reshape(bshape)
+        strides[axis] = stride
+        stride *= extents[axis]
+
+    run, base, first_absorbed = 1, 0, rank
+    for axis in reversed(range(1, rank)):
+        span = _as_contiguous(sels[axis - 1])
+        if span is None:
+            break
+        start_a, len_a = span
+        base += start_a * strides[axis]
+        run *= len_a
+        first_absorbed = axis
+        if len_a != extents[axis]:
+            break
+
+    # Whatever is left varies per run, enumerated row-major so the runs land in output order.
+    outer = list(range(1, first_absorbed))
+    if outer:
+        starts = np.zeros([sels[axis - 1].size for axis in outer], dtype=np.uint64)
+        for k, axis in enumerate(outer):
+            bshape = [1] * len(outer)
+            bshape[k] = sels[axis - 1].size
+            starts = starts + (
+                sels[axis - 1].astype(np.uint64) * np.uint64(strides[axis])
+            ).reshape(bshape)
+        starts = starts.ravel() + np.uint64(base)
+    else:
+        # Every trailing axis absorbed: the whole selection is one run per index.
+        starts = np.array([base], dtype=np.uint64)
 
     return (
         byte_getter.path,
         chunk_spec.shape,
         shape,
         rows,
-        np.ascontiguousarray(offsets.ravel()),
+        np.ascontiguousarray(starts),
+        int(run),
         out_axis_sel.start or 0,
         int(inner_shape[0]),
     )

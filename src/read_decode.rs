@@ -34,7 +34,7 @@ use crate::shard_index::ShardInfo;
 use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 
-use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, gather_columns, key_partial_decoder};
+use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, gather_runs, key_partial_decoder};
 
 /// The per-array state a decode needs, shared by every job of a call.
 struct JobContext {
@@ -501,7 +501,7 @@ fn carve<'a>(
                 run_len: item.run_len,
                 // Sharded: the shard's inner chunk. Not sharded: the item's own chunk, which
                 // is the whole store value and the whole decode.
-                col_offsets: item.col_offsets.as_deref(),
+                grid: item.grid.as_ref().map(|(starts, run)| (&starts[..], *run)),
                 ctx,
             }),
             None => absent.push(piece),
@@ -798,9 +798,10 @@ struct Job<'a> {
     coords: &'a [u64],
     /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
     run_len: u64,
-    /// The columns each coordinate takes, when they are scattered rather than consecutive --
-    /// `oindex[rows, cols]`. `None` is a contiguous run, which is every other case.
-    col_offsets: Option<&'a [u64]>,
+    /// Where each RUN starts inside a coordinate's elements, and how long a run is, when the
+    /// wanted elements are not one consecutive span -- `oindex[rows, cols]` and any rank-N
+    /// grid. `None` is a single contiguous run, which is every other case.
+    grid: Option<(&'a [u64], u64)>,
     ctx: &'a JobContext,
 }
 
@@ -886,8 +887,8 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             )
             .map_err(|e| e.to_string())?;
     }
-    match job.col_offsets {
-        Some(cols) => gather_columns(scratch, job.coords, cols, job.out, size),
+    match job.grid {
+        Some((starts, run)) => gather_runs(scratch, job.coords, starts, run, job.out, size),
         None => gather(scratch, job.coords, job.run_len, job.out, size),
     }
         .map_err(|e| format!("{}: {e}", job.key))
