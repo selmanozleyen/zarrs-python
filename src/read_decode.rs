@@ -979,8 +979,18 @@ fn read_loop<'a>(
         let ctx = group.jobs[0].ctx;
         let ranges: Vec<ByteRange> = group.jobs.iter().map(|job| job.range).collect();
         match ctx.store.get_partial_many(&group.key, Box::new(ranges.into_iter())) {
-            Ok(fetched) => {
-                let mut fetched = fetched;
+            // `None` for the whole iterator means the KEY is absent, which is a different
+            // thing from a range coming back empty. `decode_one` already knows what an absent
+            // chunk contributes -- the fill value, or an error where a shard index named it --
+            // so every job in the group gets `None` and that logic stays in one place.
+            Ok(None) => {
+                for job in group.jobs {
+                    if send_piece(job, None, decodes, failure).is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(Some(mut fetched)) => {
                 for job in group.jobs {
                     // One result per range, in order, or the pairing is wrong for every job in
                     // the group -- and wrong bytes under the right key is not something a
@@ -993,21 +1003,13 @@ fn read_loop<'a>(
                         return;
                     };
                     let bytes = match piece {
-                        Ok(b) => Some(b),
+                        Ok(b) => b,
                         Err(e) => {
                             record(failure, format!("read {} failed: {e}", job.key));
                             return;
                         }
                     };
-                    if let Err(returned) = decodes.send((job, bytes)) {
-                        // Every decoder is gone. Returning silently would leave this job's
-                        // bytes of the output at whatever `np.empty` left, and the call would
-                        // report success.
-                        let (job, _) = returned.into_inner();
-                        record(
-                            failure,
-                            format!("{}: no decoder left to take the chunk", job.key),
-                        );
+                    if send_piece(job, bytes, decodes, failure).is_err() {
                         return;
                     }
                 }
@@ -1015,6 +1017,27 @@ fn read_loop<'a>(
             Err(e) => record(failure, format!("read {} failed: {e}", group.key)),
         }
     }
+}
+
+/// Hand one job's bytes to a decoder, or record why nobody can.
+///
+/// `Err(())` means every decoder is gone. Returning silently there would leave this job's
+/// bytes of the output at whatever `np.empty` left, and the call would report success.
+fn send_piece<'a>(
+    job: Job<'a>,
+    bytes: MaybeBytes,
+    decodes: &Sender<(Job<'a>, MaybeBytes)>,
+    failure: &Mutex<Option<String>>,
+) -> Result<(), ()> {
+    if let Err(returned) = decodes.send((job, bytes)) {
+        let (job, _) = returned.into_inner();
+        record(
+            failure,
+            format!("{}: no decoder left to take the chunk", job.key),
+        );
+        return Err(());
+    }
+    Ok(())
 }
 
 fn decode_loop(decodes: &Receiver<(Job<'_>, MaybeBytes)>, failure: &Mutex<Option<String>>) {
