@@ -957,3 +957,39 @@ def test_a_strided_output_box_is_declined() -> None:
         False,
     )
     assert _chunk_unit_args(entry, (4, 5, 10), (), (4, 5, 10)) is None
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        pytest.param((5, 5), id="both-axes-scalar"),
+        pytest.param((0, 0), id="both-axes-scalar-at-the-origin"),
+        pytest.param((31, 23), id="both-axes-scalar-at-the-end"),
+        pytest.param((slice(None), 3), id="scalar-on-a-trailing-axis"),
+        pytest.param((5, slice(None)), id="scalar-row"),
+        pytest.param((5, slice(6, 18)), id="scalar-row-and-a-column-band"),
+    ],
+)
+def test_a_scalar_axis_is_served(tmp_path: Path, entries: dict[str, int], selection) -> None:
+    """zarr drops a scalar axis from the OUTPUT without saying so in `drop_axes`.
+
+    Only axis 0 was rebuilt, so `X[5, 5]` -- both axes scalar, a 0-d output -- had no
+    description and declined. Under `--strict` a decline is an error, which made a plain
+    scalar read of a 2-D array fail outright; that is what `test_strict_mode` was catching.
+
+    Rebuilding a dropped axis as an extent of one is exact rather than approximate: an axis of
+    extent one contributes no stride, so the 0-d buffer of one element and the (1, 1) buffer
+    of one element are the same bytes in the same order. The shard here is DIVIDED, so the
+    rebuilt axis has to survive the band split too.
+    """
+    values = np.arange(32 * 24, dtype=np.float64).reshape(32, 24)
+    path = tmp_path / "scalar.zarr"
+    zarr.create_array(path, dtype=values.dtype, shape=values.shape, chunks=(8, 6),
+                      shards=(16, 12))[:] = values
+
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[selection]
+
+    np.testing.assert_array_equal(got, values[selection])
+    assert entries["handle"] > 0, "a scalar axis should not send the batch to zarr-python"
+    assert entries["list"] == 0

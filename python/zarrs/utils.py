@@ -320,17 +320,33 @@ def _chunk_unit_args(
     # This was the LAST selection form reaching the fused read path: an audit of the public
     # indexing surface -- 44 forms over three layouts -- found 34 on the chunk-unit path,
     # 8 declining to zarr-python, and only this one on the fused one.
+    #
+    # EVERY scalar axis, not just axis 0. `X[5, 5]` drops both and hands over a 0-d output,
+    # which the axis-0-only version could not describe -- and under `--strict` a decline is an
+    # error, so a plain scalar read of a 2-D array failed outright. Rebuilding each dropped
+    # axis as an extent of one is exact for the same reason it was for axis 0: an axis of
+    # extent one contributes no stride, so a 0-d buffer of one element and a (1, 1) buffer of
+    # one element have identical layouts. This also picks up `X[:, 3]`, where the dropped axis
+    # is a trailing one.
+    scalars = [
+        axis for axis, sel in enumerate(chunk_sel_raw) if isinstance(sel, (int, np.integer))
+    ]
     if (
-        len(chunk_sel_raw) == len(chunk_spec.shape)
-        and len(out_sel_raw) == len(chunk_spec.shape) - 1
-        and isinstance(chunk_sel_raw[0], (int, np.integer))
-        and len(shape) == len(chunk_spec.shape) - 1
+        scalars
+        and len(chunk_sel_raw) == len(chunk_spec.shape)
+        and len(out_sel_raw) == len(shape) == len(chunk_spec.shape) - len(scalars)
     ):
-        chunk_selection = (slice(int(chunk_sel_raw[0]), int(chunk_sel_raw[0]) + 1),) + tuple(
-            chunk_sel_raw[1:]
-        )
-        out_selection = (slice(0, 1),) + tuple(out_sel_raw)
-        shape = (1,) + tuple(shape)
+        kept_out = iter(out_sel_raw)
+        kept_extent = iter(shape)
+        rebuilt = [
+            (slice(int(sel), int(sel) + 1), slice(0, 1), 1)
+            if axis in scalars
+            else (sel, next(kept_out), next(kept_extent))
+            for axis, sel in enumerate(chunk_sel_raw)
+        ]
+        chunk_selection = tuple(r[0] for r in rebuilt)
+        out_selection = tuple(r[1] for r in rebuilt)
+        shape = tuple(r[2] for r in rebuilt)
     # Not sharded: the chunk IS the decode unit, and the grid checks below then compare it
     # against itself, which is exactly right -- there is no subdivision to get wrong.
     if inner_shape == ():
