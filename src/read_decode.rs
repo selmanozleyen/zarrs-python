@@ -1067,9 +1067,21 @@ mod tests {
             output_pieces(&strided, 8).is_err(),
             "a strided output sub-box must be refused, not modelled as one run"
         );
-        // The last axis alone being partial IS one run per index, and is served.
-        let one_run = item(&[0..2, 0..10, 0..5], &[6, 10, 10]);
-        assert!(output_pieces(&one_run, 8).is_ok(), "a trailing partial axis is one run");
+        // Taking ALL of axis 1 and part of axis 2 is also strided -- ten runs of five, not
+        // one run of fifty. Written out because it is the case I got wrong first: "only the
+        // last axis is partial" is not the rule; "every axis before the last partial one
+        // takes a single element" is.
+        let wide_then_partial = item(&[0..2, 0..10, 0..5], &[6, 10, 10]);
+        assert!(
+            output_pieces(&wide_then_partial, 8).is_err(),
+            "a full axis above a partial one is still strided"
+        );
+        // One element on axis 1 and part of axis 2 IS one run per index, and is served.
+        let one_run = item(&[0..2, 3..4, 0..5], &[6, 10, 10]);
+        assert!(
+            output_pieces(&one_run, 8).is_ok(),
+            "a single element above a partial axis is one contiguous run"
+        );
         // Whole trailing axes, the ordinary case, stay on the single-range path.
         let whole = item(&[0..2, 0..10, 0..10], &[6, 10, 10]);
         assert_eq!(

@@ -137,7 +137,7 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
 /// Overlap there is a data race, so it has to be refused where the entries are accumulated --
 /// nothing downstream sees both.
 #[test]
-fn test_push_entry_refuses_output_another_entry_owns() -> PyResult<()> {
+fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
 
     Python::initialize();
@@ -147,17 +147,17 @@ fn test_push_entry_refuses_output_another_entry_owns() -> PyResult<()> {
         let b = PyArray1::from_slice(py, &[41i64]);
         handle.push_entry("c/0", vec![95], vec![100], a.readonly(), vec![0], vec![100], 10, vec![])?;
 
-        // `a` produced two items covering output 0..2, so an entry starting at 1 would give
-        // two items the same byte.
-        assert!(
-            handle
-                .push_entry("c/1", vec![95], vec![100], b.readonly(), vec![1], vec![100], 10, vec![])
-                .is_err(),
-            "an out_start inside an entry already pushed"
-        );
-        // Starting where the last one ended is exactly what zarr produces, and is allowed.
+        // `a` produced two items covering output 0..2, so an entry starting at 1 gives two
+        // items the same byte. `push_entry` no longer refuses that: the check it used could
+        // not judge a banded entry, where two bands of one read share an axis-0 start and
+        // overlap nothing, and a guard that quietly stops covering the newest shape is worse
+        // than none. The overlap is refused at read instead, by the forward-only cursor in
+        // `DisjointBytes` -- see `read_decode::tests::bytes_are_vended_once_and_forwards`,
+        // which pins that directly.
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), vec![1], vec![100], 10, vec![])?;
+        // Starting where the last one ended is exactly what zarr produces.
         handle.push_entry("c/1", vec![95], vec![100], b.readonly(), vec![2], vec![100], 10, vec![])?;
-        assert_eq!(handle.as_slice().len(), 3);
+        assert_eq!(handle.as_slice().len(), 4);
         Ok(())
     })
 }
