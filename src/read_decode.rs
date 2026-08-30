@@ -1040,6 +1040,49 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
 mod tests {
     use super::*;
 
+    /// An item's output must be ONE RUN per axis-0 index, and `output_pieces` is where that
+    /// is enforced.
+    ///
+    /// This is the guard that was missing when a banded output first landed: 633 tests failed
+    /// with "claims output bytes X..Y, which run backwards" -- `DisjointBytes` reporting the
+    /// symptom several layers from the cause. A rank-3 sub-box of `(2,5,5)` in a `(6,10,10)`
+    /// output is five runs of five at stride ten, not one run of twenty-five, and modelling it
+    /// as one claims the next item's bytes.
+    #[test]
+    fn output_pieces_refuses_a_strided_sub_box() {
+        let item = |subset: &[std::ops::Range<u64>], array: &[u64]| ChunkItem {
+            key: StoreKey::new("c/0".to_string()).expect("a key"),
+            chunk_subset: ArraySubset::new_with_ranges(subset),
+            subset: ArraySubset::new_with_ranges(subset),
+            shape: to_nonzero(array),
+            num_elements: array.iter().product(),
+            array_shape: to_nonzero(array),
+            coords: None,
+            run_len: 1,
+            grid: None,
+        };
+        // Strided: axis 1 takes 5 of 10 and axis 2 takes 5 of 10, so a row is not one run.
+        let strided = item(&[0..2, 0..5, 0..5], &[6, 10, 10]);
+        assert!(
+            output_pieces(&strided, 8).is_err(),
+            "a strided output sub-box must be refused, not modelled as one run"
+        );
+        // The last axis alone being partial IS one run per index, and is served.
+        let one_run = item(&[0..2, 0..10, 0..5], &[6, 10, 10]);
+        assert!(output_pieces(&one_run, 8).is_ok(), "a trailing partial axis is one run");
+        // Whole trailing axes, the ordinary case, stay on the single-range path.
+        let whole = item(&[0..2, 0..10, 0..10], &[6, 10, 10]);
+        assert_eq!(
+            output_pieces(&whole, 8).expect("whole").len(),
+            1,
+            "whole trailing axes are one contiguous range, not one per row"
+        );
+    }
+
+    fn to_nonzero(dims: &[u64]) -> Vec<NonZeroU64> {
+        dims.iter().map(|d| NonZeroU64::new(*d).expect("non-zero")).collect()
+    }
+
     /// The vendor is what the whole path's disjointness rests on, so its refusals are
     /// pinned here rather than left to the caller that happens to ask in order.
     #[test]

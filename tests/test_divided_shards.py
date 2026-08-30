@@ -105,8 +105,17 @@ def test_2d_slice_matches(divided_2d):
 
 @pytest.mark.parametrize(
     "rows",
-    [np.array([0, 3, 4, 5, 17, 30]), np.arange(0, 32), np.array([7, 8])],
-    ids=["scattered", "every-row", "chunk-edge"],
+    [
+        np.array([0, 3, 4, 5, 17, 30]),
+        np.arange(0, 32),
+        np.array([7, 8]),
+        # SHORT, and low. A coordinate stride taken from the shard rather than the inner
+        # chunk inflates every offset; `gather`'s bounds check catches that only once the
+        # offsets run past the decoded buffer. A read of many rows fails loudly, a read of
+        # two returns the wrong rows quietly. This is the case that fails silently.
+        np.array([0, 1]),
+    ],
+    ids=["scattered", "every-row", "chunk-edge", "short-and-low"],
 )
 def test_3d_rows_match(divided_3d, rows):
     """The case an earlier attempt got wrong, and that no existing test would have caught."""
