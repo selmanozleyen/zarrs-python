@@ -45,6 +45,61 @@ pub fn is_whole_chunk(item: &ChunkItem) -> bool {
         && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
 }
 
+/// Writes a sequence of runs across output pieces that need not align with them.
+///
+/// An item's output is ONE contiguous range only while every axis after the first is taken
+/// whole. When a shard divides a trailing axis, the item fills one range per row instead --
+/// so the gather has to write across a list of pieces rather than into a single slice. The
+/// runs it writes and the pieces it writes into are both in ascending output order, but
+/// nothing makes their boundaries line up, so a run may straddle two pieces.
+pub(crate) struct PieceWriter<'a, 'b> {
+    pieces: &'b mut [&'a mut [u8]],
+    piece: usize,
+    at: usize,
+}
+
+impl<'a, 'b> PieceWriter<'a, 'b> {
+    pub(crate) fn new(pieces: &'b mut [&'a mut [u8]]) -> Self {
+        Self { pieces, piece: 0, at: 0 }
+    }
+
+    /// Append `src`, spilling into later pieces as needed.
+    pub(crate) fn write(&mut self, mut src: &[u8]) -> Result<(), String> {
+        while !src.is_empty() {
+            // Skip pieces already filled, and any that are empty to begin with.
+            while self.piece < self.pieces.len() && self.at == self.pieces[self.piece].len() {
+                self.piece += 1;
+                self.at = 0;
+            }
+            let Some(piece) = self.pieces.get_mut(self.piece) else {
+                return Err(format!(
+                    "{} bytes left to write with no output piece to take them",
+                    src.len()
+                ));
+            };
+            let room = piece.len() - self.at;
+            let take = room.min(src.len());
+            piece[self.at..self.at + take].copy_from_slice(&src[..take]);
+            self.at += take;
+            src = &src[take..];
+        }
+        Ok(())
+    }
+
+    /// Every byte of every piece was written. The caller's buffer is `np.empty`, so a piece
+    /// left short returns whatever was already in memory, as data.
+    pub(crate) fn finished(&self) -> bool {
+        // Everything before `piece` was filled to its end by construction, so only the
+        // current piece and whatever follows it can be short.
+        self.pieces
+            .get(self.piece)
+            .is_none_or(|piece| self.at == piece.len())
+            && self.pieces[(self.piece + 1).min(self.pieces.len())..]
+                .iter()
+                .all(|piece| piece.is_empty())
+    }
+}
+
 /// Copy one RUN of `run_len` elements per coordinate out of `scratch` into `out`, in
 /// coordinate order.
 ///
@@ -87,6 +142,61 @@ pub(crate) fn gather(
             ));
         };
         out[n * run..(n + 1) * run].copy_from_slice(element);
+    }
+    Ok(())
+}
+
+/// `gather`, writing across several output pieces instead of one slice.
+///
+/// Only reached when a shard divides a trailing axis, so the item's output is one range per
+/// row rather than a single span. The single-piece case stays on `gather`, whose coalescing
+/// and bounds checks are unchanged -- this is an addition, not a replacement.
+pub(crate) fn gather_pieces(
+    scratch: &[u8],
+    coords: &[u64],
+    run_len: u64,
+    pieces: &mut [&mut [u8]],
+    size: usize,
+) -> Result<(), String> {
+    let Some(run) = usize::try_from(run_len).ok().and_then(|r| r.checked_mul(size)) else {
+        return Err(format!("run length {run_len} is too large to address"));
+    };
+    if run == 0 {
+        return Err("run length must be greater than zero".to_string());
+    }
+    let total: usize = pieces.iter().map(|p| p.len()).sum();
+    if coords.len().checked_mul(run) != Some(total) {
+        return Err("output pieces do not match the coordinate count".to_string());
+    }
+    let mut writer = PieceWriter::new(pieces);
+    // Same coalescing as `gather`: consecutive coordinates name one contiguous span of the
+    // decode, and the pieces are written in order, so a merged span still lands correctly
+    // even when it straddles two of them.
+    let mut n = 0usize;
+    while n < coords.len() {
+        let mut m = n + 1;
+        while m < coords.len() && coords[m - 1].checked_add(run_len) == Some(coords[m]) {
+            m += 1;
+        }
+        let c = coords[n];
+        let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
+            return Err(format!("coordinate {c} is too large to address"));
+        };
+        let Some(span) = (m - n).checked_mul(run) else {
+            return Err("the gathered span is too large to address".to_string());
+        };
+        let Some(region) = src.checked_add(span).and_then(|end| scratch.get(src..end)) else {
+            return Err(format!(
+                "coordinate {c} plus {} elements is outside the {} decoded",
+                (m - n) as u64 * run_len,
+                scratch.len() / size
+            ));
+        };
+        writer.write(region)?;
+        n = m;
+    }
+    if !writer.finished() {
+        return Err("the gather left part of the output unwritten".to_string());
     }
     Ok(())
 }

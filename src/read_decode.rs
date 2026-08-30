@@ -34,7 +34,9 @@ use crate::shard_index::ShardInfo;
 use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 
-use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, gather_runs, key_partial_decoder};
+use crate::utils::{
+    PyCodecErrExt as _, PyErrExt as _, gather, gather_pieces, gather_runs, key_partial_decoder,
+};
 
 /// The per-array state a decode needs, shared by every job of a call.
 struct JobContext {
@@ -294,7 +296,7 @@ impl CodecPipelineImpl {
         &self,
         shard: &ShardInfo,
         item: &ChunkItem,
-        start: u64,
+        start: &[u64],
         ctx: &JobContext,
         decoders: &mut CallDecoders,
     ) -> PyResult<Option<ByteRange>> {
@@ -306,7 +308,7 @@ impl CodecPipelineImpl {
         }
         let file = key_partial_decoder(&self.store, &item.key);
         let mut shard_shape = item.shape.clone();
-        let mut offset = start;
+        let mut offset: Vec<u64> = start.to_vec();
         // (offset, length) of the level being descended INTO, absolute in the store value.
         let mut extent: Option<(u64, u64)> = None;
         // The subchunk indices taken so far. Only built below depth 0.
@@ -314,33 +316,29 @@ impl CodecPipelineImpl {
 
         for depth in 0..shard.depth() {
             let level_shape = shard.subchunk_shape_at(depth);
-            // The descent walks axis 0 and asks for `&[index, 0, 0, ...]`, which addresses
-            // the right subchunk only if every other axis holds exactly ONE at this level.
-            // Rechecked per level rather than assumed from the item: the grid can divide at
-            // one depth and not another, and getting it wrong returns a WRONG chunk's bytes
-            // rather than an error.
-            if level_shape.len() != shard_shape.len()
-                || level_shape
-                    .iter()
-                    .zip(shard_shape.iter())
-                    .skip(1)
-                    .any(|(sub, whole)| sub.get() != whole.get())
-            {
+            // The descent walks EVERY axis. `subchunk_byte_range` has always taken a full
+            // grid index; this used to fill axis 0 and leave the rest zero, which addressed
+            // the right subchunk only when every other axis held exactly one -- the guard
+            // that made a shard dividing a trailing axis decline outright.
+            //
+            // Arity is still checked per level: the grid can divide at one depth and not
+            // another, and a mismatched index returns a WRONG chunk's bytes rather than an
+            // error.
+            if level_shape.len() != shard_shape.len() || level_shape.len() != offset.len() {
                 return Err(PyRuntimeError::new_err(format!(
-                    "{}: level {depth} divides an axis after the first ({:?} within {:?}); \
-                     this path descends on axis 0 alone",
+                    "{}: level {depth} has {} axes against a chunk of {} and a position of {}",
                     item.key,
-                    level_shape.iter().map(|d| d.get()).collect::<Vec<_>>(),
-                    shard_shape.iter().map(|d| d.get()).collect::<Vec<_>>()
+                    level_shape.len(),
+                    shard_shape.len(),
+                    offset.len()
                 )));
             }
-            let subchunk = level_shape[0].get();
-            let index = offset / subchunk;
-            offset %= subchunk;
-            // One entry per axis; zero everywhere but the split, because those axes hold a
-            // single subchunk -- just checked.
             let mut grid_index = vec![0u64; level_shape.len()];
-            grid_index[0] = index;
+            for axis in 0..level_shape.len() {
+                let subchunk = level_shape[axis].get();
+                grid_index[axis] = offset[axis] / subchunk;
+                offset[axis] %= subchunk;
+            }
 
             let decoder = if depth == 0 {
                 self.decoder_or_read(&self.shard_indexes, &mut decoders.shards, &item.key, || {
@@ -402,20 +400,10 @@ impl CodecPipelineImpl {
                 declined.push(item);
                 continue;
             }
-            // `locate` descends on axis 0 alone, so every other axis must hold the chunk
-            // whole -- otherwise it would locate a different subchunk and report success.
-            // Checked here as well as in Python, because `push_entry` is `#[pymethods]`.
-            if !trailing_axes_are_whole(&item.chunk_subset, &item.shape) {
-                return Err(PyRuntimeError::new_err(format!(
-                    "{}: this path splits axis 0 and takes the rest whole, but the chunk \
-                     subset is {} against a chunk of {:?}",
-                    item.key,
-                    item.chunk_subset,
-                    item.shape.iter().map(|d| d.get()).collect::<Vec<_>>()
-                )));
-            }
-            let start = item.chunk_subset.start().first().copied().unwrap_or(0);
-            located.push((item, self.locate(shard, item, start, ctx, &mut decoders)?));
+            // The whole position, not just axis 0: the descent divides on every axis now,
+            // so a shard that splits a trailing one is addressed rather than refused.
+            let start = item.chunk_subset.start().to_vec();
+            located.push((item, self.locate(shard, item, &start, ctx, &mut decoders)?));
         }
         Ok((located, declined))
     }
@@ -428,41 +416,79 @@ impl CodecPipelineImpl {
 ///
 /// Returns the jobs to read, and the pieces of chunks that were never written, which need
 /// only the fill value.
+/// The output byte ranges an item fills, ascending.
+///
+/// ONE range while every axis after the first is taken whole -- every rank-1 read, so the CSR
+/// path always gets one. When a shard divides a trailing axis the item fills a sub-box, which
+/// in row-major order is one range per row at the array's row stride.
+fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, usize)>> {
+    let full: Vec<u64> = item.array_shape.iter().map(|d| d.get()).collect();
+    let start = item.subset.start();
+    let shape = item.subset.shape();
+    if start.len() != full.len() || shape.len() != full.len() {
+        return Err(PyRuntimeError::new_err(format!(
+            "{}: subset {} does not match an output of {full:?}",
+            item.key, item.subset
+        )));
+    }
+    let row_stride: u64 = full[1..].iter().product();
+    let run: u64 = shape[1..].iter().product();
+    // Where the sub-box begins inside one row. Row-major, so the trailing starts fold in by
+    // the strides below them.
+    let mut elem_offset = 0u64;
+    let mut stride = 1u64;
+    for axis in (1..full.len()).rev() {
+        elem_offset += start[axis] * stride;
+        stride *= full[axis];
+    }
+    let rows = shape[0];
+    let flat = |row: u64, at: u64| -> PyResult<usize> {
+        row.checked_mul(row_stride)
+            .and_then(|v| v.checked_add(at))
+            .and_then(|v| usize::try_from(v).ok())
+            .and_then(|v| v.checked_mul(element_size))
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!("{}: output offset too large to address", item.key))
+            })
+    };
+    let width = usize::try_from(run)
+        .ok()
+        .and_then(|r| r.checked_mul(element_size))
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(format!("{}: output run too large to address", item.key))
+        })?;
+    // Whole trailing axes: the rows are adjacent, so they are ONE range. Kept as a special
+    // case because it is the common one and because `gather` then stays on its single-slice
+    // path with its own coalescing.
+    if elem_offset == 0 && run == row_stride {
+        let len = usize::try_from(rows)
+            .ok()
+            .and_then(|r| r.checked_mul(width))
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!("{}: output too large to address", item.key))
+            })?;
+        return Ok(vec![(flat(start[0], 0)?, len)]);
+    }
+    (0..rows)
+        .map(|k| Ok((flat(start[0] + k, elem_offset)?, width)))
+        .collect()
+}
+
 fn carve<'a>(
     output: &'a DisjointBytes<'a>,
     located: &[(&'a ChunkItem, Option<ByteRange>)],
     element_size: usize,
     ctx: &'a JobContext,
 ) -> PyResult<(Vec<Job<'a>>, Vec<&'a mut [u8]>)> {
-    let mut order: Vec<usize> = (0..located.len()).collect();
-    order.sort_by_key(|&i| output_offset(located[i].0));
-
-    let mut jobs: Vec<Job<'a>> = Vec::with_capacity(order.len());
-    let mut absent: Vec<&mut [u8]> = Vec::new();
-    for &i in &order {
-        let (item, range) = &located[i];
+    // Pass 1: what each item needs, and the element-count agreement that used to be checked
+    // inline. Nothing is vended yet.
+    let mut plan: Vec<(usize, Vec<(usize, usize)>)> = Vec::with_capacity(located.len());
+    for (i, (item, _)) in located.iter().enumerate() {
         let coords = coords_of(item)?;
         // WHERE a piece starts comes from `subset`, and HOW LONG it is comes from `coords`.
         // Nothing ties the two together: `ChunkItem` is constructible from Python and skips
-        // the element-count check when coords are present. If they disagree, every later
-        // piece is carved at the wrong offset and the read silently returns the right number
-        // of wrong elements.
-        // The output piece is handed out as ONE contiguous byte range, so the item's rows
-        // must be contiguous in the output -- which they are exactly when every axis after
-        // the first is taken whole. Anything else would carve a range that is not the item's.
-        if !trailing_axes_are_whole(&item.subset, &item.array_shape) {
-            return Err(PyRuntimeError::new_err(format!(
-                "{}: this path carves one contiguous output range, so axes after the first \
-                 must be whole, but the subset is {} against an output of {:?}",
-                item.key,
-                item.subset,
-                item.array_shape.iter().map(|d| d.get()).collect::<Vec<_>>()
-            )));
-        }
-        // A coordinate stands for `run_len` elements now, so it is the PRODUCT that has to
-        // match the output subset. Nothing ties `coords` to `subset` otherwise: `ChunkItem`
-        // is constructible from Python and skips the element-count check when coords are
-        // present, and a disagreement carves every later piece at the wrong offset.
+        // the element-count check when coords are present. If they disagree, a piece is
+        // carved at the wrong offset and the read returns the right number of wrong elements.
         if (coords.len() as u64).checked_mul(item.run_len) != Some(item.subset.num_elements()) {
             return Err(PyRuntimeError::new_err(format!(
                 "{} wants {} coordinates of {} elements but its output subset holds {}",
@@ -472,42 +498,53 @@ fn carve<'a>(
                 item.subset.num_elements()
             )));
         }
-        // `output_offset` saturates to `usize::MAX`, so an unchecked multiply wraps in
-        // release and the wrapped value then slips past `take`'s bounds test.
-        let (Some(start), Some(len)) = (
-            output_offset(item).checked_mul(element_size),
-            usize::try_from(item.run_len)
-                .ok()
-                .and_then(|run| coords.len().checked_mul(run))
-                .and_then(|elements| elements.checked_mul(element_size)),
-        ) else {
-            return Err(PyRuntimeError::new_err(format!(
-                "{} names an output offset or length too large to address",
-                item.key
-            )));
-        };
-        let Some(piece) = output.take(start, len) else {
-            return Err(PyRuntimeError::new_err(format!(
-                "{} claims output bytes {start}..{}, which run backwards into a piece already \
-                 handed out or past the buffer",
-                item.key,
-                start.saturating_add(len)
-            )));
-        };
+        plan.push((i, output_pieces(item, element_size)?));
+    }
 
+    // Pass 2: vend every piece of every item in ASCENDING output order.
+    //
+    // `DisjointBytes` moves a cursor forward only, which is what makes the disjointness a
+    // fact rather than an assertion. Items alone cannot be put in that order once a shard
+    // divides a trailing axis: the item for columns 0..6 and the item for columns 6..12
+    // alternate row by row through the output. Sorting the PIECES restores it.
+    let mut vend: Vec<(usize, usize, usize)> = plan
+        .iter()
+        .flat_map(|(i, pieces)| pieces.iter().map(move |&(at, len)| (at, len, *i)))
+        .collect();
+    vend.sort_unstable_by_key(|&(at, _, _)| at);
+    let mut taken: Vec<Vec<&'a mut [u8]>> = (0..located.len()).map(|_| Vec::new()).collect();
+    for (at, len, i) in vend {
+        let Some(piece) = output.take(at, len) else {
+            return Err(PyRuntimeError::new_err(format!(
+                "{} claims output bytes {at}..{}, which run backwards into a piece already \
+                 handed out or past the buffer",
+                located[i].0.key,
+                at.saturating_add(len)
+            )));
+        };
+        taken[i].push(piece);
+    }
+
+    let mut jobs: Vec<Job<'a>> = Vec::with_capacity(located.len());
+    let mut absent: Vec<&'a mut [u8]> = Vec::new();
+    // Jobs stay in ascending output order: readers take them in turn, and on high-latency
+    // storage that keeps the order they arrive in close to the order they are wanted.
+    let mut order: Vec<usize> = (0..located.len()).collect();
+    order.sort_by_key(|&i| output_offset(located[i].0));
+    for i in order {
+        let (item, range) = &located[i];
+        let pieces = std::mem::take(&mut taken[i]);
         match range {
             Some(range) => jobs.push(Job {
                 key: item.key.clone(),
                 range: *range,
-                out: piece,
-                coords,
+                out: pieces,
+                coords: coords_of(item)?,
                 run_len: item.run_len,
-                // Sharded: the shard's inner chunk. Not sharded: the item's own chunk, which
-                // is the whole store value and the whole decode.
                 grid: item.grid.as_ref().map(|(starts, run)| (&starts[..], *run)),
                 ctx,
             }),
-            None => absent.push(piece),
+            None => absent.extend(pieces),
         }
     }
     Ok((jobs, absent))
@@ -608,21 +645,6 @@ fn output_offset(item: &ChunkItem) -> usize {
     row.saturating_mul(run)
 }
 
-/// Is every axis after the first taken WHOLE, against `shape`?
-///
-/// The premise of the rank-N chunk-unit path: with the trailing axes complete, one selected
-/// index is one contiguous run, the output piece of an item is one contiguous range, and
-/// `locate`'s descent along axis 0 alone addresses the right subchunk.
-fn trailing_axes_are_whole(subset: &zarrs::array::ArraySubset, shape: &[NonZeroU64]) -> bool {
-    subset.dimensionality() == shape.len()
-        && subset
-            .start()
-            .iter()
-            .zip(subset.shape())
-            .zip(shape)
-            .skip(1)
-            .all(|((&start, &extent), whole)| start == 0 && extent == whole.get())
-}
 
 /// What the shard index cache did. Counted because nothing else can tell.
 ///
@@ -812,7 +834,10 @@ fn initial_permits(kind: Kind, want: usize, ceiling: usize) -> Vec<Permit> {
 struct Job<'a> {
     key: StoreKey,
     range: ByteRange,
-    out: &'a mut [u8],
+    /// The output ranges this chunk fills, ascending. ONE range while every axis after the
+    /// first is taken whole -- which is every rank-1 read, so the CSR path always has one.
+    /// A shard that divides a trailing axis gives an item one range per row instead.
+    out: Vec<&'a mut [u8]>,
     coords: &'a [u64],
     /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
     run_len: u64,
@@ -871,7 +896,10 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let size = ctx.element_size;
     let Some(bytes) = bytes else {
         if ctx.may_be_absent {
-            return fill(job.out, &ctx.fill_value, size);
+            for piece in &mut job.out {
+                fill(piece, &ctx.fill_value, size)?;
+            }
+            return Ok(());
         }
         return Err(format!("{} vanished between index and read", job.key));
     };
@@ -925,11 +953,23 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             )
             .map_err(|e| e.to_string())?;
     }
-    match job.grid {
-        Some((starts, run)) => gather_runs(&scratch[..], job.coords, starts, run, job.out, size),
-        None => gather(&scratch[..], job.coords, job.run_len, job.out, size),
-    }
-        .map_err(|e| format!("{}: {e}", job.key))
+    // One piece is the overwhelming case and keeps `gather` exactly as it was, coalescing and
+    // bounds checks included. Several pieces only happen when a shard divides a trailing axis.
+    let result = if let [piece] = &mut job.out[..] {
+        match job.grid {
+            Some((starts, run)) => {
+                gather_runs(&scratch[..], job.coords, starts, run, piece, size)
+            }
+            None => gather(&scratch[..], job.coords, job.run_len, piece, size),
+        }
+    } else if job.grid.is_some() {
+        // A grid takes the same sub-box out of every index, so its output is one range by
+        // construction. Reaching here means an item was built with both, which nothing does.
+        Err("a grid selection cannot also span several output pieces".to_string())
+    } else {
+        gather_pieces(&scratch[..], job.coords, job.run_len, &mut job.out, size)
+    };
+    result.map_err(|e| format!("{}: {e}", job.key))
 }
 
 #[cfg(test)]
