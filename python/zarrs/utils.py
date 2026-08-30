@@ -360,6 +360,10 @@ def _chunk_unit_args(
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
     if drop_axes or inner_shape is None:
         return None
+    # Not sharded: the chunk IS the decode unit, and the grid checks below then compare it
+    # against itself, which is exactly right -- there is no subdivision to get wrong.
+    if inner_shape == ():
+        inner_shape = tuple(int(s) for s in chunk_spec.shape)
     chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
     rank = len(chunk_spec.shape)
     if not (rank == len(chunk_sel) == len(out_sel) == len(inner_shape) == len(shape)):
@@ -445,6 +449,10 @@ def _point_unit_args(
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
     if drop_axes or inner_shape is None:
         return None
+    # Not sharded: the chunk IS the decode unit, and the grid checks below then compare it
+    # against itself, which is exactly right -- there is no subdivision to get wrong.
+    if inner_shape == ():
+        inner_shape = tuple(int(s) for s in chunk_spec.shape)
     chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
     rank = len(chunk_spec.shape)
     # Rank 1 is the plain row case, which `_chunk_unit_args` already serves better.

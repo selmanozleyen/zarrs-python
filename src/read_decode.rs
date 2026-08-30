@@ -42,6 +42,9 @@ struct JobContext {
     store: ReadableWritableListableStorage,
     codec_options: CodecOptions,
     element_size: usize,
+    /// What an absent chunk contributes. Needed in the workers, not just at carve time,
+    /// because an UNSHARDED chunk's absence is only discovered by the read.
+    fill_value: FillValue,
 }
 
 /// Shard and subshard decoders built during ONE call.
@@ -79,6 +82,7 @@ impl CodecPipelineImpl {
             store: self.store.clone(),
             codec_options: (*codec_options).with_concurrent_target(1),
             element_size,
+            fill_value: self.fill_value.clone(),
         };
 
         let (located, declined) = self.locate_chunks(shard, items, &ctx)?;
@@ -271,6 +275,12 @@ impl CodecPipelineImpl {
         ctx: &JobContext,
         decoders: &mut CallDecoders,
     ) -> PyResult<Option<ByteRange>> {
+        // Not sharded: there is no index to read and nothing to descend -- the store value is
+        // the chunk. Whether the key EXISTS is the read's business, and a missing one comes
+        // back as absent bytes there, exactly as a never-written shard entry does here.
+        if shard.depth() == 0 {
+            return Ok(Some(ByteRange::FromStart(0, None)));
+        }
         let file = key_partial_decoder(&self.store, &item.key);
         let mut shard_shape = item.shape.clone();
         let mut offset = start;
@@ -469,6 +479,14 @@ fn carve<'a>(
                 out: piece,
                 coords,
                 run_len: item.run_len,
+                // Sharded: the shard's inner chunk. Not sharded: the item's own chunk, which
+                // is the whole store value and the whole decode.
+                decode_shape: ctx
+                    .shard
+                    .subchunk_shape
+                    .as_deref()
+                    .unwrap_or(item.shape.as_slice()),
+                may_be_absent: ctx.shard.depth() == 0,
                 ctx,
             }),
             None => absent.push(piece),
@@ -765,6 +783,14 @@ struct Job<'a> {
     coords: &'a [u64],
     /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
     run_len: u64,
+    /// The unit that gets decoded into scratch: the shard's inner chunk where the array is
+    /// sharded, the item's own chunk where it is not.
+    decode_shape: &'a [NonZeroU64],
+    /// Whether missing bytes are ordinary here. A shard index that named this chunk and then
+    /// did not have it means someone rewrote the store mid-read, which is worth failing on.
+    /// An unsharded chunk has no index to consult, so its key simply may not exist yet, and
+    /// that is a fill, not a fault.
+    may_be_absent: bool,
     ctx: &'a JobContext,
 }
 
@@ -815,10 +841,13 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let ctx = job.ctx;
     let size = ctx.element_size;
     let Some(bytes) = bytes else {
+        if job.may_be_absent {
+            return fill(job.out, &ctx.fill_value, size);
+        }
         return Err(format!("{} vanished between index and read", job.key));
     };
 
-    let shape = &ctx.shard.subchunk_shape;
+    let shape = job.decode_shape;
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
     scratch.clear();

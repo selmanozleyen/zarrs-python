@@ -461,3 +461,70 @@ def test_points_with_unsorted_rows_decline_and_are_still_right(
 
     np.testing.assert_array_equal(got, values[rows, cols])
     assert entries["handle"] == 0, "an unsorted point selection reached the chunk-unit path"
+
+
+@pytest.fixture(params=["1d", "2d"])
+def unsharded(tmp_path: Path, request) -> tuple[Path, np.ndarray]:
+    """A plain chunked array with NO sharding codec at all."""
+    if request.param == "1d":
+        values = np.arange(4_000, dtype=np.float32)
+        chunks = (256,)
+    else:
+        values = np.arange(1_024 * 24, dtype=np.float32).reshape(1_024, 24)
+        chunks = (32, 24)
+    path = tmp_path / f"plain_{request.param}"
+    z = zarr.create_array(path, dtype=values.dtype, shape=values.shape, chunks=chunks)
+    z[:] = values
+    return path, values
+
+
+def test_an_unsharded_array_takes_the_path(
+    unsharded: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """No sharding codec: the chunk is its own decode unit and the store value is the chunk.
+
+    That case is SIMPLER than the sharded one -- there is no index to read and nothing to
+    descend -- and it declined only because `ShardInfo::from_codec_chain` returned None for
+    an array with no levels.
+    """
+    path, values = unsharded
+    rows = np.array([1, 3, 3, 40, 41, 300, 999])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows]
+
+    np.testing.assert_array_equal(got, values[rows])
+    assert entries["handle"] > 0, "an unsharded array did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_an_unsharded_array_matches_zarr_python(
+    unsharded: tuple[Path, np.ndarray],
+) -> None:
+    path, _ = unsharded
+    rng = np.random.default_rng(0)
+    with zarr.config.set(CHUNK_UNIT):
+        arr = zarr.open_array(path, mode="r")
+        rows = np.sort(rng.choice(arr.shape[0], size=200, replace=False))
+        mine = arr[rows]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r")[rows]
+    np.testing.assert_array_equal(mine, theirs)
+
+
+def test_an_unsharded_array_reads_unwritten_chunks_as_fill(
+    tmp_path: Path, entries: dict[str, int]
+) -> None:
+    """A key that was never written is absent, not an error -- same as a never-written shard
+    entry. `locate` hands back the whole value either way and the read finds nothing there."""
+    path = tmp_path / "sparse_plain"
+    z = zarr.create_array(
+        path, dtype=np.float32, shape=(4_000,), chunks=(256,), fill_value=np.float32(-7)
+    )
+    z[0:256] = np.arange(256, dtype=np.float32)
+
+    rows = np.array([1, 5, 2_000, 3_999])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows]
+
+    np.testing.assert_array_equal(got, np.array([1, 5, -7, -7], dtype=np.float32))
+    assert entries["handle"] > 0, "an unsharded array did not take the chunk-unit path"

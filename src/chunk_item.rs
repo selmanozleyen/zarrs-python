@@ -236,6 +236,9 @@ fn trailing_layout(chunk_shape: &[u64], shape: &[u64], starts: &[u64]) -> PyResu
 /// contiguous run, of `run_len` elements starting `elem_offset` into that index. That restriction is what
 /// lets `locate` keep descending on axis 0 alone: with a single subchunk on every other
 /// axis, the raveled chunk-grid index IS the axis-0 index. `locate` rechecks it per level.
+// Every one of these is a distinct fact about the batch and none has a default worth
+// guessing; a struct for a single call site would move the same arguments behind a name.
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn build_chunk_unit_items(
     key: &str,
@@ -436,7 +439,7 @@ impl ChunkItems {
     /// since the output subset is bounded against it. A larger one describes bytes the buffer
     /// does not have, and that produces wrong data rather than an error.
     #[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner, elem_starts=Vec::new()))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub(crate) fn push_entry(
         &mut self,
         key: &str,
@@ -471,7 +474,7 @@ impl ChunkItems {
     /// decoded is the whole win, and it is the same grouping the row case uses: the output is
     /// flat, so `shape` is 1-D here while `chunk_shape` is not.
     #[pyo3(signature = (key, chunk_shape, shape, indices, offsets, out_start, inner))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub(crate) fn push_points(
         &mut self,
         key: &str,

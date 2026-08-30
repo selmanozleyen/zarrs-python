@@ -154,7 +154,11 @@ class ZarrsCodecPipeline(CodecPipeline):
 
     @cached_property
     def _inner_chunk_shape(self) -> tuple[int, ...] | None:
-        """The shape of the INNERMOST unit the codec chain decodes, or None if not sharded.
+        """The shape of the INNERMOST unit the codec chain decodes.
+
+        Three answers, and the difference matters: a tuple is the inner chunk of a sharded
+        array; `()` means the array is NOT sharded, so its chunk is its own decode unit and
+        only an entry knows that shape; `None` means refuse.
 
         Descends through nested sharding: the first `chunk_shape` found is the outer shard's,
         not the decode unit.
@@ -176,7 +180,9 @@ class ZarrsCodecPipeline(CodecPipeline):
                 nested = getattr(codec, "codecs", ()) or ()
                 break
             if nested is None:
-                return shape
+                # No sharding codec anywhere in the chain: not an error, just a plain chunked
+                # array, whose chunk is what gets decoded.
+                return () if shape is None else shape
             codecs = nested
 
     @property
