@@ -70,7 +70,25 @@ pub(crate) fn gather(
     if coords.len().checked_mul(run) != Some(out.len()) {
         return Err("output region does not match the coordinate count".to_string());
     }
-    for (n, &c) in coords.iter().enumerate() {
+    // Coordinates that step by exactly `run_len` name one CONTIGUOUS span of `scratch`, and
+    // their outputs are already back to back, so the whole group is a single copy.
+    //
+    // This is the common case, not a rare one. A contiguous slice arrives here fully
+    // expanded -- `_chunk_unit_args` turns `a:b` into `arange(a, b)`, because a slice is a
+    // sorted integer axis spelled differently -- and on the 1-D path `run_len` is 1. So a
+    // backed CSR read of 64 neighbouring rows, ~92,800 consecutive elements, was 92,800
+    // four-byte `copy_from_slice` calls where one 371 KB copy says the same thing. That cost
+    // is per ELEMENT, so it does not shrink as the read grows more contiguous -- which is
+    // exactly the flat elements-per-second ceiling the loader measured across chunk sizes.
+    let mut n = 0usize;
+    while n < coords.len() {
+        let mut m = n + 1;
+        // `checked_add`, not `+`: a coordinate near `u64::MAX` must not wrap into looking
+        // consecutive with the next and merge two spans that are not adjacent.
+        while m < coords.len() && coords[m - 1].checked_add(run_len) == Some(coords[m]) {
+            m += 1;
+        }
+        let c = coords[n];
         // Checked, and not because a coordinate can be that large today -- they are all
         // below the inner chunk extent. Unchecked, a large one wraps in release and can land
         // back INSIDE scratch, so `get` succeeds and the wrong element is copied: exactly
@@ -78,15 +96,22 @@ pub(crate) fn gather(
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
-        // The END of the run is what has to be in bounds, not its start: a coordinate inside
-        // `scratch` whose run walks off the end would otherwise read past the decode.
-        let Some(element) = src.checked_add(run).and_then(|end| scratch.get(src..end)) else {
+        let Some(span) = (m - n).checked_mul(run) else {
+            return Err("the gathered span is too large to address".to_string());
+        };
+        // The END of the span has to be in bounds, not its start: a coordinate inside
+        // `scratch` whose run walks off the end would otherwise read past the decode. Merging
+        // does not weaken this -- the merged span covers exactly the runs it replaces, so it
+        // is in bounds precisely when every one of them is.
+        let Some(region) = src.checked_add(span).and_then(|end| scratch.get(src..end)) else {
             return Err(format!(
-                "coordinate {c} plus {run_len} elements is outside the {} decoded",
+                "coordinate {c} plus {} elements is outside the {} decoded",
+                (m - n) as u64 * run_len,
                 scratch.len() / size
             ));
         };
-        out[n * run..(n + 1) * run].copy_from_slice(element);
+        out[n * run..m * run].copy_from_slice(region);
+        n = m;
     }
     Ok(())
 }

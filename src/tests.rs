@@ -391,3 +391,50 @@ fn test_push_grid_refuses_runs_outside_the_row() -> PyResult<()> {
         Ok(())
     })
 }
+
+/// Merging consecutive coordinates must not change a single byte of the result.
+///
+/// `gather` copies one span per RUN of coordinates that step by `run_len`, rather than one per
+/// coordinate. The two are the same copy, so this pins them together over the shapes that
+/// actually occur: a fully consecutive range (a contiguous slice, expanded), a scattered set
+/// (nothing merges), and the mixed case where runs and gaps alternate.
+#[test]
+fn test_gather_merging_matches_copying_one_coordinate_at_a_time() {
+    fn one_at_a_time(scratch: &[u8], coords: &[u64], run_len: u64, size: usize) -> Vec<u8> {
+        let run = run_len as usize * size;
+        let mut out = vec![0u8; coords.len() * run];
+        for (n, &c) in coords.iter().enumerate() {
+            let src = c as usize * size;
+            out[n * run..(n + 1) * run].copy_from_slice(&scratch[src..src + run]);
+        }
+        out
+    }
+    let scratch: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+    for (name, coords, run_len) in [
+        ("one contiguous range, run 1", (0..512).collect::<Vec<u64>>(), 1u64),
+        ("one contiguous range, run 4", (0..128).map(|i| i * 4).collect(), 4),
+        ("fully scattered", vec![9, 3, 40, 17, 2, 99], 1),
+        ("runs and gaps", vec![0, 1, 2, 3, 20, 21, 22, 60, 90, 91], 1),
+        ("descending -- nothing merges", vec![50, 40, 30, 20], 1),
+        ("repeats -- nothing merges", vec![7, 7, 7, 7], 1),
+        ("single coordinate", vec![11], 2),
+    ] {
+        let size = 2usize;
+        let want = one_at_a_time(&scratch, &coords, run_len, size);
+        let mut got = vec![0u8; want.len()];
+        crate::utils::gather(&scratch, &coords, run_len, &mut got, size)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+/// A merged span is refused exactly when one of the runs it replaces would have been.
+#[test]
+fn test_gather_merging_still_refuses_a_span_past_the_decode() {
+    let scratch = vec![0u8; 8 * 2]; // eight elements of two bytes
+    let mut out = vec![0u8; 4 * 2];
+    // 6,7 are in bounds; consecutive, so they merge -- and 8,9 are not.
+    assert!(crate::utils::gather(&scratch, &[6, 7, 8, 9], 1, &mut out, 2).is_err());
+    let mut out = vec![0u8; 2 * 2];
+    assert!(crate::utils::gather(&scratch, &[6, 7], 1, &mut out, 2).is_ok());
+}
