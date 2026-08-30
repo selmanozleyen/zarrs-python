@@ -876,12 +876,27 @@ def _described(args) -> list[tuple[int, int]]:
 
 
 @pytest.mark.parametrize(
-    "shard", [(4, 5), (2, 3, 4)], ids=["rank-2", "rank-3"]
+    ("shard", "inner"),
+    [
+        ((4, 5), (4, 5)),
+        ((2, 3, 4), (2, 3, 4)),
+        # DIVIDED: the shard holds two inner chunks across, so a column range crossing the
+        # boundary is described as several items rather than one. Without a case where
+        # `inner` differs from `shard` this test cannot see a band at all.
+        ((4, 12), (4, 6)),
+        ((16, 12), (8, 6)),
+        ((4, 12, 4), (4, 6, 4)),
+        # An inner chunk that does NOT divide the shard, so the last band is short. A row
+        # stride taken from the band width agrees with one taken from the inner chunk on
+        # every other geometry here; this is where they part.
+        ((4, 12), (4, 5)),
+    ],
+    ids=["rank-2", "rank-3", "divided", "divided-tall", "divided-rank-3", "ragged-inner"],
 )
 @pytest.mark.parametrize(
     "rows", [(0, 8), (1, 9), [0, 1, 3, 6], [5]], ids=["slice", "unaligned-slice", "list", "one"]
 )
-def test_a_description_names_exactly_its_own_bytes(shard, rows) -> None:
+def test_a_description_names_exactly_its_own_bytes(shard, inner, rows) -> None:
     """Every column range over a shard grid, described and expanded back.
 
     Three things at once, and each has already been wrong: the pairs must match the selection
@@ -900,14 +915,17 @@ def test_a_description_names_exactly_its_own_bytes(shard, rows) -> None:
         entries, out_shape = _batch(shard, rows, boxes)
         pairs: list[tuple[int, int]] = []
         for entry in entries:
-            args = _chunk_unit_args(entry, out_shape, (), tuple(shard))
-            if args is None:
+            pushes = _chunk_unit_args(entry, out_shape, (), tuple(inner))
+            if pushes is None:
                 break
-            assert sorted(_described(args)) == sorted(_wanted(entry, out_shape)), (
-                f"{args[0]} for {entry[0].path} names bytes the selection did not ask for: "
-                f"{entry[2]} -> {entry[3]} of {out_shape}"
+            # One entry describes one item per band, so the entry's claim is the UNION of what
+            # its pushes say -- an individual band names only its own columns.
+            said = [pair for args in pushes for pair in _described(args)]
+            assert sorted(said) == sorted(_wanted(entry, out_shape)), (
+                f"{[a[0] for a in pushes]} for {entry[0].path} names bytes the selection did "
+                f"not ask for: {entry[2]} -> {entry[3]} of {out_shape}"
             )
-            pairs += _described(args)
+            pairs += said
         else:
             got = sorted(d for _, d in pairs)
             assert got == list(range(prod(out_shape))), (

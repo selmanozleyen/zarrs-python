@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import operator
 import os
 from dataclasses import dataclass
@@ -265,26 +266,50 @@ def _contiguous_offset(
     return offset
 
 
+def _bands(lo: int, hi: int, inner: int, out_lo: int) -> list[tuple[int, int, int]]:
+    """(chunk_start, width, out_start) per inner chunk the range `lo:hi` crosses.
+
+    A shard may hold several inner chunks across a trailing axis, and the inner chunk is the
+    decode unit -- so a selection straddling a boundary is not one read of a wide row, it is
+    one read per inner chunk. Splitting here rather than in Rust is deliberate: it is what
+    both previous attempts got wrong, and it is testable without a build.
+
+    Always advances -- `(at // inner + 1) * inner > at` for any positive `inner` -- so it
+    cannot loop. `inner <= 0` is refused by the caller before it gets here.
+    """
+    out, at = [], lo
+    while at < hi:
+        end = min((at // inner + 1) * inner, hi)
+        out.append((at, end - at, out_lo + (at - lo)))
+        at = end
+    return out
+
+
 def _chunk_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
-) -> tuple | None:
-    """Args for `ChunkItems.push_entry`, or None if this entry is not that shape.
+) -> list[tuple] | None:
+    """Args for `ChunkItems.push_entry`, one per item, or None if this entry is not that shape.
 
     Eligible: an integer axis at AXIS 0 -- non-negative, non-decreasing, against a contiguous
-    output slice -- with every axis after it taken whole OR as a contiguous sub-box, on a
-    shard grid that holds a single subchunk on each of those axes.
+    output slice -- with every axis after it taken whole or as a contiguous sub-box.
 
-    The GRID condition is what makes the rank-N case the 1-D case with a run length: with a
-    single subchunk on every axis but the split, the descent can keep walking axis 0 alone.
-    The SELECTION is free to be narrower, because the inner chunk is decoded whole either way
-    -- it is the decode unit -- so a sub-box changes only which of each decoded index's
-    elements are copied out. What it may not be is strided, since an item's output is vended
-    as one range.
+    A LIST, because one entry can describe several items. The inner chunk is the decode unit,
+    so a trailing selection crossing an inner-chunk boundary is not one wide read: it is one
+    read per inner chunk, and the items are the product of the per-axis bands. A shard holding
+    one inner chunk on each trailing axis yields exactly one item, which is every geometry this
+    path served before the split.
+
+    What a band may not be is strided within one index, since an item's output is vended as a
+    single range -- checked per band, on both the chunk and the output side.
 
     `chunk_spec.shape` is the SHARD, so `inner_shape` is passed in separately.
     """
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
     if drop_axes or inner_shape is None:
+        return None
+    # `_bands` divides by these. Metadata reaches here through its own parser, so a zero
+    # extent declines rather than raising ZeroDivisionError out of the description builder.
+    if any(int(v) <= 0 for v in inner_shape):
         return None
     chunk_sel_raw, out_sel_raw = _as_selector_tuples(chunk_selection, out_selection)
     # `X[5]` -- a SCALAR row. zarr passes a bare integer on axis 0 and an output one rank
@@ -327,13 +352,12 @@ def _chunk_unit_args(
     #
     # `inner_shape[axis] == chunk_spec.shape[axis]` is the one that must stay: it is the
     # shard GRID, not the selection, and it is what lets `locate` descend on axis 0 alone.
-    starts: list[int] = []
+    # The ENTRY's own box per trailing axis, before it is cut into bands. Only the span
+    # gate below reads these; the items are described by `lanes`.
     widths: list[int] = []
-    # Where this entry's output begins and how wide it is, per trailing axis. Both are needed:
-    # the start places the band, and the width says how much of a row it fills -- which is no
-    # longer the whole row once the output is banded.
-    out_starts: list[int] = []
-    out_widths: list[int] = []
+    # One list of bands per trailing axis. A shard holding several inner chunks across an axis
+    # turns one entry into one item per band, and the items are the product across axes.
+    lanes: list[list[tuple[int, int, int]]] = []
     for axis in range(1, rank):
         span = _step1_span(chunk_sel[axis], chunk_spec.shape[axis])
         if span is None:
@@ -349,32 +373,11 @@ def _chunk_unit_args(
         out_span = _step1_span(out_sel[axis], shape[axis])
         if out_span is None or out_span[1] - out_span[0] != hi - lo:
             return None
-        out_starts.append(int(out_span[0]))
-        out_widths.append(int(hi - lo))
-        if inner_shape[axis] != chunk_spec.shape[axis]:
-            return None
-        starts.append(lo)
-        widths.append(hi - lo)
-    # The same one-run test, against the OUTPUT extents. `_contiguous_offset` above asks
-    # whether the sub-box is one run of the CHUNK; this asks whether it is one run of the
-    # output, and they are different questions as soon as an entry stops spanning the whole
-    # trailing extent.
-    #
-    # Without it, `output_pieces` models an item as one run per axis-0 index -- true only
-    # while at most one trailing axis is partial. At rank 3 an entry claims 25 elements per
-    # index where the truth is 5 runs of 5 at stride 10, the next entry starts 5 elements in,
-    # and `DisjointBytes` refuses it as a backwards claim. That was 633 tests.
-    # NOT `out_starts[1:]`. At this point both lists hold the TRAILING axes only -- axis 0 is
-    # prepended further down -- so slicing dropped the first trailing axis and compared a
-    # short list against all the extents. That was 2,825 tests, and no type checker could
-    # have seen it: the lists are the right type and the wrong length.
-    if _contiguous_offset(out_starts, out_widths, tuple(shape[1:])) is None:
-        return None
-    # Gate only. Rust re-derives the offset from these same starts and rechecks the shape,
-    # because `push_entry` is reachable from Python with arbitrary arguments and a single
-    # fused offset is not a checkable thing.
-    if _contiguous_offset(starts, widths, tuple(chunk_spec.shape[1:])) is None:
-        return None
+        widths.append(int(hi - lo))
+        # The inner chunk is the decode unit, so a selection crossing one of its boundaries is
+        # not a wide read -- it is one read per inner chunk. `inner_shape[axis] !=
+        # chunk_spec.shape[axis]` used to decline outright here; it now splits instead.
+        lanes.append(_bands(int(lo), int(hi), int(inner_shape[axis]), int(out_span[0])))
     indices = chunk_sel[0]
     out_axis_sel = out_sel[0]
     if isinstance(indices, slice):
@@ -398,23 +401,35 @@ def _chunk_unit_args(
         # begins at column 0 and stops short of the extent passes it, and `X[a:b, 1:13]` on a
         # 12-wide shard grid builds exactly that -- one column of chunk, described as twelve.
         # The WIDTH is what has to be whole; a start of 0 then follows from it.
+        # `inner_shape[axis] == chunk_spec.shape[axis]` is NOT redundant here, and it is the
+        # edit that makes removing the gate above safe. `push_span` has nowhere to put a band:
+        # it takes the whole trailing extent and derives its row stride from the shard. Let a
+        # DIVIDED shard reach it and it builds an item spanning two inner chunks, which
+        # `locate` refuses -- and the retrieve runs outside `pipeline.py`'s try, so that is an
+        # uncaught PyRuntimeError where today there is a clean fallback.
+        #
+        # ponytail: a span read of a divided shard falls to the per-element path instead.
+        # Teach `push_span` the bands only if one shows up in a profile.
         if all(
-            int(widths[axis - 1]) == int(shape[axis]) == int(chunk_spec.shape[axis])
+            int(inner_shape[axis]) == int(chunk_spec.shape[axis])
+            and int(widths[axis - 1]) == int(shape[axis]) == int(chunk_spec.shape[axis])
             for axis in range(1, rank)
         ):
             out_span = _step1_span(out_axis_sel, shape[0])
             count = span[1] - span[0]
             if out_span is not None and out_span[1] - out_span[0] == count and count > 0:
-                return (
-                    "span",
-                    byte_getter.path,
-                    chunk_spec.shape,
-                    shape,
-                    int(span[0]),
-                    int(count),
-                    int(out_span[0]),
-                    int(inner_shape[0]),
-                )
+                return [
+                    (
+                        "span",
+                        byte_getter.path,
+                        chunk_spec.shape,
+                        shape,
+                        int(span[0]),
+                        int(count),
+                        int(out_span[0]),
+                        int(inner_shape[0]),
+                    )
+                ]
         # A sub-box on a trailing axis makes each index its own run, so the span form does
         # not describe it and the elements are named after all.
         indices = np.arange(span[0], span[1], dtype=np.int64)
@@ -426,24 +441,52 @@ def _chunk_unit_args(
     start = out_axis_sel.start or 0
     if not _output_run_matches(indices, out_axis_sel):
         return None
-    out_starts.insert(0, int(start))
-    out_widths.insert(0, int(shape[0]))
 
-    return (
-        "entry",
-        byte_getter.path,
-        chunk_spec.shape,
-        shape,
-        indices,
-        tuple(out_starts),
-        tuple(out_widths),
-        # The WHOLE inner chunk, not just the split extent. Every trailing stride Rust
-        # computes is a product of these, and the decoded buffer is the inner chunk -- so
-        # handing it the shard's extents is only right while a shard holds one inner chunk
-        # on each trailing axis, which is what the guard above still requires.
-        tuple(int(v) for v in inner_shape),
-        tuple(int(v) for v in starts),
-    )
+    pushes = []
+    # One item per combination of bands across the trailing axes. Rank 1 has no lanes, so the
+    # product is a single empty tuple and that path is unchanged.
+    for combo in itertools.product(*lanes):
+        band_starts = [b[0] for b in combo]
+        band_widths = [b[1] for b in combo]
+        band_out = [b[2] for b in combo]
+        # Both one-run tests, per band. The OUTPUT one against the output extents: without it
+        # `output_pieces` models an item as one run per axis-0 index, which is true only while
+        # at most one trailing axis is partial -- that was 633 tests. The CHUNK one against the
+        # INNER extents, with the band reduced into its own inner chunk, because the buffer
+        # being addressed is the inner chunk and not the shard.
+        #
+        # Neither may be sliced. Both lists hold the TRAILING axes only here -- axis 0 is
+        # prepended below -- and `out_starts[1:]` once compared a short list against all the
+        # extents. That was 2,825 tests, and the lists were the right type and the wrong
+        # length, so nothing but reading it could have caught it.
+        if _contiguous_offset(band_out, band_widths, tuple(shape[1:])) is None:
+            return None
+        # Gate only. Rust re-derives the offset from these same starts and rechecks the shape,
+        # because `push_entry` is reachable from Python with arbitrary arguments and a single
+        # fused offset is not a checkable thing.
+        within = [s % int(inner_shape[a + 1]) for a, s in enumerate(band_starts)]
+        if _contiguous_offset(within, band_widths, tuple(inner_shape[1:])) is None:
+            return None
+        pushes.append(
+            (
+                "entry",
+                byte_getter.path,
+                chunk_spec.shape,
+                shape,
+                indices,
+                (int(start), *band_out),
+                (int(shape[0]), *band_widths),
+                # The WHOLE inner chunk, not just the split extent. Every trailing stride Rust
+                # computes is a product of these, and the decoded buffer is the inner chunk --
+                # so handing it the shard's extents is right only while a shard holds one
+                # inner chunk on each trailing axis, which is no longer required.
+                tuple(int(v) for v in inner_shape),
+                # SHARD-relative: this is what steers `locate` to the right inner chunk.
+                # Rust reduces it into the inner chunk for the coordinate.
+                tuple(int(v) for v in band_starts),
+            )
+        )
+    return pushes
 
 
 def _point_unit_args(
@@ -693,7 +736,9 @@ def chunk_info_for_read(
     ]
     if unit_args and all(args is not None for args in unit_args):
         handle = ChunkItems()
-        for kind, *args in unit_args:
+        # An entry straddling an inner-chunk boundary on a trailing axis describes one item
+        # per band, so this is a list of lists.
+        for kind, *args in itertools.chain.from_iterable(unit_args):
             # A span names a contiguous block; an entry names its elements. Both land in the
             # same handle and are served by the same path -- the difference is only how much
             # had to be said to describe the read.
