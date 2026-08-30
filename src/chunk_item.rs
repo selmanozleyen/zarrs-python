@@ -512,6 +512,122 @@ impl ChunkItems {
         Ok(())
     }
 
+    /// Push a contiguous SPAN of the split axis, without naming its elements.
+    ///
+    /// `X[a:b]` and every whole-row read of a backed CSR arrive here. The elements are
+    /// `first..first + count` on axis 0 with the trailing axes taken whole, which in row-major
+    /// order is ONE contiguous block per inner chunk -- so each item needs a single coordinate
+    /// and a run, not a coordinate per element.
+    ///
+    /// This is the whole point. `_chunk_unit_args` used to expand the span with
+    /// `np.arange(a, b)` because "a contiguous slice IS a sorted integer axis, spelled
+    /// differently" -- true, and it costs one u64 per ELEMENT. On a chunk_size 64 preload that
+    /// is 11.9M numbers, ~95 MB, built in numpy and walked one at a time here: measured at
+    /// 98 ms to build and 112 ms to hand over, against a preload of ~317 ms. Described as
+    /// runs, the same read is 0.69 ms.
+    #[pyo3(signature = (key, chunk_shape, shape, first, count, out_start, inner))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn push_span(
+        &mut self,
+        key: &str,
+        chunk_shape: Vec<u64>,
+        shape: Vec<u64>,
+        first: u64,
+        count: u64,
+        out_start: u64,
+        inner: u64,
+    ) -> PyResult<()> {
+        if out_start < self.out_end {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "output starting at {out_start} overlaps an entry already pushed, which ends \
+                 at {}",
+                self.out_end
+            )));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let inner = NonZeroU64::new(inner)
+            .ok_or_else(|| PyErr::new::<PyValueError, _>("inner chunk shape must be non-zero"))?
+            .get();
+        if chunk_shape.is_empty() || chunk_shape.len() != shape.len() {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "push_span splits axis 0 and needs matching arity: chunk_shape has {} axes, \
+                 the output shape has {}",
+                chunk_shape.len(),
+                shape.len()
+            )));
+        }
+        // The trailing axes are taken WHOLE -- that is what makes a span of indices one
+        // contiguous block. A sub-box there would make each index its own run, which is
+        // `push_grid`'s shape, not this one.
+        if chunk_shape[1..] != shape[1..] {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "push_span takes the trailing axes whole: chunk {:?} against output {:?}",
+                &chunk_shape[1..],
+                &shape[1..]
+            )));
+        }
+        let row_stride: u64 = chunk_shape[1..].iter().product();
+        if row_stride == 0 {
+            return Err(PyErr::new::<PyValueError, _>(
+                "a trailing axis of extent zero selects nothing",
+            ));
+        }
+        let num_elements: u64 = chunk_shape.iter().product();
+        let extent = chunk_shape[0];
+        let out_extent = shape[0];
+        let last = first
+            .checked_add(count - 1)
+            .ok_or_else(|| PyErr::new::<PyValueError, _>("the span is too large to address"))?;
+        if last >= extent {
+            return Err(PyErr::new::<PyIndexError, _>(format!(
+                "index {last} is past the chunk extent {extent}"
+            )));
+        }
+        let chunk_shape_nz = to_nonzero_u64_vec(chunk_shape.clone())?;
+        let shape_nz = to_nonzero_u64_vec(shape.clone())?;
+        let key = StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?;
+
+        // One item per inner chunk the span crosses -- arithmetic, not a walk over elements.
+        for chunk_id in (first / inner)..=(last / inner) {
+            let lo = chunk_id * inner;
+            let hi = (lo + inner).min(extent);
+            let span_lo = first.max(lo);
+            let span_hi = (first + count).min(hi);
+            let rows = span_hi - span_lo;
+            let out_lo = out_start + (span_lo - first);
+            let out_hi = out_lo + rows;
+            if out_hi > out_extent {
+                return Err(PyErr::new::<PyIndexError, _>(format!(
+                    "output subset {out_lo}..{out_hi} is past the output extent {out_extent}",
+                )));
+            }
+            let mut chunk_ranges = Vec::with_capacity(chunk_shape.len());
+            chunk_ranges.push(lo..hi);
+            chunk_ranges.extend(chunk_shape[1..].iter().map(|d| 0..*d));
+            let mut out_ranges = Vec::with_capacity(shape.len());
+            out_ranges.push(out_lo..out_hi);
+            out_ranges.extend(shape[1..].iter().map(|d| 0..*d));
+            self.items.push(ChunkItem {
+                key: key.clone(),
+                chunk_subset: ArraySubset::new_with_ranges(&chunk_ranges),
+                subset: ArraySubset::new_with_ranges(&out_ranges),
+                shape: chunk_shape_nz.clone(),
+                num_elements,
+                array_shape: shape_nz.clone(),
+                // ONE coordinate: where this chunk's slice of the span begins inside the
+                // decoded chunk. `run_len` carries the rest, so `gather` moves the whole
+                // block in a single copy.
+                coords: Some(vec![(span_lo - lo) * row_stride].into()),
+                run_len: rows * row_stride,
+                grid: None,
+            });
+            self.out_end = out_hi;
+        }
+        Ok(())
+    }
+
     /// Push a GRID selection: the same columns taken from every selected index.
     ///
     /// `oindex[rows, cols]`, `X[:, cols]`, and any rank-N grid. Each selected index gives up

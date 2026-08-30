@@ -350,13 +350,37 @@ def _chunk_unit_args(
     indices = chunk_sel[0]
     out_axis_sel = out_sel[0]
     if isinstance(indices, slice):
-        # A contiguous slice IS a sorted integer axis, spelled differently -- so a sequential
-        # read gets the same grouped, scoped-worker path a scattered one does instead of
-        # falling to the fused one. The arange costs an allocation proportional to the read
-        # it serves, against a decode of that many rows.
         span = _step1_span(indices, chunk_spec.shape[0])
         if span is None:
             return None
+        # KEEP THE RUN. With the trailing axes taken whole, `first..first + count` on axis 0
+        # is one contiguous block per inner chunk, so Rust needs a coordinate and a length --
+        # not a coordinate per element.
+        #
+        # This used to `np.arange(span[0], span[1])` on the grounds that "a contiguous slice
+        # IS a sorted integer axis, spelled differently". True, and it costs one u64 per
+        # ELEMENT: a chunk_size 64 preload describes ~130 runs with 11.9M numbers, ~95 MB,
+        # measured at 98 ms to build and 112 ms to hand over against a ~317 ms preload. The
+        # runs were already there -- anndata derives them from `indptr` and zarr carries them
+        # through as slices -- and this is where they were being thrown away.
+        if all(v == 0 for v in starts) and all(
+            int(shape[axis]) == int(chunk_spec.shape[axis]) for axis in range(1, rank)
+        ):
+            out_span = _step1_span(out_axis_sel, shape[0])
+            count = span[1] - span[0]
+            if out_span is not None and out_span[1] - out_span[0] == count and count > 0:
+                return (
+                    "span",
+                    byte_getter.path,
+                    chunk_spec.shape,
+                    shape,
+                    int(span[0]),
+                    int(count),
+                    int(out_span[0]),
+                    int(inner_shape[0]),
+                )
+        # A sub-box on a trailing axis makes each index its own run, so the span form does
+        # not describe it and the elements are named after all.
         indices = np.arange(span[0], span[1], dtype=np.int64)
     if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
         return None
@@ -368,6 +392,7 @@ def _chunk_unit_args(
         return None
 
     return (
+        "entry",
         byte_getter.path,
         chunk_spec.shape,
         shape,
@@ -625,8 +650,14 @@ def chunk_info_for_read(
     ]
     if unit_args and all(args is not None for args in unit_args):
         handle = ChunkItems()
-        for args in unit_args:
-            handle.push_entry(*args)
+        for kind, *args in unit_args:
+            # A span names a contiguous block; an entry names its elements. Both land in the
+            # same handle and are served by the same path -- the difference is only how much
+            # had to be said to describe the read.
+            if kind == "span":
+                handle.push_span(*args)
+            else:
+                handle.push_entry(*args)
         return RustChunkInfo(handle, write_empty_chunks=True)
 
     # A point selection is a different SHAPE of batch, not a failed row one, so it gets its
