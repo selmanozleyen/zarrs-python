@@ -699,3 +699,62 @@ def test_rank_four_grid_takes_the_path(tmp_path: Path, entries: dict[str, int]) 
 
     np.testing.assert_array_equal(got, theirs)
     assert entries["handle"] > 0, "a rank-4 grid did not take the chunk-unit path"
+
+
+@pytest.fixture
+def nested(tmp_path: Path) -> tuple[Path, np.ndarray]:
+    """Two levels of sharding: 256-row shard -> 32-row subshard -> 8-row inner chunk.
+
+    `compressors=None` matters and is easy to omit: without it zarr puts a default compressor
+    OUTSIDE the sharding codec, the shard index stops addressing the shard, and this path
+    refuses the array for a reason that has nothing to do with nesting.
+    """
+    from zarr.codecs import BytesCodec, ShardingCodec
+
+    values = np.arange(1024 * 48, dtype=np.float32).reshape(1024, 48)
+    path = tmp_path / "nested2d"
+    z = zarr.create_array(
+        path,
+        shape=values.shape,
+        chunks=(256, 48),
+        dtype="float32",
+        compressors=None,
+        serializer=ShardingCodec(
+            chunk_shape=(32, 48),
+            codecs=[ShardingCodec(chunk_shape=(8, 48), codecs=[BytesCodec()])],
+        ),
+    )
+    z[:] = values
+    return path, values
+
+
+@pytest.mark.parametrize(
+    ("name", "read"),
+    [
+        ("whole rows", lambda a, r: a.oindex[r, :]),
+        ("column sub-box", lambda a, r: a.oindex[r, 8:24]),
+        ("grid", lambda a, r: a.oindex[r, np.array([0, 5, 5, 17, 40])]),
+        ("paired points", lambda a, r: a[r, np.array([0, 5, 5, 17, 40, 44])]),
+        ("contiguous slice", lambda a, r: a.oindex[10:200, :]),
+    ],
+)
+def test_every_shape_works_through_two_shard_levels(
+    nested: tuple[Path, np.ndarray], entries: dict[str, int], name: str, read
+) -> None:
+    """The widening is orthogonal to how deep the sharding goes.
+
+    `locate` walks one index per LEVEL and everything added here operates on the innermost
+    decoded chunk, so nesting should not interact with it at all -- which is exactly the kind
+    of "should" this repo has been wrong about, so it is asserted for every shape rather than
+    argued.
+    """
+    path, _ = nested
+    rows = np.array([1, 3, 3, 40, 300, 900])
+    with zarr.config.set(CHUNK_UNIT):
+        got = read(zarr.open_array(path, mode="r"), rows)
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = read(zarr.open_array(path, mode="r"), rows)
+
+    np.testing.assert_array_equal(got, theirs)
+    assert entries["handle"] > 0, f"{name} did not take the chunk-unit path through two levels"
+    assert entries["list"] == 0
