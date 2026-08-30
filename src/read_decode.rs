@@ -377,7 +377,10 @@ impl CodecPipelineImpl {
 
             shard_shape.clone_from(shard.subchunk_shape_at(depth));
             if depth + 1 < shard.depth() {
-                path.push(index);
+                // Every axis, not just the split. The path is the cache key for a
+                // subshard's decoder, and two positions differing only on a trailing axis
+                // would otherwise collide on it -- returning the wrong subshard's index.
+                path.extend_from_slice(&grid_index);
             }
         }
         Ok(extent.map(|(base, len)| ByteRange::FromStart(base, Some(len))))
