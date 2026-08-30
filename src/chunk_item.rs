@@ -260,6 +260,11 @@ pub(crate) fn build_chunk_unit_items(
     out_start: u64,
     inner: u64,
     offsets: Offsets<'_>,
+    // `(axis, extent)` of ONE trailing axis the shard divides, or None when every trailing
+    // axis holds a single inner chunk. Python decides: it passes this only when exactly one
+    // divides AND the selection takes the trailing axes whole, so the band split below never
+    // has to rebase a sub-box onto a band.
+    split: Option<(usize, u64)>,
 ) -> PyResult<Vec<ChunkItem>> {
     let inner = NonZeroU64::new(inner)
         .ok_or_else(|| PyErr::new::<PyValueError, _>("inner chunk shape must be non-zero"))?
@@ -383,13 +388,48 @@ pub(crate) fn build_chunk_unit_items(
                 "output subset {out_lo}..{out_hi} is past the output extent {out_extent}",
             )));
         }
-        // Axis 0 is the split; every axis after it is taken whole on both sides.
+        // Axis 0 is always split by the inner chunk. ONE trailing axis may be split too,
+        // when the shard divides it -- then this group becomes one item per band along that
+        // axis rather than one item covering the whole extent, because an item is exactly
+        // one decode unit.
+        let bands: Vec<(u64, u64)> = match split {
+            None => vec![(0, 0)],
+            Some((axis, extent)) => {
+                let whole = chunk_shape[axis].get();
+                let mut out = Vec::new();
+                let mut at = 0u64;
+                while at < whole {
+                    out.push((at, (at + extent).min(whole)));
+                    at += extent;
+                }
+                out
+            }
+        };
+        for &(band_lo, band_hi) in &bands {
+        // Within a band the decoded buffer is one inner chunk, so a row of it is the BAND
+        // wide -- not the shard. Python only passes `split` for a rank-2 selection taking
+        // the trailing axis whole, so the offset within a row is zero and the run is the
+        // whole band.
+        let (row_stride, run_len, shared_offset) = match split {
+            None => (row_stride, run_len, shared_offset),
+            Some(_) => (band_hi - band_lo, band_hi - band_lo, 0),
+        };
         let mut chunk_ranges = Vec::with_capacity(chunk_shape.len());
         chunk_ranges.push(lo..hi);
-        chunk_ranges.extend(chunk_shape[1..].iter().map(|d| 0..d.get()));
+        chunk_ranges.extend(chunk_shape[1..].iter().enumerate().map(|(i, d)| {
+            match split {
+                Some((axis, _)) if axis == i + 1 => band_lo..band_hi,
+                _ => 0..d.get(),
+            }
+        }));
         let mut out_ranges = Vec::with_capacity(shape.len());
         out_ranges.push(out_lo..out_hi);
-        out_ranges.extend(shape[1..].iter().map(|d| 0..d.get()));
+        out_ranges.extend(shape[1..].iter().enumerate().map(|(i, d)| {
+            match split {
+                Some((axis, _)) if axis == i + 1 => band_lo..band_hi,
+                _ => 0..d.get(),
+            }
+        }));
         items.push(ChunkItem {
             key: key.clone(),
             chunk_subset: ArraySubset::new_with_ranges(&chunk_ranges),
@@ -436,6 +476,7 @@ pub(crate) fn build_chunk_unit_items(
                 _ => None,
             },
         });
+        }
         a = b;
     }
     Ok(items)
@@ -485,7 +526,7 @@ impl ChunkItems {
     /// One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
     /// since the output subset is bounded against it. A larger one describes bytes the buffer
     /// does not have, and that produces wrong data rather than an error.
-    #[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner, elem_starts=Vec::new()))]
+    #[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner, elem_starts=Vec::new(), split=None))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub(crate) fn push_entry(
         &mut self,
@@ -496,6 +537,11 @@ impl ChunkItems {
         out_start: u64,
         inner: u64,
         elem_starts: Vec<u64>,
+        // `(axis, inner extent)` of a trailing axis the shard divides. Python passes it only
+        // when exactly one does AND the selection takes the trailing axes whole; anything
+        // else still declines, because rebasing a sub-box onto a band is where wrong data
+        // would come from rather than an error.
+        split: Option<(usize, u64)>,
     ) -> PyResult<()> {
         if out_start < self.out_end {
             return Err(PyErr::new::<PyValueError, _>(format!(
@@ -504,7 +550,16 @@ impl ChunkItems {
                 self.out_end
             )));
         }
-        let items = build_chunk_unit_items(key, chunk_shape, shape, indices, out_start, inner, Offsets::Uniform(&elem_starts))?;
+        let items = build_chunk_unit_items(
+            key,
+            chunk_shape,
+            shape,
+            indices,
+            out_start,
+            inner,
+            Offsets::Uniform(&elem_starts),
+            split,
+        )?;
         if let Some(last) = items.last() {
             self.out_end = last.subset.end_exc()[0];
         }
@@ -665,6 +720,7 @@ impl ChunkItems {
             out_start,
             inner,
             Offsets::Grid { starts, run },
+            None,
         )?;
         if let Some(last) = items.last() {
             self.out_end = last.subset.end_exc()[0];
@@ -713,6 +769,7 @@ impl ChunkItems {
             out_start,
             inner,
             Offsets::PerIndex(offsets),
+            None,
         )?;
         if let Some(last) = items.last() {
             self.out_end = last.subset.end_exc()[0];

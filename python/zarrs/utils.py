@@ -329,6 +329,8 @@ def _chunk_unit_args(
     # shard GRID, not the selection, and it is what lets `locate` descend on axis 0 alone.
     starts: list[int] = []
     widths: list[int] = []
+    # Set when the shard divides one trailing axis; see the band split below.
+    split: tuple[int, int] | None = None
     for axis in range(1, rank):
         span = _step1_span(chunk_sel[axis], chunk_spec.shape[axis])
         if span is None:
@@ -338,8 +340,15 @@ def _chunk_unit_args(
         # contiguous output range, which is what the carve hands out.
         if not _is_whole_axis(out_sel[axis], shape[axis]) or shape[axis] != hi - lo:
             return None
+        # A shard that divides this axis used to decline outright. It can be served, but only
+        # as one item per BAND of inner chunks along it -- and only when the selection takes
+        # the axis whole, because rebasing a sub-box onto a band is where wrong data would
+        # come from rather than an error. More than one dividing axis would need a cartesian
+        # product of bands; not built, so still declined.
         if inner_shape[axis] != chunk_spec.shape[axis]:
-            return None
+            if lo != 0 or hi - lo != chunk_spec.shape[axis] or split is not None:
+                return None
+            split = (axis, int(inner_shape[axis]))
         starts.append(lo)
         widths.append(hi - lo)
     # Gate only. Rust re-derives the offset from these same starts and rechecks the shape,
@@ -363,8 +372,12 @@ def _chunk_unit_args(
         # measured at 98 ms to build and 112 ms to hand over against a ~317 ms preload. The
         # runs were already there -- anndata derives them from `indptr` and zarr carries them
         # through as slices -- and this is where they were being thrown away.
-        if all(v == 0 for v in starts) and all(
-            int(shape[axis]) == int(chunk_spec.shape[axis]) for axis in range(1, rank)
+        if (
+            split is None
+            and all(v == 0 for v in starts)
+            and all(
+                int(shape[axis]) == int(chunk_spec.shape[axis]) for axis in range(1, rank)
+            )
         ):
             out_span = _step1_span(out_axis_sel, shape[0])
             count = span[1] - span[0]
@@ -400,6 +413,7 @@ def _chunk_unit_args(
         start,
         int(inner_shape[0]),
         tuple(int(v) for v in starts),
+        split,
     )
 
 
