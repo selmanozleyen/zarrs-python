@@ -21,7 +21,18 @@ import numpy as np
 import pytest
 import zarr
 
-from zarrs.utils import DiscontiguousArrayError  # noqa: F401  (documents the decline)
+ZARRS = {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}
+
+
+def open_strict(path):
+    """Open with no fallback, so a declined selection raises instead of being rerouted.
+
+    Without this every test here passes today: `pipeline.read` catches the decline and
+    zarr-python returns the right values. The point is not whether the answer is right -- it
+    is whether the fast path serves the geometry at all.
+    """
+    with zarr.config.set({**ZARRS, "codec_pipeline.strict": True}):
+        return zarr.open_array(path, mode="r+")
 
 
 def _write(path, values, chunks, shards):
@@ -66,13 +77,13 @@ def divided_3d(tmp_path):
 )
 def test_2d_rows_match(divided_2d, rows):
     path, values = divided_2d
-    array = zarr.open_array(path, mode="r")
+    array = open_strict(path)
     np.testing.assert_array_equal(array[rows], values[rows])
 
 
 def test_2d_slice_matches(divided_2d):
     path, values = divided_2d
-    array = zarr.open_array(path, mode="r")
+    array = open_strict(path)
     for lo, hi in [(0, 64), (3, 29), (7, 9), (15, 17)]:
         np.testing.assert_array_equal(array[lo:hi], values[lo:hi])
 
@@ -85,5 +96,5 @@ def test_2d_slice_matches(divided_2d):
 def test_3d_rows_match(divided_3d, rows):
     """The case an earlier attempt got wrong, and that no existing test would have caught."""
     path, values = divided_3d
-    array = zarr.open_array(path, mode="r")
+    array = open_strict(path)
     np.testing.assert_array_equal(array[rows], values[rows])
