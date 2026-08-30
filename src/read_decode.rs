@@ -911,7 +911,14 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         ctx.shard
             .inner_chain
             .decode_into(
-                Cow::Owned(bytes.into()),
+                // BORROWED. `ArrayBytesRaw` is `Cow<'_, [u8]>` and `Bytes` derefs to
+                // `[u8]`, so the decode can read the fetched buffer where it lies.
+                // `Cow::Owned(bytes.into())` converted it to a `Vec` first -- an allocation
+                // and, whenever the `Bytes` does not uniquely own its buffer, a copy of the
+                // whole compressed chunk. At ~90 KiB compressed and ~2,800 chunks that is a
+                // quarter of a gigabyte per preload, to hand the decoder bytes it already
+                // had.
+                Cow::Borrowed(&bytes),
                 shape,
                 ArrayBytesDecodeIntoTarget::Fixed(&mut view),
                 &ctx.codec_options,
