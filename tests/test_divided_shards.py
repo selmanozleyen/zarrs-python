@@ -67,6 +67,26 @@ def banded_output_only(tmp_path):
 
 
 @pytest.fixture
+def short_final_band(tmp_path):
+    """The array ends MID inner chunk, so the last band is narrower than the chunk it sits in.
+
+    20 columns over 12-wide shards: the second shard holds columns 12..20, and its inner
+    chunks are 6 wide, so the bands are 6 and 2. A band of 2 inside an inner chunk of 6.
+
+    This exists because the other three fixtures cannot catch a whole class of defect. In
+    `divided_2d` and `divided_3d` every band happens to cover a WHOLE inner chunk, so
+    `prod(band widths)` and `prod(inner[1:])` are the same number and a row stride taken from
+    the band survives all fourteen of their cases -- which is a cousin of the exact defect the
+    reverted attempt shipped. Modelled in Python first: with the stride taken from the widths,
+    `divided_2d`, `divided_3d`, `banded_output_only` and a single divided shard all pass, and
+    this is the first case that fails.
+    """
+    values = np.arange(64 * 20, dtype=np.float64).reshape(64, 20)
+    _write(tmp_path / "sf.zarr", values, (8, 6), (16, 12))
+    return tmp_path / "sf.zarr", values
+
+
+@pytest.fixture
 def divided_3d(tmp_path):
     """The same division on axis 1, with a third axis below it taken whole.
 
@@ -134,3 +154,28 @@ def test_banded_output_matches(banded_output_only, rows):
     path, values = banded_output_only
     array = open_strict(path)
     np.testing.assert_array_equal(array[rows], values[rows])
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        np.array([0, 3, 4, 5, 17, 30]),
+        np.arange(0, 64),
+        np.array([11]),
+        np.array([15, 16]),
+        np.array([0, 1]),
+    ],
+    ids=["scattered", "every-row", "single", "shard-edge", "short-and-low"],
+)
+def test_short_final_band_matches(short_final_band, rows):
+    """A band narrower than its inner chunk still has the inner chunk's row stride."""
+    path, values = short_final_band
+    array = open_strict(path)
+    np.testing.assert_array_equal(array[rows], values[rows])
+
+
+def test_short_final_band_slice_matches(short_final_band):
+    path, values = short_final_band
+    array = open_strict(path)
+    for lo, hi in [(0, 64), (3, 29), (15, 17)]:
+        np.testing.assert_array_equal(array[lo:hi], values[lo:hi])
