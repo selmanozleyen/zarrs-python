@@ -523,7 +523,6 @@ impl CodecPipelineImpl {
     }
 }
 
-/// A Python module implemented in Rust.
 /// `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
 ///
 /// A build is an index actually read and decoded; the two hit counts are the per-call cache
