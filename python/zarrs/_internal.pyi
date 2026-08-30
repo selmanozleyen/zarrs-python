@@ -2,10 +2,9 @@
 # ruff: noqa: E501, F401
 
 import builtins
-import typing
-
 import numpy
 import numpy.typing
+import typing
 import zarr.abc.store
 
 @typing.final
@@ -41,6 +40,7 @@ class ChunkItems:
         indices: numpy.typing.NDArray[numpy.int64],
         out_start: builtins.int,
         inner: builtins.int,
+        elem_starts: typing.Sequence[builtins.int] = [],
     ) -> None:
         r"""
         Build one batch entry's items and append them.
@@ -57,6 +57,45 @@ class ChunkItems:
         since the output subset is bounded against it. A larger one describes bytes the buffer
         does not have, and that produces wrong data rather than an error.
         """
+    def push_grid(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        starts: numpy.typing.NDArray[numpy.uint64],
+        run: builtins.int,
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a GRID selection: the same columns taken from every selected index.
+
+        `oindex[rows, cols]`, `X[:, cols]`, and any rank-N grid. Each selected index gives up
+        the same sub-box, described as `starts.len()` runs of `run` elements -- because in
+        row-major order a sub-box IS a set of runs. A fully scattered selection is `run == 1`.
+        The runs land back to back in the output, so the item is still one output range.
+        """
+    def push_points(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        offsets: numpy.typing.NDArray[numpy.uint64],
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a POINT selection: one element per index, each naming its own offset inside that
+        index's elements.
+
+        `X[rows, cols]` and `X[rows, 5]` both arrive as this -- zarr builds a
+        `CoordinateIndexer` rather than dropping an axis -- and the ordinary route spends two
+        allocations and a partial-decode call PER POINT. Grouping them by the chunk that gets
+        decoded is the whole win, and it is the same grouping the row case uses: the output is
+        flat, so `shape` is 1-D here while `chunk_shape` is not.
+        """
 
 @typing.final
 class CodecPipelineImpl:
@@ -66,9 +105,9 @@ class CodecPipelineImpl:
         store_config: zarr.abc.store.Store,
         *,
         validate_checksums: builtins.bool = False,
-        chunk_concurrent_minimum: builtins.int | None = None,
-        chunk_concurrent_maximum: builtins.int | None = None,
-        num_threads: builtins.int | None = None,
+        chunk_concurrent_minimum: typing.Optional[builtins.int] = None,
+        chunk_concurrent_maximum: typing.Optional[builtins.int] = None,
+        num_threads: typing.Optional[builtins.int] = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
         store_is_read_only: builtins.bool = False,
@@ -77,19 +116,19 @@ class CodecPipelineImpl:
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
         value: numpy.typing.NDArray[typing.Any],
-        read_concurrency: builtins.int | None = None,
-        decode_concurrency: builtins.int | None = None,
-        read_worker_ceiling: builtins.int | None = None,
-        decode_worker_ceiling: builtins.int | None = None,
+        read_concurrency: typing.Optional[builtins.int] = None,
+        decode_concurrency: typing.Optional[builtins.int] = None,
+        read_worker_ceiling: typing.Optional[builtins.int] = None,
+        decode_worker_ceiling: typing.Optional[builtins.int] = None,
     ) -> None: ...
     def retrieve_chunk_items_and_apply_index(
         self,
         chunk_items: ChunkItems,
         value: numpy.typing.NDArray[typing.Any],
-        read_concurrency: builtins.int | None = None,
-        decode_concurrency: builtins.int | None = None,
-        read_worker_ceiling: builtins.int | None = None,
-        decode_worker_ceiling: builtins.int | None = None,
+        read_concurrency: typing.Optional[builtins.int] = None,
+        decode_concurrency: typing.Optional[builtins.int] = None,
+        read_worker_ceiling: typing.Optional[builtins.int] = None,
+        decode_worker_ceiling: typing.Optional[builtins.int] = None,
     ) -> None:
         r"""
         The same read as `retrieve_chunks_and_apply_index`, from a `ChunkItems` handle.

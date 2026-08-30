@@ -50,6 +50,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
             indices.readonly(),
             7,
             inner,
+            crate::chunk_item::Offsets::Uniform(&[]),
         )?;
 
         let got: Vec<_> = items
@@ -83,7 +84,8 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 vec![100],
                 bad.readonly(),
                 0,
-                inner
+                inner,
+                crate::chunk_item::Offsets::Uniform(&[])
             )
             .is_err()
         );
@@ -96,7 +98,8 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 vec![1],
                 over.readonly(),
                 0,
-                inner
+                inner,
+                crate::chunk_item::Offsets::Uniform(&[])
             )
             .is_err()
         );
@@ -115,8 +118,8 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10)?;
-        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10)?;
+        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10, vec![])?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10, vec![])?;
 
         let got: Vec<_> = handle
             .as_slice()
@@ -143,18 +146,18 @@ fn test_push_entry_refuses_output_another_entry_owns() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10)?;
+        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10, vec![])?;
 
         // `a` produced two items covering output 0..2, so an entry starting at 1 would give
         // two items the same byte.
         assert!(
             handle
-                .push_entry("c/1", vec![95], vec![100], b.readonly(), 1, 10)
+                .push_entry("c/1", vec![95], vec![100], b.readonly(), 1, 10, vec![])
                 .is_err(),
             "an out_start inside an entry already pushed"
         );
         // Starting where the last one ended is exactly what zarr produces, and is allowed.
-        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10)?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10, vec![])?;
         assert_eq!(handle.as_slice().len(), 3);
         Ok(())
     })
@@ -183,6 +186,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
             indices.readonly(),
             2,
             inner,
+            crate::chunk_item::Offsets::Uniform(&[0]),
         )?;
 
         let got: Vec<_> = items
@@ -212,8 +216,12 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
     })
 }
 
-/// Trailing axes that disagree between chunk and output are refused, not silently trusted:
-/// `run_len` would then describe one buffer and be used to address the other.
+/// A trailing selection that is STRIDED within one index is refused, not silently trusted:
+/// `gather` copies one contiguous run per coordinate, so a strided box would be filled with
+/// whatever happened to sit consecutively after its start.
+///
+/// A merely NARROWER trailing axis is legal now -- 2 columns of a 3-column chunk is
+/// `X[rows, 0:2]` -- so this no longer asserts that, and checks the shape rule instead.
 #[test]
 fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
@@ -221,16 +229,40 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
     Python::initialize();
     Python::attach(|py| {
         let indices = PyArray1::from_slice(py, &[0i64, 1]);
-        // 3 columns in the chunk against 2 in the output.
-        let mismatched = crate::chunk_item::build_chunk_unit_items(
+        // A narrower trailing axis alone is fine: 2 of 3 columns from 0 is `X[rows, 0:2]`.
+        let narrower = crate::chunk_item::build_chunk_unit_items(
             "c/0/0",
             vec![10, 3],
             vec![10, 2],
             indices.readonly(),
             0,
             4,
+            crate::chunk_item::Offsets::Uniform(&[0]),
         );
-        assert!(mismatched.is_err());
+        assert!(narrower.is_ok(), "a contiguous column subset is served, not refused");
+        // 2 of 4 rows by 5 of 10 columns is 2 runs of 5 at a stride of 10 -- not one range.
+        // A fused offset could not see this; the per-axis starts can.
+        let strided = crate::chunk_item::build_chunk_unit_items(
+            "c/0/0/0",
+            vec![10, 4, 10],
+            vec![10, 2, 5],
+            indices.readonly(),
+            0,
+            4,
+            crate::chunk_item::Offsets::Uniform(&[0, 0]),
+        );
+        assert!(strided.is_err(), "a strided trailing box must be refused");
+        // A run that starts inside its own sub-row and walks off the end of it, likewise.
+        let wraps = crate::chunk_item::build_chunk_unit_items(
+            "c/0/0/0",
+            vec![10, 4, 10],
+            vec![10, 1, 4],
+            indices.readonly(),
+            0,
+            4,
+            crate::chunk_item::Offsets::Uniform(&[0, 8]),
+        );
+        assert!(wraps.is_err(), "a run leaving its own sub-row must be refused");
         // Differing ARITY is refused too -- a 1-D chunk against a 2-D output.
         let ranks = crate::chunk_item::build_chunk_unit_items(
             "c/0",
@@ -239,37 +271,71 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             0,
             4,
+            crate::chunk_item::Offsets::Uniform(&[0]),
         );
         assert!(ranks.is_err());
         Ok(())
     })
 }
 
-/// Consecutive rows are ONE read; a gap or a repeat starts another.
+/// Consecutive reads are ONE read; a gap or a repeat starts another -- for both item kinds.
 ///
 /// This is what decides whether the raw path is worth taking: 64 adjacent rows are one
 /// request, 64 scattered ones are 64, and the filesystem charges per request. Getting it
-/// wrong is not a wrong answer, it is a 64x IOPS bill -- measured at 0.092x against the
-/// chunk path before coalescing existed.
+/// wrong is not a wrong answer, it is a 64x IOPS bill -- measured at 0.092x against the chunk
+/// path before coalescing existed.
+///
+/// A GRID coordinate is not a run. It is the START of an index's elements, and the wanted
+/// bytes inside it are the runs the grid names, so counting one read per coordinate would
+/// both undercount the requests and -- in `raw_ranges` -- read the wrong bytes.
 #[test]
-fn test_raw_runs_counts_reads_not_rows() {
+fn test_raw_read_count_counts_reads_not_coordinates() {
+    use crate::read_decode::raw_read_count;
     let run_len = 2048;
     let c = |rows: &[u64]| -> Vec<u64> { rows.iter().map(|r| r * run_len).collect() };
 
-    // One row, one read.
-    assert_eq!(crate::read_decode::raw_runs(&c(&[7]), run_len), 1);
+    // --- plain items: a coordinate IS a run
+    assert_eq!(raw_read_count(None, run_len, &c(&[7])), 1);
     // A whole 64-row chunk, consecutive: still ONE read, which is the point.
     let dense: Vec<u64> = c(&(0..64).collect::<Vec<_>>());
-    assert_eq!(crate::read_decode::raw_runs(&dense, run_len), 1);
+    assert_eq!(raw_read_count(None, run_len, &dense), 1);
     // Every other row: adjacent to nothing, so one read each.
     let strided: Vec<u64> = c(&(0..64).step_by(2).collect::<Vec<_>>());
-    assert_eq!(crate::read_decode::raw_runs(&strided, run_len), 32);
+    assert_eq!(raw_read_count(None, run_len, &strided), 32);
     // Two blocks with a hole between them.
-    assert_eq!(crate::read_decode::raw_runs(&c(&[0, 1, 2, 10, 11]), run_len), 2);
+    assert_eq!(raw_read_count(None, run_len, &c(&[0, 1, 2, 10, 11])), 2);
     // A REPEAT steps by 0, not by run_len, so it cannot join the run: the same row twice is
     // two output pieces and cannot be served by one read.
-    assert_eq!(crate::read_decode::raw_runs(&c(&[3, 3, 4]), run_len), 2);
-    assert_eq!(crate::read_decode::raw_runs(&[], run_len), 0);
+    assert_eq!(raw_read_count(None, run_len, &c(&[3, 3, 4])), 2);
+    assert_eq!(raw_read_count(None, run_len, &[]), 0);
+
+    // --- grid items: a coordinate is a row start, and each row costs its runs
+    // Three scattered columns from four rows is twelve reads, not four.
+    let cols: &[u64] = &[5, 40, 900];
+    assert_eq!(raw_read_count(Some((cols, 1)), 2048, &c(&[0, 1, 2, 3])), 12);
+    // Runs that ABUT merge, within a row and across rows. Rows 0 and 1 are adjacent and each
+    // takes its whole 2048 elements as two runs of 1024 -- so the lot is one read.
+    let halves: &[u64] = &[0, 1024];
+    assert_eq!(raw_read_count(Some((halves, 1024)), 2048, &c(&[0, 1])), 1);
+    // The same two runs with a gap between them do not merge, and neither do the rows.
+    let apart: &[u64] = &[0, 1500];
+    assert_eq!(raw_read_count(Some((apart, 100)), 2048, &c(&[0, 5])), 4);
+}
+
+/// The raw path must read a GRID item's actual bytes, not the first `run_len` of each row.
+///
+/// The bug this prevents returns the right SHAPE full of wrong numbers and raises nothing:
+/// a grid coordinate is a row start, and `run_len` is the total gathered elements, so treating
+/// it as a contiguous span reads the front of the row instead of the selection.
+#[test]
+fn test_raw_ranges_follows_the_grid_not_the_row() {
+    use crate::read_decode::raw_read_count;
+    // One row at element 4096, taking columns 5 and 40 -- two single elements, far apart.
+    let cols: &[u64] = &[5, 40];
+    assert_eq!(raw_read_count(Some((cols, 1)), 2, &[4096]), 2);
+    // Read as a plain item the same coordinate would be ONE read of run_len elements, which
+    // is the whole bug in one line.
+    assert_eq!(raw_read_count(None, 2, &[4096]), 1);
 }
 
 /// `gather` copies by coordinate, and refuses an out-of-range coord or a mismatched output.
@@ -314,4 +380,74 @@ fn test_gather_copies_a_run_per_coordinate() {
     // A zero run length would make the output region match at every coordinate count.
     let mut out = vec![0u8; 0];
     assert!(crate::utils::gather(&scratch, &[0], 0, &mut out, 2).is_err());
+}
+
+/// `push_points` is `#[pymethods]`, so its arguments are whatever Python passed. Two things
+/// it must refuse rather than trust: a point whose offset leaves its own index's elements --
+/// `gather` only knows the whole decoded buffer, so that would return the NEXT index's
+/// element under this point's name -- and an offset array of the wrong length.
+#[test]
+fn test_push_points_refuses_offsets_that_leave_their_row() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let rows = PyArray1::from_slice(py, &[0i64, 1, 2]);
+        // A chunk row holds 48 elements, so 48 is one past the end of index 0's own.
+        let past = PyArray1::from_slice(py, &[0u64, 48, 2]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        assert!(
+            handle
+                .push_points("c/0/0", vec![64, 48], vec![3], rows.readonly(),
+                             past.readonly(), 0, 8)
+                .is_err(),
+            "a point past its own row must be refused"
+        );
+
+        let short = PyArray1::from_slice(py, &[0u64, 1]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        assert!(
+            handle
+                .push_points("c/0/0", vec![64, 48], vec![3], rows.readonly(),
+                             short.readonly(), 0, 8)
+                .is_err(),
+            "one offset per index, or the pairing is guesswork"
+        );
+
+        let ok = PyArray1::from_slice(py, &[0u64, 47, 2]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        handle.push_points("c/0/0", vec![64, 48], vec![3], rows.readonly(),
+                           ok.readonly(), 0, 8)?;
+        Ok(())
+    })
+}
+
+/// `push_grid` is `#[pymethods]` too. A column past the row it belongs to would have
+/// `gather_columns` read the NEXT row's element under this column's name, so it is refused
+/// here rather than trusted from the gate.
+#[test]
+fn test_push_grid_refuses_runs_outside_the_row() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let rows = PyArray1::from_slice(py, &[0i64, 1, 2]);
+        // A chunk row holds 48 elements, so 48 is one past the last.
+        let past = PyArray1::from_slice(py, &[0u64, 48]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        assert!(
+            handle
+                .push_grid("c/0/0", vec![64, 48], vec![3, 2], rows.readonly(),
+                           past.readonly(), 1, 0, 8)
+                .is_err(),
+            "a run past the row must be refused"
+        );
+
+        // Repeats are legal and must be kept: a panel may ask for the same gene twice.
+        let repeated = PyArray1::from_slice(py, &[5u64, 5, 47]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        handle.push_grid("c/0/0", vec![64, 48], vec![3, 3], rows.readonly(),
+                         repeated.readonly(), 1, 0, 8)?;
+        Ok(())
+    })
 }

@@ -35,7 +35,7 @@ use crate::shard_index::ShardInfo;
 use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 
-use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, key_partial_decoder};
+use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, gather_runs, key_partial_decoder};
 
 /// The per-array state a decode needs, shared by every job of a call.
 struct JobContext {
@@ -46,6 +46,22 @@ struct JobContext {
     store: ReadableWritableListableStorage,
     codec_options: CodecOptions,
     element_size: usize,
+    /// What an absent chunk contributes. Needed in the workers, not just at carve time,
+    /// because an UNSHARDED chunk's absence is only discovered by the read.
+    fill_value: FillValue,
+    /// Whether missing bytes are ordinary. A shard index that named a chunk which is then
+    /// missing means the store changed under the read, and that is worth failing on; an
+    /// unsharded chunk has no index to consult, so its key simply may not exist yet.
+    ///
+    /// Per CALL, not per job: an array is sharded or it is not. It lived on `Job` for one
+    /// commit and cost measurable throughput on the loader, because `Job` crosses TWO channels
+    /// per job -- dispatch to reader, reader to decoder -- so every byte added to it is copied
+    /// twice per job, ~8,000 times a call.
+    may_be_absent: bool,
+    /// The unit decoded into scratch: the shard's inner chunk where the array is sharded, the
+    /// CHUNK where it is not. Also per call -- an array's chunks are all one shape -- so it is
+    /// resolved once here from the first item rather than carried on every `Job`.
+    decode_shape: Vec<NonZeroU64>,
 }
 
 /// Shard and subshard decoders built during ONE call.
@@ -84,6 +100,14 @@ impl CodecPipelineImpl {
             store: self.store.clone(),
             codec_options: (*codec_options).with_concurrent_target(1),
             element_size,
+            fill_value: self.fill_value.clone(),
+            may_be_absent: shard.depth() == 0,
+            // Sharded: the shard says. Not sharded: any item does, because chunk shapes are
+            // uniform across an array -- and an empty batch never reaches a decode.
+            decode_shape: shard.subchunk_shape.as_ref().map_or_else(
+                || items.first().map(|i| i.shape.clone()).unwrap_or_default(),
+                |shape| shape.to_vec(),
+            ),
         };
 
         let (located, declined) = self.locate_chunks(shard, items, &ctx)?;
@@ -276,6 +300,12 @@ impl CodecPipelineImpl {
         ctx: &JobContext,
         decoders: &mut CallDecoders,
     ) -> PyResult<Option<ByteRange>> {
+        // Not sharded: there is no index to read and nothing to descend -- the store value is
+        // the chunk. Whether the key EXISTS is the read's business, and a missing one comes
+        // back as absent bytes there, exactly as a never-written shard entry does here.
+        if shard.depth() == 0 {
+            return Ok(Some(ByteRange::FromStart(0, None)));
+        }
         let file = key_partial_decoder(&self.store, &item.key);
         let mut shard_shape = item.shape.clone();
         let mut offset = start;
@@ -478,7 +508,11 @@ fn carve<'a>(
             //
             // The pieces are taken in coordinate order, which is ascending, so
             // `DisjointBytes` still vends each byte once and coverage is still checked.
-            Some(range) if ctx.raw && raw_runs(coords, item.run_len) <= raw_max_reads_per_chunk() => {
+            Some(range)
+                if ctx.raw
+                    && raw_read_count(grid_of(item), item.run_len, coords)
+                        <= raw_max_reads_per_chunk() =>
+            {
                 raw_row_jobs(item, *range, piece, coords, element_size, ctx, &mut jobs)?;
             }
             Some(range) => jobs.push(Job {
@@ -488,6 +522,9 @@ fn carve<'a>(
                 out: piece,
                 coords,
                 run_len: item.run_len,
+                // Sharded: the shard's inner chunk. Not sharded: the item's own chunk, which
+                // is the whole store value and the whole decode.
+                grid: item.grid.as_ref().map(|(starts, run)| (&starts[..], *run)),
                 ctx,
             }),
             None => absent.push(piece),
@@ -523,19 +560,64 @@ fn raw_max_reads_per_chunk() -> usize {
     })
 }
 
-/// How many READS this chunk's rows become once consecutive ones are merged.
+/// The source ranges an item wants, in element units, in the order the output wants them,
+/// with adjacent ones merged.
 ///
-/// The count that matters is runs, not rows: 64 consecutive rows are one read, and 64
-/// scattered ones are 64. A strided draw is the case that stays expensive however dense it
-/// looks -- `stride=2` puts 32 rows in a chunk and none of them adjacent.
-pub(crate) fn raw_runs(coords: &[u64], run_len: u64) -> usize {
-    if coords.is_empty() {
-        return 0;
+/// One description for both item kinds, because the difference is only what each coordinate
+/// stands for. A plain item's coordinate is a run of `run_len` elements. A GRID item's
+/// coordinate is the start of an index's own elements, and the wanted bytes inside it are the
+/// runs its `grid` names -- so treating a grid coordinate as a contiguous run reads the first
+/// `run_len` elements of each row and returns them as the selection. Right shape, wrong
+/// numbers, no error.
+///
+/// Merging is what makes the dense cases cost what they should: consecutive rows become one
+/// read rather than one each, and inside a grid, runs that happen to abut do too. `coords` is
+/// non-decreasing, and a duplicate steps by zero and breaks the run, which is correct -- the
+/// same row twice is two output pieces and cannot be one read.
+fn raw_ranges(
+    grid: Option<(&[u64], u64)>,
+    run_len: u64,
+    coords: &[u64],
+    mut emit: impl FnMut(u64, u64),
+) {
+    let mut pending: Option<(u64, u64)> = None;
+    let mut push = |start: u64, len: u64, pending: &mut Option<(u64, u64)>| match *pending {
+        Some((at, have)) if at + have == start => *pending = Some((at, have + len)),
+        Some((at, have)) => {
+            emit(at, have);
+            *pending = Some((start, len));
+        }
+        None => *pending = Some((start, len)),
+    };
+    match grid {
+        Some((starts, run)) => {
+            for &c in coords {
+                for &s in starts {
+                    push(c + s, run, &mut pending);
+                }
+            }
+        }
+        None => {
+            for &c in coords {
+                push(c, run_len, &mut pending);
+            }
+        }
     }
-    1 + coords
-        .windows(2)
-        .filter(|w| w[1] != w[0] + run_len)
-        .count()
+    if let Some((at, have)) = pending {
+        emit(at, have);
+    }
+}
+
+/// How many reads `raw_ranges` would issue. The gate needs the count before committing.
+pub(crate) fn raw_read_count(grid: Option<(&[u64], u64)>, run_len: u64, coords: &[u64]) -> usize {
+    let mut n = 0usize;
+    raw_ranges(grid, run_len, coords, |_, _| n += 1);
+    n
+}
+
+/// An item's grid as plain slices, for the two functions above.
+fn grid_of(item: &ChunkItem) -> Option<(&[u64], u64)> {
+    item.grid.as_ref().map(|(starts, run)| (&starts[..], *run))
 }
 
 /// One job per ROW, each reading exactly its own bytes, for a chunk that is a plain byte
@@ -564,48 +646,33 @@ fn raw_row_jobs<'a>(
             item.key
         )));
     };
-    let row_bytes = usize::try_from(item.run_len)
-        .ok()
-        .and_then(|r| r.checked_mul(element_size))
-        .ok_or_else(|| PyRuntimeError::new_err(format!("{}: row too large", item.key)))?;
-    // CONSECUTIVE rows are one range, not one each.
-    //
-    // Without this, a selection of 8-row blocks issues 8 requests of 8 KiB where one of
-    // 64 KiB would do -- and requests are the scarce resource, so it measured 0.458x against
-    // the chunk path at chunk_size=8 and 0.092x at 64. The rows were always adjacent; the
-    // code just did not look. Coalescing makes the dense cases cost what they should: at
-    // chunk_size=64 one run IS the chunk, so the raw path converges on the chunk read minus
-    // its decode rather than costing 64x the IOPS.
-    //
-    // `coords` is non-decreasing, so a run is a maximal stretch stepping by exactly
-    // `run_len`. Duplicates step by 0 and break the run, which is correct: the same row twice
-    // is two output pieces and cannot be one read.
+    // Collected first because the closure needs `&mut rest` and `&mut jobs` at once, and the
+    // count is tiny -- the gate above has already refused anything large.
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    raw_ranges(grid_of(item), item.run_len, coords, |at, len| ranges.push((at, len)));
+
     let mut rest = piece;
-    let mut start = 0usize;
-    while start < coords.len() {
-        let mut end = start + 1;
-        while end < coords.len() && coords[end] == coords[end - 1] + item.run_len {
-            end += 1;
-        }
-        let rows = end - start;
-        let span = row_bytes
-            .checked_mul(rows)
+    for (at, len) in ranges {
+        let span = usize::try_from(len)
+            .ok()
+            .and_then(|l| l.checked_mul(element_size))
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: run too large", item.key)))?;
         let (run_out, tail) = rest.split_at_mut(span.min(rest.len()));
         rest = tail;
-        let at = base
-            .checked_add(coords[start] * element_size as u64)
+        let byte_at = at
+            .checked_mul(element_size as u64)
+            .and_then(|o| base.checked_add(o))
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: offset overflow", item.key)))?;
         jobs.push(Job {
             key: item.key.clone(),
-            range: ByteRange::FromStart(at, Some(span as u64)),
+            range: ByteRange::FromStart(byte_at, Some(span as u64)),
             raw: true,
             out: run_out,
             coords: &[],
             run_len: item.run_len,
+            grid: None,
             ctx,
         });
-        start = end;
     }
     if !rest.is_empty() {
         return Err(PyRuntimeError::new_err(format!(
@@ -909,6 +976,10 @@ struct Job<'a> {
     coords: &'a [u64],
     /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
     run_len: u64,
+    /// Where each RUN starts inside a coordinate's elements, and how long a run is, when the
+    /// wanted elements are not one consecutive span -- `oindex[rows, cols]` and any rank-N
+    /// grid. `None` is a single contiguous run, which is every other case.
+    grid: Option<(&'a [u64], u64)>,
     ctx: &'a JobContext,
 }
 
@@ -959,12 +1030,15 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let ctx = job.ctx;
     let size = ctx.element_size;
     let Some(bytes) = bytes else {
+        if ctx.may_be_absent {
+            return fill(job.out, &ctx.fill_value, size);
+        }
         return Err(format!("{} vanished between index and read", job.key));
     };
 
-    // A raw job's read WAS the answer: its range is the row, not the chunk. No decode, no
-    // scratch, no gather -- but not copy-free either, since `get_partial` hands back an owned
-    // buffer and these bytes still have to be moved into the output.
+    // A raw job's read WAS the answer: its range is the wanted bytes, not the chunk. No
+    // decode, no scratch, no gather -- but not copy-free either, since `get_partial` hands
+    // back an owned buffer and these bytes still have to be moved into the output.
     if job.raw {
         if bytes.len() != job.out.len() {
             return Err(format!(
@@ -978,7 +1052,7 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         return Ok(());
     }
 
-    let shape = &ctx.shard.subchunk_shape;
+    let shape = ctx.decode_shape.as_slice();
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
     scratch.clear();
@@ -1007,7 +1081,10 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             )
             .map_err(|e| e.to_string())?;
     }
-    gather(scratch, job.coords, job.run_len, job.out, size)
+    match job.grid {
+        Some((starts, run)) => gather_runs(scratch, job.coords, starts, run, job.out, size),
+        None => gather(scratch, job.coords, job.run_len, job.out, size),
+    }
         .map_err(|e| format!("{}: {e}", job.key))
 }
 

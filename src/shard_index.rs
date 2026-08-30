@@ -35,8 +35,9 @@ pub(crate) struct ShardInfo {
     /// hot path is tuned for: one iteration, one index, one cache lookup.
     levels: Vec<Level>,
     /// The INNERMOST chunk shape — the unit the codec chain decodes, and what a job sizes
-    /// its scratch buffer by.
-    pub subchunk_shape: ChunkShape,
+    /// its scratch buffer by. `None` when the array is NOT sharded: the decode unit is then
+    /// the chunk itself, which only an item knows, so a job carries it instead.
+    pub subchunk_shape: Option<ChunkShape>,
     /// The codecs that decode an innermost chunk, bound to the array's data type and fill
     /// value. This is the only chain that legitimately holds other codecs (blosc and so on);
     /// every chain above it must be exclusively sharded.
@@ -44,8 +45,13 @@ pub(crate) struct ShardInfo {
 }
 
 impl ShardInfo {
-    /// Read off the array's BOUND codec chain, or `None` if this array is not sharded, or is
-    /// sharded in a way this path refuses.
+    /// Read off the array's BOUND codec chain, or `None` if this array is sharded in a way
+    /// this path refuses.
+    ///
+    /// A NON-sharded array is accepted, with no levels: its chunk is its own decode unit, the
+    /// store value is the whole chunk, and `locate` has nothing to descend. That case is
+    /// simpler than the sharded one, not harder -- it declined only because this returned
+    /// `None` for it.
     ///
     /// Descends while the chain's array-to-bytes codec is sharding, collecting a level each
     /// time. Refuses a chain that shards AND carries another codec beside it: the bytes on
@@ -83,7 +89,7 @@ impl ShardInfo {
             levels.push(step.0);
             current = step.1;
         }
-        let subchunk_shape = levels.last()?.subchunk_shape.clone();
+        let subchunk_shape = levels.last().map(|level| level.subchunk_shape.clone());
         Some(Self {
             levels,
             subchunk_shape,

@@ -88,14 +88,18 @@ def test_selection_matches_and_takes_the_handle(
     [
         # A backward step would mean one item per element, so the path declines it.
         pytest.param(np.array([9_000, 40, 8_000, 39]), id="decreasing"),
-        # Only integer arrays are grouped; a slice is already one subset.
-        pytest.param(slice(CHUNK - 10, 2 * CHUNK + 10), id="slice"),
+        # A STEP is not a contiguous run, so it stays on the ordinary route.
+        pytest.param(slice(0, 4 * CHUNK, 3), id="strided slice"),
     ],
 )
 def test_ineligible_selections_decline_and_are_still_right(
     array: tuple[Path, np.ndarray], entries: dict[str, int], selection
 ) -> None:
-    """Declined selections must still return the right data, down whichever path takes them."""
+    """Declined selections must still return the right data, down whichever path takes them.
+
+    A contiguous slice is NOT here any more -- it is a sorted integer axis spelled
+    differently, and it is served. Only a stepped one still declines.
+    """
     path, truth = array
 
     with zarr.config.set(CHUNK_UNIT):
@@ -213,18 +217,74 @@ def test_full_width_two_dimensional_takes_the_path(
     assert entries["list"] == 0
 
 
-def test_a_partial_column_slice_falls_back(
+def test_a_partial_column_slice_takes_the_path(
     full_width: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
-    """Same array, but only some columns: the output rows are then STRIDED, and the output
-    piece is handed out as one contiguous byte range. Declining is the only correct answer."""
+    """A column subset runs here too, which it did not used to.
+
+    The inner chunk is decoded WHOLE either way -- it is the decode unit -- so a column
+    subset narrows only which elements of each decoded row are copied out. That lives in the
+    coordinates and the run length, not in the chunk subset.
+
+    The rows deliberately share inner chunks and repeat one: a coordinate left unstepped by
+    the column offset, or scaled by the output width instead of the chunk's own row, lands on
+    the wrong elements and shows up here as wrong values rather than as an error.
+    """
     path, values = full_width
-    rows = np.array([1, 3, 9, 200])
+    rows = np.array([1, 3, 3, 9, 60, 61, 200])
     with zarr.config.set(CHUNK_UNIT):
         got = zarr.open_array(path, mode="r")[rows, 8:24]
 
     np.testing.assert_array_equal(got, values[rows, 8:24])
-    assert entries["handle"] == 0, "a partial column slice reached the chunk-unit path"
+    assert entries["handle"] > 0, "a partial column slice did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_a_strided_column_slice_still_falls_back(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """Step 2 is not one contiguous run per row, and an item's output is vended as a single
+    range. Declining is still the only correct answer -- widening took the contiguous case
+    only."""
+    path, values = full_width
+    rows = np.array([1, 3, 9, 200])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, 8:24:2]
+
+    np.testing.assert_array_equal(got, values[rows, 8:24:2])
+    assert entries["handle"] == 0, "a strided column slice reached the chunk-unit path"
+
+
+def test_a_column_slice_matches_zarr_python(
+    full_width: tuple[Path, np.ndarray],
+) -> None:
+    """The widened case, byte for byte against the reference pipeline on the same store."""
+    path, _ = full_width
+    rows = np.sort(np.random.default_rng(0).choice(256, size=64, replace=False))
+    with zarr.config.set(CHUNK_UNIT):
+        mine = zarr.open_array(path, mode="r")[rows, 8:24]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r")[rows, 8:24]
+    np.testing.assert_array_equal(mine, theirs)
+
+
+def test_the_contiguity_rule() -> None:
+    """A sub-box of one row is a single run only when every axis before the last PARTIAL one
+    takes exactly one element. Getting this wrong copies strided data as if it were
+    contiguous, which is silently wrong output rather than an error -- so it is asserted
+    directly rather than only through the shapes the fixtures happen to build.
+    """
+    from zarrs.utils import _contiguous_offset
+
+    # One trailing axis: any sub-range of it is contiguous.
+    assert _contiguous_offset([8], [16], (48,)) == 8
+    assert _contiguous_offset([0], [48], (48,)) == 0
+    # Partial middle axis, last axis whole: still one run, offset in whole last-axis rows.
+    assert _contiguous_offset([2, 0], [3, 10], (5, 10)) == 20
+    # Partial LAST axis with a wider axis ahead of it: 5 blocks of 4, strided. Decline.
+    assert _contiguous_offset([0, 2], [5, 4], (5, 10)) is None
+    # The same partial last axis is fine once the axis ahead of it takes exactly one.
+    assert _contiguous_offset([3, 2], [1, 4], (5, 10)) == 32
 
 
 def test_full_width_matches_zarr_python(
@@ -288,3 +348,413 @@ def test_a_shard_holding_one_inner_chunk(
 
     np.testing.assert_array_equal(got, values[rows])
     assert entries["handle"] > 0, "this selection should have taken the chunk-unit path"
+
+
+def test_an_array_narrower_than_its_chunk_takes_the_path(
+    tmp_path: Path, entries: dict[str, int]
+) -> None:
+    """The other case this widening admits, and probably the commoner one in real stores.
+
+    The array is 30 columns wide but its chunk is 48, so the last column of every chunk is
+    fill. `X[rows, :]` asks for the whole ARRAY and still selects only part of each decoded
+    row -- which used to decline, because the test compared the selection against the chunk
+    rather than against the array.
+    """
+    values = np.arange(256 * 30, dtype=np.float32).reshape(256, 30)
+    path = tmp_path / "narrow"
+    z = zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape, chunks=(8, 48), shards=(64, 48)
+    )
+    z[:] = values
+    rows = np.array([1, 3, 3, 9, 60, 200])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, :]
+
+    np.testing.assert_array_equal(got, values[rows, :])
+    assert entries["handle"] > 0, "a narrow array did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        pytest.param(slice(CHUNK - 10, 2 * CHUNK + 10), id="spanning chunks"),
+        pytest.param(slice(None), id="everything"),
+        pytest.param(slice(N - 100, N), id="partly covered last shard"),
+    ],
+)
+def test_a_contiguous_slice_takes_the_path(
+    array: tuple[Path, np.ndarray], entries: dict[str, int], selection
+) -> None:
+    """A sequential read is grouped like a scattered one, rather than falling to the fused path.
+
+    It used to decline for a spelling reason -- axis 0 was a `slice` rather than an integer
+    array -- not because anything about it is unservable.
+    """
+    path, truth = array
+
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[selection]
+
+    np.testing.assert_array_equal(got, truth[selection])
+    assert entries["handle"] > 0, "a contiguous slice did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_paired_points_take_the_path(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """`X[rows, cols]` -- one element per pair, and a flat result.
+
+    zarr builds a `CoordinateIndexer` for this, so it arrives as one integer array per axis
+    against a flat output slice. The columns deliberately do not ascend with the rows: an
+    implementation that folded them into a single shared offset would still pass a test where
+    they happened to.
+    """
+    path, values = full_width
+    rows = np.array([1, 3, 3, 9, 60, 61, 200])
+    cols = np.array([40, 0, 17, 5, 47, 2, 33])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, cols]
+
+    assert got.shape == (rows.size,), "a point selection is flat"
+    np.testing.assert_array_equal(got, values[rows, cols])
+    assert entries["handle"] > 0, "a point selection did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_a_single_column_takes_the_path(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """`X[rows, 5]`, which is a point selection with a constant column, not a dropped axis."""
+    path, values = full_width
+    rows = np.array([1, 3, 3, 9, 60, 61, 200])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, 5]
+
+    np.testing.assert_array_equal(got, values[rows, 5])
+    assert entries["handle"] > 0, "a single column did not take the chunk-unit path"
+
+
+def test_points_match_zarr_python(full_width: tuple[Path, np.ndarray]) -> None:
+    """Byte for byte against the reference pipeline, on the same store."""
+    path, _ = full_width
+    rng = np.random.default_rng(0)
+    rows = np.sort(rng.choice(256, size=200, replace=True))
+    cols = rng.choice(48, size=200, replace=True)
+    with zarr.config.set(CHUNK_UNIT):
+        mine = zarr.open_array(path, mode="r")[rows, cols]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r")[rows, cols]
+    np.testing.assert_array_equal(mine, theirs)
+
+
+def test_points_with_unsorted_rows_decline_and_are_still_right(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """Descending rows would make the output positions step backwards. Decline, stay correct."""
+    path, values = full_width
+    rows = np.array([200, 3, 61, 9])
+    cols = np.array([1, 2, 3, 4])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, cols]
+
+    np.testing.assert_array_equal(got, values[rows, cols])
+    assert entries["handle"] == 0, "an unsorted point selection reached the chunk-unit path"
+
+
+@pytest.fixture(params=["1d", "2d"])
+def unsharded(tmp_path: Path, request) -> tuple[Path, np.ndarray]:
+    """A plain chunked array with NO sharding codec at all."""
+    if request.param == "1d":
+        values = np.arange(4_000, dtype=np.float32)
+        chunks = (256,)
+    else:
+        values = np.arange(1_024 * 24, dtype=np.float32).reshape(1_024, 24)
+        chunks = (32, 24)
+    path = tmp_path / f"plain_{request.param}"
+    z = zarr.create_array(path, dtype=values.dtype, shape=values.shape, chunks=chunks)
+    z[:] = values
+    return path, values
+
+
+def test_an_unsharded_array_takes_the_path(
+    unsharded: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """No sharding codec: the chunk is its own decode unit and the store value is the chunk.
+
+    That case is SIMPLER than the sharded one -- there is no index to read and nothing to
+    descend -- and it declined only because `ShardInfo::from_codec_chain` returned None for
+    an array with no levels.
+    """
+    path, values = unsharded
+    rows = np.array([1, 3, 3, 40, 41, 300, 999])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows]
+
+    np.testing.assert_array_equal(got, values[rows])
+    assert entries["handle"] > 0, "an unsharded array did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_an_unsharded_array_matches_zarr_python(
+    unsharded: tuple[Path, np.ndarray],
+) -> None:
+    path, _ = unsharded
+    rng = np.random.default_rng(0)
+    with zarr.config.set(CHUNK_UNIT):
+        arr = zarr.open_array(path, mode="r")
+        rows = np.sort(rng.choice(arr.shape[0], size=200, replace=False))
+        mine = arr[rows]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r")[rows]
+    np.testing.assert_array_equal(mine, theirs)
+
+
+def test_an_unsharded_array_reads_unwritten_chunks_as_fill(
+    tmp_path: Path, entries: dict[str, int]
+) -> None:
+    """A key that was never written is absent, not an error -- same as a never-written shard
+    entry. `locate` hands back the whole value either way and the read finds nothing there."""
+    path = tmp_path / "sparse_plain"
+    z = zarr.create_array(
+        path, dtype=np.float32, shape=(4_000,), chunks=(256,), fill_value=np.float32(-7)
+    )
+    z[0:256] = np.arange(256, dtype=np.float32)
+
+    rows = np.array([1, 5, 2_000, 3_999])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows]
+
+    np.testing.assert_array_equal(got, np.array([1, 5, -7, -7], dtype=np.float32))
+    assert entries["handle"] > 0, "an unsharded array did not take the chunk-unit path"
+
+
+def test_a_grid_selection_takes_the_path(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """`oindex[rows, cols]` -- the n x m grid, which is a gene panel across cells.
+
+    zarr broadcasts the axes rather than pairing them, so this is NOT the point case: rows
+    arrive (n,1) and cols (1,m).
+
+    The columns REPEAT and are not consecutive: a gather that deduplicated them, or that took
+    a contiguous span from the first to the last, would return the right shape full of wrong
+    values. They do ascend, because an out-of-order list is a different case -- zarr then hands
+    over an ndarray out-selection, and that declines (see below).
+    """
+    path, values = full_width
+    rows = np.array([1, 3, 3, 9, 60, 61, 200])
+    cols = np.array([0, 5, 17, 17, 40])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[rows, cols]
+
+    assert got.shape == (rows.size, cols.size)
+    np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
+    assert entries["handle"] > 0, "a grid selection did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_a_whole_column_panel_takes_the_path(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """`X[:, cols]` -- every row, a panel of columns. The row axis is a slice here."""
+    path, values = full_width
+    cols = np.array([2, 7, 44])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[:, cols]
+
+    np.testing.assert_array_equal(got, values[:, cols])
+    assert entries["handle"] > 0, "a column panel did not take the chunk-unit path"
+
+
+def test_a_grid_matches_zarr_python(full_width: tuple[Path, np.ndarray]) -> None:
+    path, _ = full_width
+    rng = np.random.default_rng(0)
+    rows = np.sort(rng.choice(256, size=64, replace=False))
+    cols = np.sort(rng.choice(48, size=12, replace=True))
+    with zarr.config.set(CHUNK_UNIT):
+        mine = zarr.open_array(path, mode="r").oindex[rows, cols]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r").oindex[rows, cols]
+    np.testing.assert_array_equal(mine, theirs)
+
+
+def test_a_grid_with_unsorted_columns_declines_and_is_still_right(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """Out-of-order columns put the output rows at scattered positions.
+
+    zarr stops describing the output as slices and hands over ndarray out-selections, which is
+    the same thing that makes an unsorted ROW axis decline: an item's output is vended as one
+    contiguous range and a scattered one cannot be expressed that way.
+    """
+    path, values = full_width
+    rows = np.array([1, 3, 9, 60])
+    cols = np.array([40, 0, 17, 5])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[rows, cols]
+
+    np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
+    assert entries["handle"] == 0, "an unsorted grid reached the chunk-unit path"
+
+
+@pytest.fixture
+def volume(tmp_path: Path) -> tuple[Path, np.ndarray]:
+    """A rank-3 array whose inner chunk spans both trailing axes whole."""
+    values = np.arange(256 * 8 * 16, dtype=np.float32).reshape(256, 8, 16)
+    path = tmp_path / "vol"
+    z = zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape, chunks=(8, 8, 16), shards=(64, 8, 16)
+    )
+    z[:] = values
+    return path, values
+
+
+@pytest.mark.parametrize(
+    ("name", "sel"),
+    [
+        # The Cartesian product on all three axes.
+        ("grid on every axis", (np.array([1, 3, 3, 9, 60]), np.array([1, 3, 6]), np.array([2, 9, 15]))),
+        # A span on one trailing axis and a scattered list on the other.
+        ("span and list", (np.array([1, 3, 9, 60]), slice(2, 5), np.array([0, 7, 15]))),
+        # One plane: the middle axis takes a single element and is DROPPED from the result.
+        ("dropped middle axis", (np.array([1, 3, 9, 60]), 3, slice(4, 12))),
+        # Every row, a couple of planes.
+        ("all rows", (slice(None), np.array([1, 5]), slice(None))),
+    ],
+)
+def test_rank_three_grids_take_the_path(
+    volume: tuple[Path, np.ndarray], entries: dict[str, int], name: str, sel
+) -> None:
+    """The grid generalises to rank N: the offset of an element inside its index's own
+    elements is `sum(sel[axis][i] * stride[axis])`, and the product flattened row-major is the
+    order the output row wants -- one list, whatever the rank.
+
+    All four of these used to leave zarrs ENTIRELY, not merely miss the grouping.
+    """
+    path, values = volume
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[sel]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r").oindex[sel]
+
+    np.testing.assert_array_equal(got, theirs)
+    assert entries["handle"] > 0, f"{name} did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_a_pure_slice_box_takes_the_path_as_runs(
+    volume: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """A box of pure slices is served, because it is described as RUNS.
+
+    It used to decline on the grounds that the ordinary route copies a contiguous n-D block
+    blockwise where this path would gather element by element. That was true of the encoding,
+    not of the data: `[rows, 2:5, 4:12]` of an (8,16) row is three runs of eight, and saying so
+    turns twenty-four element copies into three memcpys.
+    """
+    path, values = volume
+    rows = np.array([1, 3, 9, 60])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[rows, 2:5, 4:12]
+
+    np.testing.assert_array_equal(got, values[np.ix_(rows, range(2, 5), range(4, 12))])
+    assert entries["handle"] > 0, "a pure-slice box did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_the_run_decomposition() -> None:
+    """The runs a selection decomposes into, asserted directly.
+
+    Values-only tests pass whatever the decomposition, so the thing that makes this path worth
+    having is invisible to them: a box copied as one run per ELEMENT is correct and slow. Only
+    an axis taken WHOLE lets the absorption continue outward past it, because a partial axis
+    leaves a gap before the next one repeats.
+    """
+    from zarrs.utils import _as_contiguous
+
+    # A slice-shaped index array is recognised as contiguous; a scattered one is not.
+    assert _as_contiguous(np.array([4, 5, 6, 7])) == (4, 4)
+    assert _as_contiguous(np.array([4])) == (4, 1)
+    assert _as_contiguous(np.array([4, 6, 7])) is None
+    # Descending is not contiguous either, however tempting the endpoints look.
+    assert _as_contiguous(np.array([7, 6, 5, 4])) is None
+def test_rank_four_grid_takes_the_path(tmp_path: Path, entries: dict[str, int]) -> None:
+    """Nothing in the offset arithmetic knows the rank, so rank 4 is not a separate case --
+    asserted rather than assumed, because "it generalises" is exactly the kind of claim that
+    is wrong once."""
+    values = np.arange(64 * 4 * 6 * 5, dtype=np.float32).reshape(64, 4, 6, 5)
+    path = tmp_path / "hyper"
+    z = zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape,
+        chunks=(8, 4, 6, 5), shards=(32, 4, 6, 5),
+    )
+    z[:] = values
+    sel = (np.array([1, 3, 3, 40]), np.array([0, 3]), slice(1, 4), np.array([0, 2, 4]))
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[sel]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r").oindex[sel]
+
+    np.testing.assert_array_equal(got, theirs)
+    assert entries["handle"] > 0, "a rank-4 grid did not take the chunk-unit path"
+
+
+@pytest.fixture
+def nested(tmp_path: Path) -> tuple[Path, np.ndarray]:
+    """Two levels of sharding: 256-row shard -> 32-row subshard -> 8-row inner chunk.
+
+    `compressors=None` matters and is easy to omit: without it zarr puts a default compressor
+    OUTSIDE the sharding codec, the shard index stops addressing the shard, and this path
+    refuses the array for a reason that has nothing to do with nesting.
+    """
+    from zarr.codecs import BytesCodec, ShardingCodec
+
+    values = np.arange(1024 * 48, dtype=np.float32).reshape(1024, 48)
+    path = tmp_path / "nested2d"
+    z = zarr.create_array(
+        path,
+        shape=values.shape,
+        chunks=(256, 48),
+        dtype="float32",
+        compressors=None,
+        serializer=ShardingCodec(
+            chunk_shape=(32, 48),
+            codecs=[ShardingCodec(chunk_shape=(8, 48), codecs=[BytesCodec()])],
+        ),
+    )
+    z[:] = values
+    return path, values
+
+
+@pytest.mark.parametrize(
+    ("name", "read"),
+    [
+        ("whole rows", lambda a, r: a.oindex[r, :]),
+        ("column sub-box", lambda a, r: a.oindex[r, 8:24]),
+        ("grid", lambda a, r: a.oindex[r, np.array([0, 5, 5, 17, 40])]),
+        ("paired points", lambda a, r: a[r, np.array([0, 5, 5, 17, 40, 44])]),
+        ("contiguous slice", lambda a, r: a.oindex[10:200, :]),
+    ],
+)
+def test_every_shape_works_through_two_shard_levels(
+    nested: tuple[Path, np.ndarray], entries: dict[str, int], name: str, read
+) -> None:
+    """The widening is orthogonal to how deep the sharding goes.
+
+    `locate` walks one index per LEVEL and everything added here operates on the innermost
+    decoded chunk, so nesting should not interact with it at all -- which is exactly the kind
+    of "should" this repo has been wrong about, so it is asserted for every shape rather than
+    argued.
+    """
+    path, _ = nested
+    rows = np.array([1, 3, 3, 40, 300, 900])
+    with zarr.config.set(CHUNK_UNIT):
+        got = read(zarr.open_array(path, mode="r"), rows)
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = read(zarr.open_array(path, mode="r"), rows)
+
+    np.testing.assert_array_equal(got, theirs)
+    assert entries["handle"] > 0, f"{name} did not take the chunk-unit path through two levels"
+    assert entries["list"] == 0
