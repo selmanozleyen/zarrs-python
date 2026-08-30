@@ -383,6 +383,33 @@ impl CodecPipelineImpl {
                 path.extend_from_slice(&grid_index);
             }
         }
+        // The item must lie inside the ONE inner chunk just located. `offset` is now its
+        // position within that chunk, and `shard_shape` the chunk's own extent.
+        //
+        // This replaces `trailing_axes_are_whole`, which the axis-0 descent needed and which
+        // this one does not -- but something has to hold, and it is not weaker. Without it an
+        // item claiming rows 0..8 x cols 0..12 of a shard whose inner chunk is 8x6 locates
+        // chunk (0,0), and its coordinates -- built for a 12-wide row -- address exactly the
+        // 48 elements that chunk holds. In bounds, wrong data, no error. `push_entry` takes
+        // arbitrary arguments from Python, so this is a trust boundary rather than an
+        // invariant the caller can be assumed to keep.
+        let held = item.chunk_subset.shape();
+        if held.len() != offset.len()
+            || held
+                .iter()
+                .zip(offset.iter())
+                .zip(shard_shape.iter())
+                .any(|((want, at), extent)| at + want > extent.get())
+        {
+            return Err(PyRuntimeError::new_err(format!(
+                "{}: the item spans {} from {:?} within an inner chunk of {:?}, so it is not \
+                 one decode unit",
+                item.key,
+                item.chunk_subset,
+                offset,
+                shard_shape.iter().map(|d| d.get()).collect::<Vec<_>>()
+            )));
+        }
         Ok(extent.map(|(base, len)| ByteRange::FromStart(base, Some(len))))
     }
 
