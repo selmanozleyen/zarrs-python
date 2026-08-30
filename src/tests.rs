@@ -51,6 +51,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
             7,
             inner,
             crate::chunk_item::Offsets::Uniform(&[]),
+            None,
         )?;
 
         let got: Vec<_> = items
@@ -187,6 +188,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
             2,
             inner,
             crate::chunk_item::Offsets::Uniform(&[0]),
+            None,
         )?;
 
         let got: Vec<_> = items
@@ -238,6 +240,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             0,
             4,
             crate::chunk_item::Offsets::Uniform(&[0]),
+            None,
         );
         assert!(narrower.is_ok(), "a contiguous column subset is served, not refused");
         // 2 of 4 rows by 5 of 10 columns is 2 runs of 5 at a stride of 10 -- not one range.
@@ -250,6 +253,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             0,
             4,
             crate::chunk_item::Offsets::Uniform(&[0, 0]),
+            None,
         );
         assert!(strided.is_err(), "a strided trailing box must be refused");
         // A run that starts inside its own sub-row and walks off the end of it, likewise.
@@ -261,6 +265,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             0,
             4,
             crate::chunk_item::Offsets::Uniform(&[0, 8]),
+            None,
         );
         assert!(wraps.is_err(), "a run leaving its own sub-row must be refused");
         // Differing ARITY is refused too -- a 1-D chunk against a 2-D output.
@@ -272,6 +277,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             0,
             4,
             crate::chunk_item::Offsets::Uniform(&[0]),
+            None,
         );
         assert!(ranks.is_err());
         Ok(())
