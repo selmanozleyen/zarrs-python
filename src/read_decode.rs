@@ -464,6 +464,30 @@ fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, 
             item.key, item.subset
         )));
     }
+    // An item's output is vended as ONE RUN PER axis-0 index, which holds only while the
+    // sub-box is contiguous within a row: every axis before the last partial one must take a
+    // single element. Anything else is a strided box, and modelling it as one run claims
+    // bytes belonging to the next item -- which `DisjointBytes` reports as a backwards claim,
+    // naming the symptom rather than this.
+    //
+    // Checked HERE because this is the funnel: `push_entry`, `push_span`, `push_grid`,
+    // `push_points` and a hand-built `ChunkItem` all reach bytes through it. One guard in the
+    // shared function beats one per constructor.
+    if let Some(last) = shape[1..]
+        .iter()
+        .zip(&full[1..])
+        .rposition(|(width, extent)| width != extent)
+    {
+        if shape[1..last + 1].iter().any(|width| *width != 1) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{}: output {:?} of {:?} is strided within one index, and an item's output is \
+                 vended as one run per index",
+                item.key,
+                &shape[1..],
+                &full[1..]
+            )));
+        }
+    }
     let row_stride: u64 = full[1..].iter().product();
     let run: u64 = shape[1..].iter().product();
     // Where the sub-box begins inside one row. Row-major, so the trailing starts fold in by
