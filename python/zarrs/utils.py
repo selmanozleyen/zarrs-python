@@ -360,6 +360,26 @@ def _chunk_unit_args(
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
     if drop_axes or inner_shape is None:
         return None
+    chunk_sel_raw, out_sel_raw = _as_selector_tuples(chunk_selection, out_selection)
+    # `X[5]` -- a SCALAR row. zarr passes a bare integer on axis 0 and an output one rank
+    # shorter, and does not use `drop_axes` to say so. The buffer is laid out exactly as the
+    # one-row selection `X[5:6]` produces, since an axis of extent one contributes no stride,
+    # so the axis is synthesised back rather than given a path of its own.
+    #
+    # This was the LAST selection form reaching the fused read path: an audit of the public
+    # indexing surface -- 44 forms over three layouts -- found 34 on the chunk-unit path,
+    # 8 declining to zarr-python, and only this one on the fused one.
+    if (
+        len(chunk_sel_raw) == len(chunk_spec.shape)
+        and len(out_sel_raw) == len(chunk_spec.shape) - 1
+        and isinstance(chunk_sel_raw[0], (int, np.integer))
+        and len(shape) == len(chunk_spec.shape) - 1
+    ):
+        chunk_selection = (slice(int(chunk_sel_raw[0]), int(chunk_sel_raw[0]) + 1),) + tuple(
+            chunk_sel_raw[1:]
+        )
+        out_selection = (slice(0, 1),) + tuple(out_sel_raw)
+        shape = (1,) + tuple(shape)
     # Not sharded: the chunk IS the decode unit, and the grid checks below then compare it
     # against itself, which is exactly right -- there is no subdivision to get wrong.
     if inner_shape == ():
