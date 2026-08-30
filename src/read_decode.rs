@@ -50,9 +50,14 @@ struct JobContext {
     /// unsharded chunk has no index to consult, so its key simply may not exist yet.
     ///
     /// Per CALL, not per job: an array is sharded or it is not. It lived on `Job` for one
-    /// commit and cost 6% on the loader, because `Job` crosses a channel ~8,000 times a call
-    /// and every byte added to it is copied that many times.
+    /// commit and cost measurable throughput on the loader, because `Job` crosses TWO channels
+    /// per job -- dispatch to reader, reader to decoder -- so every byte added to it is copied
+    /// twice per job, ~8,000 times a call.
     may_be_absent: bool,
+    /// The unit decoded into scratch: the shard's inner chunk where the array is sharded, the
+    /// CHUNK where it is not. Also per call -- an array's chunks are all one shape -- so it is
+    /// resolved once here from the first item rather than carried on every `Job`.
+    decode_shape: Vec<NonZeroU64>,
 }
 
 /// Shard and subshard decoders built during ONE call.
@@ -92,6 +97,12 @@ impl CodecPipelineImpl {
             element_size,
             fill_value: self.fill_value.clone(),
             may_be_absent: shard.depth() == 0,
+            // Sharded: the shard says. Not sharded: any item does, because chunk shapes are
+            // uniform across an array -- and an empty batch never reaches a decode.
+            decode_shape: shard.subchunk_shape.as_ref().map_or_else(
+                || items.first().map(|i| i.shape.clone()).unwrap_or_default(),
+                |shape| shape.to_vec(),
+            ),
         };
 
         let (located, declined) = self.locate_chunks(shard, items, &ctx)?;
@@ -490,11 +501,6 @@ fn carve<'a>(
                 run_len: item.run_len,
                 // Sharded: the shard's inner chunk. Not sharded: the item's own chunk, which
                 // is the whole store value and the whole decode.
-                decode_shape: ctx
-                    .shard
-                    .subchunk_shape
-                    .as_deref()
-                    .unwrap_or(item.shape.as_slice()),
                 col_offsets: item.col_offsets.as_deref(),
                 ctx,
             }),
@@ -792,10 +798,6 @@ struct Job<'a> {
     coords: &'a [u64],
     /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
     run_len: u64,
-    /// The unit that gets decoded into scratch: the shard's inner chunk where the array is
-    /// sharded, the item's own chunk where it is not. Per job only because an unsharded
-    /// array's decode unit is the ITEM's chunk; it is the same for every job in practice.
-    decode_shape: &'a [NonZeroU64],
     /// The columns each coordinate takes, when they are scattered rather than consecutive --
     /// `oindex[rows, cols]`. `None` is a contiguous run, which is every other case.
     col_offsets: Option<&'a [u64]>,
@@ -855,7 +857,7 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         return Err(format!("{} vanished between index and read", job.key));
     };
 
-    let shape = job.decode_shape;
+    let shape = ctx.decode_shape.as_slice();
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
     scratch.clear();
