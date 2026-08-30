@@ -56,10 +56,6 @@ def open_strict(path: Path) -> zarr.Array:
     [
         pytest.param(np.array([0, 3, 4, 5, 17, 30]), id="rows"),
         pytest.param((np.array([2, 3, 20]), slice(4, 18)), id="rows-slice"),
-        pytest.param((slice(None), np.array([0, 1, 7, 23])), id="cols"),
-        # Do not drop: on main this raises `RuntimeError: incompatible offset`, which the
-        # fallback does not catch, so it is the one case here fixing a hard crash.
-        pytest.param((slice(6, 9), np.array([5, 6, 13])), id="slice-cols"),
         pytest.param((np.array([4, 5, 6, 29]), 7), id="rows-int"),
         pytest.param(np.array([0, 31]), id="rows-endpoints"),
         pytest.param(np.array([11]), id="single-row"),
@@ -95,6 +91,19 @@ def test_sorted_vindex_1d(sharded_1d: tuple[Path, np.ndarray]) -> None:
         # Two array axes: outer and coordinate indexing disagree on what this means.
         pytest.param((np.array([1, 3]), np.array([0, 2])), id="two-array-axes"),
         pytest.param((slice(None), slice(None, None, 2)), id="strided"),
+        # An index ARRAY on the column axis, which reaches `_grid_unit_args`. It declines, and
+        # the shard grid is why -- not the inner chunk. The array is 24 wide over 12-wide
+        # shards, so each entry covers part of the output width, and `_is_whole_axis` on the
+        # output refuses that. Measured: both still decline when `inner == shard`, so the band
+        # split had nothing to do with it.
+        #
+        # Serving them would mean the same output-band fix `_chunk_unit_args` took, PLUS the
+        # inner-chunk split, PLUS a gather that can write several output pieces per grid item
+        # -- `decode_one` refuses that combination outright today. For a read shape of rows by
+        # all columns it is not worth five files of new offset arithmetic; the fallback is
+        # correct and this is not the hot path.
+        pytest.param((slice(None), np.array([0, 1, 7, 23])), id="cols"),
+        pytest.param((slice(6, 9), np.array([5, 6, 13])), id="slice-cols"),
     ],
 )
 def test_unsupported_raises_strictly_but_falls_back_correctly(

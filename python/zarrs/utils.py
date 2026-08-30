@@ -328,9 +328,33 @@ def _chunk_unit_args(
     # extent one contributes no stride, so a 0-d buffer of one element and a (1, 1) buffer of
     # one element have identical layouts. This also picks up `X[:, 3]`, where the dropped axis
     # is a trailing one.
-    scalars = [
-        axis for axis, sel in enumerate(chunk_sel_raw) if isinstance(sel, (int, np.integer))
-    ]
+    # A CONSTANT trailing index array is a scalar axis spelled as a point selection. `X[rows, 7]`
+    # reaches the pipeline as a `CoordinateIndexer` -- one integer array per axis, paired
+    # elementwise against a FLAT output -- so axis 1 arrives as [7, 7, 7], not as the integer the
+    # syntax suggests. Every point then sits at the same column, which is the box `rows x 7:8`,
+    # and rebuilding it is exact for the same reason the plain integer is.
+    #
+    # Axis 0 is excluded deliberately: it is the split, and a repeat there is a separate output
+    # slot rather than the same one named twice.
+    scalars: dict[int, int] = {}
+    for axis, sel in enumerate(chunk_sel_raw):
+        if isinstance(sel, (int, np.integer)):
+            scalars[axis] = int(sel)
+        elif (
+            axis > 0
+            and isinstance(sel, np.ndarray)
+            and sel.ndim == 1
+            and sel.size > 0
+            and np.issubdtype(sel.dtype, np.integer)
+            and bool((sel == sel[0]).all())
+        ):
+            scalars[axis] = int(sel[0])
+    # The three-way length EQUALITY is the whole defence, and it must stay an equality. It is
+    # what refuses a constant array whose axis the output KEPT -- `oindex[rows, [7]]`, whose
+    # output is rank 2 -- where rebuilding it as an extent of one would claim a single output
+    # column against an output that has more. That fills the right number of slots with the
+    # right bytes at the wrong stride: wrong data, no error. Weaken it to an inequality, or drop
+    # an operand from it, and this becomes a wrong-bytes path.
     if (
         scalars
         and len(chunk_sel_raw) == len(chunk_spec.shape)
@@ -339,7 +363,7 @@ def _chunk_unit_args(
         kept_out = iter(out_sel_raw)
         kept_extent = iter(shape)
         rebuilt = [
-            (slice(int(sel), int(sel) + 1), slice(0, 1), 1)
+            (slice(scalars[axis], scalars[axis] + 1), slice(0, 1), 1)
             if axis in scalars
             else (sel, next(kept_out), next(kept_extent))
             for axis, sel in enumerate(chunk_sel_raw)

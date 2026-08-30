@@ -968,6 +968,9 @@ def test_a_strided_output_box_is_declined() -> None:
         pytest.param((slice(None), 3), id="scalar-on-a-trailing-axis"),
         pytest.param((5, slice(None)), id="scalar-row"),
         pytest.param((5, slice(6, 18)), id="scalar-row-and-a-column-band"),
+        # A CoordinateIndexer with a constant column: `chunk_sel` arrives as
+        # (array([1,5,20]), array([7,7,7])), which is the box `rows x 7:8` spelled as points.
+        pytest.param((np.array([1, 5, 20]), 7), id="a-constant-column-is-a-scalar-axis"),
     ],
 )
 def test_a_scalar_axis_is_served(tmp_path: Path, entries: dict[str, int], selection) -> None:
@@ -993,3 +996,34 @@ def test_a_scalar_axis_is_served(tmp_path: Path, entries: dict[str, int], select
     np.testing.assert_array_equal(got, values[selection])
     assert entries["handle"] > 0, "a scalar axis should not send the batch to zarr-python"
     assert entries["list"] == 0
+
+
+@pytest.mark.parametrize(
+    "cols",
+    [
+        pytest.param(np.array([7]), id="one-column"),
+        pytest.param(np.array([7, 7]), id="the-same-column-twice"),
+    ],
+)
+def test_a_kept_constant_column_axis_is_not_rebuilt(tmp_path: Path, cols) -> None:
+    """`oindex[rows, [7]]` keeps the column axis, so an extent of one would be a LIE.
+
+    A constant trailing index array is read as a scalar axis, which is exact when the output
+    dropped that axis and wrong when it kept it: the item would claim one output column against
+    an output that has more, filling the right number of slots with the right bytes at the
+    wrong stride. Wrong data, no error -- so the three-way length equality that refuses it is
+    load-bearing, and this pins it.
+
+    Verified by weakening the guard: with one operand dropped, both cases below are described
+    with `out_widths=(3, 1)` against outputs of width 1 and 2.
+    """
+    values = np.arange(32 * 24, dtype=np.float64).reshape(32, 24)
+    path = tmp_path / "kept.zarr"
+    zarr.create_array(path, dtype=values.dtype, shape=values.shape, chunks=(8, 6),
+                      shards=(16, 12))[:] = values
+
+    rows = np.array([4, 5, 6])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[rows, cols]
+
+    np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
