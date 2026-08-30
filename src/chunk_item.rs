@@ -170,24 +170,24 @@ impl Offsets<'_> {
 /// copies 10 CONSECUTIVE elements which are read back as a 2x5 tile. Wrong data, no error.
 /// With the starts the shape is checkable, and so is the wrap: an offset of 8 with width 4 on
 /// an axis of extent 10 runs off the end of its own sub-row into the next one.
-fn trailing_layout(chunk_shape: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u64, u64, u64)> {
-    if chunk_shape.is_empty() || chunk_shape.len() != shape.len() {
+fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u64, u64, u64)> {
+    if inner.is_empty() || inner.len() != shape.len() {
         return Err(PyErr::new::<PyValueError, _>(format!(
-            "chunk_unit_items splits axis 0 and needs matching arity: chunk_shape has {} \
-             axes, the output shape has {}",
-            chunk_shape.len(),
+            "chunk_unit_items splits axis 0 and needs matching arity: the inner chunk has \
+             {} axes, the output shape has {}",
+            inner.len(),
             shape.len()
         )));
     }
-    if starts.len() + 1 != chunk_shape.len() {
+    if starts.len() + 1 != inner.len() {
         return Err(PyErr::new::<PyValueError, _>(format!(
             "chunk_unit_items needs one start per axis AFTER the split: {} starts against a \
-             rank-{} chunk",
+             rank-{} inner chunk",
             starts.len(),
-            chunk_shape.len()
+            inner.len()
         )));
     }
-    let extents = &chunk_shape[1..];
+    let extents = &inner[1..];
     let widths = &shape[1..];
     for (axis, ((start, width), extent)) in starts.iter().zip(widths).zip(extents).enumerate() {
         if *width == 0 || start.checked_add(*width).is_none_or(|end| end > *extent) {
@@ -280,12 +280,45 @@ pub(crate) fn build_chunk_unit_items(
     // entry spans the whole trailing extent, which stops being true once the shard grid
     // divides it.
     out_widths: &[u64],
-    inner: u64,
+    // The INNER chunk -- the unit of compression, therefore of decoding, therefore the buffer
+    // every coordinate below addresses. One extent per axis, not just the split: a shard may
+    // hold several inner chunks on a trailing axis, and then the shard's extent is not the row
+    // stride of anything that ever gets decoded.
+    inner: &[u64],
     offsets: Offsets<'_>,
 ) -> PyResult<Vec<ChunkItem>> {
-    let inner = NonZeroU64::new(inner)
-        .ok_or_else(|| PyErr::new::<PyValueError, _>("inner chunk shape must be non-zero"))?
-        .get();
+    // Arity FIRST, and rank at least one, because everything below indexes: `inner_nz[0]`
+    // for the split extent and `out_widths[1..]` for the bands. `push_entry` is a pymethod
+    // taking arbitrary vectors, so a short one has to be an error rather than a panic across
+    // the FFI. The out_starts/out_widths check that used to sit further down is folded in
+    // here for the same reason.
+    if chunk_shape.is_empty() || inner.len() != chunk_shape.len() {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "one inner extent per axis is needed, on a chunk of rank at least one: {} \
+             against a rank-{} chunk",
+            inner.len(),
+            chunk_shape.len()
+        )));
+    }
+    if out_starts.len() != shape.len() || out_widths.len() != shape.len() || shape.is_empty() {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "one output start and width per axis is needed: {} and {} against a rank-{} \
+             output",
+            out_starts.len(),
+            out_widths.len(),
+            shape.len()
+        )));
+    }
+    if inner.iter().zip(&chunk_shape).any(|(i, c)| i > c) {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "an inner chunk {inner:?} cannot be larger than the shard {chunk_shape:?} it divides"
+        )));
+    }
+    // Rejects a zero extent on any axis, which is what the scalar check used to do for one.
+    let inner_nz = to_nonzero_u64_vec(inner.to_vec())?;
+    // What axis 0 groups by. Named apart from `inner` so the two cannot be confused: one is a
+    // scalar extent on the split axis, the other the whole decode unit.
+    let split = inner_nz[0].get();
     // Strided views are legal here: an index array can be a slice of a larger one.
     let indices = indices.as_array();
     let n = indices.len();
@@ -293,16 +326,26 @@ pub(crate) fn build_chunk_unit_items(
         return Ok(Vec::new());
     }
     let (row_stride, run_len, uniform_offset) = match offsets {
-        Offsets::Uniform(starts) => trailing_layout(&chunk_shape, out_widths, starts)?,
+        // The band's position INSIDE its own inner chunk. `trailing_layout` then refuses any
+        // band that leaves it -- the same check that already refuses a run walking off its
+        // sub-row, reused rather than re-invented.
+        Offsets::Uniform(starts) => {
+            let within: Vec<u64> = starts
+                .iter()
+                .zip(&inner[1..])
+                .map(|(start, extent)| start % extent)
+                .collect();
+            trailing_layout(inner, out_widths, &within)?
+        }
         // A point names ONE element, so the run is one element and the output is flat. The
         // trailing extents are not a shared sub-box here -- each point carries its own offset
         // -- so only the stride comes from the chunk.
-        Offsets::PerIndex(_) => (chunk_shape[1..].iter().product::<u64>(), 1, 0),
+        Offsets::PerIndex(_) => (inner[1..].iter().product::<u64>(), 1, 0),
         // A grid takes the same `cols` from every row, so the run is the list's length and
         // the coordinate itself is the start of the row: the offsets are applied per element
         // by the gather, not folded into the coordinate.
         Offsets::Grid { starts, run } => {
-            let stride: u64 = chunk_shape[1..].iter().product();
+            let stride: u64 = inner[1..].iter().product();
             for &c in starts {
                 // The END of the run has to fit, not just its start.
                 if c.checked_add(run).is_none_or(|end| end > stride) {
@@ -322,6 +365,18 @@ pub(crate) fn build_chunk_unit_items(
             "a trailing axis of extent zero selects nothing",
         ));
     }
+    // (start, width) per trailing axis, SHARD-relative -- what the descent divides.
+    let trailing: Vec<(u64, u64)> = match offsets {
+        Offsets::Uniform(starts) => starts
+            .iter()
+            .zip(&out_widths[1..])
+            .map(|(start, width)| (*start, *width))
+            .collect(),
+        // Points and grids take the trailing axes whole, and their Python gates require one
+        // inner chunk there. If that ever stops being true `locate` refuses the item rather
+        // than returning wrong data.
+        _ => chunk_shape[1..].iter().map(|d| (0, *d)).collect(),
+    };
     // Constant for every index in the two shared cases; unused in the varying one.
     let shared_offset = match offsets {
         Offsets::Uniform(_) => uniform_offset,
@@ -334,15 +389,6 @@ pub(crate) fn build_chunk_unit_items(
                 "a point selection needs one offset per index: {given} against {n}"
             )));
         }
-    }
-    if out_starts.len() != shape.len() || out_widths.len() != shape.len() {
-        return Err(PyErr::new::<PyValueError, _>(format!(
-            "one output start and width per axis is needed: {} and {} against a rank-{} \
-             output",
-            out_starts.len(),
-            out_widths.len(),
-            shape.len()
-        )));
     }
     let num_elements: u64 = chunk_shape.iter().product();
     let chunk_shape = to_nonzero_u64_vec(chunk_shape)?;
@@ -374,7 +420,7 @@ pub(crate) fn build_chunk_unit_items(
             )));
         }
         previous = first;
-        let chunk_id = first / inner;
+        let chunk_id = first / split;
         let mut b = a + 1;
         while b < n {
             let value = at(b)?;
@@ -384,14 +430,14 @@ pub(crate) fn build_chunk_unit_items(
                 )));
             }
             previous = value;
-            if value / inner != chunk_id {
+            if value / split != chunk_id {
                 break;
             }
             b += 1;
         }
-        let lo = chunk_id * inner;
+        let lo = chunk_id * split;
         // Exactly one inner chunk, clamped to the extent.
-        let hi = (lo + inner).min(extent);
+        let hi = (lo + split).min(extent);
         if lo >= extent {
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "index {} is past the chunk extent {extent}",
@@ -414,10 +460,13 @@ pub(crate) fn build_chunk_unit_items(
                 "output subset {out_lo}..{out_hi} is past the output extent {out_extent}",
             )));
         }
-        // Axis 0 is the split; every axis after it is taken whole on both sides.
+        // Axis 0 is the split. Every axis after it takes the band this entry describes --
+        // `locate` divides `chunk_subset.start()` on EVERY axis, so this is what steers the
+        // descent to the right inner chunk on a trailing one. Pinned to `0..extent` it always
+        // landed on inner chunk 0, which is correct only while a shard holds exactly one.
         let mut chunk_ranges = Vec::with_capacity(chunk_shape.len());
         chunk_ranges.push(lo..hi);
-        chunk_ranges.extend(chunk_shape[1..].iter().map(|d| 0..d.get()));
+        chunk_ranges.extend(trailing.iter().map(|(start, width)| *start..*start + *width));
         let mut out_ranges = Vec::with_capacity(shape.len());
         out_ranges.push(out_lo..out_hi);
         out_ranges.extend(
@@ -531,7 +580,7 @@ impl ChunkItems {
         indices: PyReadonlyArray1<'_, i64>,
         out_starts: Vec<u64>,
         out_widths: Vec<u64>,
-        inner: u64,
+        inner: Vec<u64>,
         elem_starts: Vec<u64>,
     ) -> PyResult<()> {
         // There WAS a monotonicity check here: an entry's output start against the last
@@ -552,7 +601,7 @@ impl ChunkItems {
             indices,
             &out_starts,
             &out_widths,
-            inner,
+            &inner,
             Offsets::Uniform(&elem_starts),
         )?;
         if let Some(last) = items.last() {
@@ -711,6 +760,13 @@ impl ChunkItems {
         let out_starts = trailing_zeros(out_start, shape.len());
         // These take the trailing axes whole, so the item's extent IS the output shape.
         let out_widths = shape.clone();
+        // These paths take the trailing axes whole, and their Python gates require the shard
+        // to hold ONE inner chunk on each -- so the shard extent is the inner extent there.
+        // Widened at the call rather than in the signature, so the tautology is written down
+        // in one place instead of assumed at every use.
+        let inner: Vec<u64> = std::iter::once(inner)
+            .chain(chunk_shape[1..].iter().copied())
+            .collect();
         let items = build_chunk_unit_items(
             key,
             chunk_shape,
@@ -718,7 +774,7 @@ impl ChunkItems {
             indices,
             &out_starts,
             &out_widths,
-            inner,
+            &inner,
             Offsets::Grid { starts, run },
         )?;
         if let Some(last) = items.last() {
@@ -764,6 +820,13 @@ impl ChunkItems {
         let out_starts = trailing_zeros(out_start, shape.len());
         // These take the trailing axes whole, so the item's extent IS the output shape.
         let out_widths = shape.clone();
+        // These paths take the trailing axes whole, and their Python gates require the shard
+        // to hold ONE inner chunk on each -- so the shard extent is the inner extent there.
+        // Widened at the call rather than in the signature, so the tautology is written down
+        // in one place instead of assumed at every use.
+        let inner: Vec<u64> = std::iter::once(inner)
+            .chain(chunk_shape[1..].iter().copied())
+            .collect();
         let items = build_chunk_unit_items(
             key,
             chunk_shape,
@@ -771,7 +834,7 @@ impl ChunkItems {
             indices,
             &out_starts,
             &out_widths,
-            inner,
+            &inner,
             Offsets::PerIndex(offsets),
         )?;
         if let Some(last) = items.last() {

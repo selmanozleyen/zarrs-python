@@ -50,7 +50,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
             indices.readonly(),
             &[7],
             &[100],
-            inner,
+            &[inner],
             crate::chunk_item::Offsets::Uniform(&[]),
         )?;
 
@@ -84,7 +84,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 vec![95],
                 vec![100],
                 bad.readonly(), &[0], &[100],
-                inner,
+                &[inner],
                 crate::chunk_item::Offsets::Uniform(&[])
             )
             .is_err()
@@ -97,7 +97,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 vec![95],
                 vec![1],
                 over.readonly(), &[0], &[1],
-                inner,
+                &[inner],
                 crate::chunk_item::Offsets::Uniform(&[])
             )
             .is_err()
@@ -117,8 +117,8 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), vec![0], vec![100], 10, vec![])?;
-        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), vec![2], vec![100], 10, vec![])?;
+        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), vec![0], vec![100], vec![10], vec![])?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), vec![2], vec![100], vec![10], vec![])?;
 
         let got: Vec<_> = handle
             .as_slice()
@@ -145,7 +145,7 @@ fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), vec![0], vec![100], 10, vec![])?;
+        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), vec![0], vec![100], vec![10], vec![])?;
 
         // `a` produced two items covering output 0..2, so an entry starting at 1 gives two
         // items the same byte. `push_entry` no longer refuses that: the check it used could
@@ -154,9 +154,9 @@ fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
         // than none. The overlap is refused at read instead, by the forward-only cursor in
         // `DisjointBytes` -- see `read_decode::tests::bytes_are_vended_once_and_forwards`,
         // which pins that directly.
-        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), vec![1], vec![100], 10, vec![])?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), vec![1], vec![100], vec![10], vec![])?;
         // Starting where the last one ended is exactly what zarr produces.
-        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), vec![2], vec![100], 10, vec![])?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), vec![2], vec![100], vec![10], vec![])?;
         assert_eq!(handle.as_slice().len(), 4);
         Ok(())
     })
@@ -185,7 +185,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
             indices.readonly(),
             &[2, 0],
             &[12, cols],
-            inner,
+            &[inner, cols],
             crate::chunk_item::Offsets::Uniform(&[0]),
         )?;
 
@@ -237,7 +237,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             &[0, 0],
             &[10, 2],
-            4,
+            &[4, 3],
             crate::chunk_item::Offsets::Uniform(&[0]),
         );
         assert!(narrower.is_ok(), "a contiguous column subset is served, not refused");
@@ -250,7 +250,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             &[0, 0, 0],
             &[10, 2, 5],
-            4,
+            &[4, 4, 10],
             crate::chunk_item::Offsets::Uniform(&[0, 0]),
         );
         assert!(strided.is_err(), "a strided trailing box must be refused");
@@ -262,7 +262,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             &[0, 0, 0],
             &[10, 1, 4],
-            4,
+            &[4, 4, 10],
             crate::chunk_item::Offsets::Uniform(&[0, 8]),
         );
         assert!(wraps.is_err(), "a run leaving its own sub-row must be refused");
@@ -274,7 +274,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             &[0, 0],
             &[10, 2],
-            4,
+            &[4],
             crate::chunk_item::Offsets::Uniform(&[0]),
         );
         assert!(ranks.is_err());

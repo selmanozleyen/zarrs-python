@@ -437,7 +437,11 @@ def _chunk_unit_args(
         indices,
         tuple(out_starts),
         tuple(out_widths),
-        int(inner_shape[0]),
+        # The WHOLE inner chunk, not just the split extent. Every trailing stride Rust
+        # computes is a product of these, and the decoded buffer is the inner chunk -- so
+        # handing it the shard's extents is only right while a shard holds one inner chunk
+        # on each trailing axis, which is what the guard above still requires.
+        tuple(int(v) for v in inner_shape),
         tuple(int(v) for v in starts),
     )
 
