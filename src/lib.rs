@@ -538,6 +538,30 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
 /// Zero the counters, so one test's numbers are its own.
 #[gen_stub_pyfunction]
 #[pyfunction]
+/// Storage reads issued, and inner chunks they served.
+///
+/// `served > issued` means adjacent chunks were merged into one read; equal means nothing
+/// merged, which is the honest answer for a scattered selection. Exposed because "we merge
+/// adjacent reads" is a claim about a RUN, not about the source.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn read_merge_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        read_decode::READS_ISSUED.load(Ordering::Relaxed),
+        read_decode::CHUNKS_SERVED.load(Ordering::Relaxed),
+    )
+}
+
+/// Zero the read-merge counters, so one measurement's numbers are its own.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn reset_read_merge_stats() {
+    use std::sync::atomic::Ordering;
+    read_decode::READS_ISSUED.store(0, Ordering::Relaxed);
+    read_decode::CHUNKS_SERVED.store(0, Ordering::Relaxed);
+}
+
 fn reset_shard_index_cache_stats() {
     use std::sync::atomic::Ordering;
     read_decode::INDEX_CALL_HITS.store(0, Ordering::Relaxed);
@@ -550,6 +574,8 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(shard_index_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(reset_shard_index_cache_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(read_merge_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(reset_read_merge_stats, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
     m.add_class::<chunk_item::ChunkItems>()?;

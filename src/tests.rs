@@ -438,3 +438,39 @@ fn test_gather_merging_still_refuses_a_span_past_the_decode() {
     let mut out = vec![0u8; 2 * 2];
     assert!(crate::utils::gather(&scratch, &[6, 7], 1, &mut out, 2).is_ok());
 }
+
+/// `joined` is the whole merging rule, so it is pinned directly.
+///
+/// Merging is a claim about BYTES, and getting it wrong is not a slow read but a wrong one:
+/// an overlap would vend a byte twice and a gap would hand a chunk somebody else's bytes.
+#[test]
+fn test_joined_merges_only_exactly_adjacent_ranges() {
+    use zarrs::storage::byte_range::ByteRange::{FromStart, Suffix};
+    let joined = crate::read_decode::joined;
+
+    // Adjacent: 0..100 then 100..150 is one read of 0..150.
+    assert_eq!(
+        joined(FromStart(0, Some(100)), FromStart(100, Some(50))),
+        Some(FromStart(0, Some(150)))
+    );
+    // A GAP would fetch bytes nothing asked for.
+    assert_eq!(joined(FromStart(0, Some(100)), FromStart(101, Some(50))), None);
+    // An OVERLAP would vend the same byte to two chunks.
+    assert_eq!(joined(FromStart(0, Some(100)), FromStart(99, Some(50))), None);
+    // Backwards is not adjacency.
+    assert_eq!(joined(FromStart(100, Some(50)), FromStart(0, Some(100))), None);
+    // A whole unsharded value has no known end, and a suffix no known start.
+    assert_eq!(joined(FromStart(0, None), FromStart(0, Some(50))), None);
+    assert_eq!(joined(FromStart(0, Some(50)), FromStart(50, None)), None);
+    assert_eq!(joined(Suffix(10), FromStart(0, Some(50))), None);
+    assert_eq!(joined(FromStart(0, Some(50)), Suffix(10)), None);
+    // The cap bounds how long a merged buffer is held alive.
+    let cap = 16u64 << 20;
+    assert_eq!(
+        joined(FromStart(0, Some(cap - 10)), FromStart(cap - 10, Some(10))),
+        Some(FromStart(0, Some(cap)))
+    );
+    assert_eq!(joined(FromStart(0, Some(cap)), FromStart(cap, Some(1))), None);
+    // Overflow must not wrap into looking adjacent.
+    assert_eq!(joined(FromStart(u64::MAX, Some(1)), FromStart(0, Some(1))), None);
+}

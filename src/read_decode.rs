@@ -638,6 +638,11 @@ fn trailing_axes_are_whole(subset: &zarrs::array::ArraySubset, shape: &[NonZeroU
 pub(crate) static INDEX_CALL_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_ARRAY_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
+/// Storage reads actually issued, and inner chunks they served. Equal means nothing merged.
+/// Exposed because "adjacent ranges are merged" is a claim about a run, not about the source:
+/// a selection whose chunks never touch merges nothing however correct the code is.
+pub(crate) static READS_ISSUED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CHUNKS_SERVED: AtomicU64 = AtomicU64::new(0);
 
 /// Live workers across every in-flight call, counted separately per kind.
 static LIVE_READERS: AtomicUsize = AtomicUsize::new(0);
@@ -852,29 +857,33 @@ const MERGE_CAP_BYTES: u64 = 16 << 20;
 /// read arrives here already ascending. Nothing is sorted: sorting would let this merge two
 /// pieces whose outputs are far apart, and the group would then pin its bytes until the later
 /// one decoded.
+pub(crate) fn joined(held: ByteRange, next: ByteRange) -> Option<ByteRange> {
+    // `FromStart(_, None)` is a whole unsharded value and `Suffix` has no known start, so
+    // neither can be extended by, or extend, another range.
+    let (ByteRange::FromStart(base, Some(held_len)), ByteRange::FromStart(offset, Some(len))) =
+        (held, next)
+    else {
+        return None;
+    };
+    // EXACTLY adjacent. A gap would fetch bytes nothing asked for and an overlap would vend
+    // the same byte twice, and `base + held_len == offset` refuses both in one test.
+    if base.checked_add(held_len) != Some(offset) {
+        return None;
+    }
+    let total = held_len.checked_add(len)?;
+    (total <= MERGE_CAP_BYTES).then_some(ByteRange::FromStart(base, Some(total)))
+}
+
 fn merge_reads(jobs: Vec<Job<'_>>) -> Vec<ReadGroup<'_>> {
     let mut groups: Vec<ReadGroup<'_>> = Vec::with_capacity(jobs.len());
     for job in jobs {
-        let joins = match (groups.last(), &job.range) {
-            (Some(group), ByteRange::FromStart(offset, Some(len))) => match group.range {
-                ByteRange::FromStart(base, Some(held)) => {
-                    group.key == job.key
-                        && base.checked_add(held) == Some(*offset)
-                        && held.saturating_add(*len) <= MERGE_CAP_BYTES
-                }
-                // `FromStart(_, None)` is a whole unsharded value and `Suffix` has no known
-                // start, so neither can be extended by a following range.
-                ByteRange::FromStart(_, None) | ByteRange::Suffix(_) => false,
-            },
-            _ => false,
-        };
-        if joins {
-            let group = groups.last_mut().expect("checked above");
-            if let (ByteRange::FromStart(base, Some(held)), ByteRange::FromStart(_, Some(len))) =
-                (group.range, job.range)
-            {
-                group.range = ByteRange::FromStart(base, Some(held + len));
-            }
+        let extended = groups
+            .last()
+            .filter(|group| group.key == job.key)
+            .and_then(|group| joined(group.range, job.range));
+        if let Some(range) = extended {
+            let group = groups.last_mut().expect("filtered from `last`");
+            group.range = range;
             group.jobs.push(job);
         } else {
             groups.push(ReadGroup {
@@ -908,6 +917,8 @@ fn read_loop<'a>(
             ByteRange::FromStart(offset, _) => offset,
             ByteRange::Suffix(_) => 0,
         };
+        READS_ISSUED.fetch_add(1, Ordering::Relaxed);
+        CHUNKS_SERVED.fetch_add(group.jobs.len() as u64, Ordering::Relaxed);
         match ctx.store.get_partial(&group.key, group.range) {
             Ok(bytes) => {
                 for job in group.jobs {
