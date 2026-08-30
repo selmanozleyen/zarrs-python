@@ -252,12 +252,34 @@ fn trailing_layout(chunk_shape: &[u64], shape: &[u64], starts: &[u64]) -> PyResu
 // guessing; a struct for a single call site would move the same arguments behind a name.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_pass_by_value)]
+/// `out_start` on axis 0 and zero after it.
+///
+/// Points and grids place their output on axis 0 and take the axes after it whole, so their
+/// trailing starts are the origin. Written out rather than defaulted, so the one caller whose
+/// trailing start is NOT zero -- an entry covering a band of a divided output -- has to say so.
+fn trailing_zeros(out_start: u64, rank: usize) -> Vec<u64> {
+    let mut starts = vec![0u64; rank];
+    if let Some(first) = starts.first_mut() {
+        *first = out_start;
+    }
+    starts
+}
+
 pub(crate) fn build_chunk_unit_items(
     key: &str,
     chunk_shape: Vec<u64>,
     shape: Vec<u64>,
     indices: PyReadonlyArray1<'_, i64>,
-    out_start: u64,
+    // Where this entry's output begins on EVERY axis. Axis 0 is the split; the rest place the
+    // entry's band within the output. They were implicitly zero, which is only right when an
+    // entry spans the whole trailing extent -- false as soon as the shard grid divides it.
+    out_starts: &[u64],
+    // The item's own extent on the trailing axes. Separate from `shape`, which stays the FULL
+    // output shape: `shape` gives the row stride an output offset is computed against, and
+    // these give how much of a row this entry actually fills. They are equal only while an
+    // entry spans the whole trailing extent, which stops being true once the shard grid
+    // divides it.
+    out_widths: &[u64],
     inner: u64,
     offsets: Offsets<'_>,
 ) -> PyResult<Vec<ChunkItem>> {
@@ -271,7 +293,7 @@ pub(crate) fn build_chunk_unit_items(
         return Ok(Vec::new());
     }
     let (row_stride, run_len, uniform_offset) = match offsets {
-        Offsets::Uniform(starts) => trailing_layout(&chunk_shape, &shape, starts)?,
+        Offsets::Uniform(starts) => trailing_layout(&chunk_shape, out_widths, starts)?,
         // A point names ONE element, so the run is one element and the output is flat. The
         // trailing extents are not a shared sub-box here -- each point carries its own offset
         // -- so only the stride comes from the chunk.
@@ -312,6 +334,15 @@ pub(crate) fn build_chunk_unit_items(
                 "a point selection needs one offset per index: {given} against {n}"
             )));
         }
+    }
+    if out_starts.len() != shape.len() || out_widths.len() != shape.len() {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "one output start and width per axis is needed: {} and {} against a rank-{} \
+             output",
+            out_starts.len(),
+            out_widths.len(),
+            shape.len()
+        )));
     }
     let num_elements: u64 = chunk_shape.iter().product();
     let chunk_shape = to_nonzero_u64_vec(chunk_shape)?;
@@ -376,8 +407,8 @@ pub(crate) fn build_chunk_unit_items(
                 at(b - 1)?
             )));
         }
-        let out_lo = out_start + a as u64;
-        let out_hi = out_start + b as u64;
+        let out_lo = out_starts[0] + a as u64;
+        let out_hi = out_starts[0] + b as u64;
         if out_hi > out_extent {
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "output subset {out_lo}..{out_hi} is past the output extent {out_extent}",
@@ -389,7 +420,12 @@ pub(crate) fn build_chunk_unit_items(
         chunk_ranges.extend(chunk_shape[1..].iter().map(|d| 0..d.get()));
         let mut out_ranges = Vec::with_capacity(shape.len());
         out_ranges.push(out_lo..out_hi);
-        out_ranges.extend(shape[1..].iter().map(|d| 0..d.get()));
+        out_ranges.extend(
+            out_widths[1..]
+                .iter()
+                .zip(&out_starts[1..])
+                .map(|(width, at)| *at..at + width),
+        );
         items.push(ChunkItem {
             key: key.clone(),
             chunk_subset: ArraySubset::new_with_ranges(&chunk_ranges),
@@ -485,7 +521,7 @@ impl ChunkItems {
     /// One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
     /// since the output subset is bounded against it. A larger one describes bytes the buffer
     /// does not have, and that produces wrong data rather than an error.
-    #[pyo3(signature = (key, chunk_shape, shape, indices, out_start, inner, elem_starts=Vec::new()))]
+    #[pyo3(signature = (key, chunk_shape, shape, indices, out_starts, out_widths, inner, elem_starts=Vec::new()))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub(crate) fn push_entry(
         &mut self,
@@ -493,18 +529,29 @@ impl ChunkItems {
         chunk_shape: Vec<u64>,
         shape: Vec<u64>,
         indices: PyReadonlyArray1<'_, i64>,
-        out_start: u64,
+        out_starts: Vec<u64>,
+        out_widths: Vec<u64>,
         inner: u64,
         elem_starts: Vec<u64>,
     ) -> PyResult<()> {
-        if out_start < self.out_end {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "output starting at {out_start} overlaps an entry already pushed, which ends \
-                 at {}",
-                self.out_end
-            )));
-        }
-        let items = build_chunk_unit_items(key, chunk_shape, shape, indices, out_start, inner, Offsets::Uniform(&elem_starts))?;
+        // The monotonicity check that stood here compared `out_start` against the last
+        // entry's end. It cannot survive an entry that covers a BAND of the output: two
+        // entries holding the same rows in different column bands share an axis-0 start, and
+        // neither overlaps the other. It fired on exactly that, so it is gone.
+        //
+        // Overlap is still refused, and by the check that actually proves it: `DisjointBytes`
+        // vends every output range from a forward-only cursor, so two pieces claiming a byte
+        // cannot both be handed out. What is lost is the earlier, cheaper report.
+        let items = build_chunk_unit_items(
+            key,
+            chunk_shape,
+            shape,
+            indices,
+            &out_starts,
+            &out_widths,
+            inner,
+            Offsets::Uniform(&elem_starts),
+        )?;
         if let Some(last) = items.last() {
             self.out_end = last.subset.end_exc()[0];
         }
@@ -657,12 +704,17 @@ impl ChunkItems {
         let starts = starts.as_slice().map_err(|_| {
             PyErr::new::<PyValueError, _>("the run-start array must be contiguous")
         })?;
+        // Before the call: `shape` is moved into it, and argument evaluation is left to right.
+        let out_starts = trailing_zeros(out_start, shape.len());
+        // These take the trailing axes whole, so the item's extent IS the output shape.
+        let out_widths = shape.clone();
         let items = build_chunk_unit_items(
             key,
             chunk_shape,
             shape,
             indices,
-            out_start,
+            &out_starts,
+            &out_widths,
             inner,
             Offsets::Grid { starts, run },
         )?;
@@ -705,12 +757,17 @@ impl ChunkItems {
         let offsets = offsets.as_slice().map_err(|_| {
             PyErr::new::<PyValueError, _>("the offsets array must be contiguous")
         })?;
+        // Before the call: `shape` is moved into it, and argument evaluation is left to right.
+        let out_starts = trailing_zeros(out_start, shape.len());
+        // These take the trailing axes whole, so the item's extent IS the output shape.
+        let out_widths = shape.clone();
         let items = build_chunk_unit_items(
             key,
             chunk_shape,
             shape,
             indices,
-            out_start,
+            &out_starts,
+            &out_widths,
             inner,
             Offsets::PerIndex(offsets),
         )?;
