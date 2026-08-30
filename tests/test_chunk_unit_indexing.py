@@ -597,3 +597,84 @@ def test_a_grid_with_unsorted_columns_declines_and_is_still_right(
 
     np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
     assert entries["handle"] == 0, "an unsorted grid reached the chunk-unit path"
+
+
+@pytest.fixture
+def volume(tmp_path: Path) -> tuple[Path, np.ndarray]:
+    """A rank-3 array whose inner chunk spans both trailing axes whole."""
+    values = np.arange(256 * 8 * 16, dtype=np.float32).reshape(256, 8, 16)
+    path = tmp_path / "vol"
+    z = zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape, chunks=(8, 8, 16), shards=(64, 8, 16)
+    )
+    z[:] = values
+    return path, values
+
+
+@pytest.mark.parametrize(
+    ("name", "sel"),
+    [
+        # The Cartesian product on all three axes.
+        ("grid on every axis", (np.array([1, 3, 3, 9, 60]), np.array([1, 3, 6]), np.array([2, 9, 15]))),
+        # A span on one trailing axis and a scattered list on the other.
+        ("span and list", (np.array([1, 3, 9, 60]), slice(2, 5), np.array([0, 7, 15]))),
+        # One plane: the middle axis takes a single element and is DROPPED from the result.
+        ("dropped middle axis", (np.array([1, 3, 9, 60]), 3, slice(4, 12))),
+        # Every row, a couple of planes.
+        ("all rows", (slice(None), np.array([1, 5]), slice(None))),
+    ],
+)
+def test_rank_three_grids_take_the_path(
+    volume: tuple[Path, np.ndarray], entries: dict[str, int], name: str, sel
+) -> None:
+    """The grid generalises to rank N: the offset of an element inside its index's own
+    elements is `sum(sel[axis][i] * stride[axis])`, and the product flattened row-major is the
+    order the output row wants -- one list, whatever the rank.
+
+    All four of these used to leave zarrs ENTIRELY, not merely miss the grouping.
+    """
+    path, values = volume
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[sel]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r").oindex[sel]
+
+    np.testing.assert_array_equal(got, theirs)
+    assert entries["handle"] > 0, f"{name} did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_a_pure_slice_box_still_falls_back(
+    volume: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """A box of pure slices is a contiguous n-D block, which the ordinary route copies
+    blockwise where this path would gather it element by element. Declining is deliberate and
+    is the answer that cannot regress; taking it is a measurement nobody has made."""
+    path, values = volume
+    rows = np.array([1, 3, 9, 60])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[rows, 2:5, 4:12]
+
+    np.testing.assert_array_equal(got, values[np.ix_(rows, range(2, 5), range(4, 12))])
+    assert entries["handle"] == 0, "a pure-slice box reached the chunk-unit path"
+
+
+def test_rank_four_grid_takes_the_path(tmp_path: Path, entries: dict[str, int]) -> None:
+    """Nothing in the offset arithmetic knows the rank, so rank 4 is not a separate case --
+    asserted rather than assumed, because "it generalises" is exactly the kind of claim that
+    is wrong once."""
+    values = np.arange(64 * 4 * 6 * 5, dtype=np.float32).reshape(64, 4, 6, 5)
+    path = tmp_path / "hyper"
+    z = zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape,
+        chunks=(8, 4, 6, 5), shards=(32, 4, 6, 5),
+    )
+    z[:] = values
+    sel = (np.array([1, 3, 3, 40]), np.array([0, 3]), slice(1, 4), np.array([0, 2, 4]))
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[sel]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r").oindex[sel]
+
+    np.testing.assert_array_equal(got, theirs)
+    assert entries["handle"] > 0, "a rank-4 grid did not take the chunk-unit path"

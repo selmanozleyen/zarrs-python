@@ -506,69 +506,101 @@ def _grid_unit_args(
 ) -> tuple | None:
     """Args for `ChunkItems.push_grid`, or None if this entry is not a grid selection.
 
-    `oindex[rows, cols]` and `X[:, cols]` -- a gene panel across cells, which is the ordinary
-    way to subset both axes. zarr BROADCASTS the two axes rather than pairing them, so rows
-    arrive shaped (n, 1) and columns (1, m), and the result is the n x m grid.
+    A GRID is the Cartesian product: every selected index on axis 0 crossed with every
+    selected position on each axis after it. `oindex[rows, cols]`, `X[:, cols]`, and in rank 3
+    `oindex[rows, ys, zs]` or `X[rows, 3, 4:12]`.
 
-    Every selected row takes the SAME columns, so one shared offset list serves the item and
-    each coordinate is just the start of its row. The output row is those columns in order,
-    contiguous, which is what keeps an item to a single output range.
+    zarr BROADCASTS the axes rather than pairing them, so on rank 3 they arrive shaped
+    (n,1,1), (1,m,1), (1,1,p). Any of them may instead be a step-1 slice, and an axis taking a
+    single element may be dropped from the output entirely -- which changes nothing about the
+    buffer, since an axis of extent one contributes no stride, so it is synthesised back.
 
-    Rank 2 only. A higher-rank grid broadcasts to one array per axis and the offsets stop
-    being a single list; declining is better than half-serving it.
+    RANK-N, not rank 2. The offset of one element inside its index's own elements is
+    `sum(sel[axis][i] * stride[axis])`, and flattening the product in row-major order gives
+    exactly the order the output row wants -- one list, whatever the rank. An earlier version
+    of this declined rank > 2 claiming the offsets "stop being a single list". They do not.
+
+    At least one trailing axis must be an ARRAY. A box of pure slices -- `X[rows, 2:5, 4:12]`
+    -- is a contiguous n-D block that the ordinary route copies blockwise, where this path
+    would gather it an element at a time. That may still be worth taking, but it is a
+    measurement nobody has made, and declining is the answer that cannot regress.
     """
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
-    if drop_axes or inner_shape is None:
+    if inner_shape is None:
         return None
     if inner_shape == ():
         inner_shape = tuple(int(s) for s in chunk_spec.shape)
     chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
-    if len(chunk_spec.shape) != 2 or len(chunk_sel) != 2 or len(out_sel) != 2:
+    rank = len(chunk_spec.shape)
+    if rank < 2 or len(chunk_sel) != rank or len(inner_shape) != rank:
         return None
-    if len(shape) != 2 or len(inner_shape) != 2:
+    # The split axis is what the grouping walks; it cannot be the one that disappears.
+    if 0 in drop_axes or any(axis >= rank for axis in drop_axes):
+        return None
+    kept = [axis for axis in range(rank) if axis not in drop_axes]
+    if len(out_sel) != len(kept) or len(shape) != len(kept):
+        return None
+    # Back to full rank, so every check below indexes by CHUNK axis.
+    out_sel = tuple(
+        out_sel[kept.index(a)] if a in kept else slice(0, 1) for a in range(rank)
+    )
+    shape = tuple(shape[kept.index(a)] if a in kept else 1 for a in range(rank))
+
+    def axis_indices(sel, extent):
+        """One axis's selection as a 1-D index array, or None."""
+        if isinstance(sel, slice):
+            span = _step1_span(sel, extent)
+            return None if span is None else np.arange(span[0], span[1], dtype=np.int64)
+        if isinstance(sel, np.ndarray) and np.issubdtype(sel.dtype, np.integer):
+            return np.ravel(sel).astype(np.int64, copy=False)
         return None
 
-    rows, cols = chunk_sel
-    if isinstance(rows, slice):
-        # `X[:, cols]` -- every row, a panel of columns. The row axis is a slice for the same
-        # reason it is in `_chunk_unit_args`: a contiguous run spelled differently.
-        span = _step1_span(rows, chunk_spec.shape[0])
-        if span is None:
-            return None
-        rows = np.arange(span[0], span[1], dtype=np.int64)
-    if not (isinstance(rows, np.ndarray) and isinstance(cols, np.ndarray)):
-        return None
-    # Broadcast shapes: (n,1) against (1,m). `ravel` rather than `reshape(-1)` so a view is
-    # kept where one is possible.
-    if rows.ndim > 2 or cols.ndim > 2:
-        return None
-    rows = np.ravel(rows)
-    cols = np.ravel(cols)
-    if rows.size == 0 or cols.size == 0:
-        return None
-    if not (np.issubdtype(rows.dtype, np.integer) and np.issubdtype(cols.dtype, np.integer)):
-        return None
-
+    rows = axis_indices(chunk_sel[0], chunk_spec.shape[0])
     out_axis_sel = out_sel[0]
+    if rows is None or rows.size == 0:
+        return None
     if not _is_sorted_integer_axis(rows, out_axis_sel):
         return None
-    rows = rows.astype(np.int64, copy=False)
     if (rows < 0).any() or not _output_run_matches(rows, out_axis_sel):
         return None
-    # The output holds exactly the selected columns, and the item fills all of them.
-    if not _is_whole_axis(out_sel[1], shape[1]) or shape[1] != cols.size:
+
+    sels, any_array = [], False
+    for axis in range(1, rank):
+        if isinstance(chunk_sel[axis], np.ndarray):
+            any_array = True
+        idx = axis_indices(chunk_sel[axis], chunk_spec.shape[axis])
+        if idx is None or idx.size == 0:
+            return None
+        if (idx < 0).any() or (idx >= chunk_spec.shape[axis]).any():
+            return None
+        # The output holds exactly what was selected, and the item fills all of it.
+        if shape[axis] != idx.size or not _is_whole_axis(out_sel[axis], shape[axis]):
+            return None
+        # Still the GRID condition: one subchunk per axis after the split, or `locate` cannot
+        # keep walking axis 0 alone.
+        if inner_shape[axis] != chunk_spec.shape[axis]:
+            return None
+        sels.append(idx)
+    if not any_array:
         return None
-    if inner_shape[1] != chunk_spec.shape[1]:
-        return None
-    if (cols < 0).any() or (cols >= chunk_spec.shape[1]).any():
-        return None
+
+    # Row-major over the trailing selections, which is the order the output row wants.
+    strides, stride = [0] * (rank - 1), 1
+    for axis in reversed(range(1, rank)):
+        strides[axis - 1] = stride
+        stride *= int(chunk_spec.shape[axis])
+    offsets = np.zeros([sel.size for sel in sels], dtype=np.uint64)
+    for k, sel in enumerate(sels):
+        bshape = [1] * len(sels)
+        bshape[k] = sel.size
+        offsets = offsets + (sel.astype(np.uint64) * np.uint64(strides[k])).reshape(bshape)
 
     return (
         byte_getter.path,
         chunk_spec.shape,
         shape,
         rows,
-        cols.astype(np.uint64, copy=False),
+        np.ascontiguousarray(offsets.ravel()),
         out_axis_sel.start or 0,
         int(inner_shape[0]),
     )
