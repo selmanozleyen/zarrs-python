@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,6 +39,9 @@ use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, gather_runs, key_p
 
 /// The per-array state a decode needs, shared by every job of a call.
 struct JobContext {
+    /// See `CodecPipelineImpl::inner_chunk_is_raw`. When true a row's bytes are addressable
+    /// inside its chunk, so a job reads the ROW rather than the chunk holding it.
+    raw: bool,
     shard: Arc<ShardInfo>,
     store: ReadableWritableListableStorage,
     codec_options: CodecOptions,
@@ -91,6 +95,7 @@ impl CodecPipelineImpl {
     ) -> PyResult<Vec<&'a ChunkItem>> {
         let element_size = self.element_size()?;
         let ctx = JobContext {
+            raw: self.inner_chunk_is_raw,
             shard: shard.clone(),
             store: self.store.clone(),
             codec_options: (*codec_options).with_concurrent_target(1),
@@ -496,9 +501,23 @@ fn carve<'a>(
         };
 
         match range {
+            // One job per ROW, each reading exactly its own bytes.
+            //
+            // Only when the chunk is a plain byte tiling, so a row's offset inside it is
+            // arithmetic: `coord` is already the row's element offset within the chunk, and
+            // `run_len` its length. Measured at scale, 8,192 rows this way take 628 ms
+            // against 1121 for the chunks holding them -- the request COUNT is the same
+            // either way, so all that changes is how many bytes each one moves.
+            //
+            // The pieces are taken in coordinate order, which is ascending, so
+            // `DisjointBytes` still vends each byte once and coverage is still checked.
+            Some(range) if ctx.raw && raw_runs(coords, item.run_len) <= raw_max_reads_per_chunk() => {
+                raw_row_jobs(item, *range, piece, coords, element_size, ctx, &mut jobs)?;
+            }
             Some(range) => jobs.push(Job {
                 key: item.key.clone(),
                 range: *range,
+                raw: false,
                 out: piece,
                 coords,
                 run_len: item.run_len,
@@ -511,6 +530,128 @@ fn carve<'a>(
         }
     }
     Ok((jobs, absent))
+}
+
+/// Reads for one chunk above which reading the CHUNK beats reading its rows.
+///
+/// The two units cost very differently, and which wins is a property of the selection rather
+/// than of the array. Reading `k` rows out of a chunk costs `k` requests; reading the chunk
+/// costs one request plus a decode and a gather over the whole thing. Requests are the scarce
+/// resource -- this filesystem serves ~16k IOPS almost regardless of request size -- so rows
+/// win while `k` is small and lose once `k` is large enough that one chunk request would have
+/// covered them all.
+///
+/// At `chunk_size=1`, the workload this is for, `k` is 1: one row per chunk, and the row is
+/// obviously right. At `chunk_size=64` a run IS a whole inner chunk, `k` is 64, and reading it
+/// as 64 separate requests is 64x the IOPS for identical bytes.
+///
+/// Decided PER ITEM, not per call: one selection can be dense in some chunks and sparse in
+/// others, and each chunk's own count is already known here.
+///
+/// `ZARRS_RAW_MAX_READS_PER_CHUNK=0` disables the raw path entirely.
+fn raw_max_reads_per_chunk() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("ZARRS_RAW_MAX_READS_PER_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+/// How many READS this chunk's rows become once consecutive ones are merged.
+///
+/// The count that matters is runs, not rows: 64 consecutive rows are one read, and 64
+/// scattered ones are 64. A strided draw is the case that stays expensive however dense it
+/// looks -- `stride=2` puts 32 rows in a chunk and none of them adjacent.
+pub(crate) fn raw_runs(coords: &[u64], run_len: u64) -> usize {
+    if coords.is_empty() {
+        return 0;
+    }
+    1 + coords
+        .windows(2)
+        .filter(|w| w[1] != w[0] + run_len)
+        .count()
+}
+
+/// One job per ROW, each reading exactly its own bytes, for a chunk that is a plain byte
+/// tiling.
+///
+/// `coord` is already the row's element offset within the chunk and `run_len` its length, so
+/// the row's byte range is arithmetic. Measured at scale, 8,192 rows read this way take
+/// 628 ms against 1121 for the chunks holding them: the request COUNT is the same either way,
+/// and only the bytes each one moves change.
+///
+/// `piece` is the item's single contiguous claim, split here rather than re-claimed, so the
+/// vend-once cursor still sees exactly one take per item and coverage is still checked.
+#[allow(clippy::too_many_arguments)]
+fn raw_row_jobs<'a>(
+    item: &'a ChunkItem,
+    range: ByteRange,
+    piece: &'a mut [u8],
+    coords: &'a [u64],
+    element_size: usize,
+    ctx: &'a JobContext,
+    jobs: &mut Vec<Job<'a>>,
+) -> PyResult<()> {
+    let ByteRange::FromStart(base, _) = range else {
+        return Err(PyRuntimeError::new_err(format!(
+            "{}: the raw path needs a FromStart range, got {range:?}",
+            item.key
+        )));
+    };
+    let row_bytes = usize::try_from(item.run_len)
+        .ok()
+        .and_then(|r| r.checked_mul(element_size))
+        .ok_or_else(|| PyRuntimeError::new_err(format!("{}: row too large", item.key)))?;
+    // CONSECUTIVE rows are one range, not one each.
+    //
+    // Without this, a selection of 8-row blocks issues 8 requests of 8 KiB where one of
+    // 64 KiB would do -- and requests are the scarce resource, so it measured 0.458x against
+    // the chunk path at chunk_size=8 and 0.092x at 64. The rows were always adjacent; the
+    // code just did not look. Coalescing makes the dense cases cost what they should: at
+    // chunk_size=64 one run IS the chunk, so the raw path converges on the chunk read minus
+    // its decode rather than costing 64x the IOPS.
+    //
+    // `coords` is non-decreasing, so a run is a maximal stretch stepping by exactly
+    // `run_len`. Duplicates step by 0 and break the run, which is correct: the same row twice
+    // is two output pieces and cannot be one read.
+    let mut rest = piece;
+    let mut start = 0usize;
+    while start < coords.len() {
+        let mut end = start + 1;
+        while end < coords.len() && coords[end] == coords[end - 1] + item.run_len {
+            end += 1;
+        }
+        let rows = end - start;
+        let span = row_bytes
+            .checked_mul(rows)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("{}: run too large", item.key)))?;
+        let (run_out, tail) = rest.split_at_mut(span.min(rest.len()));
+        rest = tail;
+        let at = base
+            .checked_add(coords[start] * element_size as u64)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("{}: offset overflow", item.key)))?;
+        jobs.push(Job {
+            key: item.key.clone(),
+            range: ByteRange::FromStart(at, Some(span as u64)),
+            raw: true,
+            out: run_out,
+            coords: &[],
+            run_len: item.run_len,
+            ctx,
+        });
+        start = end;
+    }
+    if !rest.is_empty() {
+        return Err(PyRuntimeError::new_err(format!(
+            "{}: {} output bytes left after {} rows",
+            item.key,
+            rest.len(),
+            coords.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Hands out each byte range of the output at most once.
@@ -816,7 +957,10 @@ fn initial_permits(kind: Kind, want: usize, ceiling: usize) -> Vec<Permit> {
 /// One innermost chunk, and the slice of the output its elements belong in.
 struct Job<'a> {
     key: StoreKey,
+    /// The chunk's byte range, or -- on the raw path -- one ROW's range inside it.
     range: ByteRange,
+    /// Raw jobs carry the wanted bytes exactly: no decode, no scratch, no gather.
+    raw: bool,
     out: &'a mut [u8],
     coords: &'a [u64],
     /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
@@ -987,6 +1131,25 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         return Err(format!("{} vanished between index and read", job.key));
     };
 
+    // A raw job's read WAS the answer: its range is the row, not the chunk. No decode, no
+    // scratch, no gather -- but not copy-free either, since `get_partial` hands back an owned
+    // buffer and these bytes still have to be moved into the output.
+    if job.raw {
+        if bytes.len() != job.out.len() {
+            return Err(format!(
+                "{}: read {} bytes for an output of {}",
+                job.key,
+                bytes.len(),
+                job.out.len()
+            ));
+        }
+        job.out.copy_from_slice(&bytes);
+        return Ok(());
+    }
+
+    // `decode_shape` rather than `shard.subchunk_shape`: the unsharded case has no subchunk,
+    // and the decode unit is then the chunk itself. That distinction arrived with the
+    // rank-N work on this side of the merge and has to survive it.
     let shape = ctx.decode_shape.as_slice();
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
