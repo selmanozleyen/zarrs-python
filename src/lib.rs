@@ -13,7 +13,7 @@ use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_stub_gen::define_stub_info_gatherer;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
@@ -657,9 +657,38 @@ fn cached_partial_decoder<'a>(
 }
 
 /// A Python module implemented in Rust.
+/// `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
+///
+/// A build is an index actually read and decoded; the two hit counts are the per-call cache
+/// and the per-array one, which are separate because the second only engages on a read-only
+/// store. Exposed so a test can assert the cache DID something -- correctness and timing both
+/// pass a cache that is never consulted.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn shard_index_cache_stats() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        read_decode::INDEX_CALL_HITS.load(Ordering::Relaxed),
+        read_decode::INDEX_ARRAY_HITS.load(Ordering::Relaxed),
+        read_decode::INDEX_BUILDS.load(Ordering::Relaxed),
+    )
+}
+
+/// Zero the counters, so one test's numbers are its own.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn reset_shard_index_cache_stats() {
+    use std::sync::atomic::Ordering;
+    read_decode::INDEX_CALL_HITS.store(0, Ordering::Relaxed);
+    read_decode::INDEX_ARRAY_HITS.store(0, Ordering::Relaxed);
+    read_decode::INDEX_BUILDS.store(0, Ordering::Relaxed);
+}
+
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_function(wrap_pyfunction!(shard_index_cache_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(reset_shard_index_cache_stats, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
     m.add_class::<chunk_item::ChunkItems>()?;

@@ -255,6 +255,7 @@ impl CodecPipelineImpl {
         // The call's own cache first, and it is not conditional: within one call nothing can
         // have moved the bytes a decoder addresses, so it is always safe to reuse one.
         if let Some(found) = call_cache.get(key) {
+            INDEX_CALL_HITS.fetch_add(1, Ordering::Relaxed);
             return Ok(found.clone());
         }
         if self.cache_shard_indexes {
@@ -264,10 +265,12 @@ impl CodecPipelineImpl {
                 .get(key)
                 .cloned();
             if let Some(found) = found {
+                INDEX_ARRAY_HITS.fetch_add(1, Ordering::Relaxed);
                 call_cache.insert(key.clone(), found.clone());
                 return Ok(found);
             }
         }
+        INDEX_BUILDS.fetch_add(1, Ordering::Relaxed);
         let decoder = Arc::new(build()?);
         call_cache.insert(key.clone(), decoder.clone());
         if self.cache_shard_indexes {
@@ -620,6 +623,21 @@ fn trailing_axes_are_whole(subset: &zarrs::array::ArraySubset, shape: &[NonZeroU
             .skip(1)
             .all(|((&start, &extent), whole)| start == 0 && extent == whole.get())
 }
+
+/// What the shard index cache did. Counted because nothing else can tell.
+///
+/// A cache that is never consulted passes every correctness test ever written -- repeated
+/// reads still agree, writes still invalidate. And on a small array it is invisible in the
+/// timings too: the index is already in page cache, so a hit saves a memcpy rather than the
+/// full-latency round trip the cache exists to avoid. Measured that way it reported 1.03x,
+/// which says the regime was wrong and nothing about whether the cache works.
+///
+/// Three outcomes, kept apart because they mean different things: the CALL cache is
+/// unconditional and always safe, the ARRAY cache only engages on a read-only store, and a
+/// BUILD is an index actually read and decoded.
+pub(crate) static INDEX_CALL_HITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static INDEX_ARRAY_HITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 
 /// Live workers across every in-flight call, counted separately per kind.
 static LIVE_READERS: AtomicUsize = AtomicUsize::new(0);
