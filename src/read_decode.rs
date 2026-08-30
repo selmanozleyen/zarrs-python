@@ -879,12 +879,25 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let shape = ctx.decode_shape.as_slice();
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
-    scratch.clear();
-    scratch.resize(needed, 0);
+    // GROW only. `clear()` then `resize(needed, 0)` zero-fills the whole buffer, and
+    // `decode_into` below writes every byte of it -- the view is built over
+    // `new_with_shape`, the entire chunk -- so the fill is overwritten without ever being
+    // read. At an inner chunk of 91,549 f32 that is 366 KiB memset per decode, and a
+    // chunk_size 64 preload decodes ~2,800 chunks: about a gigabyte of zeroing per preload,
+    // thrown away.
+    //
+    // The buffer is reused across decodes by one worker, so it settles at the largest chunk
+    // it has seen and stops reallocating too. Everything below addresses `&mut scratch[..n]`
+    // rather than the whole Vec, so a buffer left long by a bigger chunk cannot widen a
+    // bounds check.
+    if scratch.len() < needed {
+        scratch.resize(needed, 0);
+    }
+    let scratch = &mut scratch[..needed];
 
     let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
     {
-        let slice = UnsafeCellSlice::new(scratch.as_mut_slice());
+        let slice = UnsafeCellSlice::new(&mut scratch[..]);
         let mut view = unsafe {
             // SAFETY: this view is the only writer to `scratch`, which this thread owns.
             ArrayBytesFixedDisjointView::new(
@@ -906,8 +919,8 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             .map_err(|e| e.to_string())?;
     }
     match job.grid {
-        Some((starts, run)) => gather_runs(scratch, job.coords, starts, run, job.out, size),
-        None => gather(scratch, job.coords, job.run_len, job.out, size),
+        Some((starts, run)) => gather_runs(&scratch[..], job.coords, starts, run, job.out, size),
+        None => gather(&scratch[..], job.coords, job.run_len, job.out, size),
     }
         .map_err(|e| format!("{}: {e}", job.key))
 }
