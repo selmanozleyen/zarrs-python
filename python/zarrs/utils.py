@@ -724,22 +724,20 @@ def chunk_info_for_read(
             handle.push_grid(*args)
         return RustChunkInfo(handle, write_empty_chunks=True)
 
-    return _chunk_items(
-        [
-            (byte_getter, chunk_spec, box_chunk_sel, box_out_sel, is_complete)
-            for (
-                byte_getter,
-                chunk_spec,
-                chunk_selection,
-                out_selection,
-                is_complete,
-            ) in entries
-            for box_chunk_sel, box_out_sel in split_selection_runs(
-                chunk_selection, out_selection, chunk_spec.shape
-            )
-        ],
-        drop_axes,
-        shape,
+    # Nothing else is served here. Every selection either produced a handle above or is
+    # declined to zarr-python, which is a real fallback rather than a slower Rust path.
+    #
+    # There WAS a second Rust route -- `retrieve_chunks_and_apply_index`, a partial decoder per
+    # chunk over rayon. An audit of the public indexing surface on 2026-08-30 (44 forms over
+    # 2-D sharded, 2-D plain and 3-D sharded) found exactly one selection still reaching it,
+    # `X[5]`, and once that was served nothing did. Keeping a second read path that nothing
+    # reaches is worse than not having one: it is a second concurrency model, a second set of
+    # knobs that silently govern nothing, and the only rayon left on the read side.
+    #
+    # `DiscontiguousArrayError` is what `pipeline.read` catches to fall back, so raising it is
+    # how a decline is spelled.
+    raise DiscontiguousArrayError(
+        "this selection is not served by the chunk-unit path"
     )
 
 

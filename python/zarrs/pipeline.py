@@ -242,11 +242,10 @@ class ZarrsCodecPipeline(CodecPipeline):
         else:
             out: NDArrayLike = out.as_ndarray_like()
             desc = chunks_desc.chunk_info_with_indices
-            retrieve = (
-                self.impl.retrieve_chunk_items_and_apply_index
-                if isinstance(desc, ChunkItems)
-                else self.impl.retrieve_chunks_and_apply_index
-            )
+            # One entry point. `chunk_info_for_read` either produces a handle or raises, and
+            # the raise is caught above as a fall back to zarr-python -- there is no second
+            # Rust read path to choose between any more.
+            retrieve = self.impl.retrieve_chunk_items_and_apply_index
             # Read HERE, per call, not at array open, so `with zarr.config.set(...)` scopes
             # them to the reads inside the block the way a caller expects. Read at open they
             # would be frozen for the array's life and a context manager around a read would
