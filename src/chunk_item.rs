@@ -315,10 +315,17 @@ pub(crate) fn build_chunk_unit_items(
         )));
     }
     // Rejects a zero extent on any axis, which is what the scalar check used to do for one.
-    let inner_nz = to_nonzero_u64_vec(inner.to_vec())?;
+    // Checked in place rather than through `to_nonzero_u64_vec`: that allocates a Vec, and
+    // `inner.to_vec()` allocates another, both per ENTRY. A scattered batch pushes thousands
+    // of entries per call, and the only thing wanted out of them is `inner[0]`.
+    if let Some(axis) = inner.iter().position(|e| *e == 0) {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "the inner chunk has extent zero on axis {axis}: {inner:?}"
+        )));
+    }
     // What axis 0 groups by. Named apart from `inner` so the two cannot be confused: one is a
     // scalar extent on the split axis, the other the whole decode unit.
-    let split = inner_nz[0].get();
+    let split = inner[0];
     // Strided views are legal here: an index array can be a slice of a larger one.
     let indices = indices.as_array();
     let n = indices.len();
