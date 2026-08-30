@@ -118,8 +118,8 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10, vec![])?;
-        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10, vec![])?;
+        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10, vec![], None)?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10, vec![], None)?;
 
         let got: Vec<_> = handle
             .as_slice()
@@ -146,18 +146,18 @@ fn test_push_entry_refuses_output_another_entry_owns() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10, vec![])?;
+        handle.push_entry("c/0", vec![95], vec![100], a.readonly(), 0, 10, vec![], None)?;
 
         // `a` produced two items covering output 0..2, so an entry starting at 1 would give
         // two items the same byte.
         assert!(
             handle
-                .push_entry("c/1", vec![95], vec![100], b.readonly(), 1, 10, vec![])
+                .push_entry("c/1", vec![95], vec![100], b.readonly(), 1, 10, vec![], None)
                 .is_err(),
             "an out_start inside an entry already pushed"
         );
         // Starting where the last one ended is exactly what zarr produces, and is allowed.
-        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10, vec![])?;
+        handle.push_entry("c/1", vec![95], vec![100], b.readonly(), 2, 10, vec![], None)?;
         assert_eq!(handle.as_slice().len(), 3);
         Ok(())
     })
