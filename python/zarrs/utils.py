@@ -329,11 +329,6 @@ def _chunk_unit_args(
     # shard GRID, not the selection, and it is what lets `locate` descend on axis 0 alone.
     starts: list[int] = []
     widths: list[int] = []
-    # Where this entry's output begins and how wide it is, per trailing axis. Both are needed:
-    # the start places the band, and the width says how much of a row it fills -- which is no
-    # longer the whole row once the output is banded.
-    out_starts: list[int] = []
-    out_widths: list[int] = []
     for axis in range(1, rank):
         span = _step1_span(chunk_sel[axis], chunk_spec.shape[axis])
         if span is None:
@@ -341,16 +336,8 @@ def _chunk_unit_args(
         lo, hi = span
         # The output holds exactly what was selected -- so an item filling all of it is one
         # contiguous output range, which is what the carve hands out.
-        # The output axis need not be WHOLE -- only a contiguous band as wide as the chunk
-        # selection. It stopped being whole as soon as the shard grid divided the array's
-        # trailing axis: a two-shard-wide array gives every entry half the output width, and
-        # `shape[axis] != hi - lo` refused it. That is the guard that actually kept this
-        # geometry out; the inner-chunk one below never got a chance to.
-        out_span = _step1_span(out_sel[axis], shape[axis])
-        if out_span is None or out_span[1] - out_span[0] != hi - lo:
+        if not _is_whole_axis(out_sel[axis], shape[axis]) or shape[axis] != hi - lo:
             return None
-        out_starts.append(int(out_span[0]))
-        out_widths.append(int(hi - lo))
         if inner_shape[axis] != chunk_spec.shape[axis]:
             return None
         starts.append(lo)
@@ -403,8 +390,6 @@ def _chunk_unit_args(
     start = out_axis_sel.start or 0
     if not _output_run_matches(indices, out_axis_sel):
         return None
-    out_starts.insert(0, int(start))
-    out_widths.insert(0, int(shape[0]))
 
     return (
         "entry",
@@ -412,8 +397,7 @@ def _chunk_unit_args(
         chunk_spec.shape,
         shape,
         indices,
-        tuple(out_starts),
-        tuple(out_widths),
+        start,
         int(inner_shape[0]),
         tuple(int(v) for v in starts),
     )
