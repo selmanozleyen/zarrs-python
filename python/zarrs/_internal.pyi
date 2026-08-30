@@ -57,6 +57,31 @@ class ChunkItems:
         since the output subset is bounded against it. A larger one describes bytes the buffer
         does not have, and that produces wrong data rather than an error.
         """
+    def push_span(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        first: builtins.int,
+        count: builtins.int,
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a contiguous SPAN of the split axis, without naming its elements.
+
+        `X[a:b]` and every whole-row read of a backed CSR arrive here. The elements are
+        `first..first + count` on axis 0 with the trailing axes taken whole, which in row-major
+        order is ONE contiguous block per inner chunk -- so each item needs a single coordinate
+        and a run, not a coordinate per element.
+
+        This is the whole point. `_chunk_unit_args` used to expand the span with
+        `np.arange(a, b)` because "a contiguous slice IS a sorted integer axis, spelled
+        differently" -- true, and it costs one u64 per ELEMENT. On a chunk_size 64 preload that
+        is 11.9M numbers, ~95 MB, built in numpy and walked one at a time here: measured at
+        98 ms to build and 112 ms to hand over, against a preload of ~317 ms. Described as
+        runs, the same read is 0.69 ms.
+        """
     def push_grid(
         self,
         key: builtins.str,
@@ -112,15 +137,6 @@ class CodecPipelineImpl:
         file_handle_cache_size: builtins.int = 0,
         store_is_read_only: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
-    def retrieve_chunks_and_apply_index(
-        self,
-        chunk_descriptions: typing.Sequence[ChunkItem],
-        value: numpy.typing.NDArray[typing.Any],
-        read_concurrency: typing.Optional[builtins.int] = None,
-        decode_concurrency: typing.Optional[builtins.int] = None,
-        read_worker_ceiling: typing.Optional[builtins.int] = None,
-        decode_worker_ceiling: typing.Optional[builtins.int] = None,
-    ) -> None: ...
     def retrieve_chunk_items_and_apply_index(
         self,
         chunk_items: ChunkItems,
@@ -131,11 +147,16 @@ class CodecPipelineImpl:
         decode_worker_ceiling: typing.Optional[builtins.int] = None,
     ) -> None:
         r"""
-        The same read as `retrieve_chunks_and_apply_index`, from a `ChunkItems` handle.
+        The one read entry point.
 
-        A `Vec<ChunkItem>` argument costs one pyclass allocation per item on the way out
-        of the builder and one extraction per item on the way in here. A handle costs one
-        of each per call, whatever the selection.
+        Takes a `ChunkItems` handle rather than a `Vec<ChunkItem>`: the vector costs one
+        pyclass allocation per item on the way out of the builder and one extraction per item
+        on the way in, where a handle costs one of each per call whatever the selection.
+
+        There was a second entry point until 2026-08-30 -- a partial decoder per chunk over
+        rayon, for selections this path declined. An audit of the public indexing surface found
+        nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
+        than a slower second Rust path.
         """
     def store_chunks_with_indices(
         self,
@@ -143,3 +164,19 @@ class CodecPipelineImpl:
         value: numpy.typing.NDArray[typing.Any],
         write_empty_chunks: builtins.bool,
     ) -> None: ...
+
+def reset_shard_index_cache_stats() -> None:
+    r"""
+    Zero the counters, so one test's numbers are its own.
+    """
+
+def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
+    r"""
+    A Python module implemented in Rust.
+    `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
+
+    A build is an index actually read and decoded; the two hit counts are the per-call cache
+    and the per-array one, which are separate because the second only engages on a read-only
+    store. Exposed so a test can assert the cache DID something -- correctness and timing both
+    pass a cache that is never consulted.
+    """
