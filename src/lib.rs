@@ -281,21 +281,43 @@ impl CodecPipelineImpl {
                     )
                 })?
             };
-            if !declined.is_empty() {
-            // Unreachable: a read item always carries coordinates, because `chunk_info_for_read`
-            // only ever produces a `ChunkItems` handle and every entry point into that sets
-            // them. It was a hand-off to a second Rust path that no longer exists, so if it
-            // ever fires the invariant broke and silence would be the wrong answer.
+            if declined.is_empty() {
+                return Ok(());
+            }
+            // Whatever that path could not take still has to be read, down the fused one.
+            let declined: Vec<chunk_item::ChunkItem> = declined.into_iter().cloned().collect();
+            // Unreachable: a read item always carries coordinates, because
+            // `chunk_info_for_read` only produces a `ChunkItems` handle and every route into
+            // that sets them. This was a hand-off to a second Rust path that no longer
+            // exists, so if it fires the invariant broke and silence is the wrong answer.
             return Err(PyRuntimeError::new_err(format!(
-                "{} items reached the read path without coordinates; \
-                 this path has no fallback and the caller should have declined",
+                "{} read items arrived without coordinates; there is no fallback path and \
+                 the caller should have declined to zarr-python instead",
                 declined.len()
             )));
-        }
         }
         // Not the hot path: the batch is mixed, or arrived as a list.
         Ok(())
     }
+
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl CodecPipelineImpl {
+    #[pyo3(signature = (
+        array_metadata,
+        store_config,
+        *,
+        validate_checksums=false,
+        chunk_concurrent_minimum=None,
+        chunk_concurrent_maximum=None,
+        num_threads=None,
+        direct_io=false,
+        file_handle_cache_size=0,
+        store_is_read_only=false,
+    ))]
+    #[new]
     fn new(
         array_metadata: &str,
         mut store_config: StoreConfig,
@@ -381,6 +403,17 @@ impl CodecPipelineImpl {
         })
     }
 
+    /// The one read entry point.
+    ///
+    /// Takes a `ChunkItems` handle rather than a `Vec<ChunkItem>`: the vector costs one
+    /// pyclass allocation per item on the way out of the builder and one extraction per item
+    /// on the way in, where a handle costs one of each per call whatever the selection.
+    ///
+    /// There was a second entry point until 2026-08-30 -- a partial decoder per chunk over
+    /// rayon, for selections this path declined. An audit of the public indexing surface found
+    /// nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
+    /// than a slower second Rust path.
+    #[pyo3(signature = (chunk_items, value, read_concurrency=None, decode_concurrency=None, read_worker_ceiling=None, decode_worker_ceiling=None))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,

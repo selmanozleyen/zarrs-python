@@ -19,7 +19,6 @@ from zarrs.utils import (
     DiscontiguousArrayError,
     _as_int64_batch_info,
     make_slice_selection,
-    split_selection_runs,
 )
 
 if TYPE_CHECKING:
@@ -91,16 +90,12 @@ def test_unsigned_descending_rows_are_refused(dtype: str, sharded) -> None:
         zarr.open_array(path, mode="r")[np.array([27, 3], dtype=dtype), :]
 
 
-def test_negative_chunk_relative_index_is_refused() -> None:
-    """A negative index must never become a slice bound: `slice(-13, -12)` is an empty
-    subset near the end of the chunk, not the row the caller asked for."""
-    with pytest.raises(DiscontiguousArrayError):
-        list(
-            split_selection_runs(
-                (np.array([-13]), slice(0, 20, 1)), (slice(0, 1), slice(0, 20))
-            )
-        )
-
+# `test_negative_chunk_relative_index_is_refused` was here. It called `split_selection_runs`
+# directly, and that function went with the fused read path -- reads no longer split, and
+# writes never did. The invariant it guarded is still guarded, on the live path and in two
+# places: `_chunk_unit_args` declines a negative index (`utils.py`, `(indices < 0).any()`) and
+# `build_chunk_unit_items` errors on one (`chunk_item.rs`, "index {} is negative"). What is
+# gone is a test of how a deleted function spelled the refusal.
 
 def test_sorted_selections_never_produce_a_negative_bound(sharded) -> None:
     """The guard above must not be firing on ordinary reads."""

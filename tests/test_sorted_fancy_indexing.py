@@ -115,14 +115,15 @@ def test_writes_are_not_split(
 
     The values alone prove nothing: without strict mode the write falls back to zarr-python
     whatever happens, so this passed identically when writes WERE split. What it asserts is
-    that the splitter is never reached. Rows 1, 3 and 4 share a chunk -- the losing case.
+    that a write is never split. Rows 1, 3 and 4 share a chunk -- the losing case.
     """
     path, expected = sharded
     index = np.array([1, 3, 4])
-    monkeypatch.setattr(
-        "zarrs.utils.split_selection_runs",
-        lambda *_: pytest.fail("a write reached split_selection_runs"),
-    )
+    # There is no splitter left to reach. `chunk_info_for_write` goes straight to
+    # `_chunk_items`, one item per entry, and the function this used to guard against was
+    # removed with the fused read path -- so "a write is never split" is now structural
+    # rather than something a monkeypatch has to catch. What is still worth asserting is that
+    # the write lands correctly when rows share a chunk, which is the losing case.
     with zarr.config.set(ZARRS):
         z = zarr.open_array(path, mode="r+")
         z[index, :] = np.full((len(index), SHAPE[1]), -1.0)
@@ -151,18 +152,10 @@ def test_contiguous_output_does_not_imply_sorted_input(
     np.testing.assert_array_equal(got, expected[index])
 
 
-def test_a_split_read_is_rejected_without_the_splitter(
-    sharded: tuple[Path, np.ndarray], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The tests above must be exercising the splitter, not passing for some other reason."""
-    monkeypatch.setattr(
-        "zarrs.utils.split_selection_runs",
-        lambda chunk_sel, out_sel, chunk_shape=None: ((chunk_sel, out_sel),),
-    )
-    path, _ = sharded
-    with pytest.raises(DiscontiguousArrayError):
-        open_strict(path)[np.array([0, 3, 4, 5, 17, 30])]
-
+# `test_a_split_read_is_rejected_without_the_splitter` was here -- a meta-test asserting the
+# tests above really did exercise `split_selection_runs`. That function went with the fused
+# read path, so the assertion has nothing left to make. The tests above now prove their own
+# point directly, through `entries["handle"]`, which says which Rust path actually ran.
 
 @pytest.mark.parametrize(
     "mask",
