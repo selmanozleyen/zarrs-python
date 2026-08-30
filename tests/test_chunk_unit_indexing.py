@@ -399,3 +399,65 @@ def test_a_contiguous_slice_takes_the_path(
     np.testing.assert_array_equal(got, truth[selection])
     assert entries["handle"] > 0, "a contiguous slice did not take the chunk-unit path"
     assert entries["list"] == 0
+
+
+def test_paired_points_take_the_path(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """`X[rows, cols]` -- one element per pair, and a flat result.
+
+    zarr builds a `CoordinateIndexer` for this, so it arrives as one integer array per axis
+    against a flat output slice. The columns deliberately do not ascend with the rows: an
+    implementation that folded them into a single shared offset would still pass a test where
+    they happened to.
+    """
+    path, values = full_width
+    rows = np.array([1, 3, 3, 9, 60, 61, 200])
+    cols = np.array([40, 0, 17, 5, 47, 2, 33])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, cols]
+
+    assert got.shape == (rows.size,), "a point selection is flat"
+    np.testing.assert_array_equal(got, values[rows, cols])
+    assert entries["handle"] > 0, "a point selection did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_a_single_column_takes_the_path(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """`X[rows, 5]`, which is a point selection with a constant column, not a dropped axis."""
+    path, values = full_width
+    rows = np.array([1, 3, 3, 9, 60, 61, 200])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, 5]
+
+    np.testing.assert_array_equal(got, values[rows, 5])
+    assert entries["handle"] > 0, "a single column did not take the chunk-unit path"
+
+
+def test_points_match_zarr_python(full_width: tuple[Path, np.ndarray]) -> None:
+    """Byte for byte against the reference pipeline, on the same store."""
+    path, _ = full_width
+    rng = np.random.default_rng(0)
+    rows = np.sort(rng.choice(256, size=200, replace=True))
+    cols = rng.choice(48, size=200, replace=True)
+    with zarr.config.set(CHUNK_UNIT):
+        mine = zarr.open_array(path, mode="r")[rows, cols]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r")[rows, cols]
+    np.testing.assert_array_equal(mine, theirs)
+
+
+def test_points_with_unsorted_rows_decline_and_are_still_right(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """Descending rows would make the output positions step backwards. Decline, stay correct."""
+    path, values = full_width
+    rows = np.array([200, 3, 61, 9])
+    cols = np.array([1, 2, 3, 4])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r")[rows, cols]
+
+    np.testing.assert_array_equal(got, values[rows, cols])
+    assert entries["handle"] == 0, "an unsorted point selection reached the chunk-unit path"

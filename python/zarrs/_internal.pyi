@@ -57,6 +57,26 @@ class ChunkItems:
         since the output subset is bounded against it. A larger one describes bytes the buffer
         does not have, and that produces wrong data rather than an error.
         """
+    def push_points(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        offsets: numpy.typing.NDArray[numpy.uint64],
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a POINT selection: one element per index, each naming its own offset inside that
+        index's elements.
+
+        `X[rows, cols]` and `X[rows, 5]` both arrive as this -- zarr builds a
+        `CoordinateIndexer` rather than dropping an axis -- and the ordinary route spends two
+        allocations and a partial-decode call PER POINT. Grouping them by the chunk that gets
+        decoded is the whole win, and it is the same grouping the row case uses: the output is
+        flat, so `shape` is 1-D here while `chunk_shape` is not.
+        """
 
 @typing.final
 class CodecPipelineImpl:

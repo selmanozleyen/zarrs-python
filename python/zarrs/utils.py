@@ -428,6 +428,71 @@ def _chunk_unit_args(
     )
 
 
+def _point_unit_args(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> tuple | None:
+    """Args for `ChunkItems.push_points`, or None if this entry is not a point selection.
+
+    `X[rows, cols]` and `X[rows, 5]` both reach the pipeline as a `CoordinateIndexer`: one
+    integer array per axis, paired element-wise, against a FLAT output slice -- not as a
+    dropped axis, which is what you would guess from the syntax.
+
+    Each point is a single element, so the run length is one and the only thing varying is
+    where inside its own row each point sits. That is what the per-index offsets carry. The
+    ordinary route spends two allocations and a partial-decode call per POINT, so grouping
+    them by the chunk that actually gets decoded is worth more here than anywhere else.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if drop_axes or inner_shape is None:
+        return None
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
+    rank = len(chunk_spec.shape)
+    # Rank 1 is the plain row case, which `_chunk_unit_args` already serves better.
+    if rank < 2 or len(chunk_sel) != rank or len(inner_shape) != rank:
+        return None
+    # The output of a point selection is flat, however many axes were indexed.
+    if len(out_sel) != 1 or len(shape) != 1:
+        return None
+    if not all(
+        isinstance(sel, np.ndarray)
+        and sel.ndim == 1
+        and np.issubdtype(sel.dtype, np.integer)
+        for sel in chunk_sel
+    ):
+        return None
+    n = chunk_sel[0].size
+    if n == 0 or any(sel.size != n for sel in chunk_sel):
+        return None
+    rows = chunk_sel[0].astype(np.int64, copy=False)
+    out_axis_sel = out_sel[0]
+    if not _is_sorted_integer_axis(rows, out_axis_sel):
+        return None
+    if (rows < 0).any() or not _output_run_matches(rows, out_axis_sel):
+        return None
+    # Still the GRID condition: one subchunk on every axis after the split, or `locate`
+    # cannot keep walking axis 0 alone.
+    for axis in range(1, rank):
+        if inner_shape[axis] != chunk_spec.shape[axis]:
+            return None
+    offsets = np.zeros(n, dtype=np.uint64)
+    stride = 1
+    for axis in reversed(range(1, rank)):
+        col = chunk_sel[axis]
+        if (col < 0).any() or (col >= chunk_spec.shape[axis]).any():
+            return None
+        offsets += col.astype(np.uint64, copy=False) * np.uint64(stride)
+        stride *= int(chunk_spec.shape[axis])
+    return (
+        byte_getter.path,
+        chunk_spec.shape,
+        shape,
+        rows,
+        offsets,
+        out_axis_sel.start or 0,
+        int(inner_shape[0]),
+    )
+
+
 def chunk_info_for_write(
     batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
@@ -464,6 +529,17 @@ def chunk_info_for_read(
         handle = ChunkItems()
         for args in unit_args:
             handle.push_entry(*args)
+        return RustChunkInfo(handle, write_empty_chunks=True)
+
+    # A point selection is a different SHAPE of batch, not a failed row one, so it gets its
+    # own all-or-nothing pass rather than being mixed in.
+    point_args = [
+        _point_unit_args(entry, shape, drop_axes, inner_chunk_shape) for entry in entries
+    ]
+    if point_args and all(args is not None for args in point_args):
+        handle = ChunkItems()
+        for args in point_args:
+            handle.push_points(*args)
         return RustChunkInfo(handle, write_empty_chunks=True)
 
     return _chunk_items(

@@ -50,7 +50,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
             indices.readonly(),
             7,
             inner,
-            &[],
+            crate::chunk_item::Offsets::Uniform(&[]),
         )?;
 
         let got: Vec<_> = items
@@ -85,7 +85,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 bad.readonly(),
                 0,
                 inner,
-                &[]
+                crate::chunk_item::Offsets::Uniform(&[])
             )
             .is_err()
         );
@@ -99,7 +99,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 over.readonly(),
                 0,
                 inner,
-                &[]
+                crate::chunk_item::Offsets::Uniform(&[])
             )
             .is_err()
         );
@@ -186,7 +186,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
             indices.readonly(),
             2,
             inner,
-            &[0],
+            crate::chunk_item::Offsets::Uniform(&[0]),
         )?;
 
         let got: Vec<_> = items
@@ -237,7 +237,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             0,
             4,
-            &[0],
+            crate::chunk_item::Offsets::Uniform(&[0]),
         );
         assert!(narrower.is_ok(), "a contiguous column subset is served, not refused");
         // 2 of 4 rows by 5 of 10 columns is 2 runs of 5 at a stride of 10 -- not one range.
@@ -249,7 +249,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             0,
             4,
-            &[0, 0],
+            crate::chunk_item::Offsets::Uniform(&[0, 0]),
         );
         assert!(strided.is_err(), "a strided trailing box must be refused");
         // A run that starts inside its own sub-row and walks off the end of it, likewise.
@@ -260,7 +260,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             0,
             4,
-            &[0, 8],
+            crate::chunk_item::Offsets::Uniform(&[0, 8]),
         );
         assert!(wraps.is_err(), "a run leaving its own sub-row must be refused");
         // Differing ARITY is refused too -- a 1-D chunk against a 2-D output.
@@ -271,7 +271,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             indices.readonly(),
             0,
             4,
-            &[0],
+            crate::chunk_item::Offsets::Uniform(&[0]),
         );
         assert!(ranks.is_err());
         Ok(())
@@ -320,4 +320,44 @@ fn test_gather_copies_a_run_per_coordinate() {
     // A zero run length would make the output region match at every coordinate count.
     let mut out = vec![0u8; 0];
     assert!(crate::utils::gather(&scratch, &[0], 0, &mut out, 2).is_err());
+}
+
+/// `push_points` is `#[pymethods]`, so its arguments are whatever Python passed. Two things
+/// it must refuse rather than trust: a point whose offset leaves its own index's elements --
+/// `gather` only knows the whole decoded buffer, so that would return the NEXT index's
+/// element under this point's name -- and an offset array of the wrong length.
+#[test]
+fn test_push_points_refuses_offsets_that_leave_their_row() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let rows = PyArray1::from_slice(py, &[0i64, 1, 2]);
+        // A chunk row holds 48 elements, so 48 is one past the end of index 0's own.
+        let past = PyArray1::from_slice(py, &[0u64, 48, 2]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        assert!(
+            handle
+                .push_points("c/0/0", vec![64, 48], vec![3], rows.readonly(),
+                             past.readonly(), 0, 8)
+                .is_err(),
+            "a point past its own row must be refused"
+        );
+
+        let short = PyArray1::from_slice(py, &[0u64, 1]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        assert!(
+            handle
+                .push_points("c/0/0", vec![64, 48], vec![3], rows.readonly(),
+                             short.readonly(), 0, 8)
+                .is_err(),
+            "one offset per index, or the pairing is guesswork"
+        );
+
+        let ok = PyArray1::from_slice(py, &[0u64, 47, 2]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        handle.push_points("c/0/0", vec![64, 48], vec![3], rows.readonly(),
+                           ok.readonly(), 0, 8)?;
+        Ok(())
+    })
 }

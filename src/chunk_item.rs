@@ -122,6 +122,29 @@ fn selection_to_array_subset(
     }
 }
 
+/// Where each selected index's run begins inside that index's own elements.
+#[derive(Clone, Copy)]
+pub(crate) enum Offsets<'a> {
+    /// Per-axis STARTS of a sub-box shared by every index: `X[rows, 8:24]`. The offset is
+    /// derived from these by `trailing_layout`, which is also what checks the box is one run.
+    Uniform(&'a [u64]),
+    /// One per index: a POINT selection, `X[rows, cols]`, where each point names its own
+    /// element. The run is then a single element and the output is flat, so the grouping by
+    /// inner chunk is the whole win -- the ordinary route costs a partial-decode call PER
+    /// POINT.
+    PerIndex(&'a [u64]),
+}
+
+impl Offsets<'_> {
+    /// How many indices this describes, when it describes a fixed number.
+    fn len(self) -> Option<usize> {
+        match self {
+            Self::Uniform(_) => None,
+            Self::PerIndex(offsets) => Some(offsets.len()),
+        }
+    }
+}
+
 /// `(row_stride, run_len, elem_offset)` for a selection whose trailing axes may be PARTIAL.
 ///
 /// `row_stride` is one index's worth of the decoded chunk -- the product of every axis after
@@ -221,7 +244,7 @@ pub(crate) fn build_chunk_unit_items(
     indices: PyReadonlyArray1<'_, i64>,
     out_start: u64,
     inner: u64,
-    elem_starts: &[u64],
+    offsets: Offsets<'_>,
 ) -> PyResult<Vec<ChunkItem>> {
     let inner = NonZeroU64::new(inner)
         .ok_or_else(|| PyErr::new::<PyValueError, _>("inner chunk shape must be non-zero"))?
@@ -232,7 +255,25 @@ pub(crate) fn build_chunk_unit_items(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let (row_stride, run_len, elem_offset) = trailing_layout(&chunk_shape, &shape, elem_starts)?;
+    let (row_stride, run_len, uniform_offset) = match offsets {
+        Offsets::Uniform(starts) => trailing_layout(&chunk_shape, &shape, starts)?,
+        // A point names ONE element, so the run is one element and the output is flat. The
+        // trailing extents are not a shared sub-box here -- each point carries its own offset
+        // -- so only the stride comes from the chunk.
+        Offsets::PerIndex(_) => (chunk_shape[1..].iter().product::<u64>(), 1, 0),
+    };
+    if row_stride == 0 {
+        return Err(PyErr::new::<PyValueError, _>(
+            "a trailing axis of extent zero selects nothing",
+        ));
+    }
+    if let Some(given) = offsets.len() {
+        if given != n {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "a point selection needs one offset per index: {given} against {n}"
+            )));
+        }
+    }
     let num_elements: u64 = chunk_shape.iter().product();
     let chunk_shape = to_nonzero_u64_vec(chunk_shape)?;
     let shape = to_nonzero_u64_vec(shape)?;
@@ -323,7 +364,23 @@ pub(crate) fn build_chunk_unit_items(
             // the trailing axes whole the offset is 0 and the stride is the run.
             coords: Some(
                 (a..b)
-                    .map(|i| at(i).map(|v| (v - lo) * row_stride + elem_offset))
+                    .map(|i| {
+                        let offset = match offsets {
+                            Offsets::Uniform(_) => uniform_offset,
+                            Offsets::PerIndex(per) => per[i],
+                        };
+                        // Every offset, not just a shared one, must leave the index's own
+                        // elements: `gather` only knows the whole decoded buffer's length, so
+                        // a point past its row would return the NEXT row's element under this
+                        // point's name.
+                        if offset.saturating_add(run_len) > row_stride {
+                            return Err(PyErr::new::<PyValueError, _>(format!(
+                                "offset {offset} leaves the {row_stride} elements one index \
+                                 holds"
+                            )));
+                        }
+                        at(i).map(|v| (v - lo) * row_stride + offset)
+                    })
                     .collect::<PyResult<Vec<u64>>>()?
                     .into(),
             ),
@@ -397,7 +454,55 @@ impl ChunkItems {
                 self.out_end
             )));
         }
-        let items = build_chunk_unit_items(key, chunk_shape, shape, indices, out_start, inner, &elem_starts)?;
+        let items = build_chunk_unit_items(key, chunk_shape, shape, indices, out_start, inner, Offsets::Uniform(&elem_starts))?;
+        if let Some(last) = items.last() {
+            self.out_end = last.subset.end_exc()[0];
+        }
+        self.items.extend(items);
+        Ok(())
+    }
+
+    /// Push a POINT selection: one element per index, each naming its own offset inside that
+    /// index's elements.
+    ///
+    /// `X[rows, cols]` and `X[rows, 5]` both arrive as this -- zarr builds a
+    /// `CoordinateIndexer` rather than dropping an axis -- and the ordinary route spends two
+    /// allocations and a partial-decode call PER POINT. Grouping them by the chunk that gets
+    /// decoded is the whole win, and it is the same grouping the row case uses: the output is
+    /// flat, so `shape` is 1-D here while `chunk_shape` is not.
+    #[pyo3(signature = (key, chunk_shape, shape, indices, offsets, out_start, inner))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn push_points(
+        &mut self,
+        key: &str,
+        chunk_shape: Vec<u64>,
+        shape: Vec<u64>,
+        indices: PyReadonlyArray1<'_, i64>,
+        offsets: PyReadonlyArray1<'_, u64>,
+        out_start: u64,
+        inner: u64,
+    ) -> PyResult<()> {
+        if out_start < self.out_end {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "output starting at {out_start} overlaps an entry already pushed, which ends \
+                 at {}",
+                self.out_end
+            )));
+        }
+        // Contiguous so the per-point offsets can be read as a slice; a strided view would be
+        // indexed as if it were dense.
+        let offsets = offsets.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("the offsets array must be contiguous")
+        })?;
+        let items = build_chunk_unit_items(
+            key,
+            chunk_shape,
+            shape,
+            indices,
+            out_start,
+            inner,
+            Offsets::PerIndex(offsets),
+        )?;
         if let Some(last) = items.last() {
             self.out_end = last.subset.end_exc()[0];
         }
