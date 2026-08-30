@@ -156,17 +156,18 @@ def test_unwritten_chunks_read_as_fill(
     assert entries["handle"] > 0, "this selection should have taken the chunk-unit path"
 
 
-def test_a_column_split_inner_chunk_falls_back(
+def test_a_column_split_inner_chunk_is_served(
     tmp_path: Path, entries: dict[str, int]
 ) -> None:
-    """A 2-D array whose inner chunk is NARROWER than the array declines.
+    """A 2-D array whose inner chunk is NARROWER than the shard is served, one item per band.
 
-    The rank-N path takes axes after the first whole, and that is not a formality: with the
-    columns divided, one selected row is no longer one contiguous run in the decoded chunk,
-    its output rows are no longer one contiguous range, and the shard grid no longer holds a
-    single subchunk on the column axis -- so the descent along axis 0 would address the wrong
-    subchunk. Values alone would pass a version that mis-grouped and got lucky, hence the
-    entry-point check.
+    This test asserted the opposite until the band split landed, and the reasoning it gave was
+    right about the mechanism and wrong about the remedy: with the columns divided, one
+    selected row is not one contiguous run of the SHARD, and a descent that ignored the column
+    axis would address the wrong subchunk. The answer is not to decline -- it is to describe
+    one item per inner chunk, so that each item IS one run of the buffer that gets decoded.
+
+    Values alone would pass a version that mis-grouped and got lucky, hence the entry check.
     """
     values = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
     path = tmp_path / "two_d"
@@ -180,7 +181,8 @@ def test_a_column_split_inner_chunk_falls_back(
         got = zarr.open_array(path, mode="r")[rows, :]
 
     np.testing.assert_array_equal(got, values[rows, :])
-    assert entries["handle"] == 0, "a column-split 2-D selection reached the chunk-unit path"
+    assert entries["handle"] > 0, "a column-split 2-D selection should reach the chunk-unit path"
+    assert entries["list"] == 0
 
 
 @pytest.fixture

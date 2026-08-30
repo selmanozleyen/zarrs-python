@@ -86,7 +86,10 @@ def test_the_span_path_is_actually_taken(sharded_1d):
 
     def watched(*args, **kwargs):
         out = original(*args, **kwargs)
-        seen.append(out[0] if out else None)
+        # A list of pushes, one per band -- so the KIND is the first field of each, not the
+        # first element of the return. Reading `out[0]` collected whole tuples and the
+        # membership test below then quietly never matched.
+        seen.extend(push[0] for push in out or ())
         return out
 
     utils._chunk_unit_args = watched
