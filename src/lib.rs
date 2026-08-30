@@ -540,6 +540,24 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
+/// `(issued, served)`: store calls made, and inner chunks they served, since the run began.
+///
+/// `jobs / groups` is the mean batch size, and it is the number that says whether batching
+/// ENGAGED at all. At a scattered draw over many shards consecutive jobs rarely share a key,
+/// so the ratio approaches 1 and the change is a no-op -- which is a different finding from
+/// "batching did not pay", and indistinguishable from it without this.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn read_merge_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    // (issued, served): store CALLS, then inner chunks. The probe's existing hook reads them
+    // in that order and prints the ratio.
+    (
+        read_decode::GROUP_COUNT.load(Ordering::Relaxed),
+        read_decode::GROUP_JOBS.load(Ordering::Relaxed),
+    )
+}
+
 /// Zero the counters, so one test's numbers are its own.
 #[gen_stub_pyfunction]
 #[pyfunction]
@@ -555,6 +573,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(shard_index_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(reset_shard_index_cache_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(read_merge_stats, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
     m.add_class::<chunk_item::ChunkItems>()?;
