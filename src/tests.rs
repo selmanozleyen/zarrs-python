@@ -446,7 +446,9 @@ fn test_gather_merging_still_refuses_a_span_past_the_decode() {
 #[test]
 fn test_joined_merges_only_exactly_adjacent_ranges() {
     use zarrs::storage::byte_range::ByteRange::{FromStart, Suffix};
-    let joined = crate::read_decode::joined;
+    // gap 0, the default: only exactly-touching ranges merge.
+    let cap = 16u64 << 20;
+    let joined = |a, b| crate::read_decode::joined(a, b, 0, cap);
 
     // Adjacent: 0..100 then 100..150 is one read of 0..150.
     assert_eq!(
@@ -465,7 +467,6 @@ fn test_joined_merges_only_exactly_adjacent_ranges() {
     assert_eq!(joined(Suffix(10), FromStart(0, Some(50))), None);
     assert_eq!(joined(FromStart(0, Some(50)), Suffix(10)), None);
     // The cap bounds how long a merged buffer is held alive.
-    let cap = 16u64 << 20;
     assert_eq!(
         joined(FromStart(0, Some(cap - 10)), FromStart(cap - 10, Some(10))),
         Some(FromStart(0, Some(cap)))
@@ -473,4 +474,38 @@ fn test_joined_merges_only_exactly_adjacent_ranges() {
     assert_eq!(joined(FromStart(0, Some(cap)), FromStart(cap, Some(1))), None);
     // Overflow must not wrap into looking adjacent.
     assert_eq!(joined(FromStart(u64::MAX, Some(1)), FromStart(0, Some(1))), None);
+}
+
+/// A gap tolerance widens what merges, and must not widen what OVERLAPS.
+///
+/// Once a tolerance exists, "adjacent" and "overlapping" stop being distinguishable by a
+/// single equality, and an overlap is the dangerous one: two chunks would each be handed the
+/// same byte. The refusal is on direction, not distance.
+#[test]
+fn test_joined_gap_tolerance_merges_forward_only() {
+    use zarrs::storage::byte_range::ByteRange::FromStart;
+    let cap = 16u64 << 20;
+    let with_gap = |a, b, gap| crate::read_decode::joined(a, b, gap, cap);
+
+    // 0..100 then 108..158, with 8 bytes nothing asked for between them. The merged read
+    // spans the gap, so it covers 0..158.
+    assert_eq!(
+        with_gap(FromStart(0, Some(100)), FromStart(108, Some(50)), 8),
+        Some(FromStart(0, Some(158)))
+    );
+    // One byte too far.
+    assert_eq!(with_gap(FromStart(0, Some(100)), FromStart(109, Some(50)), 8), None);
+    // Exactly touching still merges at any tolerance, and carries no unwanted bytes.
+    assert_eq!(
+        with_gap(FromStart(0, Some(100)), FromStart(100, Some(50)), 8),
+        Some(FromStart(0, Some(150)))
+    );
+    // An OVERLAP is refused however generous the gap: distance forward is not the test.
+    assert_eq!(with_gap(FromStart(0, Some(100)), FromStart(99, Some(50)), 1024), None);
+    assert_eq!(with_gap(FromStart(0, Some(100)), FromStart(0, Some(50)), 1024), None);
+    // The cap counts the gap too -- it bounds the READ, not the wanted bytes in it.
+    assert_eq!(
+        crate::read_decode::joined(FromStart(0, Some(10)), FromStart(1000, Some(10)), 2000, 500),
+        None
+    );
 }

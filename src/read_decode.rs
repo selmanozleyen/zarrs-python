@@ -179,7 +179,11 @@ impl CodecPipelineImpl {
                 spawn_decoder(permit);
             }
 
-            for group in merge_reads(jobs) {
+            for group in merge_reads(
+                jobs,
+                self.read_coalesce_max_gap_bytes,
+                self.read_coalesce_max_bytes,
+            ) {
                 if job_tx.send(group).is_err() {
                     record(&failure, "no readers left to take the job".to_string());
                     break;
@@ -839,9 +843,9 @@ struct ReadGroup<'a> {
     jobs: Vec<Job<'a>>,
 }
 
-/// The largest merged read. Bytes are held until every job in the group has decoded, so a
-/// group is also a memory bound, not only an I/O one.
-const MERGE_CAP_BYTES: u64 = 16 << 20;
+/// The largest merged read when nothing asks for another. Bytes are held until every job in
+/// the group has decoded, so a group is also a memory bound, not only an I/O one.
+pub(crate) const DEFAULT_MERGE_CAP_BYTES: u64 = 16 << 20;
 
 /// Merge jobs whose byte ranges TOUCH into one read.
 ///
@@ -857,7 +861,7 @@ const MERGE_CAP_BYTES: u64 = 16 << 20;
 /// read arrives here already ascending. Nothing is sorted: sorting would let this merge two
 /// pieces whose outputs are far apart, and the group would then pin its bytes until the later
 /// one decoded.
-pub(crate) fn joined(held: ByteRange, next: ByteRange) -> Option<ByteRange> {
+pub(crate) fn joined(held: ByteRange, next: ByteRange, gap: u64, cap: u64) -> Option<ByteRange> {
     // `FromStart(_, None)` is a whole unsharded value and `Suffix` has no known start, so
     // neither can be extended by, or extend, another range.
     let (ByteRange::FromStart(base, Some(held_len)), ByteRange::FromStart(offset, Some(len))) =
@@ -865,22 +869,27 @@ pub(crate) fn joined(held: ByteRange, next: ByteRange) -> Option<ByteRange> {
     else {
         return None;
     };
-    // EXACTLY adjacent. A gap would fetch bytes nothing asked for and an overlap would vend
-    // the same byte twice, and `base + held_len == offset` refuses both in one test.
-    if base.checked_add(held_len) != Some(offset) {
+    let end = base.checked_add(held_len)?;
+    // Forward only, and no further ahead than `gap`. An OVERLAP is refused whatever the gap
+    // allows: two chunks sharing a byte would each be handed it, and `offset < end` is the
+    // only way to tell that from adjacency once a tolerance exists.
+    if offset < end || offset.checked_sub(end)? > gap {
         return None;
     }
-    let total = held_len.checked_add(len)?;
-    (total <= MERGE_CAP_BYTES).then_some(ByteRange::FromStart(base, Some(total)))
+    // The merged range spans the gap too, so the read carries bytes no job asked for. That
+    // is the trade a gap tolerance IS -- bandwidth for round trips -- and it is why the
+    // default is zero: exact adjacency costs nothing and needs no justification.
+    let total = offset.checked_add(len)?.checked_sub(base)?;
+    (total <= cap).then_some(ByteRange::FromStart(base, Some(total)))
 }
 
-fn merge_reads(jobs: Vec<Job<'_>>) -> Vec<ReadGroup<'_>> {
+fn merge_reads(jobs: Vec<Job<'_>>, gap: u64, cap: u64) -> Vec<ReadGroup<'_>> {
     let mut groups: Vec<ReadGroup<'_>> = Vec::with_capacity(jobs.len());
     for job in jobs {
         let extended = groups
             .last()
             .filter(|group| group.key == job.key)
-            .and_then(|group| joined(group.range, job.range));
+            .and_then(|group| joined(group.range, job.range, gap, cap));
         if let Some(range) = extended {
             let group = groups.last_mut().expect("filtered from `last`");
             group.range = range;
@@ -925,7 +934,7 @@ fn read_loop<'a>(
                     // One read served several chunks, so each takes its own extent out of it.
                     // `Bytes::slice` is a refcount, not a copy -- but it does keep the WHOLE
                     // merged buffer alive until the last job of the group has decoded, which
-                    // is what `MERGE_CAP_BYTES` bounds.
+                    // is what `read_coalesce_max_bytes` bounds.
                     let piece = match (&bytes, job.range) {
                         (Some(whole), ByteRange::FromStart(offset, Some(len))) => {
                             let start = (offset - base) as usize;
