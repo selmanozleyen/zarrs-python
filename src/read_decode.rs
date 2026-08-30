@@ -414,6 +414,9 @@ impl CodecPipelineImpl {
     }
 
     /// Where each item's innermost chunk lives, from its shard's own offset/size table.
+///
+/// The descent divides on every axis, so an item is not required to take the trailing axes
+/// whole -- but it IS required to lie within one inner chunk, which `locate` checks.
     #[allow(clippy::type_complexity)]
     fn locate_chunks<'a>(
         &self,
@@ -948,6 +951,13 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     // it has seen and stops reallocating too. Everything below addresses `&mut scratch[..n]`
     // rather than the whole Vec, so a buffer left long by a bigger chunk cannot widen a
     // bounds check.
+    //
+    // What this DOES change is the failure mode if `decode_into` ever leaves part of the
+    // target unwritten: the gap now carries the PREVIOUS chunk's decoded elements rather
+    // than zeros, so it reads as plausible values instead of an obvious block of nothing.
+    // The view below is built over `new_with_shape` -- the whole chunk -- so a codec that
+    // returns `Ok` without filling it would already be broken; this makes such a bug quieter
+    // rather than causing one.
     if scratch.len() < needed {
         scratch.resize(needed, 0);
     }
