@@ -52,6 +52,21 @@ def divided_2d(tmp_path):
 
 
 @pytest.fixture
+def banded_output_only(tmp_path):
+    """The SHARD GRID halves the array's width, but each shard is one inner chunk wide.
+
+    This isolates one of the two problems the 2-D fixture has at once. Here every entry
+    covers columns 0-11 or 12-23 of a 24-wide output -- so an item's output is a sub-box
+    rather than a contiguous range -- but no shard divides into several inner chunks, so no
+    band split is needed. Fixing the output side alone should turn this green and leave
+    `divided_2d` red.
+    """
+    values = np.arange(64 * 24, dtype=np.float64).reshape(64, 24)
+    _write(tmp_path / "b2.zarr", values, (8, 12), (16, 12))
+    return tmp_path / "b2.zarr", values
+
+
+@pytest.fixture
 def divided_3d(tmp_path):
     """The same division on axis 1, with a third axis below it taken whole.
 
@@ -96,5 +111,17 @@ def test_2d_slice_matches(divided_2d):
 def test_3d_rows_match(divided_3d, rows):
     """The case an earlier attempt got wrong, and that no existing test would have caught."""
     path, values = divided_3d
+    array = open_strict(path)
+    np.testing.assert_array_equal(array[rows], values[rows])
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [np.array([0, 3, 4, 5, 17, 30]), np.arange(0, 64), np.array([11]), np.array([15, 16])],
+    ids=["scattered", "every-row", "single", "shard-edge"],
+)
+def test_banded_output_matches(banded_output_only, rows):
+    """Only the output is a sub-box; the shard is one inner chunk wide."""
+    path, values = banded_output_only
     array = open_strict(path)
     np.testing.assert_array_equal(array[rows], values[rows])
