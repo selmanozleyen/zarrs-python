@@ -364,7 +364,11 @@ def _chunk_unit_args(
     # while at most one trailing axis is partial. At rank 3 an entry claims 25 elements per
     # index where the truth is 5 runs of 5 at stride 10, the next entry starts 5 elements in,
     # and `DisjointBytes` refuses it as a backwards claim. That was 633 tests.
-    if _contiguous_offset(out_starts[1:], out_widths[1:], tuple(shape[1:])) is None:
+    # NOT `out_starts[1:]`. At this point both lists hold the TRAILING axes only -- axis 0 is
+    # prepended further down -- so slicing dropped the first trailing axis and compared a
+    # short list against all the extents. That was 2,825 tests, and no type checker could
+    # have seen it: the lists are the right type and the wrong length.
+    if _contiguous_offset(out_starts, out_widths, tuple(shape[1:])) is None:
         return None
     # Gate only. Rust re-derives the offset from these same starts and rechecks the shape,
     # because `push_entry` is reachable from Python with arbitrary arguments and a single
