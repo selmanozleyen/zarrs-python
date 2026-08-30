@@ -179,11 +179,7 @@ impl CodecPipelineImpl {
                 spawn_decoder(permit);
             }
 
-            for group in merge_reads(
-                jobs,
-                self.read_coalesce_max_gap_bytes,
-                self.read_coalesce_max_bytes,
-            ) {
+            for group in batch_by_key(jobs, self.read_coalesce_max_bytes) {
                 if job_tx.send(group).is_err() {
                     record(&failure, "no readers left to take the job".to_string());
                     break;
@@ -832,72 +828,52 @@ struct Job<'a> {
     ctx: &'a JobContext,
 }
 
-/// Several jobs whose bytes are ONE contiguous read.
+/// Several jobs whose bytes come from ONE key, fetched in ONE call.
 ///
-/// A job is an innermost chunk, and neighbouring inner chunks are neighbouring BYTES of the
-/// shard. Reading them separately asks the store for two adjacent extents where one would do
-/// -- and on Lustre a read is a round trip, so the count matters as much as the volume.
+/// Not a merged RANGE: the ranges stay exactly what each job asked for, and the store is handed
+/// all of them together. `FilesystemStore::get_partial_many` opens the file, takes its read
+/// lock and queries its size once for the whole batch, then reads each range at its own offset
+/// -- so the per-call cost is amortised without fetching a byte nobody wanted.
+///
+/// A previous version merged adjacent ranges into one read instead. On this store it merged
+/// almost nothing (1.01 chunks per read at exact adjacency: grid-consecutive inner chunks sit
+/// 400-500 KiB apart, so the shard is not packed in grid order), and forcing it with a gap
+/// tolerance -- 1.98 chunks per read at 1 MiB -- changed throughput by 0.0%. Reads were never
+/// the constraint. This keeps the one part of that worth keeping.
 struct ReadGroup<'a> {
     key: StoreKey,
-    range: ByteRange,
     jobs: Vec<Job<'a>>,
 }
 
-/// The largest merged read when nothing asks for another. Bytes are held until every job in
-/// the group has decoded, so a group is also a memory bound, not only an I/O one.
-pub(crate) const DEFAULT_MERGE_CAP_BYTES: u64 = 16 << 20;
+/// Ceiling on the bytes one call may have outstanding. The results are held until the last job
+/// of the batch has decoded, so this bounds memory rather than I/O.
+pub(crate) const DEFAULT_BATCH_CAP_BYTES: u64 = 16 << 20;
 
-/// Merge jobs whose byte ranges TOUCH into one read.
+/// Batch CONSECUTIVE jobs that share a key into one call.
 ///
-/// Only exact adjacency, and only within one key: a gap would mean reading bytes nothing
-/// asked for, which is a different trade -- worth making on a spinning disk, not obviously
-/// here -- and it can be added later as a gap tolerance without changing the shape of this.
-///
-/// A scattered selection merges nothing and pays one comparison per job. A contiguous one is
-/// where this earns: a CSR run of 64 neighbouring rows is ~92,800 elements against a 91,549
-/// element inner chunk, so it straddles a boundary and every run issued two adjacent reads.
-///
-/// Jobs are examined in the order they were built, which follows the OUTPUT, so a contiguous
-/// read arrives here already ascending. Nothing is sorted: sorting would let this merge two
-/// pieces whose outputs are far apart, and the group would then pin its bytes until the later
-/// one decoded.
-pub(crate) fn joined(held: ByteRange, next: ByteRange, gap: u64, cap: u64) -> Option<ByteRange> {
-    // `FromStart(_, None)` is a whole unsharded value and `Suffix` has no known start, so
-    // neither can be extended by, or extend, another range.
-    let (ByteRange::FromStart(base, Some(held_len)), ByteRange::FromStart(offset, Some(len))) =
-        (held, next)
-    else {
-        return None;
-    };
-    let end = base.checked_add(held_len)?;
-    // Forward only, and no further ahead than `gap`. An OVERLAP is refused whatever the gap
-    // allows: two chunks sharing a byte would each be handed it, and `offset < end` is the
-    // only way to tell that from adjacency once a tolerance exists.
-    if offset < end || offset.checked_sub(end)? > gap {
-        return None;
-    }
-    // The merged range spans the gap too, so the read carries bytes no job asked for. That
-    // is the trade a gap tolerance IS -- bandwidth for round trips -- and it is why the
-    // default is zero: exact adjacency costs nothing and needs no justification.
-    let total = offset.checked_add(len)?.checked_sub(base)?;
-    (total <= cap).then_some(ByteRange::FromStart(base, Some(total)))
-}
-
-fn merge_reads(jobs: Vec<Job<'_>>, gap: u64, cap: u64) -> Vec<ReadGroup<'_>> {
-    let mut groups: Vec<ReadGroup<'_>> = Vec::with_capacity(jobs.len());
+/// Consecutive only, and unsorted: jobs arrive in output order, and reordering them would let a
+/// batch hold bytes for a job whose output lands far away, keeping the whole batch alive until
+/// that one decoded.
+fn batch_by_key(jobs: Vec<Job<'_>>, cap: u64) -> Vec<ReadGroup<'_>> {
+    let mut groups: Vec<ReadGroup<'_>> = Vec::new();
+    let mut held: u64 = 0;
     for job in jobs {
-        let extended = groups
+        let len = match job.range {
+            ByteRange::FromStart(_, Some(len)) => len,
+            // No known length: it cannot be counted against the cap, so it starts its own batch
+            // and nothing joins it.
+            ByteRange::FromStart(_, None) | ByteRange::Suffix(_) => u64::MAX,
+        };
+        let joins = groups
             .last()
-            .filter(|group| group.key == job.key)
-            .and_then(|group| joined(group.range, job.range, gap, cap));
-        if let Some(range) = extended {
-            let group = groups.last_mut().expect("filtered from `last`");
-            group.range = range;
-            group.jobs.push(job);
+            .is_some_and(|group| group.key == job.key && held.saturating_add(len) <= cap);
+        if joins {
+            held += len;
+            groups.last_mut().expect("checked above").jobs.push(job);
         } else {
+            held = len.min(cap);
             groups.push(ReadGroup {
                 key: job.key.clone(),
-                range: job.range,
                 jobs: vec![job],
             });
         }
@@ -922,51 +898,47 @@ fn read_loop<'a>(
         let Some(ctx) = group.jobs.first().map(|job| job.ctx) else {
             continue;
         };
-        let base = match group.range {
-            ByteRange::FromStart(offset, _) => offset,
-            ByteRange::Suffix(_) => 0,
-        };
         READS_ISSUED.fetch_add(1, Ordering::Relaxed);
         CHUNKS_SERVED.fetch_add(group.jobs.len() as u64, Ordering::Relaxed);
-        match ctx.store.get_partial(&group.key, group.range) {
-            Ok(bytes) => {
+        // Collected rather than borrowed from `group.jobs`: the iterator has to be owned by
+        // the call, and `group.jobs` is consumed below to hand each job its bytes.
+        let ranges: Vec<ByteRange> = group.jobs.iter().map(|job| job.range).collect();
+        let fetched = ctx
+            .store
+            .get_partial_many(&group.key, Box::new(ranges.into_iter()));
+        match fetched {
+            // The key is absent, so every job of the batch is absent. `decode_one` decides
+            // whether that is a fill value or a failure -- it is not this loop's call.
+            Ok(None) => {
                 for job in group.jobs {
-                    // One read served several chunks, so each takes its own extent out of it.
-                    // `Bytes::slice` is a refcount, not a copy -- but it does keep the WHOLE
-                    // merged buffer alive until the last job of the group has decoded, which
-                    // is what `read_coalesce_max_bytes` bounds.
-                    let piece = match (&bytes, job.range) {
-                        (Some(whole), ByteRange::FromStart(offset, Some(len))) => {
-                            let start = (offset - base) as usize;
-                            let end = start + len as usize;
-                            if end > whole.len() {
-                                record(
-                                    failure,
-                                    format!(
-                                        "{}: the merged read returned {} bytes, short of the \
-                                         {end} this chunk needs",
-                                        job.key,
-                                        whole.len()
-                                    ),
-                                );
-                                return;
-                            }
-                            Some(whole.slice(start..end))
+                    if send_piece(decodes, job, None, failure).is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(Some(mut bytes)) => {
+                for job in group.jobs {
+                    let piece = match bytes.next() {
+                        Some(Ok(piece)) => Some(piece),
+                        Some(Err(e)) => {
+                            record(failure, format!("read {} failed: {e}", job.key));
+                            return;
                         }
-                        // A group of one, or a range with no known length: the read IS the
-                        // chunk's bytes, so there is nothing to carve.
-                        (Some(whole), _) => Some(whole.clone()),
-                        (None, _) => None,
+                        // One result per range or the pairing below is wrong for every job
+                        // after the missing one -- silently, and with plausible data.
+                        None => {
+                            record(
+                                failure,
+                                format!(
+                                    "{}: the store returned fewer ranges than the batch asked \
+                                     for",
+                                    job.key
+                                ),
+                            );
+                            return;
+                        }
                     };
-                    if let Err(returned) = decodes.send((job, piece)) {
-                        // Every decoder is gone. Returning silently would leave this job's
-                        // bytes of the output at whatever `np.empty` left, and the call would
-                        // report success.
-                        let (job, _) = returned.into_inner();
-                        record(
-                            failure,
-                            format!("{}: no decoder left to take the chunk", job.key),
-                        );
+                    if send_piece(decodes, job, piece, failure).is_err() {
                         return;
                     }
                 }
@@ -974,6 +946,27 @@ fn read_loop<'a>(
             Err(e) => record(failure, format!("read {} failed: {e}", group.key)),
         }
     }
+}
+
+/// Hand one job's bytes to a decoder, or record that there is no decoder left.
+///
+/// Returning silently on a closed channel would leave this job's bytes of the output at
+/// whatever `np.empty` left, and the call would report success.
+fn send_piece<'a>(
+    decodes: &Sender<(Job<'a>, MaybeBytes)>,
+    job: Job<'a>,
+    piece: MaybeBytes,
+    failure: &Mutex<Option<String>>,
+) -> Result<(), ()> {
+    if let Err(returned) = decodes.send((job, piece)) {
+        let (job, _) = returned.into_inner();
+        record(
+            failure,
+            format!("{}: no decoder left to take the chunk", job.key),
+        );
+        return Err(());
+    }
+    Ok(())
 }
 
 fn decode_loop(decodes: &Receiver<(Job<'_>, MaybeBytes)>, failure: &Mutex<Option<String>>) {

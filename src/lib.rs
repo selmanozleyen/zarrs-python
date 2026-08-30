@@ -75,13 +75,8 @@ pub struct CodecPipelineImpl {
     /// Whether zarr-python opened this store read-only. Not inferable here: `StoreConfig`
     /// builds a writable Rust store whatever mode the array was opened in.
     pub(crate) store_is_read_only: bool,
-    /// Bytes of UNWANTED data worth reading to turn two reads into one. 0 merges only ranges
-    /// that exactly touch, which is free; above that, a merge fetches the gap as well and
-    /// trades bandwidth for round trips. Both are widths, not paths -- what gets read is the
-    /// same either way, only how many calls carry it.
-    pub(crate) read_coalesce_max_gap_bytes: u64,
-    /// Ceiling on a merged read. Bytes are held until the last chunk sharing them is decoded,
-    /// so this bounds memory as well as I/O.
+    /// Ceiling on the bytes one store call may have outstanding. The results are held until
+    /// the last chunk of the batch has decoded, so this bounds memory rather than I/O.
     pub(crate) read_coalesce_max_bytes: u64,
 }
 
@@ -324,7 +319,6 @@ impl CodecPipelineImpl {
         direct_io=false,
         file_handle_cache_size=0,
         store_is_read_only=false,
-        read_coalesce_max_gap_bytes=0,
         read_coalesce_max_bytes=0,
     ))]
     #[new]
@@ -338,7 +332,6 @@ impl CodecPipelineImpl {
         direct_io: bool,
         file_handle_cache_size: usize,
         store_is_read_only: bool,
-        read_coalesce_max_gap_bytes: u64,
         read_coalesce_max_bytes: u64,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
@@ -412,12 +405,12 @@ impl CodecPipelineImpl {
             subshard_indexes: Mutex::new(HashMap::new()),
             cache_shard_indexes: store_is_read_only,
             store_is_read_only,
-            read_coalesce_max_gap_bytes,
             // 0 means "unset" from the Python side, where every knob defaults that way, so a
             // caller that says nothing gets the built-in ceiling rather than a cap of zero
-            // -- which would refuse every merge and read as "merging does not work".
+            // -- which would put every chunk in its own call and read as "batching does
+            // nothing".
             read_coalesce_max_bytes: if read_coalesce_max_bytes == 0 {
-                read_decode::DEFAULT_MERGE_CAP_BYTES
+                read_decode::DEFAULT_BATCH_CAP_BYTES
             } else {
                 read_coalesce_max_bytes
             },
@@ -558,9 +551,9 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
 
 /// Storage reads issued, and inner chunks they served.
 ///
-/// `served > issued` means adjacent chunks were merged into one read; equal means nothing
-/// merged, which is the honest answer for a scattered selection. Exposed because "we merge
-/// adjacent reads" is a claim about a RUN, not about the source.
+/// `served > issued` means several chunks were fetched by one call; equal means every chunk
+/// took its own. Exposed because "we batch the reads" is a claim about a RUN, not about the
+/// source -- a selection touching one chunk per key batches nothing however correct the code.
 #[gen_stub_pyfunction]
 #[pyfunction]
 fn read_merge_stats() -> (u64, u64) {
