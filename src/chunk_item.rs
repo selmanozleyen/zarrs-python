@@ -44,6 +44,11 @@ pub(crate) struct ChunkItem {
     /// is the row's length -- so `gather` moves a row per coordinate instead of an element,
     /// which is the only reason grouping a wide 2-D read is worth doing.
     pub run_len: u64,
+    /// Where each of a coordinate's `run_len` elements sits inside that coordinate's own
+    /// elements, when they are NOT consecutive: `oindex[rows, cols]` takes the same `cols`
+    /// from every selected row, so one shared list serves the whole item. `None` means the
+    /// run is contiguous, which is every other case.
+    pub col_offsets: Option<Arc<[u64]>>,
 }
 
 #[gen_stub_pymethods]
@@ -83,6 +88,7 @@ impl ChunkItem {
             array_shape: shape_nonzero_u64,
             coords: None,
             run_len: 1,
+            col_offsets: None,
         })
     }
 }
@@ -133,13 +139,17 @@ pub(crate) enum Offsets<'a> {
     /// inner chunk is the whole win -- the ordinary route costs a partial-decode call PER
     /// POINT.
     PerIndex(&'a [u64]),
+    /// A shared list of offsets taken from EVERY index: `oindex[rows, cols]`, the grid, which
+    /// is a gene panel across cells. The run is the list's length and it is scattered rather
+    /// than contiguous, so the gather steps through it per coordinate.
+    Grid(&'a [u64]),
 }
 
 impl Offsets<'_> {
     /// How many indices this describes, when it describes a fixed number.
     fn len(self) -> Option<usize> {
         match self {
-            Self::Uniform(_) => None,
+            Self::Uniform(_) | Self::Grid(_) => None,
             Self::PerIndex(offsets) => Some(offsets.len()),
         }
     }
@@ -264,6 +274,20 @@ pub(crate) fn build_chunk_unit_items(
         // trailing extents are not a shared sub-box here -- each point carries its own offset
         // -- so only the stride comes from the chunk.
         Offsets::PerIndex(_) => (chunk_shape[1..].iter().product::<u64>(), 1, 0),
+        // A grid takes the same `cols` from every row, so the run is the list's length and
+        // the coordinate itself is the start of the row: the offsets are applied per element
+        // by the gather, not folded into the coordinate.
+        Offsets::Grid(cols) => {
+            let stride: u64 = chunk_shape[1..].iter().product();
+            for &c in cols {
+                if c >= stride {
+                    return Err(PyErr::new::<PyValueError, _>(format!(
+                        "column offset {c} leaves the {stride} elements one index holds"
+                    )));
+                }
+            }
+            (stride, cols.len() as u64, 0)
+        }
     };
     if row_stride == 0 {
         return Err(PyErr::new::<PyValueError, _>(
@@ -371,6 +395,8 @@ pub(crate) fn build_chunk_unit_items(
                         let offset = match offsets {
                             Offsets::Uniform(_) => uniform_offset,
                             Offsets::PerIndex(per) => per[i],
+                            // Applied per element by the gather, not here.
+                            Offsets::Grid(_) => 0,
                         };
                         // Every offset, not just a shared one, must leave the index's own
                         // elements: `gather` only knows the whole decoded buffer's length, so
@@ -388,6 +414,10 @@ pub(crate) fn build_chunk_unit_items(
                     .into(),
             ),
             run_len,
+            col_offsets: match offsets {
+                Offsets::Grid(cols) => Some(Arc::from(cols)),
+                _ => None,
+            },
         });
         a = b;
     }
@@ -458,6 +488,50 @@ impl ChunkItems {
             )));
         }
         let items = build_chunk_unit_items(key, chunk_shape, shape, indices, out_start, inner, Offsets::Uniform(&elem_starts))?;
+        if let Some(last) = items.last() {
+            self.out_end = last.subset.end_exc()[0];
+        }
+        self.items.extend(items);
+        Ok(())
+    }
+
+    /// Push a GRID selection: the same columns taken from every selected index.
+    ///
+    /// `oindex[rows, cols]` -- a gene panel across cells -- and `X[:, cols]`. zarr broadcasts
+    /// the two axes, so rows arrive shaped (n,1) and columns (1,m); Python flattens both
+    /// before they get here. Each row contributes `cols.len()` SCATTERED elements which land
+    /// contiguously in the output, so the item is still one output range.
+    #[pyo3(signature = (key, chunk_shape, shape, indices, cols, out_start, inner))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    pub(crate) fn push_grid(
+        &mut self,
+        key: &str,
+        chunk_shape: Vec<u64>,
+        shape: Vec<u64>,
+        indices: PyReadonlyArray1<'_, i64>,
+        cols: PyReadonlyArray1<'_, u64>,
+        out_start: u64,
+        inner: u64,
+    ) -> PyResult<()> {
+        if out_start < self.out_end {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "output starting at {out_start} overlaps an entry already pushed, which ends \
+                 at {}",
+                self.out_end
+            )));
+        }
+        let cols = cols.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("the column array must be contiguous")
+        })?;
+        let items = build_chunk_unit_items(
+            key,
+            chunk_shape,
+            shape,
+            indices,
+            out_start,
+            inner,
+            Offsets::Grid(cols),
+        )?;
         if let Some(last) = items.last() {
             self.out_end = last.subset.end_exc()[0];
         }

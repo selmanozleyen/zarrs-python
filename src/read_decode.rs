@@ -34,7 +34,7 @@ use crate::shard_index::ShardInfo;
 use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 
-use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, key_partial_decoder};
+use crate::utils::{PyCodecErrExt as _, PyErrExt as _, gather, gather_columns, key_partial_decoder};
 
 /// The per-array state a decode needs, shared by every job of a call.
 struct JobContext {
@@ -487,6 +487,7 @@ fn carve<'a>(
                     .as_deref()
                     .unwrap_or(item.shape.as_slice()),
                 may_be_absent: ctx.shard.depth() == 0,
+                col_offsets: item.col_offsets.as_deref(),
                 ctx,
             }),
             None => absent.push(piece),
@@ -786,6 +787,9 @@ struct Job<'a> {
     /// The unit that gets decoded into scratch: the shard's inner chunk where the array is
     /// sharded, the item's own chunk where it is not.
     decode_shape: &'a [NonZeroU64],
+    /// The columns each coordinate takes, when they are scattered rather than consecutive --
+    /// `oindex[rows, cols]`. `None` is a contiguous run, which is every other case.
+    col_offsets: Option<&'a [u64]>,
     /// Whether missing bytes are ordinary here. A shard index that named this chunk and then
     /// did not have it means someone rewrote the store mid-read, which is worth failing on.
     /// An unsharded chunk has no index to consult, so its key simply may not exist yet, and
@@ -876,7 +880,10 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             )
             .map_err(|e| e.to_string())?;
     }
-    gather(scratch, job.coords, job.run_len, job.out, size)
+    match job.col_offsets {
+        Some(cols) => gather_columns(scratch, job.coords, cols, job.out, size),
+        None => gather(scratch, job.coords, job.run_len, job.out, size),
+    }
         .map_err(|e| format!("{}: {e}", job.key))
 }
 

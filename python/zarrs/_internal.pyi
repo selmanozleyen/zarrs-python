@@ -57,6 +57,24 @@ class ChunkItems:
         since the output subset is bounded against it. A larger one describes bytes the buffer
         does not have, and that produces wrong data rather than an error.
         """
+    def push_grid(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        cols: numpy.typing.NDArray[numpy.uint64],
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a GRID selection: the same columns taken from every selected index.
+
+        `oindex[rows, cols]` -- a gene panel across cells -- and `X[:, cols]`. zarr broadcasts
+        the two axes, so rows arrive shaped (n,1) and columns (1,m); Python flattens both
+        before they get here. Each row contributes `cols.len()` SCATTERED elements which land
+        contiguously in the output, so the item is still one output range.
+        """
     def push_points(
         self,
         key: builtins.str,

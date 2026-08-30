@@ -501,6 +501,79 @@ def _point_unit_args(
     )
 
 
+def _grid_unit_args(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> tuple | None:
+    """Args for `ChunkItems.push_grid`, or None if this entry is not a grid selection.
+
+    `oindex[rows, cols]` and `X[:, cols]` -- a gene panel across cells, which is the ordinary
+    way to subset both axes. zarr BROADCASTS the two axes rather than pairing them, so rows
+    arrive shaped (n, 1) and columns (1, m), and the result is the n x m grid.
+
+    Every selected row takes the SAME columns, so one shared offset list serves the item and
+    each coordinate is just the start of its row. The output row is those columns in order,
+    contiguous, which is what keeps an item to a single output range.
+
+    Rank 2 only. A higher-rank grid broadcasts to one array per axis and the offsets stop
+    being a single list; declining is better than half-serving it.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if drop_axes or inner_shape is None:
+        return None
+    if inner_shape == ():
+        inner_shape = tuple(int(s) for s in chunk_spec.shape)
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
+    if len(chunk_spec.shape) != 2 or len(chunk_sel) != 2 or len(out_sel) != 2:
+        return None
+    if len(shape) != 2 or len(inner_shape) != 2:
+        return None
+
+    rows, cols = chunk_sel
+    if isinstance(rows, slice):
+        # `X[:, cols]` -- every row, a panel of columns. The row axis is a slice for the same
+        # reason it is in `_chunk_unit_args`: a contiguous run spelled differently.
+        span = _step1_span(rows, chunk_spec.shape[0])
+        if span is None:
+            return None
+        rows = np.arange(span[0], span[1], dtype=np.int64)
+    if not (isinstance(rows, np.ndarray) and isinstance(cols, np.ndarray)):
+        return None
+    # Broadcast shapes: (n,1) against (1,m). `ravel` rather than `reshape(-1)` so a view is
+    # kept where one is possible.
+    if rows.ndim > 2 or cols.ndim > 2:
+        return None
+    rows = np.ravel(rows)
+    cols = np.ravel(cols)
+    if rows.size == 0 or cols.size == 0:
+        return None
+    if not (np.issubdtype(rows.dtype, np.integer) and np.issubdtype(cols.dtype, np.integer)):
+        return None
+
+    out_axis_sel = out_sel[0]
+    if not _is_sorted_integer_axis(rows, out_axis_sel):
+        return None
+    rows = rows.astype(np.int64, copy=False)
+    if (rows < 0).any() or not _output_run_matches(rows, out_axis_sel):
+        return None
+    # The output holds exactly the selected columns, and the item fills all of them.
+    if not _is_whole_axis(out_sel[1], shape[1]) or shape[1] != cols.size:
+        return None
+    if inner_shape[1] != chunk_spec.shape[1]:
+        return None
+    if (cols < 0).any() or (cols >= chunk_spec.shape[1]).any():
+        return None
+
+    return (
+        byte_getter.path,
+        chunk_spec.shape,
+        shape,
+        rows,
+        cols.astype(np.uint64, copy=False),
+        out_axis_sel.start or 0,
+        int(inner_shape[0]),
+    )
+
+
 def chunk_info_for_write(
     batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
@@ -548,6 +621,16 @@ def chunk_info_for_read(
         handle = ChunkItems()
         for args in point_args:
             handle.push_points(*args)
+        return RustChunkInfo(handle, write_empty_chunks=True)
+
+    # And a grid is a third shape: same columns from every row, scattered within the row.
+    grid_args = [
+        _grid_unit_args(entry, shape, drop_axes, inner_chunk_shape) for entry in entries
+    ]
+    if grid_args and all(args is not None for args in grid_args):
+        handle = ChunkItems()
+        for args in grid_args:
+            handle.push_grid(*args)
         return RustChunkInfo(handle, write_empty_chunks=True)
 
     return _chunk_items(

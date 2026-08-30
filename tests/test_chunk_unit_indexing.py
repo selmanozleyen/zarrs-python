@@ -528,3 +528,72 @@ def test_an_unsharded_array_reads_unwritten_chunks_as_fill(
 
     np.testing.assert_array_equal(got, np.array([1, 5, -7, -7], dtype=np.float32))
     assert entries["handle"] > 0, "an unsharded array did not take the chunk-unit path"
+
+
+def test_a_grid_selection_takes_the_path(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """`oindex[rows, cols]` -- the n x m grid, which is a gene panel across cells.
+
+    zarr broadcasts the axes rather than pairing them, so this is NOT the point case: rows
+    arrive (n,1) and cols (1,m).
+
+    The columns REPEAT and are not consecutive: a gather that deduplicated them, or that took
+    a contiguous span from the first to the last, would return the right shape full of wrong
+    values. They do ascend, because an out-of-order list is a different case -- zarr then hands
+    over an ndarray out-selection, and that declines (see below).
+    """
+    path, values = full_width
+    rows = np.array([1, 3, 3, 9, 60, 61, 200])
+    cols = np.array([0, 5, 17, 17, 40])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[rows, cols]
+
+    assert got.shape == (rows.size, cols.size)
+    np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
+    assert entries["handle"] > 0, "a grid selection did not take the chunk-unit path"
+    assert entries["list"] == 0
+
+
+def test_a_whole_column_panel_takes_the_path(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """`X[:, cols]` -- every row, a panel of columns. The row axis is a slice here."""
+    path, values = full_width
+    cols = np.array([2, 7, 44])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[:, cols]
+
+    np.testing.assert_array_equal(got, values[:, cols])
+    assert entries["handle"] > 0, "a column panel did not take the chunk-unit path"
+
+
+def test_a_grid_matches_zarr_python(full_width: tuple[Path, np.ndarray]) -> None:
+    path, _ = full_width
+    rng = np.random.default_rng(0)
+    rows = np.sort(rng.choice(256, size=64, replace=False))
+    cols = np.sort(rng.choice(48, size=12, replace=True))
+    with zarr.config.set(CHUNK_UNIT):
+        mine = zarr.open_array(path, mode="r").oindex[rows, cols]
+    with zarr.config.set({"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}):
+        theirs = zarr.open_array(path, mode="r").oindex[rows, cols]
+    np.testing.assert_array_equal(mine, theirs)
+
+
+def test_a_grid_with_unsorted_columns_declines_and_is_still_right(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
+    """Out-of-order columns put the output rows at scattered positions.
+
+    zarr stops describing the output as slices and hands over ndarray out-selections, which is
+    the same thing that makes an unsorted ROW axis decline: an item's output is vended as one
+    contiguous range and a scattered one cannot be expressed that way.
+    """
+    path, values = full_width
+    rows = np.array([1, 3, 9, 60])
+    cols = np.array([40, 0, 17, 5])
+    with zarr.config.set(CHUNK_UNIT):
+        got = zarr.open_array(path, mode="r").oindex[rows, cols]
+
+    np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
+    assert entries["handle"] == 0, "an unsorted grid reached the chunk-unit path"

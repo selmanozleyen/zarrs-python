@@ -361,3 +361,33 @@ fn test_push_points_refuses_offsets_that_leave_their_row() -> PyResult<()> {
         Ok(())
     })
 }
+
+/// `push_grid` is `#[pymethods]` too. A column past the row it belongs to would have
+/// `gather_columns` read the NEXT row's element under this column's name, so it is refused
+/// here rather than trusted from the gate.
+#[test]
+fn test_push_grid_refuses_columns_outside_the_row() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let rows = PyArray1::from_slice(py, &[0i64, 1, 2]);
+        // A chunk row holds 48 elements, so 48 is one past the last.
+        let past = PyArray1::from_slice(py, &[0u64, 48]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        assert!(
+            handle
+                .push_grid("c/0/0", vec![64, 48], vec![3, 2], rows.readonly(),
+                           past.readonly(), 0, 8)
+                .is_err(),
+            "a column past the row must be refused"
+        );
+
+        // Repeats are legal and must be kept: a panel may ask for the same gene twice.
+        let repeated = PyArray1::from_slice(py, &[5u64, 5, 47]);
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        handle.push_grid("c/0/0", vec![64, 48], vec![3, 3], rows.readonly(),
+                         repeated.readonly(), 0, 8)?;
+        Ok(())
+    })
+}
