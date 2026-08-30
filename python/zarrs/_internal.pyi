@@ -38,8 +38,9 @@ class ChunkItems:
         chunk_shape: typing.Sequence[builtins.int],
         shape: typing.Sequence[builtins.int],
         indices: numpy.typing.NDArray[numpy.int64],
-        out_start: builtins.int,
-        inner: builtins.int,
+        out_starts: typing.Sequence[builtins.int],
+        out_widths: typing.Sequence[builtins.int],
+        inner: typing.Sequence[builtins.int],
         elem_starts: typing.Sequence[builtins.int] = [],
     ) -> None:
         r"""
@@ -172,7 +173,6 @@ def reset_shard_index_cache_stats() -> None:
 
 def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
     r"""
-    A Python module implemented in Rust.
     `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
 
     A build is an index actually read and decoded; the two hit counts are the per-call cache
