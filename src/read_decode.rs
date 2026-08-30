@@ -45,6 +45,14 @@ struct JobContext {
     /// What an absent chunk contributes. Needed in the workers, not just at carve time,
     /// because an UNSHARDED chunk's absence is only discovered by the read.
     fill_value: FillValue,
+    /// Whether missing bytes are ordinary. A shard index that named a chunk which is then
+    /// missing means the store changed under the read, and that is worth failing on; an
+    /// unsharded chunk has no index to consult, so its key simply may not exist yet.
+    ///
+    /// Per CALL, not per job: an array is sharded or it is not. It lived on `Job` for one
+    /// commit and cost 6% on the loader, because `Job` crosses a channel ~8,000 times a call
+    /// and every byte added to it is copied that many times.
+    may_be_absent: bool,
 }
 
 /// Shard and subshard decoders built during ONE call.
@@ -83,6 +91,7 @@ impl CodecPipelineImpl {
             codec_options: (*codec_options).with_concurrent_target(1),
             element_size,
             fill_value: self.fill_value.clone(),
+            may_be_absent: shard.depth() == 0,
         };
 
         let (located, declined) = self.locate_chunks(shard, items, &ctx)?;
@@ -486,7 +495,6 @@ fn carve<'a>(
                     .subchunk_shape
                     .as_deref()
                     .unwrap_or(item.shape.as_slice()),
-                may_be_absent: ctx.shard.depth() == 0,
                 col_offsets: item.col_offsets.as_deref(),
                 ctx,
             }),
@@ -785,16 +793,12 @@ struct Job<'a> {
     /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
     run_len: u64,
     /// The unit that gets decoded into scratch: the shard's inner chunk where the array is
-    /// sharded, the item's own chunk where it is not.
+    /// sharded, the item's own chunk where it is not. Per job only because an unsharded
+    /// array's decode unit is the ITEM's chunk; it is the same for every job in practice.
     decode_shape: &'a [NonZeroU64],
     /// The columns each coordinate takes, when they are scattered rather than consecutive --
     /// `oindex[rows, cols]`. `None` is a contiguous run, which is every other case.
     col_offsets: Option<&'a [u64]>,
-    /// Whether missing bytes are ordinary here. A shard index that named this chunk and then
-    /// did not have it means someone rewrote the store mid-read, which is worth failing on.
-    /// An unsharded chunk has no index to consult, so its key simply may not exist yet, and
-    /// that is a fill, not a fault.
-    may_be_absent: bool,
     ctx: &'a JobContext,
 }
 
@@ -845,7 +849,7 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let ctx = job.ctx;
     let size = ctx.element_size;
     let Some(bytes) = bytes else {
-        if job.may_be_absent {
+        if ctx.may_be_absent {
             return fill(job.out, &ctx.fill_value, size);
         }
         return Err(format!("{} vanished between index and read", job.key));

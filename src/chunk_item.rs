@@ -294,6 +294,12 @@ pub(crate) fn build_chunk_unit_items(
             "a trailing axis of extent zero selects nothing",
         ));
     }
+    // Constant for every index in the two shared cases; unused in the varying one.
+    let shared_offset = match offsets {
+        Offsets::Uniform(_) => uniform_offset,
+        // Applied per element by the gather, not folded into the coordinate.
+        Offsets::Grid(_) | Offsets::PerIndex(_) => 0,
+    };
     if let Some(given) = offsets.len() {
         if given != n {
             return Err(PyErr::new::<PyValueError, _>(format!(
@@ -385,23 +391,22 @@ pub(crate) fn build_chunk_unit_items(
             shape: chunk_shape.clone(),
             num_elements,
             array_shape: shape.clone(),
-            // Relative to the chunk subset, because that is the buffer gathered from.
-            // Scaled by `row_stride`, which is one index's worth of THAT buffer, then
-            // stepped by `elem_offset` to where this selection starts inside the row. With
-            // the trailing axes whole the offset is 0 and the stride is the run.
-            coords: Some(
-                (a..b)
+            // Relative to the chunk subset, because that is the buffer gathered from,
+            // scaled by `row_stride` -- one index's worth of THAT buffer -- and stepped by
+            // the offset to where this selection starts inside the row. With the trailing
+            // axes whole the offset is 0 and the stride is the run.
+            //
+            // The shared cases step by a CONSTANT, so the offset lookup and its bounds check
+            // are hoisted out: this closure runs once per selected index, thousands of times
+            // a call, and doing loop-invariant work inside it cost 6% on the loader.
+            coords: Some(match offsets {
+                Offsets::PerIndex(per) => (a..b)
                     .map(|i| {
-                        let offset = match offsets {
-                            Offsets::Uniform(_) => uniform_offset,
-                            Offsets::PerIndex(per) => per[i],
-                            // Applied per element by the gather, not here.
-                            Offsets::Grid(_) => 0,
-                        };
-                        // Every offset, not just a shared one, must leave the index's own
-                        // elements: `gather` only knows the whole decoded buffer's length, so
-                        // a point past its row would return the NEXT row's element under this
-                        // point's name.
+                        // The only case where the offset genuinely varies, so the only one
+                        // that has to be checked per element. `gather` knows the whole
+                        // decoded buffer's length and nothing narrower, so a point past its
+                        // own row would return the NEXT row's element under this point's name.
+                        let offset = per[i];
                         if offset.saturating_add(run_len) > row_stride {
                             return Err(PyErr::new::<PyValueError, _>(format!(
                                 "offset {offset} leaves the {row_stride} elements one index \
@@ -412,7 +417,13 @@ pub(crate) fn build_chunk_unit_items(
                     })
                     .collect::<PyResult<Vec<u64>>>()?
                     .into(),
-            ),
+                // `uniform_offset` was checked once by `trailing_layout`, and `Grid`'s columns
+                // once by the arm that built it -- neither varies with the index.
+                _ => (a..b)
+                    .map(|i| at(i).map(|v| (v - lo) * row_stride + shared_offset))
+                    .collect::<PyResult<Vec<u64>>>()?
+                    .into(),
+            }),
             run_len,
             col_offsets: match offsets {
                 Offsets::Grid(cols) => Some(Arc::from(cols)),
