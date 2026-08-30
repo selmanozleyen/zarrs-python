@@ -535,9 +535,6 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
-/// Zero the counters, so one test's numbers are its own.
-#[gen_stub_pyfunction]
-#[pyfunction]
 /// Storage reads issued, and inner chunks they served.
 ///
 /// `served > issued` means adjacent chunks were merged into one read; equal means nothing
@@ -562,6 +559,9 @@ fn reset_read_merge_stats() {
     read_decode::CHUNKS_SERVED.store(0, Ordering::Relaxed);
 }
 
+/// Zero the counters, so one test's numbers are its own.
+#[gen_stub_pyfunction]
+#[pyfunction]
 fn reset_shard_index_cache_stats() {
     use std::sync::atomic::Ordering;
     read_decode::INDEX_CALL_HITS.store(0, Ordering::Relaxed);
