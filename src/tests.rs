@@ -86,7 +86,8 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 bad.readonly(),
                 0,
                 inner,
-                crate::chunk_item::Offsets::Uniform(&[])
+                crate::chunk_item::Offsets::Uniform(&[]),
+                None
             )
             .is_err()
         );
@@ -100,7 +101,8 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 over.readonly(),
                 0,
                 inner,
-                crate::chunk_item::Offsets::Uniform(&[])
+                crate::chunk_item::Offsets::Uniform(&[]),
+                None
             )
             .is_err()
         );
