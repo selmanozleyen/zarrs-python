@@ -534,14 +534,24 @@ impl ChunkItems {
         inner: u64,
         elem_starts: Vec<u64>,
     ) -> PyResult<()> {
-        // The monotonicity check that stood here compared `out_start` against the last
-        // entry's end. It cannot survive an entry that covers a BAND of the output: two
-        // entries holding the same rows in different column bands share an axis-0 start, and
-        // neither overlaps the other. It fired on exactly that, so it is gone.
+        // Entries that span the whole trailing extent still have to arrive in output order,
+        // and two of them sharing a byte is still refused here -- cheaply, and naming the
+        // entry rather than the byte.
         //
-        // Overlap is still refused, and by the check that actually proves it: `DisjointBytes`
-        // vends every output range from a forward-only cursor, so two pieces claiming a byte
-        // cannot both be handed out. What is lost is the earlier, cheaper report.
+        // A BANDED entry cannot be checked this way: two entries holding the same rows in
+        // different column bands share an axis-0 start and overlap nothing, so the comparison
+        // fires on the correct case. Rather than drop the check for everyone, it is skipped
+        // only for the entries it cannot judge. Those are still caught by `DisjointBytes`,
+        // whose forward-only cursor is what actually proves disjointness -- later, and by
+        // byte range rather than by entry.
+        let spans_trailing_whole = out_starts[1..].iter().all(|at| *at == 0)
+            && out_widths[1..] == shape[1..];
+        if spans_trailing_whole && out_starts[0] < self.out_end {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "output starting at {} overlaps an entry already pushed, which ends at {}",
+                out_starts[0], self.out_end
+            )));
+        }
         let items = build_chunk_unit_items(
             key,
             chunk_shape,
