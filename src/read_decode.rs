@@ -1002,8 +1002,11 @@ fn read_loop<'a>(
                         );
                         return;
                     };
+                    // `MaybeBytes` is `Option<Bytes>` and the iterator yields a bare `Bytes`:
+                    // a range that came back IS present, and absence is the `Ok(None)` arm
+                    // above, which is about the key rather than the range.
                     let bytes = match piece {
-                        Ok(b) => b,
+                        Ok(b) => Some(b),
                         Err(e) => {
                             record(failure, format!("read {} failed: {e}", job.key));
                             return;
