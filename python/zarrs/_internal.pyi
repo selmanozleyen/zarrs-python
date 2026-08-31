@@ -175,6 +175,16 @@ def raw_path_stats() -> tuple[builtins.int, builtins.int]:
     the same values, so a gate that refuses everything passes every values test.
     """
 
+def read_merge_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    `(issued, served)`: store calls made, and inner chunks they served, since the run began.
+
+    `jobs / groups` is the mean batch size, and it is the number that says whether batching
+    ENGAGED at all. At a scattered draw over many shards consecutive jobs rarely share a key,
+    so the ratio approaches 1 and the change is a no-op -- which is a different finding from
+    "batching did not pay", and indistinguishable from it without this.
+    """
+
 def reset_shard_index_cache_stats() -> None:
     r"""
     Zero the counters, so one test's numbers are its own.
