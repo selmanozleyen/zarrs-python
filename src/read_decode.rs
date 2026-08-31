@@ -3,7 +3,7 @@
 //! One job per innermost chunk: a reader does the blocking byte-range read, a decode worker
 //! decodes the chunk and copies out the elements the selection wants. The two are separate
 //! because a read waits on storage and a decode occupies a core, so the useful number of
-//! each is different -- hence `read_concurrency` and `decode_concurrency`.
+//! each is different -- hence a separate ceiling for each.
 //!
 //! Workers belong to the CALL. `std::thread::scope` cannot exit until they finish, so a job
 //! can hold `&mut [u8]` into the caller's output rather than a raw pointer, and the join is
@@ -140,8 +140,10 @@ impl CodecPipelineImpl {
             return Ok(declined);
         }
 
-        let want_readers = widths.read.min(jobs.len());
-        let want_decoders = widths.decode.min(jobs.len());
+        // The work, and nothing else: `initial_permits` caps this by the call's share of the
+        // ceiling, which is the only limit that was ever binding.
+        let want_readers = jobs.len();
+        let want_decoders = jobs.len();
         let _call = ActiveCall::enter();
         let failure: Mutex<Option<String>> = Mutex::new(None);
         let alive = AtomicUsize::new(0);
@@ -942,11 +944,18 @@ impl Drop for Alive<'_> {
 /// and `with zarr.config.set(...)` around a read would silently do nothing.
 #[derive(Clone, Copy)]
 pub(crate) struct CallWidths {
-    /// Readers one call may run at once.
-    pub(crate) read: usize,
-    /// Decoders one call may run at once.
-    pub(crate) decode: usize,
     /// Live READERS across every in-flight call.
+    ///
+    /// There was a per-CALL width beside this, and it was redundant: `initial_permits`
+    /// computed `want.min(share(ceiling))`, so a call never got more than its slice of the
+    /// ceiling however wide it asked to be, and nothing ever wanted LESS than its slice. Two
+    /// dials where one silently clamps the other is the shape that produces "I set it and
+    /// nothing happened" -- and a bounded pool behind a semaphore is the redundancy the
+    /// bulkhead literature names outright.
+    ///
+    /// What is left is one semaphore per kind. A call takes its fair share, the widening loop
+    /// grows it as other calls finish, and `Permit::insist` guarantees at least one worker so
+    /// a queue is never left unread.
     pub(crate) read_ceiling: usize,
     /// Live DECODERS across every in-flight call.
     ///
@@ -955,18 +964,12 @@ pub(crate) struct CallWidths {
 }
 
 impl CallWidths {
-    /// `None` for any of them takes the default: the given parallelism for the per-call
-    /// widths, and [`default_ceiling`] for either ceiling.
+    /// `None` takes [`default_ceiling`] for either ceiling.
     pub(crate) fn new(
-        read: Option<usize>,
-        decode: Option<usize>,
         read_ceiling: Option<usize>,
         decode_ceiling: Option<usize>,
-        parallelism: usize,
     ) -> Self {
         Self {
-            read: read.unwrap_or(parallelism).max(1),
-            decode: decode.unwrap_or(parallelism).max(1),
             read_ceiling: read_ceiling
                 .filter(|c| *c > 0)
                 .unwrap_or_else(default_ceiling),

@@ -477,24 +477,16 @@ impl CodecPipelineImpl {
     /// rayon, for selections this path declined. An audit of the public indexing surface found
     /// nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
     /// than a slower second Rust path.
-    #[pyo3(signature = (chunk_items, value, read_concurrency=None, decode_concurrency=None, read_worker_ceiling=None, decode_worker_ceiling=None))]
+    #[pyo3(signature = (chunk_items, value, read_worker_ceiling=None, decode_worker_ceiling=None))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,
         chunk_items: PyRef<'_, chunk_item::ChunkItems>,
         value: &Bound<'_, PyUntypedArray>,
-        read_concurrency: Option<usize>,
-        decode_concurrency: Option<usize>,
         read_worker_ceiling: Option<usize>,
         decode_worker_ceiling: Option<usize>,
     ) -> PyResult<()> {
-        let widths = read_decode::CallWidths::new(
-            read_concurrency,
-            decode_concurrency,
-            read_worker_ceiling,
-            decode_worker_ceiling,
-            self.num_threads,
-        );
+        let widths = read_decode::CallWidths::new(read_worker_ceiling, decode_worker_ceiling);
         self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, widths)
     }
 

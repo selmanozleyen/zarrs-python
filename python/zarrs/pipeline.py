@@ -255,8 +255,6 @@ class ZarrsCodecPipeline(CodecPipeline):
                 retrieve,
                 desc,
                 out,
-                config.get("codec_pipeline.read_concurrency", None),
-                config.get("codec_pipeline.decode_concurrency", None),
                 config.get("codec_pipeline.read_worker_ceiling", None),
                 config.get("codec_pipeline.decode_worker_ceiling", None),
             )

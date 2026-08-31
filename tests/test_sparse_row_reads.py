@@ -28,12 +28,12 @@ SHARD = 16384
 CONFIGS = {
     "default": {},
     "one worker": {
-        "codec_pipeline.read_concurrency": 1,
-        "codec_pipeline.decode_concurrency": 1,
+        "codec_pipeline.read_worker_ceiling": 1,
+        "codec_pipeline.decode_worker_ceiling": 1,
     },
     "wider than the machine": {
-        "codec_pipeline.read_concurrency": 64,
-        "codec_pipeline.decode_concurrency": 4,
+        "codec_pipeline.read_worker_ceiling": 64,
+        "codec_pipeline.decode_worker_ceiling": 4,
     },
 }
 
