@@ -1138,6 +1138,24 @@ fn spawn_decode<'scope, 'env>(
 ) where
     'env: 'scope,
 {
+    // A RAW job never leaves this thread. Its read WAS the answer -- `decode_one` on that path
+    // is a `copy_from_slice` with no codec and no scratch -- so handing it to the decode pool
+    // buys a queue push, a steal and a wake in order to memcpy bytes that are still in this
+    // core's cache from the read that just fetched them.
+    //
+    // Measured before this landed: on an uncompressed array, raising `decode_ceiling` made
+    // throughput fall monotonically (134.0 -> 129.2 -> 117.2 M nnz/s at 32 -> 128 -> 512),
+    // because every extra decode thread was another consumer competing for cores to perform
+    // memcpys. The fix is not a smaller default -- the array says whether there is decode work
+    // to do, and when there is none no worker should be asked.
+    if job.raw {
+        let mut scratch = Vec::new();
+        if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
+            record(failure, e);
+        }
+        debug_assert!(scratch.is_empty(), "the raw path must not touch scratch");
+        return;
+    }
     dec.spawn(move |_| {
         let mut scratch = scratch_take();
         if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
