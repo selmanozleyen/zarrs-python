@@ -164,6 +164,15 @@ class CodecPipelineImpl:
         write_empty_chunks: builtins.bool,
     ) -> None: ...
 
+def pool_sizes() -> tuple[typing.Optional[builtins.int], typing.Optional[builtins.int]]:
+    r"""
+    The sizes the two worker pools were BUILT with, or `None` where one has not been built.
+
+    Pools are sized by the first read in the process, so a ceiling set later is silently
+    ignored. A benchmark that sets one and reports a number has to be able to say which of the
+    two happened -- the repo's rule that a knob which was set is not a knob that arrived.
+    """
+
 def raw_path_stats() -> tuple[builtins.int, builtins.int]:
     r"""
     `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
