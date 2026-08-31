@@ -630,6 +630,17 @@ fn scratch_pool_stats() -> (u64, u64) {
     )
 }
 
+/// The sizes the two worker pools were BUILT with, or `None` where one has not been built.
+///
+/// Pools are sized by the first read in the process, so a ceiling set later is silently
+/// ignored. A benchmark that sets one and reports a number has to be able to say which of the
+/// two happened -- the repo's rule that a knob which was set is not a knob that arrived.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn pool_sizes() -> (Option<usize>, Option<usize>) {
+    read_decode::pool_sizes()
+}
+
 /// Zero the counters, so one test's numbers are its own.
 #[gen_stub_pyfunction]
 #[pyfunction]
@@ -648,6 +659,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(raw_path_stats, m)?)?;
     m.add_function(wrap_pyfunction!(read_merge_stats, m)?)?;
     m.add_function(wrap_pyfunction!(scratch_pool_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(pool_sizes, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
     m.add_class::<chunk_item::ChunkItems>()?;

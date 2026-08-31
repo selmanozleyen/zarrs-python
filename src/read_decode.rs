@@ -13,8 +13,8 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pyo3::PyResult;
@@ -139,99 +139,44 @@ impl CodecPipelineImpl {
             return Ok(declined);
         }
 
-        // The work, and nothing else: `initial_permits` caps this by the call's share of the
-        // ceiling, which is the only limit that was ever binding.
+        // TWO POOLS, TWO QUEUES, NO DIVISION.
         //
-        // Count each queue in ITS OWN unit. The job channel carries GROUPS -- `batch_by_key`
-        // packs up to `GROUP_MAX_JOBS` jobs of the same key into one -- so one reader can
-        // only ever take one group at a time, and the reader target is the group count. The
-        // decode channel carries one item per JOB, so that target is the job count.
-        let groups = batch_by_key(jobs);
-        let want_readers = groups.len();
-        let want_decoders = groups.iter().map(|g| g.jobs.len()).sum::<usize>();
-        let _call = ActiveCall::enter();
+        // Capacity is not partitioned between calls any more. Both pools are persistent and
+        // work-stealing: a free worker takes the next task, whoever queued it. A 585-chunk
+        // call and a 9-chunk call contend on the same deque and the big one simply gets more
+        // workers, which is what four attempts at a per-call share never managed.
+        //
+        // What that deletes, and why each had to go:
+        //
+        //   `share = ceiling / ACTIVE_CALLS` -- a snapshot taken once, at the worst instant
+        //     (every loader worker has just entered), never recomputed. Integer division also
+        //     lost capacity outright: at C=90 with 32 calls the share is 2, all 32 hold 64,
+        //     and 26 permits were unreachable by construction.
+        //   the widening loop -- which existed ONLY to correct that staleness, and whose
+        //     correction was worth 25% on a long call. A mechanism whose correction term is
+        //     worth 25% has a wrong initial allocation.
+        //   `Permit::insist` -- a floor over the ceiling, so the real bound was C + N rather
+        //     than C, and the knob did not mean what it said.
+        //
+        // READS AND DECODES GET SEPARATE POOLS ON PURPOSE. A read blocks on storage; a decode
+        // occupies a core. A reader parked on Lustre must occupy a READER, never a decode
+        // worker, or one slow shard starves every decode in the process.
+        //
+        // The scopes nest so a reader can hand its chunks straight to the decode pool, and
+        // `in_place_scope` runs the CALLING thread as a worker rather than leaving it asleep --
+        // which is the one thing daf9ca4 got right, kept here without being a special case.
+        // Both scopes block until their tasks finish, which is what keeps `&'a mut [u8]` into
+        // the caller's numpy buffer valid without a raw pointer or a completion latch.
         let failure: Mutex<Option<String>> = Mutex::new(None);
+        let groups = batch_by_key(jobs);
 
-        std::thread::scope(|scope| {
-            let (job_tx, job_rx) = unbounded::<ReadGroup<'_>>();
-            // Unbounded, but only this call's own jobs are ever sent, so peak resident is
-            // the batch the caller asked for. Do not bound it: readers running ahead of
-            // decoders is the prefetch on high-latency storage.
-            let (dec_tx, dec_rx) = unbounded::<(Job<'_>, MaybeBytes)>();
-            {
-                let spawn_reader = |permit: Permit| {
-                    debug_assert_eq!(permit.0, Kind::Read);
-                    let (jobs, decodes, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
-                    scope.spawn(move || {
-                        // Held for the life of the thread and released as it returns: the
-                        // permit is free the moment this worker stops using it.
-                        let _permit = permit;
-                        read_loop(&jobs, &decodes, failure);
-                    });
-                };
-                let spawn_decoder = |permit: Permit| {
-                    debug_assert_eq!(permit.0, Kind::Decode);
-                    let (decodes, failure) = (dec_rx.clone(), &failure);
-                    scope.spawn(move || {
-                        let _permit = permit;
-                        decode_loop(&decodes, failure);
-                    });
-                };
-
-                for permit in initial_permits(Kind::Read, want_readers, ceilings.read_ceiling) {
-                    spawn_reader(permit);
-                }
-                // The calling thread takes one of the call's OWN decode permits rather than a
-                // spare of its own. Asking for `want - 1` here does not work and was wrong for
-                // one commit: `initial_permits` returns `min(want, share)`, so subtracting from
-                // `want` only bites when the call is smaller than its share -- for every call
-                // bigger than it, the target is the share regardless and the calling thread put
-                // the call at share + 1. One caller with a ceiling of 8 ran 9 decoders.
-                let mut decoders =
-                    initial_permits(Kind::Decode, want_decoders, ceilings.decode_ceiling);
-                let mine = decoders.pop().expect("initial_permits floors at one");
-                for permit in decoders {
-                    spawn_decoder(permit);
-                }
-
+        decode_pool(ceilings.decode_ceiling).in_place_scope(|dec| {
+            read_pool(ceilings.read_ceiling).in_place_scope(|rd| {
                 for group in groups {
-                    if job_tx.send(group).is_err() {
-                        record(&failure, "no readers left to take the job".to_string());
-                        break;
-                    }
+                    let (failure, ctx) = (&failure, &ctx);
+                    rd.spawn(move |_| read_group(group, dec, failure, ctx));
                 }
-            }
-            // Every sender for the job queue is gone, so readers finish what is queued and
-            // exit. Theirs are the only `dec_tx` clones left once the closures above have
-            // been dropped with this block -- which is what lets `dec_rx` ever disconnect.
-            drop(job_tx);
-            drop(dec_tx);
-
-            // THE CALLING THREAD DECODES. It arrived on its own OS thread with the GIL
-            // released and, until now, spent the call asleep: it spawned workers and then
-            // polled a widening loop at 200 us -- ~5k `clock_nanosleep`/s per in-flight call
-            // -- waiting for permits so that OTHER threads could do the work it was
-            // perfectly able to do itself. With 10-30 calls in flight that is 10-30 real
-            // threads sleeping against a ceiling of `available_parallelism()` decoders.
-            //
-            // This deletes the widening loop rather than correcting it a third time. The
-            // loop existed to grow a call that started at the floor; the floor is now the
-            // calling thread, which cannot be starved, costs no `clone()`, and is already
-            // counted against the caller's own fetch threads. Gone with it: `WIDEN_POLL`,
-            // the `Alive` count, the `decoded` reconciliation, and `Permit::insist` on the
-            // decode side -- a call can no longer have zero decoders.
-            //
-            // Charged to the ceiling like any other worker: this thread holds one of the
-            // permits the call already took, so `share` decoders run in total, not `share + 1`.
-            // The floor inside `initial_permits` is what guarantees there is one to hold -- a
-            // call must never be left unable to decode because every other call got there
-            // first, and this thread is the one that guarantees the queue is drained.
-            let _permit = mine;
-            decode_loop(&dec_rx, &failure);
-            // Deliberately last: dropping it earlier would disconnect nothing, since the
-            // readers hold their own clones, but it keeps the receiver alive for exactly as
-            // long as this thread is reading from it.
-            drop(dec_rx);
+            });
         });
 
         if let Some(e) = failure.lock().expect("failure slot poisoned").take() {
@@ -885,64 +830,81 @@ pub(crate) static INDEX_CALL_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_ARRAY_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 
-/// Live workers across every in-flight call, counted separately per kind.
-static LIVE_READERS: AtomicUsize = AtomicUsize::new(0);
-static LIVE_DECODERS: AtomicUsize = AtomicUsize::new(0);
-
-/// Which budget a worker is drawn from.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
-    Read,
-    Decode,
-}
-
-impl Kind {
-    fn live(self) -> &'static AtomicUsize {
-        match self {
-            Self::Read => &LIVE_READERS,
-            Self::Decode => &LIVE_DECODERS,
-        }
-    }
-}
-
-/// The default ceiling on live workers of ONE kind, across every in-flight call.
+/// The default size of either pool: the machine's parallelism.
 ///
-/// The available parallelism. Raise it per read; see `codec_pipeline.read_worker_ceiling`.
+/// A read waits on storage and a decode wants a core, so these are not the same quantity and
+/// only the decode side is really bounded by cores. They share a default because the machine
+/// is the only thing either can be guessed from; a caller that knows its storage sets the read
+/// side higher.
 fn default_ceiling() -> usize {
     std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
 }
 
-/// The worker ceilings ONE call runs under, read from `zarr.config` when that call starts.
+/// The two pools, built once and shared by every call in the process.
 ///
-/// Per call, not per array: read at array open these would be frozen for the array's life,
-/// and `with zarr.config.set(...)` around a read would silently do nothing.
+/// PERSISTENT, because the alternative was measured and lost. Threads used to be spawned per
+/// call and their capacity divided between calls by `ceiling / ACTIVE_CALLS` -- a snapshot
+/// taken once, at the instant every loader worker had just entered, and never recomputed. A
+/// call was then stuck with that share for its whole life while other calls finished and left
+/// permits unclaimed, and integer division lost capacity outright (at C=90 with 32 calls the
+/// share is 2, all 32 hold 64, and 26 are unreachable). Four attempts to correct that
+/// staleness in flight -- a polling loop, twice re-predicated, then deleted -- shipped a
+/// 200 us poll, a wrong unit, a hang, and a 25% regression between them.
+///
+/// A work-stealing pool has none of those failure modes because it never divides anything: a
+/// free worker takes the next task, whoever queued it, so a call with more work simply gets
+/// more workers.
+///
+/// SIZED ONCE. This is the honest cost of the change: `read_worker_ceiling` and
+/// `decode_worker_ceiling` are read from `zarr.config` per call, but only the FIRST call's
+/// values build the pools. A later `with zarr.config.set(...)` around a read no longer resizes
+/// anything. `pool_sizes()` reports what was actually built, so a bench can assert it rather
+/// than assume -- this repo's rule that a knob which was set is not a knob that arrived.
+static READ_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static DECODE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+fn build_pool(size: usize, name: &'static str) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(size)
+        .thread_name(move |i| format!("zarrs-{name}-{i}"))
+        .build()
+        .expect("a thread pool of a positive size")
+}
+
+/// Threads that BLOCK on storage. Sized independently of the core count for that reason.
+fn read_pool(size: usize) -> &'static rayon::ThreadPool {
+    READ_POOL.get_or_init(|| build_pool(size, "read"))
+}
+
+/// Threads that occupy a core. This is the one genuinely bounded by parallelism.
+fn decode_pool(size: usize) -> &'static rayon::ThreadPool {
+    DECODE_POOL.get_or_init(|| build_pool(size, "decode"))
+}
+
+/// What the pools were actually BUILT with, or `None` where one has not been built yet.
+///
+/// Sizes are fixed at first use, so a caller that sets a ceiling after the first read gets the
+/// old value silently. Reporting the built size is what lets a benchmark tell "the knob did
+/// not pay" from "the knob never arrived".
+pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
+    (
+        READ_POOL.get().map(rayon::ThreadPool::current_num_threads),
+        DECODE_POOL.get().map(rayon::ThreadPool::current_num_threads),
+    )
+}
+
+/// The pool sizes ONE call asks for, read from `zarr.config` when that call starts.
+///
+/// Only the first call's values are used -- see [`READ_POOL`].
 #[derive(Clone, Copy)]
 pub(crate) struct Ceilings {
-    /// Live READERS across every in-flight call.
-    ///
-    /// There was a per-CALL width beside this, and it was redundant: `initial_permits`
-    /// computed `want.min(share(ceiling))`, so a call never got more than its slice of the
-    /// ceiling however wide it asked to be, and nothing ever wanted LESS than its slice. Two
-    /// dials where one silently clamps the other is the shape that produces "I set it and
-    /// nothing happened" -- and a bounded pool behind a semaphore is the redundancy the
-    /// bulkhead literature names outright.
-    ///
-    /// What is left is one semaphore per kind. A call takes its fair share, the widening loop
-    /// grows it as other calls finish, and `Permit::insist` guarantees at least one worker so
-    /// a queue is never left unread.
     pub(crate) read_ceiling: usize,
-    /// Live DECODERS across every in-flight call.
-    ///
-    /// Separate from the reader ceiling: a read waits on storage, a decode occupies a core.
     pub(crate) decode_ceiling: usize,
 }
 
 impl Ceilings {
-    /// `None` takes [`default_ceiling`] for either ceiling.
-    pub(crate) fn new(
-        read_ceiling: Option<usize>,
-        decode_ceiling: Option<usize>,
-    ) -> Self {
+    /// `None`, or a zero, takes [`default_ceiling`].
+    pub(crate) fn new(read_ceiling: Option<usize>, decode_ceiling: Option<usize>) -> Self {
         Self {
             read_ceiling: read_ceiling
                 .filter(|c| *c > 0)
@@ -952,86 +914,6 @@ impl Ceilings {
                 .unwrap_or_else(default_ceiling),
         }
     }
-}
-
-/// Calls in flight, so a call takes a SHARE of the ceiling rather than racing for it.
-static ACTIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// Counts one call for as long as it is in flight. A guard, so an early return or a panic
-/// cannot leave the count high for the life of the process.
-struct ActiveCall;
-
-impl ActiveCall {
-    fn enter() -> Self {
-        ACTIVE_CALLS.fetch_add(1, Ordering::AcqRel);
-        Self
-    }
-
-    /// An equal share of the ceiling. Never zero, or a call's queue would never be read.
-    fn share(ceiling: usize) -> usize {
-        (ceiling / ACTIVE_CALLS.load(Ordering::Relaxed).max(1)).max(1)
-    }
-}
-
-impl Drop for ActiveCall {
-    fn drop(&mut self) {
-        ACTIVE_CALLS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// One worker's permit, released when THAT worker exits, not when the call does.
-struct Permit(Kind);
-
-impl Permit {
-    /// `None` when the ceiling is full, so the caller decides whether to insist or wait.
-    fn take(kind: Kind, ceiling: usize) -> Option<Self> {
-        let counter = kind.live();
-        let mut live = counter.load(Ordering::Relaxed);
-        loop {
-            if live >= ceiling {
-                return None;
-            }
-            match counter.compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => return Some(Self(kind)),
-                Err(actual) => live = actual,
-            }
-        }
-    }
-
-    /// The floor of one, taken over the ceiling. Without it a call that finds nothing free
-    /// waits for a call that is itself waiting, and ten of them deadlock on each other.
-    fn insist(kind: Kind) -> Self {
-        kind.live().fetch_add(1, Ordering::AcqRel);
-        Self(kind)
-    }
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.0.live().fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// What a call STARTS with: its equal share of the ceiling, capped by the work it has.
-///
-/// Never empty. A call with no reader never drains its job queue and a call with no decoder
-/// never drains its decode queue, and in both cases nothing else will do that work for it, so
-/// the last one is taken OVER the ceiling via [`Permit::insist`] rather than leaving the call
-/// stuck. That floor is why the calling thread can pop a permit unconditionally.
-fn initial_permits(kind: Kind, want: usize, ceiling: usize) -> Vec<Permit> {
-    let target = want.min(ActiveCall::share(ceiling));
-    let mut held = Vec::with_capacity(target);
-    while held.len() < target {
-        match Permit::take(kind, ceiling) {
-            Some(permit) => held.push(permit),
-            None => break,
-        }
-    }
-    if held.is_empty() {
-        held.push(Permit::insist(kind));
-    }
-    held
 }
 
 /// One innermost chunk, and the slice of the output its elements belong in.
@@ -1188,90 +1070,82 @@ fn batch_by_key(jobs: Vec<Job<'_>>) -> Vec<ReadGroup<'_>> {
     groups
 }
 
-fn read_loop<'a>(
-    jobs: &Receiver<ReadGroup<'a>>,
-    decodes: &Sender<(Job<'a>, MaybeBytes)>,
-    failure: &Mutex<Option<String>>,
-) {
-    while let Ok(group) = jobs.recv() {
-        let ctx = group.jobs[0].ctx;
-        let ranges: Vec<ByteRange> = group.jobs.iter().map(|job| job.range).collect();
-        match ctx.store.get_partial_many(&group.key, Box::new(ranges.into_iter())) {
-            // `None` for the whole iterator means the KEY is absent, which is a different
-            // thing from a range coming back empty. `decode_one` already knows what an absent
-            // chunk contributes -- the fill value, or an error where a shard index named it --
-            // so every job in the group gets `None` and that logic stays in one place.
-            Ok(None) => {
-                for job in group.jobs {
-                    if send_piece(job, None, decodes, failure).is_err() {
-                        return;
-                    }
-                }
-            }
-            Ok(Some(mut fetched)) => {
-                for job in group.jobs {
-                    // One result per range, in order, or the pairing is wrong for every job in
-                    // the group -- and wrong bytes under the right key is not something a
-                    // later check would catch.
-                    let Some(piece) = fetched.next() else {
-                        record(
-                            failure,
-                            format!("{}: the store returned fewer ranges than asked", job.key),
-                        );
-                        return;
-                    };
-                    // `MaybeBytes` is `Option<Bytes>` and the iterator yields a bare `Bytes`:
-                    // a range that came back IS present, and absence is the `Ok(None)` arm
-                    // above, which is about the key rather than the range.
-                    let bytes = match piece {
-                        Ok(b) => Some(b),
-                        Err(e) => {
-                            record(failure, format!("read {} failed: {e}", job.key));
-                            return;
-                        }
-                    };
-                    if send_piece(job, bytes, decodes, failure).is_err() {
-                        return;
-                    }
-                }
-            }
-            // Records and CONTINUES, so this reader goes on to the next group.
-            Err(e) => record(failure, format!("read {} failed: {e}", group.key)),
-        }
-    }
-}
-
-/// Hand one job's bytes to a decoder, or record why nobody can.
+/// One group: one store call, then one decode task per chunk it returned.
 ///
-/// `Err(())` means every decoder is gone. Returning silently there would leave this job's
-/// bytes of the output at whatever `np.empty` left, and the call would report success.
-fn send_piece<'a>(
-    job: Job<'a>,
-    bytes: MaybeBytes,
-    decodes: &Sender<(Job<'a>, MaybeBytes)>,
-    failure: &Mutex<Option<String>>,
-) -> Result<(), ()> {
-    if let Err(returned) = decodes.send((job, bytes)) {
-        let (job, _) = returned.into_inner();
-        record(
-            failure,
-            format!("{}: no decoder left to take the chunk", job.key),
-        );
-        return Err(());
+/// The decode tasks go to the DECODE pool, not this one. A reader is parked on storage for
+/// most of its life and a decode wants a core, so mixing them means one slow shard holds a
+/// core that a ready chunk needs.
+///
+/// Each chunk is spawned as it arrives rather than after the whole group, so the first chunk
+/// decodes while the rest of the group is still being handed over.
+fn read_group<'scope, 'env>(
+    group: ReadGroup<'env>,
+    dec: &rayon::Scope<'scope>,
+    failure: &'env Mutex<Option<String>>,
+    ctx: &'env JobContext,
+) where
+    'env: 'scope,
+{
+    let ranges: Vec<ByteRange> = group.jobs.iter().map(|job| job.range).collect();
+    match ctx.store.get_partial_many(&group.key, Box::new(ranges.into_iter())) {
+        // `None` for the whole iterator means the KEY is absent, which is a different thing
+        // from a range coming back empty. `decode_one` already knows what an absent chunk
+        // contributes -- the fill value, or an error where a shard index named it -- so every
+        // job in the group gets `None` and that logic stays in one place.
+        Ok(None) => {
+            for job in group.jobs {
+                spawn_decode(dec, job, None, failure);
+            }
+        }
+        Ok(Some(mut fetched)) => {
+            for job in group.jobs {
+                // One result per range, in order, or the pairing is wrong for every job in the
+                // group -- and wrong bytes under the right key is not something a later check
+                // would catch.
+                let Some(piece) = fetched.next() else {
+                    record(
+                        failure,
+                        format!("{}: the store returned fewer ranges than asked", job.key),
+                    );
+                    return;
+                };
+                // `MaybeBytes` is `Option<Bytes>` and the iterator yields a bare `Bytes`: a
+                // range that came back IS present, and absence is the `Ok(None)` arm above,
+                // which is about the key rather than the range.
+                let bytes = match piece {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        record(failure, format!("read {} failed: {e}", job.key));
+                        return;
+                    }
+                };
+                spawn_decode(dec, job, bytes, failure);
+            }
+        }
+        Err(e) => record(failure, format!("read {} failed: {e}", group.key)),
     }
-    Ok(())
 }
 
-fn decode_loop(decodes: &Receiver<(Job<'_>, MaybeBytes)>, failure: &Mutex<Option<String>>) {
-    let mut scratch: Vec<u8> = scratch_take();
-    while let Ok((mut job, bytes)) = decodes.recv() {
+/// One chunk's decode, on the decode pool.
+///
+/// The scratch buffer is taken from the pool and returned inside the task, so a decode worker
+/// that handles chunks from many different calls reuses one buffer across all of them -- which
+/// is what `SCRATCH_POOL` was for when workers were per-call and short-lived.
+fn spawn_decode<'scope, 'env>(
+    dec: &rayon::Scope<'scope>,
+    mut job: Job<'env>,
+    bytes: MaybeBytes,
+    failure: &'env Mutex<Option<String>>,
+) where
+    'env: 'scope,
+{
+    dec.spawn(move |_| {
+        let mut scratch = scratch_take();
         if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
             record(failure, e);
         }
-    }
-    // On the normal return only. A panicking worker drops its buffer instead, which costs one
-    // allocation and keeps the unwind path free of a lock.
-    scratch_give(scratch);
+        scratch_give(scratch);
+    });
 }
 
 /// Decode one innermost chunk into scratch, then gather the wanted elements into `out`.
@@ -1486,51 +1360,41 @@ mod tests {
         assert_eq!(buffer[4], 2);
     }
 
-    /// One test rather than several: `LIVE_READERS`, `LIVE_DECODERS` and `ACTIVE_CALLS` are
-    /// process-wide, and separate `#[test]` functions run concurrently in one process, so
-    /// they would race each other.
+    /// The pools are built at the size asked for, and the size is ONE-SHOT.
+    ///
+    /// Both halves matter. The first is the ordinary contract. The second is the cost of
+    /// persistent pools and the thing most likely to mislead someone later: a ceiling set
+    /// after the first read is silently ignored, so `pool_sizes` has to report what was built
+    /// rather than what was asked for.
+    ///
+    /// One test rather than several because the pools are process-wide `OnceLock`s and
+    /// separate `#[test]` functions run concurrently in one process, so they would race.
     #[test]
-    fn a_call_takes_a_share_and_releases_per_worker() {
-        let ceiling = 16;
-        let first = ActiveCall::enter();
-
-        // Alone, a call may have the whole ceiling -- capped by the work it has.
-        assert_eq!(initial_permits(Kind::Read, 4, ceiling).len(), 4);
+    fn a_pool_is_built_once_at_the_size_asked_for() {
         assert_eq!(
-            LIVE_READERS.load(Ordering::Relaxed),
-            0,
-            "a permit is released when its worker drops it, not when the call ends"
+            pool_sizes(),
+            (None, None),
+            "no read has run, so neither pool should exist yet"
         );
 
-        // A second call in flight halves the share rather than finding it already spent.
-        let second = ActiveCall::enter();
-        assert_eq!(ActiveCall::share(ceiling), 8);
-        drop(second);
-        assert_eq!(ActiveCall::share(ceiling), ceiling);
+        let pool = read_pool(3);
+        assert_eq!(pool.current_num_threads(), 3);
+        assert_eq!(pool_sizes().0, Some(3));
 
-        // With every permit held, a call still gets a worker: the floor of one is what stops
-        // calls from waiting on each other.
-        let held = initial_permits(Kind::Read, ceiling, ceiling);
-        assert_eq!(held.len(), ceiling);
-        let starved = initial_permits(Kind::Read, 4, ceiling);
-        assert_eq!(starved.len(), 1);
-        assert_eq!(LIVE_READERS.load(Ordering::Relaxed), ceiling + 1);
+        // Asking again with a different size returns the pool already built. This is the
+        // documented one-shot behaviour, not an accident, and it is why the size is reported.
+        assert_eq!(read_pool(64).current_num_threads(), 3);
+        assert_eq!(pool_sizes().0, Some(3));
 
-        // THE TWO BUDGETS ARE SEPARATE. Readers are exhausted here; decoders must not notice.
-        assert_eq!(LIVE_DECODERS.load(Ordering::Relaxed), 0);
-        let decoders = initial_permits(Kind::Decode, 4, ceiling);
+        // THE TWO POOLS ARE SEPARATE. The read pool is built here; the decode pool must not
+        // have been dragged into existence with it, or a read-side default would silently
+        // become the decode width.
         assert_eq!(
-            decoders.len(),
-            4,
-            "decoders were charged the readers' ceiling"
+            pool_sizes().1,
+            None,
+            "building the read pool must not build the decode pool"
         );
-
-        drop(held);
-        drop(starved);
-        drop(decoders);
-        drop(first);
-        assert_eq!(LIVE_READERS.load(Ordering::Relaxed), 0);
-        assert_eq!(LIVE_DECODERS.load(Ordering::Relaxed), 0);
-        assert_eq!(ACTIVE_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(decode_pool(2).current_num_threads(), 2);
+        assert_eq!(pool_sizes(), (Some(3), Some(2)));
     }
 }
