@@ -142,8 +142,20 @@ impl CodecPipelineImpl {
 
         // The work, and nothing else: `initial_permits` caps this by the call's share of the
         // ceiling, which is the only limit that was ever binding.
-        let want_readers = jobs.len();
-        let want_decoders = jobs.len();
+        //
+        // Count each queue in ITS OWN unit. The job channel carries GROUPS -- `batch_by_key`
+        // packs up to `GROUP_MAX_JOBS` jobs of the same key into one -- so one reader can
+        // only ever take one group at a time, and the reader target is the group count. The
+        // decode channel carries one item per JOB, so that target is the job count.
+        //
+        // Counting jobs for BOTH made `live_readers < want_readers` true for the whole call
+        // on any batch that grouped at all: the widening loop could never reach its target,
+        // so it polled at `WIDEN_POLL` from start to finish -- ~5k `clock_nanosleep`/s per
+        // in-flight call, buying nothing, against decoders that are supposed to own the
+        // cores. The loop's first clause was dead weight, not a gate.
+        let groups = batch_by_key(jobs);
+        let want_readers = groups.len();
+        let want_decoders = groups.iter().map(|g| g.jobs.len()).sum::<usize>();
         let _call = ActiveCall::enter();
         let failure: Mutex<Option<String>> = Mutex::new(None);
         let alive = AtomicUsize::new(0);
@@ -188,7 +200,7 @@ impl CodecPipelineImpl {
                 spawn_decoder(permit);
             }
 
-            for group in batch_by_key(jobs) {
+            for group in groups {
                 if job_tx.send(group).is_err() {
                     record(&failure, "no readers left to take the job".to_string());
                     break;
