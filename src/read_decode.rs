@@ -612,7 +612,12 @@ fn carve<'a>(
             // piece per row and a grid item carries its own per-element offsets; neither is a
             // single contiguous claim, so both take the ordinary path rather than get a second
             // implementation here.
-            Some(range) if ctx.raw && pieces.len() == 1 && item.grid.is_none() => {
+            Some(range)
+                if ctx.raw
+                    && pieces.len() == 1
+                    && item.grid.is_none()
+                    && raw_runs(coords_of(item)?, item.run_len) <= raw_max_reads_per_chunk() =>
+            {
                 let piece = pieces.into_iter().next().expect("length checked");
                 raw_row_jobs(item, *range, piece, coords_of(item)?, element_size, ctx, &mut jobs)?;
             }
@@ -632,8 +637,45 @@ fn carve<'a>(
     Ok((jobs, absent))
 }
 
-/// One job per ROW, each reading exactly its own bytes, for a chunk that is a plain byte
-/// tiling.
+/// How many READS this chunk's rows become once consecutive ones are merged.
+///
+/// The count that matters is runs, not rows: 64 consecutive rows are ONE read, and 64
+/// scattered ones are 64. `coords` is non-decreasing, so a run is a maximal stretch stepping
+/// by exactly `run_len`. A duplicate steps by 0 and breaks the run, which is right -- the same
+/// row twice is two output pieces and cannot be one read.
+pub(crate) fn raw_runs(coords: &[u64], run_len: u64) -> usize {
+    if coords.is_empty() {
+        return 0;
+    }
+    1 + coords
+        .windows(2)
+        .filter(|w| w[1] != w[0] + run_len)
+        .count()
+}
+
+/// Reads a chunk may become before the raw path is declined for it.
+///
+/// The raw path trades BYTES for REQUESTS, and requests are the scarce resource. Measured at
+/// 14 plates on uncompressed CSR, cs=1, with no gate at all: amplification fell 87.3x -> 2.6x
+/// (20.82 GB -> 0.61 GB, matching zarr-python exactly) and throughput fell with it, 10,540
+/// rows/s -> 1,360, at 2.4x the CPU. A 5.8 KB row costs nearly what a 366 KB chunk costs to
+/// fetch, so 63 tiny reads lose to one large one however few bytes they move.
+///
+/// So the choice is PER ITEM, not per array: take the raw path only where a chunk's rows
+/// collapse to a handful of reads. 8 is a placeholder below chunk_size=64, not a measured
+/// value; `ZARRS_RAW_MAX_READS_PER_CHUNK=0` disables the raw path entirely.
+fn raw_max_reads_per_chunk() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("ZARRS_RAW_MAX_READS_PER_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+/// One job per RUN of consecutive rows, each reading exactly its own bytes, for a chunk that
+/// is a plain byte tiling.
 ///
 /// `coord` is already the row's element offset within the chunk and `run_len` its length, so
 /// the row's byte range is arithmetic. Measured at scale, 8,192 rows read this way take
@@ -662,23 +704,35 @@ fn raw_row_jobs<'a>(
         .ok()
         .and_then(|r| r.checked_mul(element_size))
         .ok_or_else(|| PyRuntimeError::new_err(format!("{}: row too large", item.key)))?;
+    // CONSECUTIVE rows are one range, not one each. Without this a selection of 8-row blocks
+    // issues 8 requests of 8 KiB where one of 64 KiB would do, and requests are the scarce
+    // resource. The rows were always adjacent; the code just did not look.
     let mut rest = piece;
-    for coord in coords {
-        let (row_out, tail) = rest.split_at_mut(row_bytes.min(rest.len()));
+    let mut start = 0usize;
+    while start < coords.len() {
+        let mut end = start + 1;
+        while end < coords.len() && coords[end] == coords[end - 1] + item.run_len {
+            end += 1;
+        }
+        let span = row_bytes
+            .checked_mul(end - start)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("{}: run too large", item.key)))?;
+        let (run_out, tail) = rest.split_at_mut(span.min(rest.len()));
         rest = tail;
         let at = base
-            .checked_add(coord * element_size as u64)
+            .checked_add(coords[start] * element_size as u64)
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: offset overflow", item.key)))?;
         jobs.push(Job {
             key: item.key.clone(),
-            range: ByteRange::FromStart(at, Some(row_bytes as u64)),
+            range: ByteRange::FromStart(at, Some(span as u64)),
             raw: true,
-            out: vec![row_out],
+            out: vec![run_out],
             coords: &[],
             run_len: item.run_len,
             grid: None,
             ctx,
         });
+        start = end;
     }
     if !rest.is_empty() {
         return Err(PyRuntimeError::new_err(format!(
