@@ -166,6 +166,15 @@ class CodecPipelineImpl:
         write_empty_chunks: builtins.bool,
     ) -> None: ...
 
+def raw_path_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
+    inner chunks read and decoded.
+
+    Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
+    the same values, so a gate that refuses everything passes every values test.
+    """
+
 def reset_shard_index_cache_stats() -> None:
     r"""
     Zero the counters, so one test's numbers are its own.
