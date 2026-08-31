@@ -147,7 +147,7 @@ impl CodecPipelineImpl {
         let alive = AtomicUsize::new(0);
 
         std::thread::scope(|scope| {
-            let (job_tx, job_rx) = unbounded::<Job<'_>>();
+            let (job_tx, job_rx) = unbounded::<ReadGroup<'_>>();
             // Unbounded, but only this call's own jobs are ever sent, so peak resident is
             // the batch the caller asked for. Do not bound it: readers running ahead of
             // decoders is the prefetch on high-latency storage.
@@ -186,8 +186,8 @@ impl CodecPipelineImpl {
                 spawn_decoder(permit);
             }
 
-            for job in jobs {
-                if job_tx.send(job).is_err() {
+            for group in batch_by_key(jobs) {
+                if job_tx.send(group).is_err() {
                     record(&failure, "no readers left to take the job".to_string());
                     break;
                 }
@@ -1084,29 +1084,149 @@ fn record(failure: &Mutex<Option<String>>, message: String) {
     }
 }
 
+/// Consecutive jobs sharing a store key, read in one call.
+///
+/// `FilesystemStore::get_partial_many` opens the file, takes its read lock and queries its
+/// size ONCE for the whole batch, then reads each range at its own offset. Per job that is
+/// three syscalls saved; whether that is worth anything depends entirely on whether the read
+/// was request-bound, which is a question for the measurement and not for this comment.
+struct ReadGroup<'a> {
+    key: StoreKey,
+    jobs: Vec<Job<'a>>,
+}
+
+/// Cap on the bytes one group may hold in flight.
+///
+/// A group's results are held until its LAST job has decoded, so an ungrouped batch would let
+/// one key's whole shard sit resident while the first of its jobs decodes. 64 MiB is far above
+/// any single inner chunk here and far below the memory a preload already holds.
+const GROUP_MAX_BYTES: u64 = 64 << 20;
+
+/// Cap on the JOBS one group may hold, which is the one that binds.
+///
+/// A group is read by ONE worker, so a large group serialises what the workers would otherwise
+/// have done in parallel -- and it does not release any of its bytes until its last job has
+/// decoded. Measured at 14 plates: a scattered draw groups 2-3 chunks per call and gains from
+/// batching (sparse_c cs=4 went 1.12x -> 1.30x), while a strided draw groups 172-382 and loses
+/// heavily (sparse_c stride 32 went 2.59x -> 1.80x, and sparse_r stride 128 fell to 0.91x,
+/// below zarr-python).
+///
+/// So the byte cap never bound on the case that needed it: 64 MiB is ~180 inner chunks here.
+/// Eight keeps every group a scattered draw actually forms while cutting a strided one to a
+/// size a single worker can still finish promptly.
+const GROUP_MAX_JOBS: usize = 8;
+
+/// Jobs batched, and the groups they went into, since the run began. Without these a null
+/// result is ambiguous: "batching bought nothing" and "batching never engaged" produce the
+/// same number, and at a scattered draw over many shards the second is the likely one.
+pub(crate) static GROUP_JOBS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GROUP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Consecutive only, and deliberately not sorted. Jobs arrive in OUTPUT order; reordering them
+/// to make bigger groups would let a batch hold bytes for a job whose output lands far away,
+/// keeping the whole group alive until that one is reached.
+fn batch_by_key(jobs: Vec<Job<'_>>) -> Vec<ReadGroup<'_>> {
+    let mut groups: Vec<ReadGroup<'_>> = Vec::new();
+    let mut held: u64 = 0;
+    for job in jobs {
+        let len = match job.range {
+            ByteRange::FromStart(_, Some(n)) | ByteRange::Suffix(n) => n,
+            // An open-ended range's size is not known until the read returns, so it cannot be
+            // budgeted -- give it a group of its own rather than guess.
+            _ => u64::MAX,
+        };
+        let fits = groups.last().is_some_and(|g| {
+            g.key == job.key
+                && g.jobs.len() < GROUP_MAX_JOBS
+                && held.saturating_add(len) <= GROUP_MAX_BYTES
+        });
+        if fits {
+            held = held.saturating_add(len);
+            groups.last_mut().expect("checked above").jobs.push(job);
+        } else {
+            held = len;
+            groups.push(ReadGroup { key: job.key.clone(), jobs: vec![job] });
+        }
+    }
+    GROUP_JOBS.fetch_add(
+        groups.iter().map(|g| g.jobs.len() as u64).sum::<u64>(),
+        Ordering::Relaxed,
+    );
+    GROUP_COUNT.fetch_add(groups.len() as u64, Ordering::Relaxed);
+    groups
+}
+
 fn read_loop<'a>(
-    jobs: &Receiver<Job<'a>>,
+    jobs: &Receiver<ReadGroup<'a>>,
     decodes: &Sender<(Job<'a>, MaybeBytes)>,
     failure: &Mutex<Option<String>>,
 ) {
-    while let Ok(job) = jobs.recv() {
-        match job.ctx.store.get_partial(&job.key, job.range) {
-            Ok(bytes) => {
-                if let Err(returned) = decodes.send((job, bytes)) {
-                    // Every decoder is gone. Returning silently would leave this job's bytes
-                    // of the output at whatever `np.empty` left, and the call would report
-                    // success.
-                    let (job, _) = returned.into_inner();
-                    record(
-                        failure,
-                        format!("{}: no decoder left to take the chunk", job.key),
-                    );
-                    return;
+    while let Ok(group) = jobs.recv() {
+        let ctx = group.jobs[0].ctx;
+        let ranges: Vec<ByteRange> = group.jobs.iter().map(|job| job.range).collect();
+        match ctx.store.get_partial_many(&group.key, Box::new(ranges.into_iter())) {
+            // `None` for the whole iterator means the KEY is absent, which is a different
+            // thing from a range coming back empty. `decode_one` already knows what an absent
+            // chunk contributes -- the fill value, or an error where a shard index named it --
+            // so every job in the group gets `None` and that logic stays in one place.
+            Ok(None) => {
+                for job in group.jobs {
+                    if send_piece(job, None, decodes, failure).is_err() {
+                        return;
+                    }
                 }
             }
-            Err(e) => record(failure, format!("read {} failed: {e}", job.key)),
+            Ok(Some(mut fetched)) => {
+                for job in group.jobs {
+                    // One result per range, in order, or the pairing is wrong for every job in
+                    // the group -- and wrong bytes under the right key is not something a
+                    // later check would catch.
+                    let Some(piece) = fetched.next() else {
+                        record(
+                            failure,
+                            format!("{}: the store returned fewer ranges than asked", job.key),
+                        );
+                        return;
+                    };
+                    // `MaybeBytes` is `Option<Bytes>` and the iterator yields a bare `Bytes`:
+                    // a range that came back IS present, and absence is the `Ok(None)` arm
+                    // above, which is about the key rather than the range.
+                    let bytes = match piece {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            record(failure, format!("read {} failed: {e}", job.key));
+                            return;
+                        }
+                    };
+                    if send_piece(job, bytes, decodes, failure).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(e) => record(failure, format!("read {} failed: {e}", group.key)),
         }
     }
+}
+
+/// Hand one job's bytes to a decoder, or record why nobody can.
+///
+/// `Err(())` means every decoder is gone. Returning silently there would leave this job's
+/// bytes of the output at whatever `np.empty` left, and the call would report success.
+fn send_piece<'a>(
+    job: Job<'a>,
+    bytes: MaybeBytes,
+    decodes: &Sender<(Job<'a>, MaybeBytes)>,
+    failure: &Mutex<Option<String>>,
+) -> Result<(), ()> {
+    if let Err(returned) = decodes.send((job, bytes)) {
+        let (job, _) = returned.into_inner();
+        record(
+            failure,
+            format!("{}: no decoder left to take the chunk", job.key),
+        );
+        return Err(());
+    }
+    Ok(())
 }
 
 fn decode_loop(decodes: &Receiver<(Job<'_>, MaybeBytes)>, failure: &Mutex<Option<String>>) {
