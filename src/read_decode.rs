@@ -159,6 +159,10 @@ impl CodecPipelineImpl {
         let _call = ActiveCall::enter();
         let failure: Mutex<Option<String>> = Mutex::new(None);
         let alive = AtomicUsize::new(0);
+        // Jobs whose decode has RETURNED, success or failure. This is the call's outstanding
+        // work, and it is what the widening loop below stays alive on -- see the comment there
+        // for why an empty queue is not the same question.
+        let decoded = AtomicUsize::new(0);
 
         std::thread::scope(|scope| {
             let (job_tx, job_rx) = unbounded::<ReadGroup<'_>>();
@@ -181,12 +185,12 @@ impl CodecPipelineImpl {
             };
             let spawn_decoder = |permit: Permit| {
                 debug_assert_eq!(permit.0, Kind::Decode);
-                let (decodes, failure) = (dec_rx.clone(), &failure);
+                let (decodes, failure, decoded) = (dec_rx.clone(), &failure, &decoded);
                 let alive = Alive::enter(&alive);
                 scope.spawn(move || {
                     let _permit = permit;
                     let _alive = alive;
-                    decode_loop(&decodes, failure);
+                    decode_loop(&decodes, failure, decoded);
                 });
             };
 
@@ -208,17 +212,29 @@ impl CodecPipelineImpl {
             }
             drop(job_tx);
 
-            // Widen while there is still queued work, so a call that started at the floor
-            // does not keep one worker for its whole duration. Run from the calling thread,
-            // which is idle until the join.
+            // Widen while there is still work OUTSTANDING, so a call that started at the
+            // floor does not keep one worker for its whole duration. Run from the calling
+            // thread, which is idle until the join.
             //
-            // Outstanding work in EITHER queue keeps this alive, not just the job queue:
-            // reads can drain while decode is still the bottleneck, and decoders that started
-            // narrow would then have no way to widen.
+            // Outstanding work is `decoded < want_decoders` -- jobs dispatched minus jobs
+            // whose decode has returned -- and NOT "a queue is non-empty". The two differ
+            // exactly when readers are keeping up: the decode queue is then empty for an
+            // instant between one decode finishing and the next chunk arriving, which says
+            // nothing about whether the call is done.
             //
-            // Stops only when nothing is left alive to drain the queues.
+            // Measured, because this looked like a nicety and was not. When `want_readers`
+            // was corrected from jobs to groups (b110164), dense_r cs=64 lost 12.5%: with
+            // ~9 readers the decode queue was never observed empty and the loop survived
+            // long enough to widen decoders from their initial share to their target; with
+            // ~4 readers it drained, the loop exited PERMANENTLY, and decoders stayed at the
+            // floor for the rest of the call. Cores fell 6.79 -> 5.62 and throughput with
+            // them. The readers had been propping up decoder widening by accident.
+            //
+            // `alive > 0` stays as the backstop for the case this cannot see: if every worker
+            // dies -- a panic, or a reader that returned on error with jobs still unsent --
+            // no further decode will ever land and `decoded` would never reach its target.
             while (live_readers < want_readers || live_decoders < want_decoders)
-                && (!job_rx.is_empty() || !dec_rx.is_empty())
+                && decoded.load(Ordering::Relaxed) < want_decoders
                 && alive.load(Ordering::Relaxed) > 0
             {
                 let mut took = false;
@@ -1296,12 +1312,20 @@ fn send_piece<'a>(
     Ok(())
 }
 
-fn decode_loop(decodes: &Receiver<(Job<'_>, MaybeBytes)>, failure: &Mutex<Option<String>>) {
+fn decode_loop(
+    decodes: &Receiver<(Job<'_>, MaybeBytes)>,
+    failure: &Mutex<Option<String>>,
+    decoded: &AtomicUsize,
+) {
     let mut scratch: Vec<u8> = scratch_take();
     while let Ok((mut job, bytes)) = decodes.recv() {
         if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
             record(failure, e);
         }
+        // After the decode either way. A failed job is still not outstanding, and the call
+        // fails on `failure` regardless -- counting only successes would leave the widening
+        // loop spinning against a target it can never reach.
+        decoded.fetch_add(1, Ordering::Relaxed);
     }
     // On the normal return only. A panicking worker drops its buffer instead, which costs one
     // allocation and keeps the unwind path free of a lock.
