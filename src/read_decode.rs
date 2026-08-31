@@ -16,7 +16,6 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
 use pyo3::PyResult;
 use pyo3::exceptions::PyRuntimeError;
 use unsafe_cell_slice::UnsafeCellSlice;
