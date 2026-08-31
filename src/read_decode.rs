@@ -949,15 +949,14 @@ fn spawn_decode<'scope, 'env>(
 ) where
     'env: 'scope,
 {
-    // EVERY job goes to the pool, including a raw one whose "decode" is only a
-    // `copy_from_slice`. Running raw jobs inline on the reader was tried and reverted: it cost
-    // 82% on `dense_r` cs=1 and 85% on `dense_c` strided, and was negative on 10 of 12 cells.
-    //
-    // The argument for inlining was that a hand-off buys a queue push, a steal and a wake in
-    // order to memcpy bytes already in this core's cache. That much is true and it is not the
-    // point. A reader that copies inline stops issuing reads while it copies, so storage
-    // latency and the copy serialise per reader instead of overlapping, and the decode pool
-    // sits idle. The hand-off is not overhead -- it is what keeps reads in flight.
+    // MEASUREMENT BRANCH: a raw job decodes inline on the reader rather than on the pool.
+    if job.raw {
+        let mut scratch = Vec::new();
+        if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
+            record(failure, e);
+        }
+        return;
+    }
     dec.spawn(move |_| {
         SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
