@@ -932,6 +932,20 @@ struct ReadGroup<'a> {
 /// any single inner chunk here and far below the memory a preload already holds.
 const GROUP_MAX_BYTES: u64 = 64 << 20;
 
+/// Cap on the JOBS one group may hold, which is the one that binds.
+///
+/// A group is read by ONE worker, so a large group serialises what the workers would otherwise
+/// have done in parallel -- and it does not release any of its bytes until its last job has
+/// decoded. Measured at 14 plates: a scattered draw groups 2-3 chunks per call and gains from
+/// batching (sparse_c cs=4 went 1.12x -> 1.30x), while a strided draw groups 172-382 and loses
+/// heavily (sparse_c stride 32 went 2.59x -> 1.80x, and sparse_r stride 128 fell to 0.91x,
+/// below zarr-python).
+///
+/// So the byte cap never bound on the case that needed it: 64 MiB is ~180 inner chunks here.
+/// Eight keeps every group a scattered draw actually forms while cutting a strided one to a
+/// size a single worker can still finish promptly.
+const GROUP_MAX_JOBS: usize = 8;
+
 /// Jobs batched, and the groups they went into, since the run began. Without these a null
 /// result is ambiguous: "batching bought nothing" and "batching never engaged" produce the
 /// same number, and at a scattered draw over many shards the second is the likely one.
@@ -951,9 +965,11 @@ fn batch_by_key(jobs: Vec<Job<'_>>) -> Vec<ReadGroup<'_>> {
             // budgeted -- give it a group of its own rather than guess.
             _ => u64::MAX,
         };
-        let fits = groups
-            .last()
-            .is_some_and(|g| g.key == job.key && held.saturating_add(len) <= GROUP_MAX_BYTES);
+        let fits = groups.last().is_some_and(|g| {
+            g.key == job.key
+                && g.jobs.len() < GROUP_MAX_JOBS
+                && held.saturating_add(len) <= GROUP_MAX_BYTES
+        });
         if fits {
             held = held.saturating_add(len);
             groups.last_mut().expect("checked above").jobs.push(job);
