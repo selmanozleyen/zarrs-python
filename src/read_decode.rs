@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pyo3::PyResult;
@@ -147,22 +146,11 @@ impl CodecPipelineImpl {
         // packs up to `GROUP_MAX_JOBS` jobs of the same key into one -- so one reader can
         // only ever take one group at a time, and the reader target is the group count. The
         // decode channel carries one item per JOB, so that target is the job count.
-        //
-        // Counting jobs for BOTH made `live_readers < want_readers` true for the whole call
-        // on any batch that grouped at all: the widening loop could never reach its target,
-        // so it polled at `WIDEN_POLL` from start to finish -- ~5k `clock_nanosleep`/s per
-        // in-flight call, buying nothing, against decoders that are supposed to own the
-        // cores. The loop's first clause was dead weight, not a gate.
         let groups = batch_by_key(jobs);
         let want_readers = groups.len();
         let want_decoders = groups.iter().map(|g| g.jobs.len()).sum::<usize>();
         let _call = ActiveCall::enter();
         let failure: Mutex<Option<String>> = Mutex::new(None);
-        let alive = AtomicUsize::new(0);
-        // Jobs whose decode has RETURNED, success or failure. This is the call's outstanding
-        // work, and it is what the widening loop below stays alive on -- see the comment there
-        // for why an empty queue is not the same question.
-        let decoded = AtomicUsize::new(0);
 
         std::thread::scope(|scope| {
             let (job_tx, job_rx) = unbounded::<ReadGroup<'_>>();
@@ -170,109 +158,78 @@ impl CodecPipelineImpl {
             // the batch the caller asked for. Do not bound it: readers running ahead of
             // decoders is the prefetch on high-latency storage.
             let (dec_tx, dec_rx) = unbounded::<(Job<'_>, MaybeBytes)>();
-            let spawn_reader = |permit: Permit| {
-                debug_assert_eq!(permit.0, Kind::Read);
-                let (jobs, decodes, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
-                let decoded = &decoded;
-                let alive = Alive::enter(&alive);
-                scope.spawn(move || {
-                    // Both held for the life of the thread and released as it returns: the
-                    // permit is free the moment this worker stops using it, and the count
-                    // falls the moment it stops existing.
-                    let _permit = permit;
-                    let _alive = alive;
-                    read_loop(&jobs, &decodes, failure, decoded);
-                });
-            };
-            let spawn_decoder = |permit: Permit| {
-                debug_assert_eq!(permit.0, Kind::Decode);
-                let (decodes, failure, decoded) = (dec_rx.clone(), &failure, &decoded);
-                let alive = Alive::enter(&alive);
-                scope.spawn(move || {
-                    let _permit = permit;
-                    let _alive = alive;
-                    decode_loop(&decodes, failure, decoded);
-                });
-            };
-
-            let mut readers = initial_permits(Kind::Read, want_readers, ceilings.read_ceiling);
-            let mut decoders = initial_permits(Kind::Decode, want_decoders, ceilings.decode_ceiling);
-            let (mut live_readers, mut live_decoders) = (readers.len(), decoders.len());
-            for permit in readers.drain(..) {
-                spawn_reader(permit);
-            }
-            for permit in decoders.drain(..) {
-                spawn_decoder(permit);
-            }
-
-            // `send` fails only when every receiver is gone, and this closure holds `job_rx`
-            // until after the widening loop -- so this cannot currently fire. It is still
-            // reconciled rather than merely broken out of: an undispatched group's jobs reach
-            // no decoder, and the widening loop waits for every job to be accounted for, so
-            // leaving any behind would hang the call rather than fail it. A guard that is
-            // unreachable today and wedges the process if it ever becomes reachable is not a
-            // guard worth keeping cheap.
-            let mut undispatched = groups.into_iter();
-            for group in undispatched.by_ref() {
-                if let Err(returned) = job_tx.send(group) {
-                    record(&failure, "no readers left to take the job".to_string());
-                    let stranded: usize = returned.into_inner().jobs.len()
-                        + undispatched.map(|g| g.jobs.len()).sum::<usize>();
-                    decoded.fetch_add(stranded, Ordering::Relaxed);
-                    break;
-                }
-            }
-            drop(job_tx);
-
-            // Widen while there is still work OUTSTANDING, so a call that started at the
-            // floor does not keep one worker for its whole duration. Run from the calling
-            // thread, which is idle until the join.
-            //
-            // Outstanding work is `decoded < want_decoders` -- jobs dispatched minus jobs
-            // whose decode has returned -- and NOT "a queue is non-empty". The two differ
-            // exactly when readers are keeping up: the decode queue is then empty for an
-            // instant between one decode finishing and the next chunk arriving, which says
-            // nothing about whether the call is done.
-            //
-            // Measured, because this looked like a nicety and was not. When `want_readers`
-            // was corrected from jobs to groups (b110164), dense_r cs=64 lost 12.5%: with
-            // ~9 readers the decode queue was never observed empty and the loop survived
-            // long enough to widen decoders from their initial share to their target; with
-            // ~4 readers it drained, the loop exited PERMANENTLY, and decoders stayed at the
-            // floor for the rest of the call. Cores fell 6.79 -> 5.62 and throughput with
-            // them. The readers had been propping up decoder widening by accident.
-            //
-            // `alive > 0` stays as the backstop for the case this cannot see: if every worker
-            // dies -- a panic, or a reader that returned on error with jobs still unsent --
-            // no further decode will ever land and `decoded` would never reach its target.
-            while (live_readers < want_readers || live_decoders < want_decoders)
-                && decoded.load(Ordering::Relaxed) < want_decoders
-                && alive.load(Ordering::Relaxed) > 0
             {
-                let mut took = false;
-                if live_readers < want_readers && !job_rx.is_empty() {
-                    if let Some(permit) = Permit::take(Kind::Read, ceilings.read_ceiling) {
-                        spawn_reader(permit);
-                        live_readers += 1;
-                        took = true;
-                    }
+                let spawn_reader = |permit: Permit| {
+                    debug_assert_eq!(permit.0, Kind::Read);
+                    let (jobs, decodes, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
+                    scope.spawn(move || {
+                        // Held for the life of the thread and released as it returns: the
+                        // permit is free the moment this worker stops using it.
+                        let _permit = permit;
+                        read_loop(&jobs, &decodes, failure);
+                    });
+                };
+                let spawn_decoder = |permit: Permit| {
+                    debug_assert_eq!(permit.0, Kind::Decode);
+                    let (decodes, failure) = (dec_rx.clone(), &failure);
+                    scope.spawn(move || {
+                        let _permit = permit;
+                        decode_loop(&decodes, failure);
+                    });
+                };
+
+                for permit in initial_permits(Kind::Read, want_readers, ceilings.read_ceiling, true) {
+                    spawn_reader(permit);
                 }
-                if live_decoders < want_decoders && !dec_rx.is_empty() {
-                    if let Some(permit) = Permit::take(Kind::Decode, ceilings.decode_ceiling) {
-                        spawn_decoder(permit);
-                        live_decoders += 1;
-                        took = true;
-                    }
+                // One fewer than the share: the calling thread is about to become a decoder
+                // itself, and it is charged to the ceiling below, so spawning a full share
+                // here would put the call one over its allowance.
+                let share = initial_permits(
+                    Kind::Decode,
+                    want_decoders.saturating_sub(1),
+                    ceilings.decode_ceiling,
+                    false,
+                );
+                for permit in share {
+                    spawn_decoder(permit);
                 }
-                if !took {
-                    std::thread::sleep(WIDEN_POLL);
+
+                for group in groups {
+                    if job_tx.send(group).is_err() {
+                        record(&failure, "no readers left to take the job".to_string());
+                        break;
+                    }
                 }
             }
-
-            // The clones held here would keep every worker waiting on a channel that will
-            // never deliver again, and the scope cannot exit until they return.
-            drop(job_rx);
+            // Every sender for the job queue is gone, so readers finish what is queued and
+            // exit. Theirs are the only `dec_tx` clones left once the closures above have
+            // been dropped with this block -- which is what lets `dec_rx` ever disconnect.
+            drop(job_tx);
             drop(dec_tx);
+
+            // THE CALLING THREAD DECODES. It arrived on its own OS thread with the GIL
+            // released and, until now, spent the call asleep: it spawned workers and then
+            // polled a widening loop at 200 us -- ~5k `clock_nanosleep`/s per in-flight call
+            // -- waiting for permits so that OTHER threads could do the work it was
+            // perfectly able to do itself. With 10-30 calls in flight that is 10-30 real
+            // threads sleeping against a ceiling of `available_parallelism()` decoders.
+            //
+            // This deletes the widening loop rather than correcting it a third time. The
+            // loop existed to grow a call that started at the floor; the floor is now the
+            // calling thread, which cannot be starved, costs no `clone()`, and is already
+            // counted against the caller's own fetch threads. Gone with it: `WIDEN_POLL`,
+            // the `Alive` count, the `decoded` reconciliation, and `Permit::insist` on the
+            // decode side -- a call can no longer have zero decoders.
+            //
+            // Charged to the ceiling like any other worker, so the number a user sets is the
+            // number that runs. `insist` because this thread is not optional: it is the one
+            // that guarantees the queue is drained, and a call must never be left unable to
+            // decode because every other call got there first.
+            let _permit = Permit::insist(Kind::Decode);
+            decode_loop(&dec_rx, &failure);
+            // Deliberately last: dropping it earlier would disconnect nothing, since the
+            // readers hold their own clones, but it keeps the receiver alive for exactly as
+            // long as this thread is reading from it.
             drop(dec_rx);
         });
 
@@ -954,30 +911,6 @@ fn default_ceiling() -> usize {
     std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
 }
 
-/// How long the widening loop waits between attempts when no permit is free.
-const WIDEN_POLL: Duration = Duration::from_micros(200);
-
-/// Workers alive in ONE call, raised before a thread starts and lowered when it returns.
-///
-/// The widening loop below needs to tell "everything is busy" from "nothing is left to drain
-/// this queue". Do not infer that from elapsed time: on slow storage, which is what this
-/// module is for, no progress for a while is normal.
-struct Alive<'a>(&'a AtomicUsize);
-
-impl<'a> Alive<'a> {
-    /// Taken on the spawning thread, so the loop cannot read zero between spawn and run.
-    fn enter(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::AcqRel);
-        Self(count)
-    }
-}
-
-impl Drop for Alive<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// The worker ceilings ONE call runs under, read from `zarr.config` when that call starts.
 ///
 /// Per call, not per array: read at array open these would be frozen for the array's life,
@@ -1081,8 +1014,15 @@ impl Drop for Permit {
 
 /// What a call STARTS with: its equal share of the ceiling, capped by the work it has.
 ///
-/// It grows from here -- see the widening loop in `retrieve_chunk_units`.
-fn initial_permits(kind: Kind, want: usize, ceiling: usize) -> Vec<Permit> {
+/// `floor` decides what happens when the ceiling is already full. READERS take it: a call with
+/// no reader never drains its job queue, and nothing else will do that work for it, so one is
+/// taken over the ceiling via [`Permit::insist`] rather than leaving the call stuck.
+///
+/// DECODERS do not, and that is the point of the calling thread decoding: it is itself the
+/// floor, it cannot be starved, and it is charged to the ceiling separately. Applying a floor
+/// here as well would spawn a worker the call does not need -- for a single-job call, a whole
+/// extra decoder beside the calling thread -- and charge the ceiling twice for it.
+fn initial_permits(kind: Kind, want: usize, ceiling: usize, floor: bool) -> Vec<Permit> {
     let target = want.min(ActiveCall::share(ceiling));
     let mut held = Vec::with_capacity(target);
     while held.len() < target {
@@ -1091,7 +1031,7 @@ fn initial_permits(kind: Kind, want: usize, ceiling: usize) -> Vec<Permit> {
             None => break,
         }
     }
-    if held.is_empty() {
+    if floor && held.is_empty() {
         held.push(Permit::insist(kind));
     }
     held
@@ -1164,37 +1104,6 @@ const GROUP_MAX_JOBS: usize = 8;
 /// same number, and at a scattered draw over many shards the second is the likely one.
 pub(crate) static GROUP_JOBS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GROUP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Jobs this worker still owes the call, retired on Drop so an UNWIND counts as surely as a
-/// return does.
-///
-/// The widening loop waits until every job is accounted for. A job that reaches no decoder is
-/// counted by nothing else, so one left behind spins that loop until the process dies -- and a
-/// panic is exactly the path where a hand-written `fetch_add` at the end of a function is not
-/// reached. The call still fails through `failure`; this only keeps the accounting honest.
-struct Owed<'a> {
-    decoded: &'a AtomicUsize,
-    remaining: usize,
-}
-
-impl<'a> Owed<'a> {
-    fn new(decoded: &'a AtomicUsize, remaining: usize) -> Self {
-        Self { decoded, remaining }
-    }
-
-    /// One job handed on to a decoder, which will now count it itself.
-    fn passed_on(&mut self) {
-        self.remaining = self.remaining.saturating_sub(1);
-    }
-}
-
-impl Drop for Owed<'_> {
-    fn drop(&mut self) {
-        if self.remaining > 0 {
-            self.decoded.fetch_add(self.remaining, Ordering::Relaxed);
-        }
-    }
-}
 
 /// Decode scratch outlives the CALL, because the threads that hold it do not.
 ///
@@ -1286,13 +1195,10 @@ fn read_loop<'a>(
     jobs: &Receiver<ReadGroup<'a>>,
     decodes: &Sender<(Job<'a>, MaybeBytes)>,
     failure: &Mutex<Option<String>>,
-    decoded: &AtomicUsize,
 ) {
     while let Ok(group) = jobs.recv() {
         let ctx = group.jobs[0].ctx;
         let ranges: Vec<ByteRange> = group.jobs.iter().map(|job| job.range).collect();
-        // Everything this group owes the call, retired on every path out -- including a panic.
-        let mut owed = Owed::new(decoded, group.jobs.len());
         match ctx.store.get_partial_many(&group.key, Box::new(ranges.into_iter())) {
             // `None` for the whole iterator means the KEY is absent, which is a different
             // thing from a range coming back empty. `decode_one` already knows what an absent
@@ -1303,7 +1209,6 @@ fn read_loop<'a>(
                     if send_piece(job, None, decodes, failure).is_err() {
                         return;
                     }
-                    owed.passed_on();
                 }
             }
             Ok(Some(mut fetched)) => {
@@ -1331,11 +1236,9 @@ fn read_loop<'a>(
                     if send_piece(job, bytes, decodes, failure).is_err() {
                         return;
                     }
-                    owed.passed_on();
                 }
             }
-            // Records and CONTINUES, so this reader goes on to the next group. `owed` still
-            // holds the whole group and retires it as it drops at the end of this iteration.
+            // Records and CONTINUES, so this reader goes on to the next group.
             Err(e) => record(failure, format!("read {} failed: {e}", group.key)),
         }
     }
@@ -1362,17 +1265,9 @@ fn send_piece<'a>(
     Ok(())
 }
 
-fn decode_loop(
-    decodes: &Receiver<(Job<'_>, MaybeBytes)>,
-    failure: &Mutex<Option<String>>,
-    decoded: &AtomicUsize,
-) {
+fn decode_loop(decodes: &Receiver<(Job<'_>, MaybeBytes)>, failure: &Mutex<Option<String>>) {
     let mut scratch: Vec<u8> = scratch_take();
     while let Ok((mut job, bytes)) = decodes.recv() {
-        // Retired on Drop, so a decode that PANICS is accounted for too. Counting only
-        // successes -- or only returns -- would leave the widening loop waiting on a target it
-        // can never reach. The call still fails through `failure`.
-        let _owed = Owed::new(decoded, 1);
         if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
             record(failure, e);
         }
@@ -1603,7 +1498,7 @@ mod tests {
         let first = ActiveCall::enter();
 
         // Alone, a call may have the whole ceiling -- capped by the work it has.
-        assert_eq!(initial_permits(Kind::Read, 4, ceiling).len(), 4);
+        assert_eq!(initial_permits(Kind::Read, 4, ceiling, true).len(), 4);
         assert_eq!(
             LIVE_READERS.load(Ordering::Relaxed),
             0,
@@ -1618,15 +1513,25 @@ mod tests {
 
         // With every permit held, a call still gets a worker: the floor of one is what stops
         // calls from waiting on each other.
-        let held = initial_permits(Kind::Read, ceiling, ceiling);
+        let held = initial_permits(Kind::Read, ceiling, ceiling, true);
         assert_eq!(held.len(), ceiling);
-        let starved = initial_permits(Kind::Read, 4, ceiling);
+        let starved = initial_permits(Kind::Read, 4, ceiling, true);
         assert_eq!(starved.len(), 1);
+        assert_eq!(LIVE_READERS.load(Ordering::Relaxed), ceiling + 1);
+
+        // WITHOUT the floor -- how decoders are asked for -- an exhausted ceiling yields
+        // nothing rather than one over. The calling thread is the decode floor now, so a
+        // spawned decoder here would be a worker the call does not need, charged twice.
+        let no_floor = initial_permits(Kind::Read, 4, ceiling, false);
+        assert!(
+            no_floor.is_empty(),
+            "the floor is opt-in: without it a full ceiling must yield no permit"
+        );
         assert_eq!(LIVE_READERS.load(Ordering::Relaxed), ceiling + 1);
 
         // THE TWO BUDGETS ARE SEPARATE. Readers are exhausted here; decoders must not notice.
         assert_eq!(LIVE_DECODERS.load(Ordering::Relaxed), 0);
-        let decoders = initial_permits(Kind::Decode, 4, ceiling);
+        let decoders = initial_permits(Kind::Decode, 4, ceiling, false);
         assert_eq!(
             decoders.len(),
             4,
@@ -1635,6 +1540,7 @@ mod tests {
 
         drop(held);
         drop(starved);
+        drop(no_floor);
         drop(decoders);
         drop(first);
         assert_eq!(LIVE_READERS.load(Ordering::Relaxed), 0);
