@@ -437,9 +437,12 @@ def _chunk_unit_args(
         isinstance(indices, np.ndarray)
         and indices.size > 1
         and _is_sorted_integer_axis(indices, out_axis_sel)
-        # `ptp + 1 == size` proves consecutive-and-unique for a non-decreasing array without
-        # allocating a diff: a repeat would make the span shorter than the count.
-        and int(indices[-1]) - int(indices[0]) + 1 == indices.size
+        # STRICTLY consecutive, checked by differencing. An earlier version tested
+        # `last - first + 1 == size` to avoid the allocation, on the reasoning that a repeat
+        # makes the span shorter than the count. That is false when a GAP cancels the repeat:
+        # `[1, 3, 3]` spans 3 and counts 3, and would have been read as rows 1, 2, 3 --
+        # silent wrong data. `tests/test_chunk_unit_indexing.py` caught it on the first run.
+        and bool((np.diff(indices) == 1).all())
     ):
         indices = slice(int(indices[0]), int(indices[-1]) + 1)
     if isinstance(indices, slice):
