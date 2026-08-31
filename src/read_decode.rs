@@ -173,6 +173,7 @@ impl CodecPipelineImpl {
             let spawn_reader = |permit: Permit| {
                 debug_assert_eq!(permit.0, Kind::Read);
                 let (jobs, decodes, failure) = (job_rx.clone(), dec_tx.clone(), &failure);
+                let decoded = &decoded;
                 let alive = Alive::enter(&alive);
                 scope.spawn(move || {
                     // Both held for the life of the thread and released as it returns: the
@@ -180,7 +181,7 @@ impl CodecPipelineImpl {
                     // falls the moment it stops existing.
                     let _permit = permit;
                     let _alive = alive;
-                    read_loop(&jobs, &decodes, failure);
+                    read_loop(&jobs, &decodes, failure, decoded);
                 });
             };
             let spawn_decoder = |permit: Permit| {
@@ -204,9 +205,20 @@ impl CodecPipelineImpl {
                 spawn_decoder(permit);
             }
 
-            for group in groups {
-                if job_tx.send(group).is_err() {
+            // `send` fails only when every receiver is gone, and this closure holds `job_rx`
+            // until after the widening loop -- so this cannot currently fire. It is still
+            // reconciled rather than merely broken out of: an undispatched group's jobs reach
+            // no decoder, and the widening loop waits for every job to be accounted for, so
+            // leaving any behind would hang the call rather than fail it. A guard that is
+            // unreachable today and wedges the process if it ever becomes reachable is not a
+            // guard worth keeping cheap.
+            let mut undispatched = groups.into_iter();
+            for group in undispatched.by_ref() {
+                if let Err(returned) = job_tx.send(group) {
                     record(&failure, "no readers left to take the job".to_string());
+                    let stranded: usize = returned.into_inner().jobs.len()
+                        + undispatched.map(|g| g.jobs.len()).sum::<usize>();
+                    decoded.fetch_add(stranded, Ordering::Relaxed);
                     break;
                 }
             }
@@ -1153,6 +1165,37 @@ const GROUP_MAX_JOBS: usize = 8;
 pub(crate) static GROUP_JOBS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GROUP_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Jobs this worker still owes the call, retired on Drop so an UNWIND counts as surely as a
+/// return does.
+///
+/// The widening loop waits until every job is accounted for. A job that reaches no decoder is
+/// counted by nothing else, so one left behind spins that loop until the process dies -- and a
+/// panic is exactly the path where a hand-written `fetch_add` at the end of a function is not
+/// reached. The call still fails through `failure`; this only keeps the accounting honest.
+struct Owed<'a> {
+    decoded: &'a AtomicUsize,
+    remaining: usize,
+}
+
+impl<'a> Owed<'a> {
+    fn new(decoded: &'a AtomicUsize, remaining: usize) -> Self {
+        Self { decoded, remaining }
+    }
+
+    /// One job handed on to a decoder, which will now count it itself.
+    fn passed_on(&mut self) {
+        self.remaining = self.remaining.saturating_sub(1);
+    }
+}
+
+impl Drop for Owed<'_> {
+    fn drop(&mut self) {
+        if self.remaining > 0 {
+            self.decoded.fetch_add(self.remaining, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Decode scratch outlives the CALL, because the threads that hold it do not.
 ///
 /// `decode_loop` grows its buffer to the largest chunk that worker has seen and then reuses it
@@ -1243,10 +1286,13 @@ fn read_loop<'a>(
     jobs: &Receiver<ReadGroup<'a>>,
     decodes: &Sender<(Job<'a>, MaybeBytes)>,
     failure: &Mutex<Option<String>>,
+    decoded: &AtomicUsize,
 ) {
     while let Ok(group) = jobs.recv() {
         let ctx = group.jobs[0].ctx;
         let ranges: Vec<ByteRange> = group.jobs.iter().map(|job| job.range).collect();
+        // Everything this group owes the call, retired on every path out -- including a panic.
+        let mut owed = Owed::new(decoded, group.jobs.len());
         match ctx.store.get_partial_many(&group.key, Box::new(ranges.into_iter())) {
             // `None` for the whole iterator means the KEY is absent, which is a different
             // thing from a range coming back empty. `decode_one` already knows what an absent
@@ -1257,6 +1303,7 @@ fn read_loop<'a>(
                     if send_piece(job, None, decodes, failure).is_err() {
                         return;
                     }
+                    owed.passed_on();
                 }
             }
             Ok(Some(mut fetched)) => {
@@ -1284,8 +1331,11 @@ fn read_loop<'a>(
                     if send_piece(job, bytes, decodes, failure).is_err() {
                         return;
                     }
+                    owed.passed_on();
                 }
             }
+            // Records and CONTINUES, so this reader goes on to the next group. `owed` still
+            // holds the whole group and retires it as it drops at the end of this iteration.
             Err(e) => record(failure, format!("read {} failed: {e}", group.key)),
         }
     }
@@ -1319,13 +1369,13 @@ fn decode_loop(
 ) {
     let mut scratch: Vec<u8> = scratch_take();
     while let Ok((mut job, bytes)) = decodes.recv() {
+        // Retired on Drop, so a decode that PANICS is accounted for too. Counting only
+        // successes -- or only returns -- would leave the widening loop waiting on a target it
+        // can never reach. The call still fails through `failure`.
+        let _owed = Owed::new(decoded, 1);
         if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
             record(failure, e);
         }
-        // After the decode either way. A failed job is still not outstanding, and the call
-        // fails on `failure` regardless -- counting only successes would leave the widening
-        // loop spinning against a target it can never reach.
-        decoded.fetch_add(1, Ordering::Relaxed);
     }
     // On the normal return only. A panicking worker drops its buffer instead, which costs one
     // allocation and keeps the unwind path free of a lock.
