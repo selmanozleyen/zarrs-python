@@ -178,19 +178,19 @@ impl CodecPipelineImpl {
                     });
                 };
 
-                for permit in initial_permits(Kind::Read, want_readers, ceilings.read_ceiling, true) {
+                for permit in initial_permits(Kind::Read, want_readers, ceilings.read_ceiling) {
                     spawn_reader(permit);
                 }
-                // One fewer than the share: the calling thread is about to become a decoder
-                // itself, and it is charged to the ceiling below, so spawning a full share
-                // here would put the call one over its allowance.
-                let share = initial_permits(
-                    Kind::Decode,
-                    want_decoders.saturating_sub(1),
-                    ceilings.decode_ceiling,
-                    false,
-                );
-                for permit in share {
+                // The calling thread takes one of the call's OWN decode permits rather than a
+                // spare of its own. Asking for `want - 1` here does not work and was wrong for
+                // one commit: `initial_permits` returns `min(want, share)`, so subtracting from
+                // `want` only bites when the call is smaller than its share -- for every call
+                // bigger than it, the target is the share regardless and the calling thread put
+                // the call at share + 1. One caller with a ceiling of 8 ran 9 decoders.
+                let mut decoders =
+                    initial_permits(Kind::Decode, want_decoders, ceilings.decode_ceiling);
+                let mine = decoders.pop().expect("initial_permits floors at one");
+                for permit in decoders {
                     spawn_decoder(permit);
                 }
 
@@ -221,11 +221,12 @@ impl CodecPipelineImpl {
             // the `Alive` count, the `decoded` reconciliation, and `Permit::insist` on the
             // decode side -- a call can no longer have zero decoders.
             //
-            // Charged to the ceiling like any other worker, so the number a user sets is the
-            // number that runs. `insist` because this thread is not optional: it is the one
-            // that guarantees the queue is drained, and a call must never be left unable to
-            // decode because every other call got there first.
-            let _permit = Permit::insist(Kind::Decode);
+            // Charged to the ceiling like any other worker: this thread holds one of the
+            // permits the call already took, so `share` decoders run in total, not `share + 1`.
+            // The floor inside `initial_permits` is what guarantees there is one to hold -- a
+            // call must never be left unable to decode because every other call got there
+            // first, and this thread is the one that guarantees the queue is drained.
+            let _permit = mine;
             decode_loop(&dec_rx, &failure);
             // Deliberately last: dropping it earlier would disconnect nothing, since the
             // readers hold their own clones, but it keeps the receiver alive for exactly as
@@ -1014,15 +1015,11 @@ impl Drop for Permit {
 
 /// What a call STARTS with: its equal share of the ceiling, capped by the work it has.
 ///
-/// `floor` decides what happens when the ceiling is already full. READERS take it: a call with
-/// no reader never drains its job queue, and nothing else will do that work for it, so one is
-/// taken over the ceiling via [`Permit::insist`] rather than leaving the call stuck.
-///
-/// DECODERS do not, and that is the point of the calling thread decoding: it is itself the
-/// floor, it cannot be starved, and it is charged to the ceiling separately. Applying a floor
-/// here as well would spawn a worker the call does not need -- for a single-job call, a whole
-/// extra decoder beside the calling thread -- and charge the ceiling twice for it.
-fn initial_permits(kind: Kind, want: usize, ceiling: usize, floor: bool) -> Vec<Permit> {
+/// Never empty. A call with no reader never drains its job queue and a call with no decoder
+/// never drains its decode queue, and in both cases nothing else will do that work for it, so
+/// the last one is taken OVER the ceiling via [`Permit::insist`] rather than leaving the call
+/// stuck. That floor is why the calling thread can pop a permit unconditionally.
+fn initial_permits(kind: Kind, want: usize, ceiling: usize) -> Vec<Permit> {
     let target = want.min(ActiveCall::share(ceiling));
     let mut held = Vec::with_capacity(target);
     while held.len() < target {
@@ -1031,7 +1028,7 @@ fn initial_permits(kind: Kind, want: usize, ceiling: usize, floor: bool) -> Vec<
             None => break,
         }
     }
-    if floor && held.is_empty() {
+    if held.is_empty() {
         held.push(Permit::insist(kind));
     }
     held
@@ -1498,7 +1495,7 @@ mod tests {
         let first = ActiveCall::enter();
 
         // Alone, a call may have the whole ceiling -- capped by the work it has.
-        assert_eq!(initial_permits(Kind::Read, 4, ceiling, true).len(), 4);
+        assert_eq!(initial_permits(Kind::Read, 4, ceiling).len(), 4);
         assert_eq!(
             LIVE_READERS.load(Ordering::Relaxed),
             0,
@@ -1513,25 +1510,15 @@ mod tests {
 
         // With every permit held, a call still gets a worker: the floor of one is what stops
         // calls from waiting on each other.
-        let held = initial_permits(Kind::Read, ceiling, ceiling, true);
+        let held = initial_permits(Kind::Read, ceiling, ceiling);
         assert_eq!(held.len(), ceiling);
-        let starved = initial_permits(Kind::Read, 4, ceiling, true);
+        let starved = initial_permits(Kind::Read, 4, ceiling);
         assert_eq!(starved.len(), 1);
-        assert_eq!(LIVE_READERS.load(Ordering::Relaxed), ceiling + 1);
-
-        // WITHOUT the floor -- how decoders are asked for -- an exhausted ceiling yields
-        // nothing rather than one over. The calling thread is the decode floor now, so a
-        // spawned decoder here would be a worker the call does not need, charged twice.
-        let no_floor = initial_permits(Kind::Read, 4, ceiling, false);
-        assert!(
-            no_floor.is_empty(),
-            "the floor is opt-in: without it a full ceiling must yield no permit"
-        );
         assert_eq!(LIVE_READERS.load(Ordering::Relaxed), ceiling + 1);
 
         // THE TWO BUDGETS ARE SEPARATE. Readers are exhausted here; decoders must not notice.
         assert_eq!(LIVE_DECODERS.load(Ordering::Relaxed), 0);
-        let decoders = initial_permits(Kind::Decode, 4, ceiling, false);
+        let decoders = initial_permits(Kind::Decode, 4, ceiling);
         assert_eq!(
             decoders.len(),
             4,
@@ -1540,7 +1527,6 @@ mod tests {
 
         drop(held);
         drop(starved);
-        drop(no_floor);
         drop(decoders);
         drop(first);
         assert_eq!(LIVE_READERS.load(Ordering::Relaxed), 0);
