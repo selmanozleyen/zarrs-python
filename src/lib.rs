@@ -291,7 +291,7 @@ impl CodecPipelineImpl {
         py: Python,
         chunk_descriptions: &[chunk_item::ChunkItem],
         value: &Bound<'_, PyUntypedArray>,
-        widths: read_decode::CallWidths,
+        ceilings: read_decode::Ceilings,
     ) -> PyResult<()> {
         // Every item must be a chunk-unit item and the array must present a sharding codec.
         // Both are guaranteed by `chunk_info_for_read`, which is the only route to a
@@ -324,7 +324,7 @@ impl CodecPipelineImpl {
                         chunk_descriptions,
                         output,
                         output_len,
-                        widths,
+                        ceilings,
                         &codec_options,
                     )
                 })?
@@ -486,8 +486,8 @@ impl CodecPipelineImpl {
         read_worker_ceiling: Option<usize>,
         decode_worker_ceiling: Option<usize>,
     ) -> PyResult<()> {
-        let widths = read_decode::CallWidths::new(read_worker_ceiling, decode_worker_ceiling);
-        self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, widths)
+        let ceilings = read_decode::Ceilings::new(read_worker_ceiling, decode_worker_ceiling);
+        self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, ceilings)
     }
 
     fn store_chunks_with_indices(

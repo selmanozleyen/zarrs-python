@@ -92,7 +92,7 @@ impl CodecPipelineImpl {
         items: &'a [ChunkItem],
         output: UnsafeCellSlice<'_, u8>,
         output_len: usize,
-        widths: CallWidths,
+        ceilings: Ceilings,
         codec_options: &CodecOptions,
     ) -> PyResult<Vec<&'a ChunkItem>> {
         let element_size = self.element_size()?;
@@ -178,8 +178,8 @@ impl CodecPipelineImpl {
                 });
             };
 
-            let mut readers = initial_permits(Kind::Read, want_readers, widths.read_ceiling);
-            let mut decoders = initial_permits(Kind::Decode, want_decoders, widths.decode_ceiling);
+            let mut readers = initial_permits(Kind::Read, want_readers, ceilings.read_ceiling);
+            let mut decoders = initial_permits(Kind::Decode, want_decoders, ceilings.decode_ceiling);
             let (mut live_readers, mut live_decoders) = (readers.len(), decoders.len());
             for permit in readers.drain(..) {
                 spawn_reader(permit);
@@ -211,14 +211,14 @@ impl CodecPipelineImpl {
             {
                 let mut took = false;
                 if live_readers < want_readers && !job_rx.is_empty() {
-                    if let Some(permit) = Permit::take(Kind::Read, widths.read_ceiling) {
+                    if let Some(permit) = Permit::take(Kind::Read, ceilings.read_ceiling) {
                         spawn_reader(permit);
                         live_readers += 1;
                         took = true;
                     }
                 }
                 if live_decoders < want_decoders && !dec_rx.is_empty() {
-                    if let Some(permit) = Permit::take(Kind::Decode, widths.decode_ceiling) {
+                    if let Some(permit) = Permit::take(Kind::Decode, ceilings.decode_ceiling) {
                         spawn_decoder(permit);
                         live_decoders += 1;
                         took = true;
@@ -938,12 +938,12 @@ impl Drop for Alive<'_> {
     }
 }
 
-/// The concurrency ONE call may use, read from `zarr.config` when that call starts.
+/// The worker ceilings ONE call runs under, read from `zarr.config` when that call starts.
 ///
 /// Per call, not per array: read at array open these would be frozen for the array's life,
 /// and `with zarr.config.set(...)` around a read would silently do nothing.
 #[derive(Clone, Copy)]
-pub(crate) struct CallWidths {
+pub(crate) struct Ceilings {
     /// Live READERS across every in-flight call.
     ///
     /// There was a per-CALL width beside this, and it was redundant: `initial_permits`
@@ -963,7 +963,7 @@ pub(crate) struct CallWidths {
     pub(crate) decode_ceiling: usize,
 }
 
-impl CallWidths {
+impl Ceilings {
     /// `None` takes [`default_ceiling`] for either ceiling.
     pub(crate) fn new(
         read_ceiling: Option<usize>,
