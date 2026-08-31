@@ -188,6 +188,17 @@ def reset_shard_index_cache_stats() -> None:
     Zero the counters, so one test's numbers are its own.
     """
 
+def scratch_pool_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    Decode buffers served from the pool, and buffers that had to be allocated.
+
+    A decoder worker is scoped to its call, so its scratch buffer used to die with it: at a
+    small batch a worker allocated and memset an inner chunk to decode exactly one chunk.
+    `hits / (hits + misses)` says whether the pool actually served that case. Without it a
+    flat benchmark cannot be told from a pool that never ran -- which has happened twice on
+    this branch, once for a gate that silently refused everything.
+    """
+
 def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
     r"""
     `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
