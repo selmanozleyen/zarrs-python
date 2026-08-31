@@ -2,9 +2,9 @@
 # ruff: noqa: E501, F401
 
 import builtins
-import typing
-
+import numpy
 import numpy.typing
+import typing
 import zarr.abc.store
 
 @typing.final
@@ -16,7 +16,112 @@ class ChunkItem:
         chunk_shape: typing.Sequence[builtins.int],
         subset: typing.Sequence[slice],
         shape: typing.Sequence[builtins.int],
-    ) -> ChunkItem: ...
+    ) -> ChunkItem:
+        r"""
+        `coords` is always `None` here -- it is not a parameter, so this constructor cannot
+        build a chunk-unit item. `ChunkItems::push_entry` builds those.
+        """
+
+@typing.final
+class ChunkItems:
+    r"""
+    A batch of chunk items, built and held in Rust.
+
+    Push one entry at a time, then pass the handle to
+    `retrieve_chunk_items_and_apply_index`.
+    """
+    def __new__(cls) -> ChunkItems: ...
+    def __len__(self) -> builtins.int: ...
+    def push_entry(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        out_starts: typing.Sequence[builtins.int],
+        out_widths: typing.Sequence[builtins.int],
+        inner: typing.Sequence[builtins.int],
+        elem_starts: typing.Sequence[builtins.int] = [],
+    ) -> None:
+        r"""
+        Build one batch entry's items and append them.
+
+        `indices` select along AXIS 0 and are checked here: non-negative, non-decreasing, and
+        inside the chunk extent. So is `out_start` -- entries must be pushed in increasing
+        order, and one that would reuse output another entry already owns is refused.
+
+        Axes after the first are taken WHOLE and must be the same extent in `chunk_shape` and
+        in `shape`; that is checked too. It is what makes one index one contiguous run, and
+        the rank-N case the 1-D case with a run length.
+
+        One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
+        since the output subset is bounded against it. A larger one describes bytes the buffer
+        does not have, and that produces wrong data rather than an error.
+        """
+    def push_span(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        first: builtins.int,
+        count: builtins.int,
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a contiguous SPAN of the split axis, without naming its elements.
+
+        `X[a:b]` and every whole-row read of a backed CSR arrive here. The elements are
+        `first..first + count` on axis 0 with the trailing axes taken whole, which in row-major
+        order is ONE contiguous block per inner chunk -- so each item needs a single coordinate
+        and a run, not a coordinate per element.
+
+        This is the whole point. `_chunk_unit_args` used to expand the span with
+        `np.arange(a, b)` because "a contiguous slice IS a sorted integer axis, spelled
+        differently" -- true, and it costs one u64 per ELEMENT. On a chunk_size 64 preload that
+        is 11.9M numbers, ~95 MB, built in numpy and walked one at a time here: measured at
+        98 ms to build and 112 ms to hand over, against a preload of ~317 ms. Described as
+        runs, the same read is 0.69 ms.
+        """
+    def push_grid(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        starts: numpy.typing.NDArray[numpy.uint64],
+        run: builtins.int,
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a GRID selection: the same columns taken from every selected index.
+
+        `oindex[rows, cols]`, `X[:, cols]`, and any rank-N grid. Each selected index gives up
+        the same sub-box, described as `starts.len()` runs of `run` elements -- because in
+        row-major order a sub-box IS a set of runs. A fully scattered selection is `run == 1`.
+        The runs land back to back in the output, so the item is still one output range.
+        """
+    def push_points(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        offsets: numpy.typing.NDArray[numpy.uint64],
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a POINT selection: one element per index, each naming its own offset inside that
+        index's elements.
+
+        `X[rows, cols]` and `X[rows, 5]` both arrive as this -- zarr builds a
+        `CoordinateIndexer` rather than dropping an axis -- and the ordinary route spends two
+        allocations and a partial-decode call PER POINT. Grouping them by the chunk that gets
+        decoded is the whole win, and it is the same grouping the row case uses: the output is
+        flat, so `shape` is 1-D here while `chunk_shape` is not.
+        """
 
 @typing.final
 class CodecPipelineImpl:
@@ -26,21 +131,89 @@ class CodecPipelineImpl:
         store_config: zarr.abc.store.Store,
         *,
         validate_checksums: builtins.bool = False,
-        chunk_concurrent_minimum: builtins.int | None = None,
-        chunk_concurrent_maximum: builtins.int | None = None,
-        num_threads: builtins.int | None = None,
+        chunk_concurrent_minimum: typing.Optional[builtins.int] = None,
+        chunk_concurrent_maximum: typing.Optional[builtins.int] = None,
+        num_threads: typing.Optional[builtins.int] = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
         store_is_read_only: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
-    def retrieve_chunks_and_apply_index(
+    def retrieve_chunk_items_and_apply_index(
         self,
-        chunk_descriptions: typing.Sequence[ChunkItem],
+        chunk_items: ChunkItems,
         value: numpy.typing.NDArray[typing.Any],
-    ) -> None: ...
+        read_worker_ceiling: typing.Optional[builtins.int] = None,
+        decode_worker_ceiling: typing.Optional[builtins.int] = None,
+    ) -> None:
+        r"""
+        The one read entry point.
+
+        Takes a `ChunkItems` handle rather than a `Vec<ChunkItem>`: the vector costs one
+        pyclass allocation per item on the way out of the builder and one extraction per item
+        on the way in, where a handle costs one of each per call whatever the selection.
+
+        There was a second entry point until 2026-08-30 -- a partial decoder per chunk over
+        rayon, for selections this path declined. An audit of the public indexing surface found
+        nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
+        than a slower second Rust path.
+        """
     def store_chunks_with_indices(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
         value: numpy.typing.NDArray[typing.Any],
         write_empty_chunks: builtins.bool,
     ) -> None: ...
+
+def pool_sizes() -> tuple[typing.Optional[builtins.int], typing.Optional[builtins.int]]:
+    r"""
+    The sizes the two worker pools were BUILT with, or `None` where one has not been built.
+
+    Pools are sized by the first read in the process, so a ceiling set later is silently
+    ignored. A benchmark that sets one and reports a number has to be able to say which of the
+    two happened -- the repo's rule that a knob which was set is not a knob that arrived.
+    """
+
+def raw_path_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
+    inner chunks read and decoded.
+
+    Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
+    the same values, so a gate that refuses everything passes every values test.
+    """
+
+def read_merge_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    `(issued, served)`: store calls made, and inner chunks they served, since the run began.
+
+    `jobs / groups` is the mean batch size, and it is the number that says whether batching
+    ENGAGED at all. At a scattered draw over many shards consecutive jobs rarely share a key,
+    so the ratio approaches 1 and the change is a no-op -- which is a different finding from
+    "batching did not pay", and indistinguishable from it without this.
+    """
+
+def reset_shard_index_cache_stats() -> None:
+    r"""
+    Zero the counters, so one test's numbers are its own.
+    """
+
+def scratch_pool_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    Decode buffers served from the pool, and buffers that had to be allocated.
+
+    A decoder worker is scoped to its call, so its scratch buffer used to die with it: at a
+    small batch a worker allocated and memset an inner chunk to decode exactly one chunk.
+    `hits / (hits + misses)` says whether the pool actually served that case. Without it a
+    flat benchmark cannot be told from a pool that never ran -- which has happened twice on
+    this branch, once for a gate that silently refused everything.
+    """
+
+def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
+    r"""
+    `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
+
+    A build is an index actually read and decoded; the two hit counts are the per-call cache
+    and the per-array one, which are separate because the second only engages on a read-only
+    store. Exposed so a test can assert the cache DID something -- correctness and timing both
+    pass a cache that is never consulted.
+    """
