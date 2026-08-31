@@ -461,7 +461,7 @@ impl CodecPipelineImpl {
             shard,
             shard_indexes: Mutex::new(HashMap::new()),
             subshard_indexes: Mutex::new(HashMap::new()),
-            cache_shard_indexes: store_is_read_only,
+            cache_shard_indexes: false,  // MEASUREMENT BRANCH: array cache off, call cache stays
             inner_chunk_is_raw: inner_chunk_is_raw(array_metadata),
             store_is_read_only,
         })
