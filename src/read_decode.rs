@@ -624,7 +624,10 @@ fn carve<'a>(
             Some(range) => jobs.push(Job {
                 key: item.key.clone(),
                 range: *range,
-                raw: false,
+                raw: {
+                    CHUNK_JOBS.fetch_add(1, Ordering::Relaxed);
+                    false
+                },
                 out: pieces,
                 coords: coords_of(item)?,
                 run_len: item.run_len,
@@ -636,6 +639,16 @@ fn carve<'a>(
     }
     Ok((jobs, absent))
 }
+
+/// Jobs that took the RAW path, and jobs that read a whole chunk, since the run began.
+///
+/// The project rule -- a knob that was set is not a knob that arrived -- applied to a code
+/// path. A gate that silently refuses everything is indistinguishable from a gate that is
+/// working: values stay correct either way and only the throughput differs, which reads as
+/// "the raw path did not pay" rather than "the raw path was never taken". Both failures have
+/// already happened here once.
+pub(crate) static RAW_JOBS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CHUNK_JOBS: AtomicU64 = AtomicU64::new(0);
 
 /// How many READS this chunk's rows become once consecutive ones are merged.
 ///
@@ -748,6 +761,7 @@ fn raw_row_jobs<'a>(
             ctx,
         });
         start = end;
+        RAW_JOBS.fetch_add(1, Ordering::Relaxed);
     }
     if !rest.is_empty() {
         return Err(PyRuntimeError::new_err(format!(

@@ -588,6 +588,21 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
+/// `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
+/// inner chunks read and decoded.
+///
+/// Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
+/// the same values, so a gate that refuses everything passes every values test.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn raw_path_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        read_decode::RAW_JOBS.load(Ordering::Relaxed),
+        read_decode::CHUNK_JOBS.load(Ordering::Relaxed),
+    )
+}
+
 /// Zero the counters, so one test's numbers are its own.
 #[gen_stub_pyfunction]
 #[pyfunction]
@@ -603,6 +618,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(shard_index_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(reset_shard_index_cache_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(raw_path_stats, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
     m.add_class::<chunk_item::ChunkItems>()?;
