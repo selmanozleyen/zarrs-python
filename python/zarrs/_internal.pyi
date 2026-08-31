@@ -142,8 +142,6 @@ class CodecPipelineImpl:
         self,
         chunk_items: ChunkItems,
         value: numpy.typing.NDArray[typing.Any],
-        read_concurrency: typing.Optional[builtins.int] = None,
-        decode_concurrency: typing.Optional[builtins.int] = None,
         read_worker_ceiling: typing.Optional[builtins.int] = None,
         decode_worker_ceiling: typing.Optional[builtins.int] = None,
     ) -> None:
