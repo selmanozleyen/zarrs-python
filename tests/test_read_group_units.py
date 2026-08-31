@@ -70,6 +70,13 @@ def test_scratch_pool_serves_a_later_call(tmp_path: Path):
     Same reasoning as above: values cannot see this. A pool that never serves and a pool
     that serves but buys nothing produce identical bytes and identical timings-within-noise,
     so the counter is the only thing that separates them.
+
+    COMPRESSED, deliberately, and it caught a real change when it was not. An uncompressed
+    inner chunk takes the raw path, where the read IS the answer and `decode_one` is a
+    `copy_from_slice` with no scratch at all -- so this test built its array with
+    `compressors=None` and then asserted that a buffer pool it could never reach had served
+    one. It failed the moment raw jobs stopped being handed to the decode pool, which is
+    exactly the behaviour that commit intended. The pool is for real decodes; test it on one.
     """
     from zarrs._internal import scratch_pool_stats
 
@@ -80,7 +87,7 @@ def test_scratch_pool_serves_a_later_call(tmp_path: Path):
         chunks=CHUNKS,
         shards=SHARDS,
         dtype="float32",
-        compressors=None,
+        compressors=zarr.codecs.BloscCodec(cname="lz4", clevel=1),
     )
     array[:] = values
 
@@ -95,4 +102,41 @@ def test_scratch_pool_serves_a_later_call(tmp_path: Path):
     assert after_hits > before_hits, (
         "no decode buffer was served from the pool on the second read -- the workers of the "
         "first call returned nothing, so every decoder is still allocating its own scratch"
+    )
+
+
+def test_the_raw_path_never_reaches_the_scratch_pool(tmp_path: Path):
+    """An uncompressed chunk has nothing to decode, so no decode worker should be asked.
+
+    The read IS the answer on the raw path -- `decode_one` is a `copy_from_slice` on bytes
+    the reader just fetched, still in that core's cache. Handing it to the decode pool buys
+    a queue push, a steal and a wake to run a memcpy, and it showed up as an uncompressed
+    array getting monotonically SLOWER as the decode pool grew: 134.0 -> 129.2 -> 117.2
+    M nnz/s at 32 -> 128 -> 512 threads.
+
+    Asserted through the counter because values cannot see it: both paths return identical
+    bytes and only the thread hand-off differs.
+    """
+    from zarrs._internal import scratch_pool_stats
+
+    values = np.arange(SHAPE[0] * SHAPE[1], dtype=np.float32).reshape(SHAPE)
+    array = zarr.create_array(
+        store=tmp_path / "c.zarr",
+        shape=SHAPE,
+        chunks=CHUNKS,
+        shards=SHARDS,
+        dtype="float32",
+        compressors=None,
+    )
+    array[:] = values
+
+    with zarr.config.set(CHUNK_UNIT):
+        before = scratch_pool_stats()
+        got = array.oindex[np.arange(0, 32), :]
+        after = scratch_pool_stats()
+
+    np.testing.assert_array_equal(got, values[0:32, :])
+    assert after == before, (
+        f"the raw path touched the scratch pool: {before} -> {after}. An uncompressed chunk "
+        "needs no scratch, so asking a decode worker for one is a hand-off bought for a memcpy"
     )
