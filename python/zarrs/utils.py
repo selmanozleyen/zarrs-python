@@ -420,31 +420,6 @@ def _chunk_unit_args(
         lanes.append(_bands(int(lo), int(hi), int(inner_shape[axis]), int(out_span[0])))
     indices = chunk_sel[0]
     out_axis_sel = out_sel[0]
-    # An integer array whose values step by exactly 1 IS a contiguous slice, and the caller
-    # spelling it as elements should not cost what naming elements costs. zarr hands one over
-    # whenever the selection was built from a row array rather than a slice -- which annbatch's
-    # dense fetch does for every batch -- and at chunk_size 64 each entry's indices are then 64
-    # CONSECUTIVE rows described one number at a time.
-    #
-    # Measured: `_chunk_unit_args` costs 0.253 s cumulative on the array form against 0.108 s
-    # on the slice form, with FEWER calls, and that difference is the whole of a 13% deficit at
-    # cs=64. The run structure was in the input; nothing looked for it.
-    #
-    # This is the third appearance of one defect. `np.arange` expanding a slice on the way IN
-    # was the first, the output side was the second. The rule the three share: never turn a run
-    # into elements, and never fail to notice one that is already there.
-    if (
-        isinstance(indices, np.ndarray)
-        and indices.size > 1
-        and _is_sorted_integer_axis(indices, out_axis_sel)
-        # STRICTLY consecutive, checked by differencing. An earlier version tested
-        # `last - first + 1 == size` to avoid the allocation, on the reasoning that a repeat
-        # makes the span shorter than the count. That is false when a GAP cancels the repeat:
-        # `[1, 3, 3]` spans 3 and counts 3, and would have been read as rows 1, 2, 3 --
-        # silent wrong data. `tests/test_chunk_unit_indexing.py` caught it on the first run.
-        and bool((np.diff(indices) == 1).all())
-    ):
-        indices = slice(int(indices[0]), int(indices[-1]) + 1)
     if isinstance(indices, slice):
         span = _step1_span(indices, chunk_spec.shape[0])
         if span is None:

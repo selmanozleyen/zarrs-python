@@ -1027,31 +1027,3 @@ def test_a_kept_constant_column_axis_is_not_rebuilt(tmp_path: Path, cols) -> Non
         got = zarr.open_array(path, mode="r").oindex[rows, cols]
 
     np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
-
-
-def test_a_gap_cancelled_by_a_repeat_is_not_a_span(tmp_path: Path) -> None:
-    """`[1, 3, 3]` spans three and counts three, and is not consecutive.
-
-    A consecutive integer array is described as a SPAN -- a first and a count -- because that
-    is what it is, and naming its elements costs one u64 each. The test for consecutive has to
-    be `diff == 1` and not `last - first + 1 == size`: the cheap form is fooled exactly when a
-    GAP is cancelled by a REPEAT, and it then reads rows 1, 2, 3 for a caller who asked for
-    1, 3, 3. Wrong data, no error.
-
-    This shipped for one suite run. `test_an_unsharded_array_takes_the_path[2d]` caught it,
-    because its row draw contains a repeat and a gap in the same chunk.
-    """
-    values = np.arange(64 * 8, dtype=np.float32).reshape(64, 8)
-    path = tmp_path / "gap.zarr"
-    zarr.create_array(path, dtype=values.dtype, shape=values.shape, chunks=(32, 8))[:] = values
-
-    rows = np.array([1, 3, 3])
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r")[rows]
-    np.testing.assert_array_equal(got, values[rows])
-
-    # And the span form is still taken where it genuinely applies.
-    consecutive = np.arange(8, 16)
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r")[consecutive]
-    np.testing.assert_array_equal(got, values[consecutive])
