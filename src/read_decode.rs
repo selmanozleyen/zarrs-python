@@ -662,15 +662,30 @@ pub(crate) fn raw_runs(coords: &[u64], run_len: u64) -> usize {
 /// fetch, so 63 tiny reads lose to one large one however few bytes they move.
 ///
 /// So the choice is PER ITEM, not per array: take the raw path only where a chunk's rows
-/// collapse to a handful of reads. 8 is a placeholder below chunk_size=64, not a measured
-/// value; `ZARRS_RAW_MAX_READS_PER_CHUNK=0` disables the raw path entirely.
+/// collapse to a handful of reads.
+///
+/// TWO, and it is measured rather than picked. Sweeping stride against 64-row chunks walks the
+/// gate's operating region directly, which is the thing an earlier sweep could not do -- it
+/// sampled patterns at ~1, 1 and ~32 runs a chunk and concluded from points on either side of
+/// the value being judged:
+///
+///     runs/chunk   32     16      8      4      2      1
+///     ratio      0.97x  0.97x  0.95x  0.98x  1.03x  1.31x
+///
+/// Raw pays at <= 2 and is flat to slightly negative from 4 up. A gate of 8 therefore ADMITS
+/// the 0.95x and 0.98x cases; 2 refuses them and keeps only the wins. Eight requests for a
+/// fraction of the bytes is not better than one request for all of them when requests are the
+/// scarce resource, which is the same wall `get_partial_many` runs into from the other side.
+///
+/// `ZARRS_RAW_MAX_READS_PER_CHUNK=0` disables the raw path entirely; the sweep above is in
+/// `notes/read-unit-and-hints.md`.
 fn raw_max_reads_per_chunk() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
         std::env::var("ZARRS_RAW_MAX_READS_PER_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8)
+            .unwrap_or(2)
     })
 }
 
