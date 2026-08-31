@@ -1137,6 +1137,58 @@ const GROUP_MAX_JOBS: usize = 8;
 pub(crate) static GROUP_JOBS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GROUP_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Decode scratch outlives the CALL, because the threads that hold it do not.
+///
+/// `decode_loop` grows its buffer to the largest chunk that worker has seen and then reuses it
+/// -- which only pays if the worker decodes more than one chunk. Workers are call-scoped, and
+/// at a chunk_size of 64 a call has ~9 chunks and spawns ~9 decoders, so nearly every worker
+/// paid a fresh allocation and a full `resize(needed, 0)` memset of an inner chunk (366 KiB
+/// sparse, 512 KiB dense) in order to decode exactly ONE chunk. Above glibc's 128 KiB mmap
+/// threshold that is an mmap, a memset, a page-fault per page, and a munmap at thread exit.
+///
+/// The buffers are interchangeable, so they are kept rather than freed. At chunk_size 1 a
+/// worker decodes ~65 chunks and already amortised this; the pool is aimed squarely at the
+/// small-batch end, and if it moves the large-batch end too then the mechanism is not what
+/// this comment claims.
+static SCRATCH_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Enough for every worker one call may hold at a generous ceiling; past that, dropping a
+/// buffer is cheaper than keeping a pool nobody drains.
+const SCRATCH_POOL_MAX: usize = 128;
+
+/// Buffers served from the pool, and buffers that had to be created. Without these a null
+/// result cannot be told from "the pool never ran" -- the failure this project has already
+/// been bitten by twice.
+pub(crate) static SCRATCH_HITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SCRATCH_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// A buffer to decode into, reused if one is free. Its contents are meaningless -- every
+/// caller `resize`s to what it needs before writing, and addresses only `..needed`.
+fn scratch_take() -> Vec<u8> {
+    match SCRATCH_POOL.lock().ok().and_then(|mut pool| pool.pop()) {
+        Some(buf) => {
+            SCRATCH_HITS.fetch_add(1, Ordering::Relaxed);
+            buf
+        }
+        None => {
+            SCRATCH_MISSES.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        }
+    }
+}
+
+/// Hands a buffer back. An empty one is not worth a lock -- it carries no allocation.
+fn scratch_give(buf: Vec<u8>) {
+    if buf.capacity() == 0 {
+        return;
+    }
+    if let Ok(mut pool) = SCRATCH_POOL.lock() {
+        if pool.len() < SCRATCH_POOL_MAX {
+            pool.push(buf);
+        }
+    }
+}
+
 /// Consecutive only, and deliberately not sorted. Jobs arrive in OUTPUT order; reordering them
 /// to make bigger groups would let a batch hold bytes for a job whose output lands far away,
 /// keeping the whole group alive until that one is reached.
@@ -1245,12 +1297,15 @@ fn send_piece<'a>(
 }
 
 fn decode_loop(decodes: &Receiver<(Job<'_>, MaybeBytes)>, failure: &Mutex<Option<String>>) {
-    let mut scratch: Vec<u8> = Vec::new();
+    let mut scratch: Vec<u8> = scratch_take();
     while let Ok((mut job, bytes)) = decodes.recv() {
         if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
             record(failure, e);
         }
     }
+    // On the normal return only. A panicking worker drops its buffer instead, which costs one
+    // allocation and keeps the unwind path free of a lock.
+    scratch_give(scratch);
 }
 
 /// Decode one innermost chunk into scratch, then gather the wanted elements into `out`.
@@ -1310,6 +1365,10 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     // What this DOES change is the failure mode if `decode_into` ever leaves part of the
     // target unwritten: the gap now carries the PREVIOUS chunk's decoded elements rather
     // than zeros, so it reads as plausible values instead of an obvious block of nothing.
+    // With `SCRATCH_POOL` that previous chunk may belong to an earlier CALL rather than to
+    // this one -- the same class of staleness, over a wider provenance. It is still bounded
+    // by the same condition: the view below is the whole chunk, so any codec that can leave
+    // a gap is already broken, whoever wrote the bytes that show through.
     // The view below is built over `new_with_shape` -- the whole chunk -- so a codec that
     // returns `Ok` without filling it would already be broken; this makes such a bug quieter
     // rather than causing one.

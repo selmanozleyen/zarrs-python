@@ -613,6 +613,23 @@ fn read_merge_stats() -> (u64, u64) {
     )
 }
 
+/// Decode buffers served from the pool, and buffers that had to be allocated.
+///
+/// A decoder worker is scoped to its call, so its scratch buffer used to die with it: at a
+/// small batch a worker allocated and memset an inner chunk to decode exactly one chunk.
+/// `hits / (hits + misses)` says whether the pool actually served that case. Without it a
+/// flat benchmark cannot be told from a pool that never ran -- which has happened twice on
+/// this branch, once for a gate that silently refused everything.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn scratch_pool_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        read_decode::SCRATCH_HITS.load(Ordering::Relaxed),
+        read_decode::SCRATCH_MISSES.load(Ordering::Relaxed),
+    )
+}
+
 /// Zero the counters, so one test's numbers are its own.
 #[gen_stub_pyfunction]
 #[pyfunction]
@@ -630,6 +647,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(reset_shard_index_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(raw_path_stats, m)?)?;
     m.add_function(wrap_pyfunction!(read_merge_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(scratch_pool_stats, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
     m.add_class::<chunk_item::ChunkItems>()?;

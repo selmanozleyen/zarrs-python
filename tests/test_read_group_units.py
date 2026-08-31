@@ -62,3 +62,37 @@ def test_jobs_and_groups_are_different_counts(tmp_path: Path):
         "group count and the decoder target the job count; if these coincide the widening "
         "loop's units are untested."
     )
+
+
+def test_scratch_pool_serves_a_later_call(tmp_path: Path):
+    """The decode buffer must outlive the call, because the worker holding it does not.
+
+    Same reasoning as above: values cannot see this. A pool that never serves and a pool
+    that serves but buys nothing produce identical bytes and identical timings-within-noise,
+    so the counter is the only thing that separates them.
+    """
+    from zarrs._internal import scratch_pool_stats
+
+    values = np.arange(SHAPE[0] * SHAPE[1], dtype=np.float32).reshape(SHAPE)
+    array = zarr.create_array(
+        store=tmp_path / "b.zarr",
+        shape=SHAPE,
+        chunks=CHUNKS,
+        shards=SHARDS,
+        dtype="float32",
+        compressors=None,
+    )
+    array[:] = values
+
+    with zarr.config.set(CHUNK_UNIT):
+        # The first read fills the pool as its workers exit; the second must be served by it.
+        array.oindex[np.arange(0, 32), :]
+        before_hits, _ = scratch_pool_stats()
+        got = array.oindex[np.arange(32, 64), :]
+        after_hits, _ = scratch_pool_stats()
+
+    np.testing.assert_array_equal(got, values[32:64, :])
+    assert after_hits > before_hits, (
+        "no decode buffer was served from the pool on the second read -- the workers of the "
+        "first call returned nothing, so every decoder is still allocating its own scratch"
+    )
