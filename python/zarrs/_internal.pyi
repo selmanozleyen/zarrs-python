@@ -137,13 +137,14 @@ class CodecPipelineImpl:
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
         store_is_read_only: builtins.bool = False,
+        read_worker_ceiling: typing.Optional[builtins.int] = None,
+        decode_worker_ceiling: typing.Optional[builtins.int] = None,
+        strict: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
     def retrieve_chunk_items_and_apply_index(
         self,
         chunk_items: ChunkItems,
         value: numpy.typing.NDArray[typing.Any],
-        read_worker_ceiling: typing.Optional[builtins.int] = None,
-        decode_worker_ceiling: typing.Optional[builtins.int] = None,
     ) -> None:
         r"""
         The one read entry point.
