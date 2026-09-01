@@ -29,7 +29,8 @@ from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
     UnsupportedVIndexingError,
-    make_chunk_info_for_rust_with_indices,
+    chunk_info_for_read,
+    chunk_info_for_write,
 )
 
 
@@ -39,6 +40,19 @@ class UnsupportedDataTypeError(Exception):
 
 class UnsupportedMetadataError(Exception):
     pass
+
+
+#: What sends a batch to zarr-python's pipeline instead of this one.
+#:
+#: Each means "zarrs cannot describe this", not "the read failed". `read` and `write` must
+#: use the same set: a member in one and not the other falls back on read, raises on write.
+FALLBACK_TO_ZARR_PYTHON = (
+    UnsupportedMetadataError,
+    DiscontiguousArrayError,
+    UnsupportedVIndexingError,
+    UnsupportedDataTypeError,
+    FillValueNoneError,
+)
 
 
 def get_codec_pipeline_impl(
@@ -183,16 +197,8 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = make_chunk_info_for_rust_with_indices(
-                batch_info, drop_axes, out.shape
-            )
-        except (
-            UnsupportedMetadataError,
-            DiscontiguousArrayError,
-            UnsupportedVIndexingError,
-            UnsupportedDataTypeError,
-            FillValueNoneError,
-        ):
+            chunks_desc = chunk_info_for_read(batch_info, drop_axes, out.shape)
+        except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
             await self.python_impl.read(batch_info, out, drop_axes)
@@ -218,16 +224,8 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = make_chunk_info_for_rust_with_indices(
-                batch_info, drop_axes, value.shape
-            )
-        except (
-            UnsupportedMetadataError,
-            DiscontiguousArrayError,
-            UnsupportedVIndexingError,
-            UnsupportedDataTypeError,
-            FillValueNoneError,
-        ):
+            chunks_desc = chunk_info_for_write(batch_info, drop_axes, value.shape)
+        except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
             await self.python_impl.write(batch_info, value, drop_axes)
