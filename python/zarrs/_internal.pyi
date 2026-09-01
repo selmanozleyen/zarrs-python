@@ -174,6 +174,15 @@ def pool_sizes() -> tuple[typing.Optional[builtins.int], typing.Optional[builtin
     two happened -- the repo's rule that a knob which was set is not a knob that arrived.
     """
 
+def raw_path_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
+    inner chunks read and decoded.
+
+    Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
+    the same values, so a gate that refuses everything passes every values test.
+    """
+
 def read_merge_stats() -> tuple[builtins.int, builtins.int]:
     r"""
     `(issued, served)`: store calls made, and inner chunks they served, since the run began.
