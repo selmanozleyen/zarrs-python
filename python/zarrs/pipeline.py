@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, TypedDict
 from warnings import warn
 
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
 
-from ._internal import CodecPipelineImpl
+from ._internal import ChunkItems, CodecPipelineImpl
 from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
@@ -151,6 +152,39 @@ class ZarrsCodecPipeline(CodecPipeline):
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
 
+    @cached_property
+    def _inner_chunk_shape(self) -> tuple[int, ...] | None:
+        """The shape of the INNERMOST unit the codec chain decodes.
+
+        Three answers, and the difference matters: a tuple is the inner chunk of a sharded
+        array; `()` means the array is NOT sharded, so its chunk is its own decode unit and
+        only an entry knows that shape; `None` means refuse.
+
+        Descends through nested sharding: the first `chunk_shape` found is the outer shard's,
+        not the decode unit.
+        """
+        codecs = getattr(self.metadata, "codecs", ()) or ()
+        shape = None
+        while True:
+            nested = None
+            for position, codec in enumerate(codecs):
+                chunk_shape = getattr(codec, "chunk_shape", None)
+                if chunk_shape is None:
+                    continue
+                # A codec AFTER the sharding codec compresses the whole shard, so the shard
+                # index's byte ranges no longer address the shard. One inner chunk cannot be
+                # read on its own; decline.
+                if position != len(codecs) - 1:
+                    return None
+                shape = tuple(int(s) for s in chunk_shape)
+                nested = getattr(codec, "codecs", ()) or ()
+                break
+            if nested is None:
+                # No sharding codec anywhere in the chain: not an error, just a plain chunked
+                # array, whose chunk is what gets decoded.
+                return () if shape is None else shape
+            codecs = nested
+
     @property
     def supports_partial_decode(self) -> bool:
         return False
@@ -197,7 +231,9 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = chunk_info_for_read(batch_info, drop_axes, out.shape)
+            chunks_desc = chunk_info_for_read(
+                batch_info, drop_axes, out.shape, self._inner_chunk_shape
+            )
         except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
@@ -205,10 +241,27 @@ class ZarrsCodecPipeline(CodecPipeline):
             return None
         else:
             out: NDArrayLike = out.as_ndarray_like()
+            desc = chunks_desc.chunk_info_with_indices
+            # One entry point. `chunk_info_for_read` either produces a handle or raises, and
+            # the raise is caught above as a fall back to zarr-python -- there is no second
+            # Rust read path to choose between any more.
+            retrieve = self.impl.retrieve_chunk_items_and_apply_index
+            # Read HERE, per call, not at array open: read at open they would be frozen for
+            # the array's life and a `with zarr.config.set(...)` around a read would silently
+            # do nothing.
+            #
+            # Only `raw_max_reads_per_chunk` is actually honoured per call, though. The two
+            # ceilings SIZE PROCESS-WIDE POOLS and only the first read in the process builds
+            # them, so a later value is read here and then ignored downstream. That is worth
+            # saying at the call site rather than only in the Rust: passing a value that has
+            # no effect looks like a bug from up here. `pool_sizes()` reports what was built.
             await asyncio.to_thread(
-                self.impl.retrieve_chunks_and_apply_index,
-                chunks_desc.chunk_info_with_indices,
+                retrieve,
+                desc,
                 out,
+                config.get("codec_pipeline.read_worker_ceiling", None),
+                config.get("codec_pipeline.decode_worker_ceiling", None),
+                config.get("codec_pipeline.raw_max_reads_per_chunk", None),
             )
             return None
 
