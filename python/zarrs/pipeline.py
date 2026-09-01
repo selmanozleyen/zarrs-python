@@ -80,6 +80,16 @@ def get_codec_pipeline_impl(
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
             ),
+            # Read at OPEN, like `num_threads` and the chunk-concurrency bounds beside them.
+            # They size process-wide pools that only the first read builds, so offering them
+            # per call would be offering a choice that cannot be honoured.
+            read_worker_ceiling=config.get("codec_pipeline.read_worker_ceiling", None),
+            decode_worker_ceiling=config.get(
+                "codec_pipeline.decode_worker_ceiling", None
+            ),
+            # Under `strict`, a ceiling the process cannot give is an error rather than a
+            # warning -- the same switch that turns a decline into a raise.
+            strict=strict,
             store_is_read_only=store.read_only,
         )
     except TypeError as e:
@@ -246,21 +256,13 @@ class ZarrsCodecPipeline(CodecPipeline):
             # the raise is caught above as a fall back to zarr-python -- there is no second
             # Rust read path to choose between any more.
             retrieve = self.impl.retrieve_chunk_items_and_apply_index
-            # Read HERE, per call, not at array open: read at open they would be frozen for
-            # the array's life and a `with zarr.config.set(...)` around a read would silently
-            # do nothing.
-            #
-            # Only `raw_max_reads_per_chunk` is actually honoured per call, though. The two
-            # ceilings SIZE PROCESS-WIDE POOLS and only the first read in the process builds
-            # them, so a later value is read here and then ignored downstream. That is worth
-            # saying at the call site rather than only in the Rust: passing a value that has
-            # no effect looks like a bug from up here. `pool_sizes()` reports what was built.
+            # Per call because it IS a per-call decision: a threshold on how many byte-range
+            # reads one chunk is worth, not a size that something was built at. The two pool
+            # ceilings are not here -- they were read when the array was opened.
             await asyncio.to_thread(
                 retrieve,
                 desc,
                 out,
-                config.get("codec_pipeline.read_worker_ceiling", None),
-                config.get("codec_pipeline.decode_worker_ceiling", None),
                 config.get("codec_pipeline.raw_max_reads_per_chunk", None),
             )
             return None

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use pyo3::types::PyAnyMethods;
 use pyo3::{PyResult, Python};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
     ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
@@ -850,7 +850,11 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
 /// opens a second array wanting a different width is doing something legitimate -- refusing it
 /// would turn a sizing hint into a failed read. A caller needing the guarantee asserts on
 /// [`pool_sizes`], which is what the benchmark does.
-pub(crate) fn warn_if_ceiling_ignored(py: Python<'_>, config: ReadConfig) -> PyResult<()> {
+pub(crate) fn check_ceiling_arrived(
+    py: Python<'_>,
+    config: ReadConfig,
+    strict: bool,
+) -> PyResult<()> {
     for (built, asked, knob) in [
         (pool_sizes().0, config.read_ceiling, "read_worker_ceiling"),
         (pool_sizes().1, config.decode_ceiling, "decode_worker_ceiling"),
@@ -863,8 +867,16 @@ pub(crate) fn warn_if_ceiling_ignored(py: Python<'_>, config: ReadConfig) -> PyR
         let message = format!(
             "codec_pipeline.{knob} = {asked} was ignored: the pool was built with {built} \
              threads by the first read in this process and cannot be resized. Set it before \
-             the first read, or call zarrs._internal.pool_sizes() for what was built."
+             the array that does the first read is opened, or call \
+             zarrs._internal.pool_sizes() for what was built."
         );
+        // `codec_pipeline.strict` already means "do not paper over what this pipeline cannot
+        // do" -- it turns a decline into a raise instead of a silent fallback to zarr-python.
+        // A width the process cannot give is the same kind of thing, and a caller who asked
+        // for strictness would rather find out here than infer it from a throughput number.
+        if strict {
+            return Err(PyValueError::new_err(message));
+        }
         py.import("warnings")?.call_method1("warn", (message,))?;
     }
     Ok(())
@@ -882,6 +894,13 @@ pub(crate) struct ReadConfig {
     pub(crate) raw_max_reads: usize,
 }
 
+/// A ceiling as the pipeline will use it: zero or absent means "as much as the machine has".
+///
+/// Public so the pipeline can resolve at OPEN, which is when these are read.
+pub(crate) fn resolve_ceiling(ceiling: Option<usize>) -> usize {
+    ceiling.filter(|c| *c > 0).unwrap_or_else(default_ceiling)
+}
+
 impl ReadConfig {
     /// `None`, or a zero, takes the default for each -- except `raw_max_reads`, where zero is
     /// meaningful: it disables the raw path.
@@ -891,12 +910,22 @@ impl ReadConfig {
         raw_max_reads: Option<usize>,
     ) -> Self {
         Self {
-            read_ceiling: read_ceiling
-                .filter(|c| *c > 0)
-                .unwrap_or_else(default_ceiling),
-            decode_ceiling: decode_ceiling
-                .filter(|c| *c > 0)
-                .unwrap_or_else(default_ceiling),
+            read_ceiling: resolve_ceiling(read_ceiling),
+            decode_ceiling: resolve_ceiling(decode_ceiling),
+            raw_max_reads: raw_max_reads.unwrap_or(RAW_MAX_READS),
+        }
+    }
+
+    /// The ceilings as the ARRAY was opened with, already resolved, plus this call's raw
+    /// threshold. The two are read at different times on purpose -- see the fields.
+    pub(crate) fn from_open(
+        read_ceiling: usize,
+        decode_ceiling: usize,
+        raw_max_reads: Option<usize>,
+    ) -> Self {
+        Self {
+            read_ceiling,
+            decode_ceiling,
             raw_max_reads: raw_max_reads.unwrap_or(RAW_MAX_READS),
         }
     }
