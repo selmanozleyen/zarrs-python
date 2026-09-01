@@ -492,6 +492,9 @@ impl CodecPipelineImpl {
             decode_worker_ceiling,
             raw_max_reads_per_chunk,
         );
+        // The pools are sized once, by the first read. A ceiling arriving after that cannot
+        // be honoured, and a caller who is not told believes it was.
+        read_decode::warn_if_ceiling_ignored(py, config)?;
         self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, config)
     }
 

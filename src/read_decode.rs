@@ -16,7 +16,8 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use pyo3::PyResult;
+use pyo3::types::PyAnyMethods;
+use pyo3::{PyResult, Python};
 use pyo3::exceptions::PyRuntimeError;
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
@@ -835,6 +836,38 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
         READ_POOL.get().map(rayon::ThreadPool::current_num_threads),
         DECODE_POOL.get().map(rayon::ThreadPool::current_num_threads),
     )
+}
+
+/// Say so when a ceiling asked for is not the one the pools were built with.
+///
+/// The pools are sized by the FIRST read in the process, so a `zarr.config.set` around a later
+/// read resizes nothing. That is the accepted cost of persistence; doing it SILENTLY is not.
+/// From the outside "the knob did not pay" and "the knob never arrived" look identical, and
+/// this project has published a number from each. [`pool_sizes`] lets a caller ask; this tells
+/// one who did not.
+///
+/// A warning, not an error. The read is correct at the width already built, and a process that
+/// opens a second array wanting a different width is doing something legitimate -- refusing it
+/// would turn a sizing hint into a failed read. A caller needing the guarantee asserts on
+/// [`pool_sizes`], which is what the benchmark does.
+pub(crate) fn warn_if_ceiling_ignored(py: Python<'_>, config: ReadConfig) -> PyResult<()> {
+    for (built, asked, knob) in [
+        (pool_sizes().0, config.read_ceiling, "read_worker_ceiling"),
+        (pool_sizes().1, config.decode_ceiling, "decode_worker_ceiling"),
+    ] {
+        // Only when a pool EXISTS and differs. Before the first read there is nothing to
+        // contradict, and the ordinary case costs one atomic load per pool per call.
+        let Some(built) = built.filter(|built| *built != asked) else {
+            continue;
+        };
+        let message = format!(
+            "codec_pipeline.{knob} = {asked} was ignored: the pool was built with {built} \
+             threads by the first read in this process and cannot be resized. Set it before \
+             the first read, or call zarrs._internal.pool_sizes() for what was built."
+        );
+        py.import("warnings")?.call_method1("warn", (message,))?;
+    }
+    Ok(())
 }
 
 /// What ONE call reads from `zarr.config` when it starts.
