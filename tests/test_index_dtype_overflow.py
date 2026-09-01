@@ -1,15 +1,10 @@
-"""What an index array IS, before anything tries to read with it.
+"""An index array's dtype must not change which selections are accepted.
 
-Every array index in a batch is normalised to int64 positions on the way in. Three cases
-decide what that means, and each of them read the wrong data or crashed before it:
-
-  - an unsigned DECREASE wraps to +1 under a consecutive-difference test, so a descending
-    selection reads as consecutive;
-  - a uint64 selection arrives as float64, because uint64 - int64 promotes;
-  - a boolean MASK is not an index array at all -- its positions are what it means.
-
-These are dtype questions, so they are tested through the smallest read that reaches the
-description, plus two direct calls on the collapse itself.
+Subtracting in the incoming dtype inverts the comparison, because on an unsigned array a
+decrease wraps to a large positive step -- ``np.diff(np.array([255, 0], "uint8"))`` is
+``[1]``, so the most extreme possible decrease reads as consecutive and the slice built
+from it, ``slice(255, 1)``, is empty. uint64 is worse than wrong: it reaches us promoted
+to float64 (zarr subtracts an int64 chunk offset) and loses exactness above 2**53.
 """
 
 from __future__ import annotations
@@ -50,15 +45,23 @@ def sharded(tmp_path: Path) -> tuple[Path, np.ndarray]:
 
 
 def test_wraparound_decrease_is_not_consecutive() -> None:
-    """[3, 1] on uint8 differences to 254, not -2. Normalised, it is refused."""
+    """[255, 0] as uint8 differences to 1. It is a decrease of 255, not a step of 1.
+
+    `make_slice_selection` differences directly, so go through the boundary that
+    normalises: neither half is a guarantee alone.
+    """
+    selection = (np.array([255, 0], dtype="uint8"),)
+    ((_, _, chunk_selection, _, _),) = _as_int64_batch_info(
+        [(None, None, selection, selection, True)]
+    )
     with pytest.raises(DiscontiguousArrayError):
-        make_slice_selection((np.array([3, 1], dtype="uint8").astype(np.int64),))
+        make_slice_selection(chunk_selection)
 
 
 @pytest.mark.parametrize("dtype", UNSIGNED)
 def test_consecutive_unsigned_still_collapses(dtype: str) -> None:
-    """The normalisation must not reject what was always valid."""
-    (result,) = make_slice_selection((np.array([7, 8, 9], dtype=dtype).astype(np.int64),))
+    """The fix must not reject what was always valid."""
+    (result,) = make_slice_selection((np.array([7, 8, 9], dtype=dtype),))
     assert result == slice(7, 10, 1)
 
 
@@ -66,7 +69,7 @@ def test_consecutive_unsigned_still_collapses(dtype: str) -> None:
 def test_unsigned_rows_read_the_same_as_signed(dtype: str, sharded) -> None:
     """A selection's dtype is not part of its meaning."""
     path, values = sharded
-    rows = [3, 4, 5, 6]
+    rows = [3, 4, 5, 11, 12, 27]
     with zarr.config.set(STRICT):
         array = zarr.open_array(path, mode="r")
         unsigned = array[np.array(rows, dtype=dtype), :]
@@ -75,27 +78,29 @@ def test_unsigned_rows_read_the_same_as_signed(dtype: str, sharded) -> None:
     np.testing.assert_array_equal(unsigned, signed)
 
 
-def test_a_boolean_mask_reads_the_rows_it_marks(sharded) -> None:
-    """A mask's POSITIONS are the selection.
+@pytest.mark.parametrize("dtype", UNSIGNED)
+def test_unsigned_descending_rows_are_refused(dtype: str, sharded) -> None:
+    """Rows 27 and 3 land in different shards, so each arrives alone and looks orderable.
 
-    Cast elementwise instead, and an all-True mask becomes [1, 1, ...]: non-decreasing, the
-    right length, and every row read is row 1. That returned wrong data with no error.
+    What refuses them is the negative bound: zarr makes 3 chunk-relative against shard 1
+    and hands over [-13]. Signed dtypes are unaffected, which is why this is dtype-specific.
     """
+    path, _ = sharded
+    with zarr.config.set(STRICT), pytest.raises(DiscontiguousArrayError):
+        zarr.open_array(path, mode="r")[np.array([27, 3], dtype=dtype), :]
+
+
+# A negative index is refused in two places on the live path: `_chunk_unit_args` declines one
+# (`utils.py`, `(indices < 0).any()`) and `build_chunk_unit_items` errors on one
+# (`chunk_item.rs`, "index {} is negative"). Tested through the read below rather than by
+# calling either directly, so the test survives a change of spelling.
+
+def test_sorted_selections_never_produce_a_negative_bound(sharded) -> None:
+    """The guard above must not be firing on ordinary reads."""
     path, values = sharded
-    mask = np.zeros(len(values), dtype=bool)
-    mask[4:8] = True
+    rng = np.random.default_rng(0)
     with zarr.config.set(STRICT):
-        masked = zarr.open_array(path, mode="r")[mask, :]
-    np.testing.assert_array_equal(masked, values[4:8, :])
-
-
-def test_an_unreadable_index_dtype_is_declined() -> None:
-    """Not guessed at: a dtype that is not an integer, unsigned or float position.
-
-    Called directly. zarr's own `BasicIndexer` refuses a string selection before the
-    pipeline is handed one, so no read can reach this branch -- and the branch still has to
-    hold, because the next thing it would do is cast something that is not a position.
-    """
-    batch = [(None, None, np.array([3, 4], dtype="complex128"), slice(0, 2), False)]
-    with pytest.raises(DiscontiguousArrayError):
-        list(_as_int64_batch_info(batch))
+        array = zarr.open_array(path, mode="r")
+        for _ in range(50):
+            rows = np.sort(rng.choice(32, size=rng.integers(1, 8), replace=False))
+            np.testing.assert_array_equal(array[rows, :], values[rows, :])
