@@ -66,7 +66,9 @@ def test_consecutive_unsigned_still_collapses(dtype: str) -> None:
 def test_unsigned_rows_read_the_same_as_signed(dtype: str, sharded) -> None:
     """A selection's dtype is not part of its meaning."""
     path, values = sharded
-    rows = [3, 4, 5, 6]
+    # Spanning shards, so this is a scattered selection rather than one run -- the shape the
+    # chunk-unit path exists for. A dtype must not change which of them is served.
+    rows = [3, 4, 5, 11, 12, 27]
     with zarr.config.set(STRICT):
         array = zarr.open_array(path, mode="r")
         unsigned = array[np.array(rows, dtype=dtype), :]
@@ -158,3 +160,32 @@ def test_an_all_false_mask_declines_rather_than_raising_IndexError() -> None:
     assert chunk_selection[0].size == 0
     with pytest.raises(DiscontiguousArrayError):
         make_slice_selection(chunk_selection)
+
+
+@pytest.mark.parametrize("dtype", UNSIGNED)
+def test_unsigned_descending_rows_are_refused(dtype: str, sharded) -> None:
+    """Rows 27 and 3 land in different shards, so each arrives alone and looks orderable.
+
+    What refuses them is the negative bound: zarr makes 3 chunk-relative against shard 1
+    and hands over [-13]. Signed dtypes are unaffected, which is why this is dtype-specific.
+    """
+    path, _ = sharded
+    with zarr.config.set(STRICT), pytest.raises(DiscontiguousArrayError):
+        zarr.open_array(path, mode="r")[np.array([27, 3], dtype=dtype), :]
+
+
+# A negative index is refused in two places on the live path: `_chunk_unit_args` declines one
+# (`utils.py`, `(indices < 0).any()`) and `build_chunk_unit_items` errors on one
+# (`chunk_item.rs`, "index {} is negative"). Tested through the read below rather than by
+# calling either directly, so the test survives a change of spelling.
+
+
+def test_sorted_selections_never_produce_a_negative_bound(sharded) -> None:
+    """The guard above must not be firing on ordinary reads."""
+    path, values = sharded
+    rng = np.random.default_rng(0)
+    with zarr.config.set(STRICT):
+        array = zarr.open_array(path, mode="r")
+        for _ in range(50):
+            rows = np.sort(rng.choice(32, size=rng.integers(1, 8), replace=False))
+            np.testing.assert_array_equal(array[rows, :], values[rows, :])
