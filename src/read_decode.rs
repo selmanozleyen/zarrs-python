@@ -35,6 +35,7 @@ use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 
 use crate::utils::{
     PyCodecErrExt as _, PyErrExt as _, gather, gather_pieces, gather_runs, key_partial_decoder,
+    coord_runs,
 };
 
 /// The per-array state a decode needs, shared by every job of a call.
@@ -584,17 +585,11 @@ pub(crate) static CHUNK_JOBS: AtomicU64 = AtomicU64::new(0);
 /// How many READS this chunk's rows become once consecutive ones are merged.
 ///
 /// The count that matters is runs, not rows: 64 consecutive rows are ONE read, and 64
-/// scattered ones are 64. `coords` is non-decreasing, so a run is a maximal stretch stepping
-/// by exactly `run_len`. A duplicate steps by 0 and breaks the run, which is right -- the same
-/// row twice is two output pieces and cannot be one read.
+/// scattered ones are 64. See [`coord_runs`] for what counts as consecutive; this is the gate, and
+/// `raw_row_jobs` emits exactly the runs it counts here -- from the same walk, so the gate
+/// cannot come to disagree with what it admits.
 pub(crate) fn raw_runs(coords: &[u64], run_len: u64) -> usize {
-    if coords.is_empty() {
-        return 0;
-    }
-    1 + coords
-        .windows(2)
-        .filter(|w| w[1] != w[0] + run_len)
-        .count()
+    coord_runs(coords, run_len).count()
 }
 
 /// Default for `codec_pipeline.raw_max_reads_per_chunk`.
@@ -640,19 +635,14 @@ fn raw_row_jobs<'a>(
     // issues 8 requests of 8 KiB where one of 64 KiB would do, and requests are the scarce
     // resource. The rows were always adjacent; the code just did not look.
     let mut rest = piece;
-    let mut start = 0usize;
-    while start < coords.len() {
-        let mut end = start + 1;
-        while end < coords.len() && coords[end] == coords[end - 1] + item.run_len {
-            end += 1;
-        }
+    for run in coord_runs(coords, item.run_len) {
         let span = row_bytes
-            .checked_mul(end - start)
+            .checked_mul(run.len())
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: run too large", item.key)))?;
         let (run_out, tail) = rest.split_at_mut(span.min(rest.len()));
         rest = tail;
         let at = base
-            .checked_add(coords[start] * element_size as u64)
+            .checked_add(coords[run.start] * element_size as u64)
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: offset overflow", item.key)))?;
         jobs.push(Job {
             key: item.key.clone(),
@@ -664,7 +654,6 @@ fn raw_row_jobs<'a>(
             grid: None,
             ctx,
         });
-        start = end;
         RAW_JOBS.fetch_add(1, Ordering::Relaxed);
     }
     if !rest.is_empty() {
@@ -1129,8 +1118,10 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             )
             .map_err(|e| e.to_string())?;
     }
-    // One piece is the overwhelming case and keeps `gather` exactly as it was, coalescing and
-    // bounds checks included. Several pieces only happen when a shard divides a trailing axis.
+    // One piece is the overwhelming case: `gather` writes into a single slice, one copy per
+    // coordinate, with its own bounds checks. Several pieces only happen when a shard divides
+    // a trailing axis, and `gather_pieces` merges consecutive coordinates because there a run
+    // can straddle two pieces.
     let result = if let [piece] = &mut job.out[..] {
         match job.grid {
             Some((starts, run)) => {

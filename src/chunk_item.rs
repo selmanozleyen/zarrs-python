@@ -611,10 +611,7 @@ impl ChunkItems {
             &inner,
             Offsets::Uniform(&elem_starts),
         )?;
-        if let Some(last) = items.last() {
-            self.out_end = last.subset.end_exc()[0];
-        }
-        self.items.extend(items);
+        self.extend_items(items);
         Ok(())
     }
 
@@ -753,42 +750,18 @@ impl ChunkItems {
         out_start: u64,
         inner: u64,
     ) -> PyResult<()> {
-        if out_start < self.out_end {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "output starting at {out_start} overlaps an entry already pushed, which ends \
-                 at {}",
-                self.out_end
-            )));
-        }
         let starts = starts.as_slice().map_err(|_| {
             PyErr::new::<PyValueError, _>("the run-start array must be contiguous")
         })?;
-        // Before the call: `shape` is moved into it, and argument evaluation is left to right.
-        let out_starts = trailing_zeros(out_start, shape.len());
-        // These take the trailing axes whole, so the item's extent IS the output shape.
-        let out_widths = shape.clone();
-        // These paths take the trailing axes whole, and their Python gates require the shard
-        // to hold ONE inner chunk on each -- so the shard extent is the inner extent there.
-        // Widened at the call rather than in the signature, so the tautology is written down
-        // in one place instead of assumed at every use.
-        let inner: Vec<u64> = std::iter::once(inner)
-            .chain(chunk_shape[1..].iter().copied())
-            .collect();
-        let items = build_chunk_unit_items(
+        self.push_widened(
             key,
             chunk_shape,
             shape,
             indices,
-            &out_starts,
-            &out_widths,
-            &inner,
+            out_start,
+            inner,
             Offsets::Grid { starts, run },
-        )?;
-        if let Some(last) = items.last() {
-            self.out_end = last.subset.end_exc()[0];
-        }
-        self.items.extend(items);
-        Ok(())
+        )
     }
 
     /// Push a POINT selection: one element per index, each naming its own offset inside that
@@ -811,6 +784,56 @@ impl ChunkItems {
         out_start: u64,
         inner: u64,
     ) -> PyResult<()> {
+        // Contiguous so the per-point offsets can be read as a slice; a strided view would be
+        // indexed as if it were dense.
+        let offsets = offsets.as_slice().map_err(|_| {
+            PyErr::new::<PyValueError, _>("the offsets array must be contiguous")
+        })?;
+        self.push_widened(
+            key,
+            chunk_shape,
+            shape,
+            indices,
+            out_start,
+            inner,
+            Offsets::PerIndex(offsets),
+        )
+    }
+}
+
+impl ChunkItems {
+    pub(crate) fn as_slice(&self) -> &[ChunkItem] {
+        &self.items
+    }
+
+    /// Append built items and move the output cursor past them.
+    ///
+    /// The cursor is what `push_span`, `push_grid` and `push_points` check their `out_start`
+    /// against. Every push that BUILDS its items advances it here; `push_span` emits one item
+    /// per inner chunk as it walks and sets the cursor from the last one itself.
+    fn extend_items(&mut self, items: Vec<ChunkItem>) {
+        if let Some(last) = items.last() {
+            self.out_end = last.subset.end_exc()[0];
+        }
+        self.items.extend(items);
+    }
+
+    /// The body `push_grid` and `push_points` share: guard the cursor, widen the trailing-axis
+    /// descriptions, build, append.
+    ///
+    /// Those two differ only in what an index carries -- a run per start, or one offset each
+    /// -- which is what `Offsets` says, and they were otherwise the same forty lines twice.
+    #[allow(clippy::too_many_arguments)]
+    fn push_widened(
+        &mut self,
+        key: &str,
+        chunk_shape: Vec<u64>,
+        shape: Vec<u64>,
+        indices: PyReadonlyArray1<'_, i64>,
+        out_start: u64,
+        inner: u64,
+        offsets: Offsets<'_>,
+    ) -> PyResult<()> {
         if out_start < self.out_end {
             return Err(PyErr::new::<PyValueError, _>(format!(
                 "output starting at {out_start} overlaps an entry already pushed, which ends \
@@ -818,21 +841,20 @@ impl ChunkItems {
                 self.out_end
             )));
         }
-        // Contiguous so the per-point offsets can be read as a slice; a strided view would be
-        // indexed as if it were dense.
-        let offsets = offsets.as_slice().map_err(|_| {
-            PyErr::new::<PyValueError, _>("the offsets array must be contiguous")
-        })?;
         // Before the call: `shape` is moved into it, and argument evaluation is left to right.
         let out_starts = trailing_zeros(out_start, shape.len());
         // These take the trailing axes whole, so the item's extent IS the output shape.
         let out_widths = shape.clone();
         // These paths take the trailing axes whole, and their Python gates require the shard
         // to hold ONE inner chunk on each -- so the shard extent is the inner extent there.
-        // Widened at the call rather than in the signature, so the tautology is written down
-        // in one place instead of assumed at every use.
+        // Widened here rather than in the signature, so the tautology is written down in one
+        // place instead of assumed at every use.
+        //
+        // `skip(1)`, not `[1..]`: these are pymethods taking arbitrary vectors, and a rank-0
+        // chunk must reach `build_chunk_unit_items` to be refused by name rather than panic
+        // across the FFI here.
         let inner: Vec<u64> = std::iter::once(inner)
-            .chain(chunk_shape[1..].iter().copied())
+            .chain(chunk_shape.iter().skip(1).copied())
             .collect();
         let items = build_chunk_unit_items(
             key,
@@ -842,18 +864,9 @@ impl ChunkItems {
             &out_starts,
             &out_widths,
             &inner,
-            Offsets::PerIndex(offsets),
+            offsets,
         )?;
-        if let Some(last) = items.last() {
-            self.out_end = last.subset.end_exc()[0];
-        }
-        self.items.extend(items);
+        self.extend_items(items);
         Ok(())
-    }
-}
-
-impl ChunkItems {
-    pub(crate) fn as_slice(&self) -> &[ChunkItem] {
-        &self.items
     }
 }

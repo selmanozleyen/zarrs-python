@@ -579,14 +579,15 @@ def _point_unit_args(
     for axis in range(1, rank):
         if inner_shape[axis] != chunk_spec.shape[axis]:
             return None
-    offsets = np.zeros(n, dtype=np.uint64)
-    stride = 1
-    for axis in reversed(range(1, rank)):
-        col = chunk_sel[axis]
-        if (col < 0).any() or (col >= chunk_spec.shape[axis]).any():
-            return None
-        offsets += col.astype(np.uint64, copy=False) * np.uint64(stride)
-        stride *= int(chunk_spec.shape[axis])
+    # A point's offset inside its own index is the C-order ravel of the trailing axes, which
+    # is `np.ravel_multi_index` -- bounds check included, negatives included. Out of bounds is
+    # a DECLINE here, not an error: the ordinary route serves the read.
+    try:
+        offsets = np.ravel_multi_index(
+            tuple(chunk_sel[1:]), tuple(chunk_spec.shape[1:])
+        ).astype(np.uint64, copy=False)
+    except ValueError:
+        return None
     return (
         byte_getter.path,
         chunk_spec.shape,

@@ -420,3 +420,19 @@ fn test_raw_runs_counts_reads_not_rows() {
     // pieces and cannot be served by one read.
     assert_eq!(crate::read_decode::raw_runs(&c(&[3, 3, 4]), run_len), 2);
 }
+
+/// A coordinate near the top of the range ENDS a run instead of starting the next one.
+///
+/// The three walks `coord_runs` replaced did not agree: two added unchecked, so
+/// `coord + run_len` wrapped in release -- and a wrapped sum that happens to equal the next
+/// coordinate reads as CONSECUTIVE, which merges two reads that share no bytes. The checked
+/// walk is the only behaviour this de-duplication changed, so it is the one thing pinned here.
+#[test]
+fn test_coord_runs_do_not_wrap_at_the_top_of_the_range() {
+    let run_len = 4u64;
+    // (u64::MAX - 1) + 4 wraps to 2. Unchecked, these two are one run.
+    assert_eq!(crate::utils::coord_runs(&[u64::MAX - 1, 2], run_len).count(), 2);
+    // The ordinary case still merges, and the empty one is still no runs at all.
+    assert_eq!(crate::utils::coord_runs(&[0, 4, 8], run_len).count(), 1);
+    assert_eq!(crate::utils::coord_runs(&[], run_len).count(), 0);
+}
