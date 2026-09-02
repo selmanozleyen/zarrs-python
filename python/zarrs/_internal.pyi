@@ -4,6 +4,7 @@
 import builtins
 import typing
 
+import numpy
 import numpy.typing
 import zarr.abc.store
 
@@ -16,7 +17,89 @@ class ChunkItem:
         chunk_shape: typing.Sequence[builtins.int],
         subset: typing.Sequence[slice],
         shape: typing.Sequence[builtins.int],
-    ) -> ChunkItem: ...
+    ) -> ChunkItem:
+        r"""
+        `coords` is always `None` here -- it is not a parameter, so this constructor cannot
+        build a chunk-unit item. `ChunkItems::push_entry` builds those.
+        """
+
+@typing.final
+class ChunkItems:
+    r"""
+    A batch of chunk items, built and held in Rust.
+
+    Push one entry at a time, then pass the handle to
+    `retrieve_chunk_items_and_apply_index`.
+    """
+    def __new__(cls) -> ChunkItems: ...
+    def __len__(self) -> builtins.int: ...
+    def push_entry(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        out_starts: typing.Sequence[builtins.int],
+        out_widths: typing.Sequence[builtins.int],
+        inner: typing.Sequence[builtins.int],
+        elem_starts: typing.Sequence[builtins.int] = [],
+    ) -> None:
+        r"""
+        Build one batch entry's items and append them.
+
+        `indices` select along AXIS 0 and are checked here: non-negative, non-decreasing, and
+        inside the chunk extent. So is `out_start` -- entries must be pushed in increasing
+        order, and one that would reuse output another entry already owns is refused.
+
+        Axes after the first are taken WHOLE and must be the same extent in `chunk_shape` and
+        in `shape`; that is checked too. It is what makes one index one contiguous run, and
+        the rank-N case the 1-D case with a run length.
+
+        One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
+        since the output subset is bounded against it. A larger one describes bytes the buffer
+        does not have, and that produces wrong data rather than an error.
+        """
+    def push_span(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        first: builtins.int,
+        count: builtins.int,
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a contiguous SPAN of the split axis, without naming its elements.
+        """
+    def push_grid(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        starts: numpy.typing.NDArray[numpy.uint64],
+        run: builtins.int,
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a GRID selection: the same columns taken from every selected index.
+        """
+    def push_points(
+        self,
+        key: builtins.str,
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        indices: numpy.typing.NDArray[numpy.int64],
+        offsets: numpy.typing.NDArray[numpy.uint64],
+        out_start: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push a POINT selection: one element per index, each naming its own offset inside that
+        index's elements.
+        """
 
 @typing.final
 class CodecPipelineImpl:
@@ -31,15 +114,39 @@ class CodecPipelineImpl:
         num_threads: builtins.int | None = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
+        read_worker_ceiling: builtins.int | None = None,
+        decode_worker_ceiling: builtins.int | None = None,
+        strict: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
-    def retrieve_chunks_and_apply_index(
-        self,
-        chunk_descriptions: typing.Sequence[ChunkItem],
-        value: numpy.typing.NDArray[typing.Any],
-    ) -> None: ...
+    def retrieve_chunk_items_and_apply_index(
+        self, chunk_items: ChunkItems, value: numpy.typing.NDArray[typing.Any]
+    ) -> None:
+        r"""
+        The one read entry point.
+
+        There was a second entry point until 2026-08-30 -- a partial decoder per chunk over
+        rayon, for selections this path declined. An audit of the public indexing surface found
+        nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
+        than a slower second Rust path.
+        """
     def store_chunks_with_indices(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
         value: numpy.typing.NDArray[typing.Any],
         write_empty_chunks: builtins.bool,
     ) -> None: ...
+
+def pool_sizes() -> tuple[builtins.int | None, builtins.int | None]:
+    r"""
+    The sizes the two worker pools were BUILT with, or `None` where one has not been built.
+    """
+
+def reset_shard_index_cache_stats() -> None:
+    r"""
+    Zero the counters, so one test's numbers are its own.
+    """
+
+def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
+    r"""
+    `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
+    """
