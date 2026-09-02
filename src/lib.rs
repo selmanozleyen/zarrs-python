@@ -42,6 +42,65 @@ use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
+/// What `endian` in a `bytes` codec's configuration has to say for the stored bytes to be
+/// usable without conversion.
+const NATIVE_ENDIAN: &str = if cfg!(target_endian = "little") {
+    "little"
+} else {
+    "big"
+};
+
+/// Is an innermost chunk a plain byte tiling of its elements?
+///
+/// True only when the sharding codec's inner chain is exactly `bytes`: no filter, no
+/// compressor, nothing between an element and its bytes. Then a chunk's bytes are its
+/// elements in C order, the offset of any row inside it is arithmetic, and a row can be read
+/// WITHOUT reading the chunk around it.
+///
+/// Read off the metadata JSON the pipeline is constructed from, rather than taken as another
+/// constructor flag -- that argument list already carries three bools and nine parameters.
+///
+/// Conservative by construction: anything unrecognised, unparsable or nested returns false
+/// and the read takes the ordinary chunk path, which is always correct.
+fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(array_metadata_json) else {
+        return false;
+    };
+    let Some(codecs) = meta.get("codecs").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    for codec in codecs {
+        if codec.get("name").and_then(|n| n.as_str()) != Some("sharding_indexed") {
+            continue;
+        }
+        let inner = codec
+            .get("configuration")
+            .and_then(|c| c.get("codecs"))
+            .and_then(|c| c.as_array());
+        let Some(inner) = inner else { return false };
+        // Exactly the byte reinterpretation, and nothing beside it: a `crc32c` or a `blosc`
+        // here means the chunk cannot be entered part-way, which is the whole reason the
+        // chunk is the read unit. Matched as ONE codec rather than by collecting the names
+        // that parse, so a codec carrying no `name` cannot be skipped over silently.
+        let [only] = inner.as_slice() else { return false };
+        if only.get("name").and_then(|n| n.as_str()) != Some("bytes") {
+            return false;
+        }
+        // AND in this machine's own byte order. The `bytes` codec REVERSES a multi-byte
+        // element when the array's order is not the platform's, so on a foreign-order array
+        // the chunk path swaps and the raw path -- which copies the stored bytes verbatim --
+        // does not. Same array, two answers, no error, and big-endian is legal Zarr V3.
+        //
+        // Absent is only legal for a single-byte element, which has no order to get wrong.
+        let endian = only
+            .get("configuration")
+            .and_then(|c| c.get("endian"))
+            .and_then(serde_json::Value::as_str);
+        return endian.is_none_or(|e| e == NATIVE_ENDIAN);
+    }
+    false
+}
+
 #[gen_stub_pyclass]
 #[pyclass]
 pub(crate) struct CodecPipelineImpl {
@@ -73,6 +132,9 @@ pub(crate) struct CodecPipelineImpl {
     /// Whether to remember shard indexes at all: true exactly when `writable_store`
     /// is `None`, so a store this pipeline can write through never caches.
     pub(crate) cache_shard_indexes: bool,
+    /// Whether an innermost chunk is a plain byte tiling -- no filter, no compressor -- so a
+    /// row's bytes are addressable arithmetically and readable without the chunk around them.
+    pub(crate) inner_chunk_is_raw: bool,
     /// The pool sizes this array was opened with.
     pub(crate) read_ceiling: usize,
     pub(crate) decode_ceiling: usize,
@@ -421,6 +483,7 @@ impl CodecPipelineImpl {
             // that index addresses.
             cache_shard_indexes: writable_store.is_none(),
             writable_store,
+            inner_chunk_is_raw: inner_chunk_is_raw(array_metadata),
             read_ceiling: read_decode::resolve_ceiling(read_worker_ceiling),
             decode_ceiling: read_decode::resolve_ceiling(decode_worker_ceiling),
             strict,
@@ -429,16 +492,21 @@ impl CodecPipelineImpl {
 
     /// The one read entry point. A selection this declines falls back to zarr-python; there is
     /// no second Rust path.
-    #[pyo3(signature = (chunk_items, value))]
+    #[pyo3(signature = (chunk_items, value, raw_max_reads_per_chunk=None))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,
         chunk_items: PyRef<'_, chunk_item::ChunkItems>,
         value: &Bound<'_, PyUntypedArray>,
+        raw_max_reads_per_chunk: Option<usize>,
     ) -> PyResult<()> {
         // The ceilings come from the array, not from this call: they were read when it was
-        // opened.
-        let config = read_decode::ReadConfig::from_open(self.read_ceiling, self.decode_ceiling);
+        // opened. The raw threshold is a per-call decision and stays one.
+        let config = read_decode::ReadConfig::from_open(
+            self.read_ceiling,
+            self.decode_ceiling,
+            raw_max_reads_per_chunk,
+        );
         // The pools are sized once, by the first read. A ceiling arriving after that cannot
         // be honoured, and a caller who is not told believes it was.
         read_decode::check_ceiling_arrived(py, config, self.strict)?;
@@ -528,6 +596,21 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
+/// `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
+/// inner chunks read and decoded.
+///
+/// Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
+/// the same values, so a gate that refuses everything passes every values test.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn raw_path_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        read_decode::RAW_JOBS.load(Ordering::Relaxed),
+        read_decode::CHUNK_JOBS.load(Ordering::Relaxed),
+    )
+}
+
 /// The sizes the two worker pools were built with, or `None` where one has not been built.
 #[gen_stub_pyfunction]
 #[pyfunction]
@@ -562,6 +645,8 @@ pub mod _internal {
     use super::reset_shard_index_cache_stats;
     #[pymodule_export]
     use super::shard_index_cache_stats;
+    #[pymodule_export]
+    use super::raw_path_stats;
 }
 
 define_stub_info_gatherer!(stub_info);
