@@ -35,11 +35,15 @@ use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 
 use crate::utils::{
-    PyCodecErrExt as _, PyErrExt as _, gather, gather_pieces, gather_runs, key_partial_decoder,
+    PyCodecErrExt as _, PyErrExt as _, coord_runs, gather, gather_pieces, gather_runs,
+    key_partial_decoder,
 };
 
 /// The per-array state a decode needs, shared by every job of a call.
 struct JobContext {
+    /// See `CodecPipelineImpl::inner_chunk_is_raw`. When true a row's bytes are addressable
+    /// inside its chunk, so a job reads the ROW rather than the chunk holding it.
+    raw: bool,
     shard: Arc<ShardInfo>,
     store: ReadableWritableListableStorage,
     codec_options: CodecOptions,
@@ -56,6 +60,8 @@ struct JobContext {
     /// per job -- dispatch to reader, reader to decoder -- so every byte added to it is copied
     /// twice per job, ~8,000 times a call.
     may_be_absent: bool,
+    /// See [`RAW_MAX_READS`]. Per call, so a caller can disable the raw path for one read.
+    raw_max_reads: usize,
     /// The unit decoded into scratch: the shard's inner chunk where the array is sharded, the
     /// CHUNK where it is not. Also per call -- an array's chunks are all one shape -- so it is
     /// resolved once here from the first item rather than carried on every `Job`.
@@ -94,6 +100,8 @@ impl CodecPipelineImpl {
     ) -> PyResult<Vec<&'a ChunkItem>> {
         let element_size = self.element_size()?;
         let ctx = JobContext {
+            raw: self.inner_chunk_is_raw,
+            raw_max_reads: config.raw_max_reads,
             shard: shard.clone(),
             store: self.store.clone(),
             codec_options: (*codec_options).with_concurrent_target(1),
@@ -507,22 +515,158 @@ fn carve<'a>(
     for i in order {
         let (item, range) = &located[i];
         let pieces = std::mem::take(&mut taken[i]);
+        // A range is the chunk's place in its shard; its absence means the chunk was never
+        // written, and the output it owns is filled rather than read.
         match range {
-            // A range is the chunk's place in its shard; its absence means the chunk was
-            // never written, and the output it owns is filled rather than read.
-            Some(range) => jobs.push(Job {
-                key: item.key.clone(),
-                range: *range,
-                out: pieces,
-                coords: coords_of(item)?,
-                run_len: item.run_len,
-                grid: item.grid.as_ref().map(|(starts, run)| (&starts[..], *run)),
-                ctx,
-            }),
+            // One job per ROW, each reading exactly its own bytes.
+            //
+            // Only when the chunk is a plain byte tiling, so a row's offset inside it is
+            // arithmetic: `coord` is already the row's element offset within the chunk, and
+            // `run_len` its length. Measured at scale, 8,192 rows this way take 628 ms
+            // against 1121 for the chunks holding them -- the request COUNT is the same
+            // either way, so all that changes is how many bytes each one moves.
+            //
+            // The pieces are taken in coordinate order, which is ascending, so
+            // `DisjointBytes` still vends each byte once and coverage is still checked.
+            // One output piece and no grid: the item is a plain run of rows, which is every
+            // rank-1 read and every read whose trailing axes are whole. A banded item has one
+            // piece per row and a grid item carries its own per-element offsets; neither is a
+            // single contiguous claim, so both take the ordinary path rather than get a second
+            // implementation here.
+            Some(range)
+                if ctx.raw
+                    // Zero DISABLES, which the threshold alone does not say: an item with no
+                    // coordinates is 0 reads, and `0 <= 0` would take the path the knob was
+                    // set to refuse. Nothing builds such an item today -- `push_span` returns
+                    // early on an empty count -- so this makes the documented behaviour true
+                    // by construction rather than by the absence of a caller.
+                    && ctx.raw_max_reads > 0
+                    && pieces.len() == 1
+                    && item.grid.is_none()
+                    && raw_runs(coords_of(item)?, item.run_len) <= ctx.raw_max_reads =>
+            {
+                let piece = pieces.into_iter().next().expect("length checked");
+                raw_row_jobs(
+                    item,
+                    *range,
+                    piece,
+                    coords_of(item)?,
+                    element_size,
+                    ctx,
+                    &mut jobs,
+                )?;
+            }
+            Some(range) => {
+                CHUNK_JOBS.fetch_add(1, Ordering::Relaxed);
+                jobs.push(Job {
+                    key: item.key.clone(),
+                    range: *range,
+                    raw: false,
+                    out: pieces,
+                    coords: coords_of(item)?,
+                    run_len: item.run_len,
+                    grid: item.grid.as_ref().map(|(starts, run)| (&starts[..], *run)),
+                    ctx,
+                });
+            }
             None => absent.extend(pieces),
         }
     }
     Ok((jobs, absent))
+}
+
+/// Jobs that took the RAW path, and jobs that read a whole chunk, since the run began.
+///
+/// The project rule -- a knob that was set is not a knob that arrived -- applied to a code
+/// path. A gate that silently refuses everything is indistinguishable from a gate that is
+/// working: values stay correct either way and only the throughput differs, which reads as
+/// "the raw path did not pay" rather than "the raw path was never taken". Both failures have
+/// already happened here once.
+pub(crate) static RAW_JOBS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CHUNK_JOBS: AtomicU64 = AtomicU64::new(0);
+
+/// How many READS this chunk's rows become once consecutive ones are merged.
+///
+/// The count that matters is runs, not rows: 64 consecutive rows are ONE read, and 64
+/// scattered ones are 64. See [`coord_runs`] for what counts as consecutive; this is the gate, and
+/// `raw_row_jobs` emits exactly the runs it counts here -- from the same walk, so the gate
+/// cannot come to disagree with what it admits.
+pub(crate) fn raw_runs(coords: &[u64], run_len: u64) -> usize {
+    coord_runs(coords, run_len).count()
+}
+
+/// Default for `codec_pipeline.raw_max_reads_per_chunk`.
+///
+/// The raw path reads a row's exact bytes instead of the chunk around it, which trades BYTES
+/// for REQUESTS -- and requests are the scarce resource, since a row costs nearly what the
+/// chunk holding it costs to fetch. Hence a PER-ITEM gate: take it only where a chunk's wanted
+/// rows collapse to a handful of reads. Two is measured; zero disables the path and costs ~75%
+/// on an uncompressed scattered draw. See README and `notes/deferred-wins.md`.
+const RAW_MAX_READS: usize = 2;
+
+/// One job per RUN of consecutive rows, each reading exactly its own bytes, for a chunk that
+/// is a plain byte tiling.
+///
+/// `coord` is already the row's element offset within the chunk and `run_len` its length, so
+/// the row's byte range is arithmetic. Measured at scale, 8,192 rows read this way take
+/// 628 ms against 1121 for the chunks holding them: the request COUNT is the same either way,
+/// and only the bytes each one moves change.
+///
+/// `piece` is the item's single contiguous claim, split here rather than re-claimed, so the
+/// vend-once cursor still sees exactly one take per item and coverage is still checked.
+fn raw_row_jobs<'a>(
+    item: &'a ChunkItem,
+    range: ByteRange,
+    piece: &'a mut [u8],
+    coords: &'a [u64],
+    element_size: usize,
+    ctx: &'a JobContext,
+    jobs: &mut Vec<Job<'a>>,
+) -> PyResult<()> {
+    let ByteRange::FromStart(base, _) = range else {
+        return Err(PyRuntimeError::new_err(format!(
+            "{}: the raw path needs a FromStart range, got {range:?}",
+            item.key
+        )));
+    };
+    let row_bytes = usize::try_from(item.run_len)
+        .ok()
+        .and_then(|r| r.checked_mul(element_size))
+        .ok_or_else(|| PyRuntimeError::new_err(format!("{}: row too large", item.key)))?;
+    // CONSECUTIVE rows are one range, not one each. Without this a selection of 8-row blocks
+    // issues 8 requests of 8 KiB where one of 64 KiB would do, and requests are the scarce
+    // resource. The rows were always adjacent; the code just did not look.
+    let mut rest = piece;
+    for run in coord_runs(coords, item.run_len) {
+        let span = row_bytes
+            .checked_mul(run.len())
+            .ok_or_else(|| PyRuntimeError::new_err(format!("{}: run too large", item.key)))?;
+        let (run_out, tail) = rest.split_at_mut(span.min(rest.len()));
+        rest = tail;
+        let at = base
+            .checked_add(coords[run.start] * element_size as u64)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("{}: offset overflow", item.key)))?;
+        jobs.push(Job {
+            key: item.key.clone(),
+            range: ByteRange::FromStart(at, Some(span as u64)),
+            raw: true,
+            out: vec![run_out],
+            coords: &[],
+            run_len: item.run_len,
+            grid: None,
+            ctx,
+        });
+        RAW_JOBS.fetch_add(1, Ordering::Relaxed);
+    }
+    if !rest.is_empty() {
+        return Err(PyRuntimeError::new_err(format!(
+            "{}: {} output bytes left after {} rows",
+            item.key,
+            rest.len(),
+            coords.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Hands out each byte range of the output at most once.
@@ -739,6 +883,9 @@ pub(crate) struct ReadConfig {
     pub(crate) read_ceiling: usize,
     /// Only the FIRST call's value is used -- see [`READ_POOL`].
     pub(crate) decode_ceiling: usize,
+    /// Reads a chunk may become before the raw path is declined for it; see [`RAW_MAX_READS`].
+    /// Per call, and honoured on every call rather than only the first.
+    pub(crate) raw_max_reads: usize,
 }
 
 /// A ceiling as the pipeline will use it: zero or absent means "as much as the machine has".
@@ -749,19 +896,31 @@ pub(crate) fn resolve_ceiling(ceiling: Option<usize>) -> usize {
 }
 
 impl ReadConfig {
-    pub(crate) fn from_open(read_ceiling: usize, decode_ceiling: usize) -> Self {
+    /// The ceilings as the ARRAY was opened with, already resolved, plus this call's raw
+    /// threshold. The two are read at different times on purpose -- see the fields.
+    pub(crate) fn from_open(
+        read_ceiling: usize,
+        decode_ceiling: usize,
+        raw_max_reads: Option<usize>,
+    ) -> Self {
         Self {
             read_ceiling,
             decode_ceiling,
+            raw_max_reads: raw_max_reads.unwrap_or(RAW_MAX_READS),
         }
     }
 }
 
-/// One innermost chunk, and the slice of the output its elements belong in.
+/// One read, and the slice of the output its bytes belong in: an innermost chunk, or -- on
+/// the raw path -- one run of rows taken straight out of the chunk holding them.
 struct Job<'a> {
     key: StoreKey,
-    /// The chunk's byte range within its shard.
+    /// The chunk's byte range within its shard, or -- on the raw path -- one run of rows'
+    /// range inside that chunk.
     range: ByteRange,
+    /// Raw jobs carry the wanted bytes exactly: no decode, no scratch, no gather. Their
+    /// `range` is the ROW's bytes inside the chunk rather than the whole chunk's.
+    raw: bool,
     /// The output ranges this chunk fills, ascending. ONE range while every axis after the
     /// first is taken whole -- which is every rank-1 read, so the CSR path always has one.
     /// A shard that divides a trailing axis gives an item one range per row instead.
@@ -835,7 +994,9 @@ fn spawn_decode<'scope, 'env>(
 ) where
     'env: 'scope,
 {
-    // EVERY job goes to the pool: the reader hands off, it never decodes.
+    // EVERY job goes to the pool, including a raw one whose "decode" is only a
+    // `copy_from_slice`. Running raw jobs inline on the reader was tried and reverted: it cost
+    // 82% on `dense_r` cs=1 and 85% on `dense_c` strided, and was negative on 10 of 12 cells.
     //
     // The argument for inlining was that a hand-off buys a queue push, a steal and a wake in
     // order to memcpy bytes already in this core's cache. That much is true and it is not the
@@ -865,6 +1026,31 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         }
         return Err(format!("{} vanished between index and read", job.key));
     };
+
+    // A raw job's read WAS the answer: its range is the row, not the chunk. No decode, no
+    // scratch, no gather -- but not copy-free either, since `get_partial` hands back an owned
+    // buffer and these bytes still have to be moved into the output.
+    //
+    // `out` is a Vec since the band split, so a raw job's bytes are laid across its pieces in
+    // order. `raw_row_jobs` only ever builds ONE piece per job -- a raw job is one run of one
+    // row -- but walking the pieces costs nothing and means this cannot silently write only
+    // the first if that ever stops being true.
+    if job.raw {
+        let want: usize = job.out.iter().map(|p| p.len()).sum();
+        if bytes.len() != want {
+            return Err(format!(
+                "{}: read {} bytes for an output of {want}",
+                job.key,
+                bytes.len(),
+            ));
+        }
+        let mut at = 0;
+        for piece in job.out.iter_mut() {
+            piece.copy_from_slice(&bytes[at..at + piece.len()]);
+            at += piece.len();
+        }
+        return Ok(());
+    }
 
     let shape = ctx.decode_shape.as_slice();
     let elements: u64 = shape.iter().map(|s| s.get()).product();
