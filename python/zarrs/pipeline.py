@@ -54,22 +54,30 @@ FALLBACK_TO_ZARR_PYTHON = (
 )
 
 
-def _warn_if_ceiling_was_ignored(*, strict: bool) -> None:
-    """The two pool ceilings are fixed by the first read in the process and cannot be resized.
+#: The two pool ceilings, as read from config when an array is opened.
+CEILING_KNOBS = (
+    "codec_pipeline.read_worker_ceiling",
+    "codec_pipeline.decode_worker_ceiling",
+)
 
-    Read from config HERE, not at array open: a `zarr.config.set` block around a read is the
-    case this exists for, and open-time values cannot see it.
+
+def _ceiling_asks() -> tuple[int | None, int | None]:
+    """What config asks for, read at OPEN. The pools are fixed by the first read."""
+    read, decode = (config.get(knob, None) for knob in CEILING_KNOBS)
+    return read, decode
+
+
+def _warn_if_ceiling_was_ignored(asks, *, strict: bool) -> None:
+    """Whether the ceilings this array was opened with are the ones the pools were built at.
+
+    Saved at open rather than re-read here: the ask is a property of this array, and config
+    may have moved on. Nothing to compare until the pools exist, which the first read does.
     """
-    for built, knob in zip(
-        pool_sizes(),
-        ("codec_pipeline.read_worker_ceiling", "codec_pipeline.decode_worker_ceiling"),
-        strict=True,
-    ):
-        asked = config.get(knob, None)
-        if built is None or asked is None or int(asked) == built:
+    for ask, built, knob in zip(asks, pool_sizes(), CEILING_KNOBS, strict=True):
+        if ask is None or built is None or int(ask) == built:
             continue
         message = (
-            f"{knob} = {asked} was ignored: the pool was built with {built} threads by the "
+            f"{knob} = {ask} was ignored: the pool was built with {built} threads by the "
             f"first read in this process and cannot be resized. Set it before the array that "
             f"does the first read is opened, or call zarrs._internal.pool_sizes()."
         )
@@ -150,6 +158,10 @@ class ZarrsCodecPipeline(CodecPipeline):
     store: Store
     impl: CodecPipelineImpl | None
     python_impl: BatchedCodecPipeline | None
+    #: What this array asked the two pools to be, and whether that has been checked against
+    #: what they were actually built with. Nothing to compare until the first read exists.
+    ceiling_asks: tuple[int | None, int | None] = (None, None)
+    ceiling_checked: bool = False
 
     def __getstate__(self) -> ZarrsCodecPipelineState:
         return {"metadata": self.metadata, "store": self.store}
@@ -160,6 +172,8 @@ class ZarrsCodecPipeline(CodecPipeline):
         strict = config.get("codec_pipeline.strict", False)
         self.impl = get_codec_pipeline_impl(self.metadata, self.store, strict=strict)
         self.python_impl = get_codec_pipeline_fallback(self.metadata, strict=strict)
+        self.ceiling_asks = _ceiling_asks()
+        self.ceiling_checked = False
 
     def evolve_from_array_spec(self, array_spec: ArraySpec) -> Self:
         return self
@@ -178,6 +192,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             store=store,
             impl=get_codec_pipeline_impl(array_metadata, store, strict=strict),
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
+            ceiling_asks=_ceiling_asks(),
         )
 
     @cached_property
@@ -255,10 +270,20 @@ class ZarrsCodecPipeline(CodecPipeline):
             # the raise is caught above as a fall back to zarr-python -- there is no second
             # Rust read path to choose between any more.
             retrieve = self.impl.retrieve_chunk_items_and_apply_index
-            await asyncio.to_thread(retrieve, desc, out)
-            _warn_if_ceiling_was_ignored(
-                strict=config.get("codec_pipeline.strict", False)
+            # Per call because it IS a per-call decision: a threshold on how many byte-range
+            # reads one chunk is worth, not a ceiling something was built at.
+            await asyncio.to_thread(
+                retrieve,
+                desc,
+                out,
+                config.get("codec_pipeline.raw_max_reads_per_chunk", None),
             )
+            if not self.ceiling_checked:
+                self.ceiling_checked = True
+                _warn_if_ceiling_was_ignored(
+                    self.ceiling_asks,
+                    strict=config.get("codec_pipeline.strict", False),
+                )
             return None
 
     async def write(
