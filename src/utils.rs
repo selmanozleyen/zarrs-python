@@ -46,6 +46,36 @@ pub fn is_whole_chunk(item: &ChunkItem) -> bool {
         && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
 }
 
+/// The maximal runs of CONSECUTIVE coordinates, as index ranges into `coords`.
+///
+/// `coords` is non-decreasing and a run is a stretch stepping by exactly `run_len`, so one run
+/// names one contiguous span: it starts `coords[r.start]` elements in and is `r.len() *
+/// run_len` elements long. A duplicate steps by 0, which breaks the run -- the same row twice
+/// is two output pieces and cannot be one span.
+///
+/// Written once because three callers want this same walk and had three copies of it: counting
+/// the reads a chunk becomes (`raw_runs`), emitting them (`raw_row_jobs`), and merging copies
+/// out of a decoded chunk (`gather_pieces`).
+///
+/// `coord_runs`, not `runs`: a run of COORDINATES is not `gather_runs`' run of elements
+/// inside one index's row, and this file needs both words in the same loop.
+pub(crate) fn coord_runs(coords: &[u64], run_len: u64) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut start = 0usize;
+    std::iter::from_fn(move || {
+        if start >= coords.len() {
+            return None;
+        }
+        let mut end = start + 1;
+        // Checked: a coordinate near u64::MAX must end the run, not wrap into the next one.
+        while end < coords.len() && coords[end - 1].checked_add(run_len) == Some(coords[end]) {
+            end += 1;
+        }
+        let run = start..end;
+        start = end;
+        Some(run)
+    })
+}
+
 /// Writes a sequence of runs across output pieces that need not align with them.
 pub(crate) struct PieceWriter<'a, 'b> {
     pieces: &'b mut [&'a mut [u8]],
@@ -115,24 +145,6 @@ fn run_bytes(run_len: u64, size: usize) -> Result<usize, String> {
         return Err("run length must be greater than zero".to_string());
     }
     Ok(bytes)
-}
-
-/// Maximal runs of CONSECUTIVE coordinates, as index ranges into `coords`.
-pub(crate) fn coord_runs(coords: &[u64], run_len: u64) -> impl Iterator<Item = Range<usize>> + '_ {
-    let mut start = 0usize;
-    std::iter::from_fn(move || {
-        if start >= coords.len() {
-            return None;
-        }
-        let mut end = start + 1;
-        // Checked: a coordinate near u64::MAX must end the run, not wrap into the next one.
-        while end < coords.len() && coords[end - 1].checked_add(run_len) == Some(coords[end]) {
-            end += 1;
-        }
-        let run = start..end;
-        start = end;
-        Some(run)
-    })
 }
 
 pub(crate) fn gather(
