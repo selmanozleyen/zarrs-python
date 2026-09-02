@@ -62,6 +62,11 @@ A read of a sharded array **remembers each shard's decoded index** for the durat
   - Both default to the available parallelism, doubled for readers. Separate, because a reader waits on storage while a decoder occupies a core: a value above the core count is defensible for readers and not for decoders. On high-latency storage more readers is usually better, up to the number of chunks a read touches.
   - **Per call.** Each read takes at most this many workers out of the pools, which are process-wide and work-stealing, so two reads asking for different widths both get what they asked for. The one width that cannot be served is one above what the pools were built with, since a rayon pool cannot grow.
 
+- `codec_pipeline.raw_max_reads_per_chunk`: how many separate reads a chunk's wanted rows may become before the fast "read the row's bytes, not the chunk" path is declined for that chunk.
+  - Defaults to `2`, and applies only where an inner chunk is a plain byte tiling (no compression), since that is what makes a row's bytes addressable inside it.
+  - It trades bytes for requests. A row costs nearly as much to fetch as the whole chunk containing it, so a scattered selection that would become many small reads is served better by one large one — hence a per-chunk gate rather than an array-wide switch.
+  - `0` disables the path entirely. On an uncompressed store with a scattered row draw that costs about 75% of throughput, so raise it rather than disable it unless you are measuring.
+  - Unlike the two ceilings above, this is honoured on every read, so `zarr.config.set` scopes it as expected.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -80,6 +85,7 @@ zarr.config.set({
         "file_handle_cache_size": 0,
         "read_workers": None,
         "decode_workers": None,
+        "raw_max_reads_per_chunk": 2,
         "direct_io": False,
         "strict": False,
     },
