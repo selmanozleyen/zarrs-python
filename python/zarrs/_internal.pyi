@@ -19,7 +19,7 @@ class ChunkItem:
         shape: typing.Sequence[builtins.int],
     ) -> ChunkItem:
         r"""
-        `coords` is always `None` here -- it is not a parameter, so this constructor cannot
+        `element_offsets` is always `None` here -- it is not a parameter, so this constructor cannot
         build a chunk-unit item. `ChunkItems::push_indices` builds those.
         """
 
@@ -146,7 +146,7 @@ class CodecPipelineImpl:
         self,
         chunk_items: ChunkItems,
         value: numpy.typing.NDArray[typing.Any],
-        raw_max_reads_per_chunk: builtins.int | None = None,
+        max_row_reads_per_chunk: builtins.int | None = None,
     ) -> None:
         r"""
         The one read entry point.
@@ -176,12 +176,12 @@ def pool_sizes() -> tuple[builtins.int | None, builtins.int | None]:
     two happened -- the repo's rule that a knob which was set is not a knob that arrived.
     """
 
-def raw_path_stats() -> tuple[builtins.int, builtins.int]:
+def read_unit_stats() -> tuple[builtins.int, builtins.int]:
     r"""
-    `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
+    `(row, chunk)` jobs since the run began: rows read as their own byte range, against whole
     inner chunks read and decoded.
 
-    Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
+    Exposed so a test can assert the row path was TAKEN. Correctness cannot: both paths return
     the same values, so a gate that refuses everything passes every values test.
     """
 

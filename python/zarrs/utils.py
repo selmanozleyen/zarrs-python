@@ -383,7 +383,7 @@ def _chunk_unit_args(
     #
     # The chunk slice no longer has to be the whole axis. A column subset still decodes the
     # entire inner chunk -- that is the decode unit either way -- so what narrows is only
-    # which elements of each decoded row get copied out. That lives entirely in `coords` and
+    # which elements of each decoded row get copied out. That lives entirely in `element_offsets` and
     # the run length, so the chunk subset handed to Rust stays whole. `trailing_layout`
     # is what rechecks that shape on the Rust side.
     #

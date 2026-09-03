@@ -62,7 +62,7 @@ const NATIVE_ENDIAN: &str = if cfg!(target_endian = "little") {
 ///
 /// Conservative by construction: anything unrecognised, unparsable or nested returns false
 /// and the read takes the ordinary chunk path, which is always correct.
-fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
+fn inner_chunk_is_plain_bytes(array_metadata_json: &str) -> bool {
     let Ok(meta) = serde_json::from_str::<serde_json::Value>(array_metadata_json) else {
         return false;
     };
@@ -88,7 +88,7 @@ fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
         }
         // AND in this machine's own byte order. The `bytes` codec REVERSES a multi-byte
         // element when the array's order is not the platform's, so on a foreign-order array
-        // the chunk path swaps and the raw path -- which copies the stored bytes verbatim --
+        // the chunk path swaps and the row path -- which copies the stored bytes verbatim --
         // does not. Same array, two answers, no error, and big-endian is legal Zarr V3.
         //
         // Absent is only legal for a single-byte element, which has no order to get wrong.
@@ -139,7 +139,7 @@ pub struct CodecPipelineImpl {
     /// reading the chunk around them. Measured at scale: 8,192 rows as exact ranges take
     /// 628 ms against 1121 for the chunks holding them, because the request COUNT is the
     /// same either way and only the bytes differ.
-    pub(crate) inner_chunk_is_raw: bool,
+    pub(crate) inner_chunk_is_plain_bytes: bool,
     /// The pool sizes this array was OPENED with.
     ///
     /// Read once, here, exactly as `num_threads` and the chunk-concurrency bounds are. They
@@ -332,7 +332,7 @@ impl CodecPipelineImpl {
         // zarr-python in Python. The check stays because this is a `#[pymethods]` boundary,
         // and what it guards is an exclusive output slice.
         if let (true, Some(shard)) = (
-            !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.coords.is_some()),
+            !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.element_offsets.is_some()),
             self.shard.as_ref(),
         ) {
             // Confined to this block so no live `&mut` exists when the fallback below takes
@@ -503,7 +503,7 @@ impl CodecPipelineImpl {
             shard_decoders: Mutex::new(HashMap::new()),
             subshard_decoders: Mutex::new(HashMap::new()),
             cache_shard_indexes: store_is_read_only,
-            inner_chunk_is_raw: inner_chunk_is_raw(array_metadata),
+            inner_chunk_is_plain_bytes: inner_chunk_is_plain_bytes(array_metadata),
             store_is_read_only,
             read_pool_size: read_decode::resolve_pool_size(read_pool_size),
             decode_pool_size: read_decode::resolve_pool_size(decode_pool_size),
@@ -521,20 +521,20 @@ impl CodecPipelineImpl {
     /// rayon, for selections this path declined. An audit of the public indexing surface found
     /// nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
     /// than a slower second Rust path.
-    #[pyo3(signature = (chunk_items, value, raw_max_reads_per_chunk=None))]
+    #[pyo3(signature = (chunk_items, value, max_row_reads_per_chunk=None))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,
         chunk_items: PyRef<'_, chunk_item::ChunkItems>,
         value: &Bound<'_, PyUntypedArray>,
-        raw_max_reads_per_chunk: Option<usize>,
+        max_row_reads_per_chunk: Option<usize>,
     ) -> PyResult<()> {
         // The pool sizes come from the array, not from this call: they were read when it was
-        // opened. The raw threshold is a per-call decision and stays one.
+        // opened. The row threshold is a per-call decision and stays one.
         let config = read_decode::ReadConfig::from_open(
             self.read_pool_size,
             self.decode_pool_size,
-            raw_max_reads_per_chunk,
+            max_row_reads_per_chunk,
         );
         // The pools are sized once, by the first read. A size arriving after that cannot
         // be honoured, and a caller who is not told believes it was.
@@ -632,17 +632,17 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
-/// `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
+/// `(row, chunk)` jobs since the run began: rows read as their own byte range, against whole
 /// inner chunks read and decoded.
 ///
-/// Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
+/// Exposed so a test can assert the row path was TAKEN. Correctness cannot: both paths return
 /// the same values, so a gate that refuses everything passes every values test.
 #[gen_stub_pyfunction]
 #[pyfunction]
-fn raw_path_stats() -> (u64, u64) {
+fn read_unit_stats() -> (u64, u64) {
     use std::sync::atomic::Ordering;
     (
-        read_decode::RAW_JOBS.load(Ordering::Relaxed),
+        read_decode::ROW_JOBS.load(Ordering::Relaxed),
         read_decode::CHUNK_JOBS.load(Ordering::Relaxed),
     )
 }
@@ -673,7 +673,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(shard_index_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(reset_shard_index_cache_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(raw_path_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(read_unit_stats, m)?)?;
     m.add_function(wrap_pyfunction!(pool_sizes, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;

@@ -46,28 +46,28 @@ pub fn is_whole_chunk(item: &ChunkItem) -> bool {
         && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
 }
 
-/// The maximal runs of CONSECUTIVE coordinates, as index ranges into `coords`.
+/// The maximal runs of CONSECUTIVE coordinates, as index ranges into `element_offsets`.
 ///
-/// `coords` is non-decreasing and a run is a stretch stepping by exactly `run_len`, so one run
-/// names one contiguous span: it starts `coords[r.start]` elements in and is `r.len() *
+/// `element_offsets` is non-decreasing and a run is a stretch stepping by exactly `run_len`, so one run
+/// names one contiguous span: it starts `element_offsets[r.start]` elements in and is `r.len() *
 /// run_len` elements long. A duplicate steps by 0, which breaks the run -- the same row twice
 /// is two output pieces and cannot be one span.
 ///
 /// Written once because three callers want this same walk and had three copies of it: counting
-/// the reads a chunk becomes (`raw_runs`), emitting them (`raw_row_jobs`), and merging copies
+/// the reads a chunk becomes (`row_read_count`), emitting them (`row_jobs`), and merging copies
 /// out of a decoded chunk (`gather_pieces`).
 ///
-/// `coord_runs`, not `runs`: a run of COORDINATES is not `gather_runs`' run of elements
+/// `offset_runs`, not `runs`: a run of COORDINATES is not `gather_runs`' run of elements
 /// inside one index's row, and this file needs both words in the same loop.
-pub(crate) fn coord_runs(coords: &[u64], run_len: u64) -> impl Iterator<Item = Range<usize>> + '_ {
+pub(crate) fn offset_runs(element_offsets: &[u64], run_len: u64) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut start = 0usize;
     std::iter::from_fn(move || {
-        if start >= coords.len() {
+        if start >= element_offsets.len() {
             return None;
         }
         let mut end = start + 1;
         // Checked: a coordinate near u64::MAX must end the run, not wrap into the next one.
-        while end < coords.len() && coords[end - 1].checked_add(run_len) == Some(coords[end]) {
+        while end < element_offsets.len() && element_offsets[end - 1].checked_add(run_len) == Some(element_offsets[end]) {
             end += 1;
         }
         let run = start..end;
@@ -143,10 +143,10 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
 /// -- one `copy_from_slice` of `run_len * size` bytes instead of `run_len` of `size`, which
 /// is the whole reason grouping a wide read pays.
 ///
-/// `out` must be exactly `coords.len() * run_len * size` bytes.
+/// `out` must be exactly `element_offsets.len() * run_len * size` bytes.
 pub(crate) fn gather(
     scratch: &[u8],
-    coords: &[u64],
+    element_offsets: &[u64],
     run_len: u64,
     out: &mut [u8],
     size: usize,
@@ -160,10 +160,10 @@ pub(crate) fn gather(
     if run == 0 {
         return Err("run length must be greater than zero".to_string());
     }
-    if coords.len().checked_mul(run) != Some(out.len()) {
+    if element_offsets.len().checked_mul(run) != Some(out.len()) {
         return Err("output region does not match the coordinate count".to_string());
     }
-    for (n, &c) in coords.iter().enumerate() {
+    for (n, &c) in element_offsets.iter().enumerate() {
         // Checked, and not because a coordinate can be that large today -- they are all
         // below the inner chunk extent. Unchecked, a large one wraps in release and can land
         // back INSIDE scratch, so `get` succeeds and the wrong element is copied: exactly
@@ -191,7 +191,7 @@ pub(crate) fn gather(
 /// addition, not a replacement.
 pub(crate) fn gather_pieces(
     scratch: &[u8],
-    coords: &[u64],
+    element_offsets: &[u64],
     run_len: u64,
     pieces: &mut [&mut [u8]],
     size: usize,
@@ -206,7 +206,7 @@ pub(crate) fn gather_pieces(
         return Err("run length must be greater than zero".to_string());
     }
     let total: usize = pieces.iter().map(|p| p.len()).sum();
-    if coords.len().checked_mul(run) != Some(total) {
+    if element_offsets.len().checked_mul(run) != Some(total) {
         return Err("output pieces do not match the coordinate count".to_string());
     }
     let mut writer = PieceWriter::new(pieces);
@@ -214,8 +214,8 @@ pub(crate) fn gather_pieces(
     // The pieces are written in order, so a merged span still lands correctly when it
     // straddles two of them. (`gather`, the single-piece path, does NOT merge: it writes into
     // one slice at a fixed stride, where a copy per coordinate costs nothing extra.)
-    for r in coord_runs(coords, run_len) {
-        let c = coords[r.start];
+    for r in offset_runs(element_offsets, run_len) {
+        let c = element_offsets[r.start];
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
@@ -253,7 +253,7 @@ pub(crate) fn gather_pieces(
 /// -- so an item is still vended as a single range.
 pub(crate) fn gather_runs(
     scratch: &[u8],
-    coords: &[u64],
+    element_offsets: &[u64],
     starts: &[u64],
     run: u64,
     out: &mut [u8],
@@ -268,10 +268,10 @@ pub(crate) fn gather_runs(
     let Some(row) = starts.len().checked_mul(span) else {
         return Err("the gathered rows are too large to address".to_string());
     };
-    if coords.len().checked_mul(row) != Some(out.len()) {
+    if element_offsets.len().checked_mul(row) != Some(out.len()) {
         return Err("output region does not match the coordinate count".to_string());
     }
-    for (n, &c) in coords.iter().enumerate() {
+    for (n, &c) in element_offsets.iter().enumerate() {
         for (j, &start) in starts.iter().enumerate() {
             // Checked for the reason the contiguous gather checks: unchecked, a large value
             // wraps in release and can land back INSIDE scratch, so the read succeeds and

@@ -40,7 +40,7 @@ pub(crate) struct ChunkItem {
     pub array_shape: Vec<NonZeroU64>,
     /// Indices within `chunk_subset`, when this item is a whole inner chunk plus the
     /// elements wanted from it. The chunk is decoded once and these are gathered out.
-    pub coords: Option<Arc<[u64]>>,
+    pub element_offsets: Option<Arc<[u64]>>,
     /// How many CONSECUTIVE elements each coordinate stands for. 1 on the 1-D path, where a
     /// coordinate is one element. On a rank-N selection whose split axis is 0 and whose
     /// trailing axes are taken whole, one coordinate is the start of a whole row, and this
@@ -57,7 +57,7 @@ pub(crate) struct ChunkItem {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ChunkItem {
-    /// `coords` is always `None` here -- it is not a parameter, so this constructor cannot
+    /// `element_offsets` is always `None` here -- it is not a parameter, so this constructor cannot
     /// build a chunk-unit item. `ChunkItems::push_indices` builds those.
     #[new]
     #[pyo3(signature = (key, chunk_subset, chunk_shape, subset, shape))]
@@ -89,7 +89,7 @@ impl ChunkItem {
             shape: chunk_shape_nonzero_u64,
             num_elements,
             array_shape: shape_nonzero_u64,
-            coords: None,
+            element_offsets: None,
             run_len: 1,
             grid: None,
         })
@@ -514,7 +514,7 @@ pub(crate) fn build_chunk_unit_items(
             // The shared cases step by a CONSTANT, so the offset lookup and its bounds check
             // are hoisted out: this closure runs once per selected index, thousands of times
             // a call, and doing loop-invariant work inside it cost 6% on the loader.
-            coords: Some(match offsets {
+            element_offsets: Some(match offsets {
                 Offsets::PerIndex(per) => (a..b)
                     .map(|i| {
                         // The only case where the offset genuinely varies, so the only one
@@ -745,7 +745,7 @@ impl ChunkItems {
                 // ONE coordinate: where this chunk's slice of the span begins inside the
                 // decoded chunk. `run_len` carries the rest, so `gather` moves the whole
                 // block in a single copy.
-                coords: Some(vec![(span_lo - lo) * row_stride].into()),
+                element_offsets: Some(vec![(span_lo - lo) * row_stride].into()),
                 run_len: rows * row_stride,
                 grid: None,
             });

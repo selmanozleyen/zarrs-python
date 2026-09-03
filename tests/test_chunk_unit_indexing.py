@@ -355,7 +355,7 @@ def test_a_codec_after_sharding_is_refused(
 def test_a_shard_holding_one_inner_chunk(
     tmp_path: Path, entries: dict[str, int]
 ) -> None:
-    """`shards == chunks`, so a coords item's chunk subset IS the whole chunk -- the key never
+    """`shards == chunks`, so a element_offsets item's chunk subset IS the whole chunk -- the key never
     entered the partial-decoder cache and the read failed with "Partial decoder not found"."""
     values = np.arange(4096, dtype=np.float32)
     path = tmp_path / "one_per_shard"
@@ -905,7 +905,7 @@ def _described(args) -> list[tuple[int, int]]:
 
     `span`: the trailing axes WHOLE on both sides -- `push_span` has nowhere to put anything
     else. `entry`: one run of `prod(out_widths[1:])` per index, at `starts` into the chunk row
-    and at `out_starts[1:]` into the output row, which is `coords`/`run_len` and
+    and at `out_starts[1:]` into the output row, which is `element_offsets`/`run_len` and
     `output_pieces` respectively.
     """
     if args[0] == "span":

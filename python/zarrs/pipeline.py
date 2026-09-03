@@ -273,7 +273,7 @@ class ZarrsCodecPipeline(CodecPipeline):
                 retrieve,
                 desc,
                 out,
-                config.get("codec_pipeline.raw_max_reads_per_chunk", None),
+                config.get("codec_pipeline.max_row_reads_per_chunk", None),
             )
             return None
 

@@ -32,7 +32,7 @@ fn test_nparray_to_unsafe_cell_slice_empty() -> PyResult<()> {
     })
 }
 
-/// One item per inner chunk: coords relative to it, output runs contiguous and in order.
+/// One item per inner chunk: element_offsets relative to it, output runs contiguous and in order.
 #[test]
 fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
@@ -62,7 +62,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                     i.chunk_subset.end_exc()[0],
                     i.subset.start()[0],
                     i.subset.end_exc()[0],
-                    i.coords.as_ref().unwrap().to_vec(),
+                    i.element_offsets.as_ref().unwrap().to_vec(),
                 )
             })
             .collect();
@@ -246,7 +246,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
                     i.chunk_subset.end_exc(),
                     i.subset.start().to_vec(),
                     i.subset.end_exc(),
-                    i.coords.as_ref().unwrap().to_vec(),
+                    i.element_offsets.as_ref().unwrap().to_vec(),
                     i.run_len,
                 )
             })
@@ -495,38 +495,38 @@ fn test_push_grid_refuses_runs_outside_the_row() -> PyResult<()> {
     })
 }
 
-/// `raw_runs` counts READS, not rows, and that distinction is the whole gate.
+/// `row_read_count` counts READS, not rows, and that distinction is the whole gate.
 ///
 /// Written because getting it wrong is not a crash: counting rows makes the gate refuse the
 /// dense cases it should serve, and the read silently stays on the chunk path -- which reads
-/// as "the raw path did not pay" rather than as "the raw path was never taken".
+/// as "the row path did not pay" rather than as "the row path was never taken".
 #[test]
 fn test_raw_runs_counts_reads_not_rows() {
     let run_len = 2u64;
     let c = |v: &[u64]| v.iter().map(|r| r * run_len).collect::<Vec<u64>>();
 
-    assert_eq!(crate::read_decode::raw_runs(&[], run_len), 0);
-    assert_eq!(crate::read_decode::raw_runs(&c(&[7]), run_len), 1);
+    assert_eq!(crate::read_decode::row_read_count(&[], run_len), 0);
+    assert_eq!(crate::read_decode::row_read_count(&c(&[7]), run_len), 1);
     // A whole 64-row chunk, consecutive: still ONE read, which is the point.
     let dense: Vec<u64> = (0..64).map(|r| r * run_len).collect();
-    assert_eq!(crate::read_decode::raw_runs(&dense, run_len), 1);
+    assert_eq!(crate::read_decode::row_read_count(&dense, run_len), 1);
     // Every other row: 32 reads, and the gate should refuse it.
     let strided: Vec<u64> = (0..64).step_by(2).map(|r| r * run_len).collect();
-    assert_eq!(crate::read_decode::raw_runs(&strided, run_len), 32);
+    assert_eq!(crate::read_decode::row_read_count(&strided, run_len), 32);
     // Two blocks.
     assert_eq!(
-        crate::read_decode::raw_runs(&c(&[0, 1, 2, 10, 11]), run_len),
+        crate::read_decode::row_read_count(&c(&[0, 1, 2, 10, 11]), run_len),
         2
     );
     // A DUPLICATE steps by 0, so it breaks the run: the same row twice is two output
     // pieces and cannot be served by one read.
-    assert_eq!(crate::read_decode::raw_runs(&c(&[3, 3, 4]), run_len), 2);
+    assert_eq!(crate::read_decode::row_read_count(&c(&[3, 3, 4]), run_len), 2);
 }
 
-/// The raw path may only be taken when the stored bytes are already in this machine's order.
+/// The row path may only be taken when the stored bytes are already in this machine's order.
 ///
 /// The `bytes` codec REVERSES a multi-byte element when the array's order is not the
-/// platform's. The chunk path goes through the codec and swaps; the raw path copies the
+/// platform's. The chunk path goes through the codec and swaps; the row path copies the
 /// stored bytes verbatim and does not. Same array, two answers, no error -- and big-endian
 /// is legal Zarr V3 that nothing else here refuses.
 #[test]
@@ -543,27 +543,27 @@ fn test_raw_is_refused_for_a_foreign_byte_order() {
     };
 
     assert_eq!(
-        crate::inner_chunk_is_raw(&bytes_with("little")),
+        crate::inner_chunk_is_plain_bytes(&bytes_with("little")),
         cfg!(target_endian = "little")
     );
     assert_eq!(
-        crate::inner_chunk_is_raw(&bytes_with("big")),
+        crate::inner_chunk_is_plain_bytes(&bytes_with("big")),
         cfg!(target_endian = "big")
     );
     // No `endian` at all is only legal for a single-byte element, which has no order to get
     // wrong -- so it stays eligible.
-    assert!(crate::inner_chunk_is_raw(&meta(r#"{"name":"bytes"}"#)));
+    assert!(crate::inner_chunk_is_plain_bytes(&meta(r#"{"name":"bytes"}"#)));
     // A codec beside the byte reinterpretation still declines, and one carrying no name
     // cannot be skipped past to reach that conclusion.
-    assert!(!crate::inner_chunk_is_raw(&meta(
+    assert!(!crate::inner_chunk_is_plain_bytes(&meta(
         r#"{"name":"bytes"},{"name":"crc32c"}"#
     )));
-    assert!(!crate::inner_chunk_is_raw(&meta(r#"{"configuration":{}}"#)));
+    assert!(!crate::inner_chunk_is_plain_bytes(&meta(r#"{"configuration":{}}"#)));
 }
 
 /// A coordinate near the top of the range ENDS a run instead of starting the next one.
 ///
-/// The three walks `coord_runs` replaced did not agree: two added unchecked, so
+/// The three walks `offset_runs` replaced did not agree: two added unchecked, so
 /// `coord + run_len` wrapped in release -- and a wrapped sum that happens to equal the next
 /// coordinate reads as CONSECUTIVE, which merges two reads that share no bytes. The checked
 /// walk is the only behaviour this de-duplication changed, so it is the one thing pinned here.
@@ -572,10 +572,10 @@ fn test_coord_runs_do_not_wrap_at_the_top_of_the_range() {
     let run_len = 4u64;
     // (u64::MAX - 1) + 4 wraps to 2. Unchecked, these two are one run.
     assert_eq!(
-        crate::utils::coord_runs(&[u64::MAX - 1, 2], run_len).count(),
+        crate::utils::offset_runs(&[u64::MAX - 1, 2], run_len).count(),
         2
     );
     // The ordinary case still merges, and the empty one is still no runs at all.
-    assert_eq!(crate::utils::coord_runs(&[0, 4, 8], run_len).count(), 1);
-    assert_eq!(crate::utils::coord_runs(&[], run_len).count(), 0);
+    assert_eq!(crate::utils::offset_runs(&[0, 4, 8], run_len).count(), 1);
+    assert_eq!(crate::utils::offset_runs(&[], run_len).count(), 0);
 }
