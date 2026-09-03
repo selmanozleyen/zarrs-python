@@ -782,7 +782,7 @@ impl ChunkItems {
             shape,
             indices,
             out_start,
-            inner,
+            inner_extent,
             Offsets::Grid { starts, run },
         )
     }
@@ -818,7 +818,7 @@ impl ChunkItems {
             shape,
             indices,
             out_start,
-            inner,
+            inner_extent,
             Offsets::PerIndex(offsets),
         )
     }
