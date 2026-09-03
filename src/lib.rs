@@ -122,11 +122,11 @@ pub struct CodecPipelineImpl {
     ///
     /// Only for a READ-ONLY store: a write through this pipeline would move the bytes a
     /// remembered range addresses. An external writer still can, and no cache here sees it.
-    pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Arc<ShardingPartialDecoder>>>,
+    pub(crate) shard_decoders: Mutex<HashMap<StoreKey, Arc<ShardingPartialDecoder>>>,
     /// The same, for levels BELOW the outermost, keyed by the path of subchunk indices that
     /// reaches them. Empty and untouched unless the array is nested-sharded, which keeps the
     /// single-level path free of the key allocation this needs.
-    pub(crate) subshard_indexes: Mutex<HashMap<(StoreKey, Vec<u64>), Arc<ShardingPartialDecoder>>>,
+    pub(crate) subshard_decoders: Mutex<HashMap<(StoreKey, Vec<u64>), Arc<ShardingPartialDecoder>>>,
     /// Whether to remember shard indexes at all: true only for a read-only store.
     pub(crate) cache_shard_indexes: bool,
     /// Whether zarr-python opened this store read-only. Not inferable here: `StoreConfig`
@@ -497,8 +497,8 @@ impl CodecPipelineImpl {
             fill_value,
             data_type,
             shard,
-            shard_indexes: Mutex::new(HashMap::new()),
-            subshard_indexes: Mutex::new(HashMap::new()),
+            shard_decoders: Mutex::new(HashMap::new()),
+            subshard_decoders: Mutex::new(HashMap::new()),
             cache_shard_indexes: store_is_read_only,
             inner_chunk_is_raw: inner_chunk_is_raw(array_metadata),
             store_is_read_only,

@@ -1,6 +1,7 @@
 //! Reading and decoding the innermost chunks of one call, concurrently.
 //!
-//! One job per innermost chunk: a reader does the blocking byte-range read, a decode worker
+//! One job per READ -- an innermost chunk, or one run of rows inside a chunk whose inner
+//! chain is plain bytes: a reader does the blocking byte-range read, a decode worker
 //! decodes the chunk and copies out the elements the selection wants. The two are separate
 //! because a read waits on storage and a decode occupies a core, so the useful number of
 //! each is different -- hence a separate ceiling for each.
@@ -279,7 +280,7 @@ impl CodecPipelineImpl {
             }
 
             let decoder = if depth == 0 {
-                self.decoder_or_read(&self.shard_indexes, &mut decoders.shards, &item.key, || {
+                self.decoder_or_read(&self.shard_decoders, &mut decoders.shards, &item.key, || {
                     shard.level_decoder(
                         0,
                         key_partial_decoder(&self.store, &item.key),
@@ -293,7 +294,7 @@ impl CodecPipelineImpl {
                 let (base, len) = extent.expect("a level below 0 has a parent extent");
                 let key = (item.key.clone(), path.clone());
                 self.decoder_or_read(
-                    &self.subshard_indexes,
+                    &self.subshard_decoders,
                     &mut decoders.subshards,
                     &key,
                     || {
@@ -601,7 +602,7 @@ pub(crate) fn raw_runs(coords: &[u64], run_len: u64) -> usize {
 /// for REQUESTS -- and requests are the scarce resource, since a row costs nearly what the
 /// chunk holding it costs to fetch. Hence a PER-ITEM gate: take it only where a chunk's wanted
 /// rows collapse to a handful of reads. Two is measured; zero disables the path and costs ~75%
-/// on an uncompressed scattered draw. See README and `notes/deferred-wins.md`.
+/// on an uncompressed scattered draw. See README.
 const RAW_MAX_READS: usize = 2;
 
 /// One job per RUN of consecutive rows, each reading exactly its own bytes, for a chunk that
@@ -786,8 +787,9 @@ fn default_ceiling() -> usize {
 ///
 /// Persistent and work-stealing, so capacity is never divided between calls: a free worker
 /// takes the next task, whoever queued it. The alternative -- per-call threads drawing an
-/// equal share of a global ceiling -- was measured and lost; `notes/read-path.md` has the
-/// numbers and the four attempts to make it work.
+/// equal share of a global ceiling -- was measured and lost. The share is a snapshot taken
+/// when every caller has just arrived and is never recomputed; integer division strands
+/// capacity outright; and a partition blocked on I/O cannot lend to one that is starved.
 ///
 /// SIZED ONCE, and this is the honest cost. `read_worker_ceiling` and `decode_worker_ceiling`
 /// are read from `zarr.config` per call, but only the FIRST call's values build the pools; a
@@ -963,8 +965,8 @@ thread_local! {
 ///
 /// ONE JOB PER READ, deliberately. Packing jobs that share a shard into one `get_partial_many`
 /// was measured and removed: it shares a file-handle lookup, not a syscall, since the store
-/// maps each range to its own `read_exact_at`. `notes/deferred-wins.md` has the numbers and
-/// the case for bringing it back on higher-latency storage.
+/// maps each range to its own `read_exact_at`. It is worth revisiting on storage where a
+/// request costs more than a file-handle lookup -- object stores, or anything over a network.
 fn read_one<'scope, 'env>(
     job: Job<'env>,
     dec: &rayon::Scope<'scope>,

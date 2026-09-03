@@ -176,7 +176,7 @@ impl Offsets<'_> {
 fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u64, u64, u64)> {
     if inner.is_empty() || inner.len() != shape.len() {
         return Err(PyErr::new::<PyValueError, _>(format!(
-            "chunk_unit_items splits axis 0 and needs matching arity: the inner chunk has \
+            "push_entry splits axis 0 and needs matching arity: the inner chunk has \
              {} axes, the output shape has {}",
             inner.len(),
             shape.len()
@@ -184,7 +184,7 @@ fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u6
     }
     if starts.len() + 1 != inner.len() {
         return Err(PyErr::new::<PyValueError, _>(format!(
-            "chunk_unit_items needs one start per axis AFTER the split: {} starts against a \
+            "push_entry needs one start per axis AFTER the split: {} starts against a \
              rank-{} inner chunk",
             starts.len(),
             inner.len()
@@ -195,7 +195,7 @@ fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u6
     for (axis, ((start, width), extent)) in starts.iter().zip(widths).zip(extents).enumerate() {
         if *width == 0 || start.checked_add(*width).is_none_or(|end| end > *extent) {
             return Err(PyErr::new::<PyValueError, _>(format!(
-                "axis {} takes {width} elements from {start}, which leaves its extent {extent}",
+                "axis {} takes {width} elements from {start}, which runs past its extent {extent}",
                 axis + 1
             )));
         }
@@ -582,12 +582,16 @@ impl ChunkItems {
     /// Build one batch entry's items and append them.
     ///
     /// `indices` select along AXIS 0 and are checked here: non-negative, non-decreasing, and
-    /// inside the chunk extent. So is `out_start` -- entries must be pushed in increasing
-    /// order, and one that would reuse output another entry already owns is refused.
+    /// inside the chunk extent.
     ///
-    /// Axes after the first are taken WHOLE and must be the same extent in `chunk_shape` and
-    /// in `shape`; that is checked too. It is what makes one index one contiguous run, and
-    /// the rank-N case the 1-D case with a run length.
+    /// `out_starts` is NOT checked against entries already pushed. It was once -- see the
+    /// comment in the body for why that check could not judge a banded entry and was removed.
+    /// Disjointness is enforced downstream instead, by `DisjointBytes`, which vends every
+    /// output range from a forward-only cursor and so cannot hand the same byte out twice.
+    ///
+    /// Axes after the first may be taken WHOLE or as one contiguous band, described by
+    /// `out_starts`, `out_widths` and `elem_starts` -- so one selected index is still one
+    /// contiguous run, and the rank-N case is the 1-D case with a run length.
     ///
     /// One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
     /// since the output subset is bounded against it. A larger one describes bytes the buffer
