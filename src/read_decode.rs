@@ -4,7 +4,7 @@
 //! chain is plain bytes: a reader does the blocking byte-range read, a decode worker
 //! decodes the chunk and copies out the elements the selection wants. The two are separate
 //! because a read waits on storage and a decode occupies a core, so the useful number of
-//! each is different -- hence a separate ceiling for each.
+//! each is different -- hence a separate size for each.
 //!
 //! Workers belong to the CALL. `std::thread::scope` cannot exit until they finish, so a job
 //! can hold `&mut [u8]` into the caller's output rather than a raw pointer, and the join is
@@ -164,7 +164,7 @@ impl CodecPipelineImpl {
         // the caller's numpy buffer valid without a raw pointer or a completion latch.
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
-        let (read_pool, decode_pool) = pools(config.read_ceiling, config.decode_ceiling);
+        let (read_pool, decode_pool) = pools(config.read_pool_size, config.decode_pool_size);
         decode_pool.in_place_scope(|dec| {
             read_pool.in_place_scope(|rd| {
                 for job in jobs {
@@ -335,7 +335,7 @@ impl CodecPipelineImpl {
         // descending axis 0 with whole trailing axes would be. Without it an
         // item claiming rows 0..8 x cols 0..12 of a shard whose inner chunk is 8x6 locates
         // chunk (0,0), and its coordinates -- built for a 12-wide row -- address exactly the
-        // 48 elements that chunk holds. In bounds, wrong data, no error. `push_entry` takes
+        // 48 elements that chunk holds. In bounds, wrong data, no error. `push_indices` takes
         // arbitrary arguments from Python, so this is a trust boundary rather than an
         // invariant the caller can be assumed to keep.
         let held = item.chunk_subset.shape();
@@ -387,13 +387,6 @@ impl CodecPipelineImpl {
     }
 }
 
-/// Split the output into the disjoint piece each located chunk writes, in offset order.
-///
-/// Each piece comes from `DisjointBytes::take`, whose cursor only moves forward, so a second
-/// claim on the same bytes is refused rather than aliased.
-///
-/// Returns the jobs to read, and the pieces of chunks that were never written, which need
-/// only the fill value.
 /// The output byte ranges an item fills, ascending.
 ///
 /// ONE range while every axis after the first is taken whole -- every rank-1 read, so the CSR
@@ -423,7 +416,7 @@ fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, 
     // to the next item -- which `DisjointBytes` reports as a backwards claim, naming the
     // symptom rather than this.
     //
-    // Checked HERE because this is the funnel: `push_entry`, `push_span`, `push_grid`,
+    // Checked HERE because this is the funnel: `push_indices`, `push_span`, `push_grid`,
     // `push_points` and a hand-built `ChunkItem` all reach bytes through it.
     let runs = item
         .subset
@@ -462,6 +455,15 @@ fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, 
         .collect()
 }
 
+/// Split the output into the disjoint piece each located chunk writes, and turn each into a
+/// job, in output-offset order.
+///
+/// Every piece comes from `DisjointBytes::take`, whose cursor only moves forward, so a second
+/// claim on the same bytes is refused rather than aliased -- which is what the `unsafe` in
+/// `take` rests on, and why the pieces are cut here rather than by each job for itself.
+///
+/// Returns the jobs to read, and the pieces of chunks that were never written, which need no
+/// read at all -- only the fill value.
 fn carve<'a>(
     output: &'a DisjointBytes<'a>,
     located: &[(&'a ChunkItem, Option<ByteRange>)],
@@ -535,11 +537,17 @@ fn carve<'a>(
             //
             // The pieces are taken in coordinate order, which is ascending, so
             // `DisjointBytes` still vends each byte once and coverage is still checked.
-            // One output piece and no grid: the item is a plain run of rows, which is every
-            // rank-1 read and every read whose trailing axes are whole. A banded item has one
-            // piece per row and a grid item carries its own per-element offsets; neither is a
-            // single contiguous claim, so both take the ordinary path rather than get a second
-            // implementation here.
+            // ONE OUTPUT PIECE and no grid, which is the whole admission rule. That covers
+            // every rank-1 read and every read whose trailing axes are whole -- and also a
+            // BANDED item of a single row, where `coords[0]` is a column offset inside the
+            // row rather than a row start and `run_len` is the band width rather than the row
+            // width. The arithmetic is the same either way, which is why the band needs no
+            // second implementation; a scattered banded selection reaches it often, since
+            // rows in different chunks each give a one-row item.
+            //
+            // A grid item carries its own per-element offsets, and a banded item of SEVERAL
+            // rows fills one output range per row. Neither is a single contiguous claim, so
+            // both take the ordinary path.
             Some(range)
                 if ctx.raw
                     // Zero DISABLES, which the threshold alone does not say: an item with no
@@ -801,7 +809,7 @@ pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 /// only the decode side is really bounded by cores. They share a default because the machine
 /// is the only thing either can be guessed from; a caller that knows its storage sets the read
 /// side higher.
-fn default_ceiling() -> usize {
+fn default_pool_size() -> usize {
     std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
 }
 
@@ -809,11 +817,11 @@ fn default_ceiling() -> usize {
 ///
 /// Persistent and work-stealing, so capacity is never divided between calls: a free worker
 /// takes the next task, whoever queued it. The alternative -- per-call threads drawing an
-/// equal share of a global ceiling -- was measured and lost. The share is a snapshot taken
+/// equal share of a global budget -- was measured and lost. The share is a snapshot taken
 /// when every caller has just arrived and is never recomputed; integer division strands
 /// capacity outright; and a partition blocked on I/O cannot lend to one that is starved.
 ///
-/// SIZED ONCE, and this is the honest cost. `read_worker_ceiling` and `decode_worker_ceiling`
+/// SIZED ONCE, and this is the honest cost. `read_pool_size` and `decode_pool_size`
 /// are read from `zarr.config` per call, but only the FIRST call's values build the pools; a
 /// later `with zarr.config.set(...)` around a read resizes nothing. [`pool_sizes`] reports
 /// what was actually built, so a caller can assert rather than assume.
@@ -874,14 +882,14 @@ fn pools(read_size: usize, decode_size: usize) -> (Arc<rayon::ThreadPool>, Arc<r
 
 /// What the pools were actually BUILT with, or `None` where one has not been built yet.
 ///
-/// Sizes are fixed at first use, so a caller that sets a ceiling after the first read gets the
+/// Sizes are fixed at first use, so a caller that sets a size after the first read gets the
 /// old value silently. Reporting the built size is what lets a benchmark tell "the knob did
 /// not pay" from "the knob never arrived".
 pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
     let guard = POOLS.lock().expect("the pool lock is never held across a panic");
     match guard.as_ref() {
         // A pool built by a PARENT process is not this process's pool, and reporting its size
-        // here would be the same lie `check_ceiling_arrived` exists to prevent.
+        // here would be the same lie `check_pool_size_arrived` exists to prevent.
         Some(p) if p.pid == std::process::id() => (
             Some(p.read.current_num_threads()),
             Some(p.decode.current_num_threads()),
@@ -890,7 +898,7 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
     }
 }
 
-/// Say so when a ceiling asked for is not the one the pools were built with.
+/// Say so when a size asked for is not the one the pools were built with.
 ///
 /// The pools are sized by the FIRST read in the process, so a `zarr.config.set` around a later
 /// read resizes nothing. That is the accepted cost of persistence; doing it SILENTLY is not.
@@ -902,17 +910,17 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
 /// opens a second array wanting a different width is doing something legitimate -- refusing it
 /// would turn a sizing hint into a failed read. A caller needing the guarantee asserts on
 /// [`pool_sizes`], which is what the benchmark does.
-pub(crate) fn check_ceiling_arrived(
+pub(crate) fn check_pool_size_arrived(
     py: Python<'_>,
     config: ReadConfig,
     strict: bool,
 ) -> PyResult<()> {
     for (built, asked, knob) in [
-        (pool_sizes().0, config.read_ceiling, "read_worker_ceiling"),
+        (pool_sizes().0, config.read_pool_size, "read_pool_size"),
         (
             pool_sizes().1,
-            config.decode_ceiling,
-            "decode_worker_ceiling",
+            config.decode_pool_size,
+            "decode_pool_size",
         ),
     ] {
         // Only when a pool EXISTS and differs. Before the first read there is nothing to
@@ -942,32 +950,37 @@ pub(crate) fn check_ceiling_arrived(
 #[derive(Clone, Copy)]
 pub(crate) struct ReadConfig {
     /// Only the FIRST call's value in this process is used -- see [`Pools`].
-    pub(crate) read_ceiling: usize,
+    pub(crate) read_pool_size: usize,
     /// Only the FIRST call's value in this process is used -- see [`Pools`].
-    pub(crate) decode_ceiling: usize,
+    pub(crate) decode_pool_size: usize,
     /// Reads a chunk may become before the raw path is declined for it; see [`RAW_MAX_READS`].
     /// Per call, and honoured on every call rather than only the first.
     pub(crate) raw_max_reads: usize,
 }
 
-/// A ceiling as the pipeline will use it: zero or absent means "as much as the machine has".
+/// A pool size as the pipeline will use it.
+///
+/// ZERO OR ABSENT MEANS "as many threads as the machine has", NOT "disabled". Worth saying
+/// because its neighbours in the same config namespace read the other way: `file_handle_cache_size
+/// = 0` and `raw_max_reads_per_chunk = 0` both turn their feature off. A pool of no threads
+/// cannot run a read at all, so there is nothing for zero to mean here except the default.
 ///
 /// Public so the pipeline can resolve at OPEN, which is when these are read.
-pub(crate) fn resolve_ceiling(ceiling: Option<usize>) -> usize {
-    ceiling.filter(|c| *c > 0).unwrap_or_else(default_ceiling)
+pub(crate) fn resolve_pool_size(asked: Option<usize>) -> usize {
+    asked.filter(|n| *n > 0).unwrap_or_else(default_pool_size)
 }
 
 impl ReadConfig {
-    /// The ceilings as the ARRAY was opened with, already resolved, plus this call's raw
+    /// The pool sizes as the ARRAY was opened with, already resolved, plus this call's raw
     /// threshold. The two are read at different times on purpose -- see the fields.
     pub(crate) fn from_open(
-        read_ceiling: usize,
-        decode_ceiling: usize,
+        read_pool_size: usize,
+        decode_pool_size: usize,
         raw_max_reads: Option<usize>,
     ) -> Self {
         Self {
-            read_ceiling,
-            decode_ceiling,
+            read_pool_size,
+            decode_pool_size,
             raw_max_reads: raw_max_reads.unwrap_or(RAW_MAX_READS),
         }
     }
@@ -1294,7 +1307,7 @@ mod tests {
     /// The pools are built at the size asked for, and the size is ONE-SHOT.
     ///
     /// Both halves matter. The first is the ordinary contract. The second is the cost of
-    /// persistent pools and the thing most likely to mislead someone later: a ceiling set
+    /// persistent pools and the thing most likely to mislead someone later: a size set
     /// after the first read is silently ignored, so `pool_sizes` has to report what was built
     /// rather than what was asked for.
     ///

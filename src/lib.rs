@@ -145,12 +145,12 @@ pub struct CodecPipelineImpl {
     /// Read once, here, exactly as `num_threads` and the chunk-concurrency bounds are. They
     /// size process-wide pools that only the first read builds, so reading them per call
     /// would offer a caller a choice that cannot be honoured.
-    pub(crate) read_ceiling: usize,
-    pub(crate) decode_ceiling: usize,
-    /// Whether a ceiling that cannot be honoured is an ERROR rather than a warning.
+    pub(crate) read_pool_size: usize,
+    pub(crate) decode_pool_size: usize,
+    /// Whether a size that cannot be honoured is an ERROR rather than a warning.
     ///
     /// `codec_pipeline.strict` already means "do not paper over something this pipeline
-    /// cannot do" -- it turns a decline into a raise instead of a silent fallback. A ceiling
+    /// cannot do" -- it turns a decline into a raise instead of a silent fallback. A pool size
     /// the process cannot give is the same kind of thing, so it answers to the same switch.
     pub(crate) strict: bool,
 }
@@ -414,8 +414,8 @@ impl CodecPipelineImpl {
         direct_io=false,
         file_handle_cache_size=0,
         store_is_read_only=false,
-        read_worker_ceiling=None,
-        decode_worker_ceiling=None,
+        read_pool_size=None,
+        decode_pool_size=None,
         strict=false,
     ))]
     #[new]
@@ -429,8 +429,8 @@ impl CodecPipelineImpl {
         direct_io: bool,
         file_handle_cache_size: usize,
         store_is_read_only: bool,
-        read_worker_ceiling: Option<usize>,
-        decode_worker_ceiling: Option<usize>,
+        read_pool_size: Option<usize>,
+        decode_pool_size: Option<usize>,
         strict: bool,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
@@ -505,8 +505,8 @@ impl CodecPipelineImpl {
             cache_shard_indexes: store_is_read_only,
             inner_chunk_is_raw: inner_chunk_is_raw(array_metadata),
             store_is_read_only,
-            read_ceiling: read_decode::resolve_ceiling(read_worker_ceiling),
-            decode_ceiling: read_decode::resolve_ceiling(decode_worker_ceiling),
+            read_pool_size: read_decode::resolve_pool_size(read_pool_size),
+            decode_pool_size: read_decode::resolve_pool_size(decode_pool_size),
             strict,
         })
     }
@@ -529,16 +529,16 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         raw_max_reads_per_chunk: Option<usize>,
     ) -> PyResult<()> {
-        // The ceilings come from the array, not from this call: they were read when it was
+        // The pool sizes come from the array, not from this call: they were read when it was
         // opened. The raw threshold is a per-call decision and stays one.
         let config = read_decode::ReadConfig::from_open(
-            self.read_ceiling,
-            self.decode_ceiling,
+            self.read_pool_size,
+            self.decode_pool_size,
             raw_max_reads_per_chunk,
         );
-        // The pools are sized once, by the first read. A ceiling arriving after that cannot
+        // The pools are sized once, by the first read. A size arriving after that cannot
         // be honoured, and a caller who is not told believes it was.
-        read_decode::check_ceiling_arrived(py, config, self.strict)?;
+        read_decode::check_pool_size_arrived(py, config, self.strict)?;
         self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, config)
     }
 
@@ -649,7 +649,7 @@ fn raw_path_stats() -> (u64, u64) {
 
 /// The sizes the two worker pools were BUILT with, or `None` where one has not been built.
 ///
-/// Pools are sized by the first read in the process, so a ceiling set later is silently
+/// Pools are sized by the first read in the process, so a size set later is silently
 /// ignored. A benchmark that sets one and reports a number has to be able to say which of the
 /// two happened -- the repo's rule that a knob which was set is not a knob that arrived.
 #[gen_stub_pyfunction]

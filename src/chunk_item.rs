@@ -58,7 +58,7 @@ pub(crate) struct ChunkItem {
 #[pymethods]
 impl ChunkItem {
     /// `coords` is always `None` here -- it is not a parameter, so this constructor cannot
-    /// build a chunk-unit item. `ChunkItems::push_entry` builds those.
+    /// build a chunk-unit item. `ChunkItems::push_indices` builds those.
     #[new]
     #[pyo3(signature = (key, chunk_subset, chunk_shape, subset, shape))]
     #[allow(clippy::needless_pass_by_value)]
@@ -176,7 +176,7 @@ impl Offsets<'_> {
 fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u64, u64, u64)> {
     if inner.is_empty() || inner.len() != shape.len() {
         return Err(PyErr::new::<PyValueError, _>(format!(
-            "push_entry splits axis 0 and needs matching arity: the inner chunk has \
+            "push_indices splits axis 0 and needs matching arity: the inner chunk has \
              {} axes, the output shape has {}",
             inner.len(),
             shape.len()
@@ -184,7 +184,7 @@ fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u6
     }
     if starts.len() + 1 != inner.len() {
         return Err(PyErr::new::<PyValueError, _>(format!(
-            "push_entry needs one start per axis AFTER the split: {} starts against a \
+            "push_indices needs one start per axis AFTER the split: {} starts against a \
              rank-{} inner chunk",
             starts.len(),
             inner.len()
@@ -297,7 +297,7 @@ pub(crate) fn build_chunk_unit_items(
     offsets: Offsets<'_>,
 ) -> PyResult<Vec<ChunkItem>> {
     // Arity FIRST, and rank at least one, because everything below indexes: `inner_nz[0]`
-    // for the split extent and `out_widths[1..]` for the bands. `push_entry` is a pymethod
+    // for the split extent and `out_widths[1..]` for the bands. `push_indices` is a pymethod
     // taking arbitrary vectors, so a short one has to be an error rather than a panic across
     // the FFI. The out_starts/out_widths check that used to sit further down is folded in
     // here for the same reason.
@@ -415,14 +415,16 @@ pub(crate) fn build_chunk_unit_items(
     let out_extent = shape[0].get();
     let key = StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?;
 
-    let at = |i: usize| -> PyResult<u64> {
+    // Named apart from the `start` bindings further down: this reads an index VALUE out of the
+    // selection, and those are element starts on a trailing axis. One function had both as `at`.
+    let index_at = |i: usize| -> PyResult<u64> {
         u64::try_from(indices[i])
             .map_err(|_| PyErr::new::<PyValueError, _>(format!("index {} is negative", indices[i])))
     };
 
     // NON-DECREASING is assumed below: the grouping walks a RUN of equal chunk ids, so out of
     // order the same chunk is grouped twice, and the extent check trusts the last of a group
-    // to be its largest. `push_entry` is `#[pymethods]` and takes an arbitrary array, so it is
+    // to be its largest. `push_indices` is `#[pymethods]` and takes an arbitrary array, so it is
     // enforced here as well as by Python's `_is_sorted_integer_axis`. A violation that slipped
     // through would be caught downstream by `gather` rather than returning wrong data -- but
     // as an out-of-range coordinate, which says nothing about which index was bad.
@@ -431,7 +433,7 @@ pub(crate) fn build_chunk_unit_items(
     let mut a = 0usize;
     let mut previous = 0u64;
     while a < n {
-        let first = at(a)?;
+        let first = index_at(a)?;
         if a > 0 && first < previous {
             return Err(PyErr::new::<PyValueError, _>(format!(
                 "indices must be non-decreasing: {first} follows {previous}"
@@ -441,7 +443,7 @@ pub(crate) fn build_chunk_unit_items(
         let chunk_id = first / split;
         let mut b = a + 1;
         while b < n {
-            let value = at(b)?;
+            let value = index_at(b)?;
             if value < previous {
                 return Err(PyErr::new::<PyValueError, _>(format!(
                     "indices must be non-decreasing: {value} follows {previous}"
@@ -459,16 +461,16 @@ pub(crate) fn build_chunk_unit_items(
         if lo >= extent {
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "index {} is past the chunk extent {extent}",
-                at(a)?
+                index_at(a)?
             )));
         }
         // `lo >= extent` only catches a chunk that STARTS past the end. An index inside the
         // last chunk but past the extent would gather fill bytes, so check it too. Indices
         // are non-decreasing, so the last of the group is the largest.
-        if at(b - 1)? >= extent {
+        if index_at(b - 1)? >= extent {
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "index {} is past the chunk extent {extent}",
-                at(b - 1)?
+                index_at(b - 1)?
             )));
         }
         let out_lo = out_starts[0] + a as u64;
@@ -492,10 +494,10 @@ pub(crate) fn build_chunk_unit_items(
         let mut out_ranges = Vec::with_capacity(shape.len());
         out_ranges.push(out_lo..out_hi);
         out_ranges.extend(
-            out_widths[1..]
+            out_starts[1..]
                 .iter()
-                .zip(&out_starts[1..])
-                .map(|(width, at)| *at..at + width),
+                .zip(&out_widths[1..])
+                .map(|(start, width)| *start..start + width),
         );
         items.push(ChunkItem {
             key: key.clone(),
@@ -526,14 +528,14 @@ pub(crate) fn build_chunk_unit_items(
                                  holds"
                             )));
                         }
-                        at(i).map(|v| (v - lo) * row_stride + offset)
+                        index_at(i).map(|v| (v - lo) * row_stride + offset)
                     })
                     .collect::<PyResult<Vec<u64>>>()?
                     .into(),
                 // `uniform_offset` was checked once by `trailing_layout`, and `Grid`'s columns
                 // once by the arm that built it -- neither varies with the index.
                 _ => (a..b)
-                    .map(|i| at(i).map(|v| (v - lo) * row_stride + shared_offset))
+                    .map(|i| index_at(i).map(|v| (v - lo) * row_stride + shared_offset))
                     .collect::<PyResult<Vec<u64>>>()?
                     .into(),
             }),
@@ -557,7 +559,7 @@ pub(crate) fn build_chunk_unit_items(
 pub(crate) struct ChunkItems {
     items: Vec<ChunkItem>,
     /// Where the last entry's output ended, so a later one cannot overlap it. Python drives
-    /// `push_entry` directly, and two entries sharing an `out_start` would give two items
+    /// `push_indices` directly, and two entries sharing an `out_start` would give two items
     /// overlapping output ranges -- which the read path writes CONCURRENTLY through views
     /// whose safety contract is that they are disjoint. A wrong answer would be recoverable;
     /// this would be a data race.
@@ -596,9 +598,9 @@ impl ChunkItems {
     /// One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
     /// since the output subset is bounded against it. A larger one describes bytes the buffer
     /// does not have, and that produces wrong data rather than an error.
-    #[pyo3(signature = (key, chunk_shape, shape, indices, out_starts, out_widths, inner, elem_starts=Vec::new()))]
+    #[pyo3(signature = (key, chunk_shape, shape, indices, out_starts, out_widths, inner_shape, elem_starts=Vec::new()))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-    pub(crate) fn push_entry(
+    pub(crate) fn push_indices(
         &mut self,
         key: &str,
         chunk_shape: Vec<u64>,
@@ -606,7 +608,7 @@ impl ChunkItems {
         indices: PyReadonlyArray1<'_, i64>,
         out_starts: Vec<u64>,
         out_widths: Vec<u64>,
-        inner: Vec<u64>,
+        inner_shape: Vec<u64>,
         elem_starts: Vec<u64>,
     ) -> PyResult<()> {
         // There WAS a monotonicity check here: an entry's output start against the last
@@ -627,7 +629,7 @@ impl ChunkItems {
             indices,
             &out_starts,
             &out_widths,
-            &inner,
+            &inner_shape,
             Offsets::Uniform(&elem_starts),
         )?;
         self.extend_items(items);
@@ -647,7 +649,7 @@ impl ChunkItems {
     /// is 11.9M numbers, ~95 MB, built in numpy and walked one at a time here: measured at
     /// 98 ms to build and 112 ms to hand over, against a preload of ~317 ms. Described as
     /// runs, the same read is 0.69 ms.
-    #[pyo3(signature = (key, chunk_shape, shape, first, count, out_start, inner))]
+    #[pyo3(signature = (key, chunk_shape, shape, first, count, out_start, inner_extent))]
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn push_span(
         &mut self,
@@ -657,7 +659,7 @@ impl ChunkItems {
         first: u64,
         count: u64,
         out_start: u64,
-        inner: u64,
+        inner_extent: u64,
     ) -> PyResult<()> {
         if out_start < self.out_end {
             return Err(PyErr::new::<PyValueError, _>(format!(
@@ -669,8 +671,10 @@ impl ChunkItems {
         if count == 0 {
             return Ok(());
         }
-        let inner = NonZeroU64::new(inner)
-            .ok_or_else(|| PyErr::new::<PyValueError, _>("inner chunk shape must be non-zero"))?
+        let inner_extent = NonZeroU64::new(inner_extent)
+            .ok_or_else(|| {
+                PyErr::new::<PyValueError, _>("the inner chunk's extent on axis 0 must be non-zero")
+            })?
             .get();
         if chunk_shape.is_empty() || chunk_shape.len() != shape.len() {
             return Err(PyErr::new::<PyValueError, _>(format!(
@@ -712,9 +716,9 @@ impl ChunkItems {
         let key = StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?;
 
         // One item per inner chunk the span crosses -- arithmetic, not a walk over elements.
-        for chunk_id in (first / inner)..=(last / inner) {
-            let lo = chunk_id * inner;
-            let hi = (lo + inner).min(extent);
+        for chunk_id in (first / inner_extent)..=(last / inner_extent) {
+            let lo = chunk_id * inner_extent;
+            let hi = (lo + inner_extent).min(extent);
             let span_lo = first.max(lo);
             let span_hi = (first + count).min(hi);
             let rows = span_hi - span_lo;
@@ -756,7 +760,7 @@ impl ChunkItems {
     /// the same sub-box, described as `starts.len()` runs of `run` elements -- because in
     /// row-major order a sub-box IS a set of runs. A fully scattered selection is `run == 1`.
     /// The runs land back to back in the output, so the item is still one output range.
-    #[pyo3(signature = (key, chunk_shape, shape, indices, starts, run, out_start, inner))]
+    #[pyo3(signature = (key, chunk_shape, shape, indices, starts, run, out_start, inner_extent))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub(crate) fn push_grid(
         &mut self,
@@ -767,7 +771,7 @@ impl ChunkItems {
         starts: PyReadonlyArray1<'_, u64>,
         run: u64,
         out_start: u64,
-        inner: u64,
+        inner_extent: u64,
     ) -> PyResult<()> {
         let starts = starts
             .as_slice()
@@ -791,7 +795,7 @@ impl ChunkItems {
     /// allocations and a partial-decode call PER POINT. Grouping them by the chunk that gets
     /// decoded is the whole win, and it is the same grouping the row case uses: the output is
     /// flat, so `shape` is 1-D here while `chunk_shape` is not.
-    #[pyo3(signature = (key, chunk_shape, shape, indices, offsets, out_start, inner))]
+    #[pyo3(signature = (key, chunk_shape, shape, indices, offsets, out_start, inner_extent))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub(crate) fn push_points(
         &mut self,
@@ -801,7 +805,7 @@ impl ChunkItems {
         indices: PyReadonlyArray1<'_, i64>,
         offsets: PyReadonlyArray1<'_, u64>,
         out_start: u64,
-        inner: u64,
+        inner_extent: u64,
     ) -> PyResult<()> {
         // Contiguous so the per-point offsets can be read as a slice; a strided view would be
         // indexed as if it were dense.
@@ -850,7 +854,7 @@ impl ChunkItems {
         shape: Vec<u64>,
         indices: PyReadonlyArray1<'_, i64>,
         out_start: u64,
-        inner: u64,
+        inner_extent: u64,
         offsets: Offsets<'_>,
     ) -> PyResult<()> {
         if out_start < self.out_end {
@@ -872,7 +876,7 @@ impl ChunkItems {
         // `skip(1)`, not `[1..]`: these are pymethods taking arbitrary vectors, and a rank-0
         // chunk must reach `build_chunk_unit_items` to be refused by name rather than panic
         // across the FFI here.
-        let inner: Vec<u64> = std::iter::once(inner)
+        let inner_shape: Vec<u64> = std::iter::once(inner_extent)
             .chain(chunk_shape.iter().skip(1).copied())
             .collect();
         let items = build_chunk_unit_items(
@@ -882,7 +886,7 @@ impl ChunkItems {
             indices,
             &out_starts,
             &out_widths,
-            &inner,
+            &inner_shape,
             offsets,
         )?;
         self.extend_items(items);

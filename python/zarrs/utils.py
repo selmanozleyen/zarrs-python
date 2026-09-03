@@ -242,10 +242,8 @@ def _step1_span(sel: Any, extent: int) -> tuple[int, int] | None:
     return lo, hi
 
 
-def _contiguous_offset(
-    starts: list[int], widths: list[int], extents: tuple[int, ...]
-) -> int | None:
-    """Element offset of a sub-box within ONE row, or None if that box is not contiguous.
+def _is_contiguous_box(widths: list[int], extents: tuple[int, ...]) -> bool:
+    """Whether a sub-box of ONE row is a single unbroken range of elements.
 
     Row-major, the box is one unbroken range exactly when every axis before the last partial
     one selects a single element. Give a partial axis a wider axis ahead of it and the box
@@ -254,19 +252,17 @@ def _contiguous_offset(
 
     So `X[rows, a:b]` on a 2-D array is always contiguous (there is nothing before axis 1),
     which is the case this exists for; `X[rows, :, a:b]` on a rank-3 array is not.
+
+    A GATE, and only a gate. It used to return the box's element offset as well, and neither
+    caller ever read it -- Rust re-derives that in `trailing_layout`, against the extents it
+    will actually decode against, which is the only place it can be checked. Computing it here
+    was a stride loop per band on the description path for a number that was discarded.
     """
     last_partial = -1
     for axis, (width, extent) in enumerate(zip(widths, extents, strict=True)):
         if width != extent:
             last_partial = axis
-    if last_partial > 0 and any(width != 1 for width in widths[:last_partial]):
-        return None
-    offset = 0
-    stride = 1
-    for axis in reversed(range(len(widths))):
-        offset += starts[axis] * stride
-        stride *= extents[axis]
-    return offset
+    return last_partial <= 0 or all(width == 1 for width in widths[:last_partial])
 
 
 def _bands(lo: int, hi: int, inner: int, out_lo: int) -> list[tuple[int, int, int]]:
@@ -291,7 +287,7 @@ def _bands(lo: int, hi: int, inner: int, out_lo: int) -> list[tuple[int, int, in
 def _chunk_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
 ) -> list[tuple] | None:
-    """Args for `ChunkItems.push_entry`, one per item, or None if this entry is not that shape.
+    """Args for `ChunkItems.push_indices`, one per item, or None if this entry is not that shape.
 
     Eligible: an integer axis at AXIS 0 -- non-negative, non-decreasing, against a contiguous
     output slice -- with every axis after it taken whole or as a contiguous sub-box.
@@ -504,17 +500,17 @@ def _chunk_unit_args(
         # prepended below -- and `out_starts[1:]` once compared a short list against all the
         # extents. That was 2,825 tests, and the lists were the right type and the wrong
         # length, so nothing but reading it could have caught it.
-        if _contiguous_offset(band_out, band_widths, tuple(shape[1:])) is None:
+        if not _is_contiguous_box(band_widths, tuple(shape[1:])):
             return None
         # Gate only. Rust re-derives the offset from these same starts and rechecks the shape,
-        # because `push_entry` is reachable from Python with arbitrary arguments and a single
+        # because `push_indices` is reachable from Python with arbitrary arguments and a single
         # fused offset is not a checkable thing.
         within = [s % int(inner_shape[a + 1]) for a, s in enumerate(band_starts)]
-        if _contiguous_offset(within, band_widths, tuple(inner_shape[1:])) is None:
+        if not _is_contiguous_box(band_widths, tuple(inner_shape[1:])):
             return None
         pushes.append(
             (
-                "entry",
+                "indices",
                 byte_getter.path,
                 chunk_spec.shape,
                 shape,
@@ -793,13 +789,13 @@ def chunk_info_for_read(
         # An entry straddling an inner-chunk boundary on a trailing axis describes one item
         # per band, so this is a list of lists.
         for kind, *args in itertools.chain.from_iterable(unit_args):
-            # A span names a contiguous block; an entry names its elements. Both land in the
-            # same handle and are served by the same path -- the difference is only how much
-            # had to be said to describe the read.
+            # A span names a contiguous block; the other names the indices themselves. Both
+            # land in the same handle and are served by the same path -- the difference is only
+            # how much had to be said to describe the read.
             if kind == "span":
                 handle.push_span(*args)
             else:
-                handle.push_entry(*args)
+                handle.push_indices(*args)
         return RustChunkInfo(handle, write_empty_chunks=True)
 
     # A point selection is a different SHAPE of batch, not a failed row one, so it gets its

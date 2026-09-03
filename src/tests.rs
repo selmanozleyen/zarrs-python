@@ -110,7 +110,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
     })
 }
 
-/// `push_entry` must ACCUMULATE, not replace: a selection spanning two shards is two entries,
+/// `push_indices` must ACCUMULATE, not replace: a selection spanning two shards is two entries,
 /// and the second entry's output starts where the first left off.
 #[test]
 fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
@@ -121,7 +121,7 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry(
+        handle.push_indices(
             "c/0",
             vec![95],
             vec![100],
@@ -131,7 +131,7 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
             vec![10],
             vec![],
         )?;
-        handle.push_entry(
+        handle.push_indices(
             "c/1",
             vec![95],
             vec![100],
@@ -154,12 +154,12 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
 
 /// Two entries may not claim the same output bytes.
 ///
-/// `push_entry` is `#[pymethods]` with a caller-chosen `out_start`, and the read path writes
+/// `push_indices` is `#[pymethods]` with a caller-chosen `out_start`, and the read path writes
 /// items CONCURRENTLY through views whose safety contract is that their subsets are disjoint.
 /// Overlap there is a data race, so it has to be refused where the entries are accumulated --
 /// nothing downstream sees both.
 #[test]
-fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
+fn test_push_indices_leaves_overlap_to_the_vendor() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
 
     Python::initialize();
@@ -167,7 +167,7 @@ fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
         let mut handle = crate::chunk_item::ChunkItems::new();
         let a = PyArray1::from_slice(py, &[3i64, 20]);
         let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry(
+        handle.push_indices(
             "c/0",
             vec![95],
             vec![100],
@@ -179,13 +179,13 @@ fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
         )?;
 
         // `a` produced two items covering output 0..2, so an entry starting at 1 gives two
-        // items the same byte. `push_entry` no longer refuses that: the check it used could
+        // items the same byte. `push_indices` no longer refuses that: the check it used could
         // not judge a banded entry, where two bands of one read share an axis-0 start and
         // overlap nothing, and a guard that quietly stops covering the newest shape is worse
         // than none. The overlap is refused at read instead, by the forward-only cursor in
         // `DisjointBytes` -- see `read_decode::tests::bytes_are_vended_once_and_forwards`,
         // which pins that directly.
-        handle.push_entry(
+        handle.push_indices(
             "c/1",
             vec![95],
             vec![100],
@@ -196,7 +196,7 @@ fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
             vec![],
         )?;
         // Starting where the last one ended is exactly what zarr produces.
-        handle.push_entry(
+        handle.push_indices(
             "c/1",
             vec![95],
             vec![100],

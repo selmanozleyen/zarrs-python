@@ -101,7 +101,7 @@ def test_the_gate_is_a_config_knob(tmp_path: Path):
     """`raw_max_reads_per_chunk` must reach the read, and 0 must turn the path off.
 
     Values cannot see this -- both paths return the same bytes -- so it is asserted through
-    the counter. The knob is honoured per call, unlike the two pool ceilings, which only the
+    the counter. The knob is honoured per call, unlike the two pool sizes, which only the
     first read in a process gets to set.
     """
     from zarrs._internal import raw_path_stats
@@ -164,23 +164,32 @@ def test_a_column_sub_box_is_read_raw_from_the_right_columns(tmp_path: Path) -> 
     assert chunk == 0, f"{chunk} jobs still read a whole chunk"
 
 
-def test_many_banded_rows_do_not_take_the_raw_path(tmp_path: Path) -> None:
-    """The other half: more than one row of a column sub-box is one piece PER ROW, which the
-    gate refuses. Named so that widening the gate has to change a test rather than pass one."""
+def test_several_banded_rows_in_ONE_chunk_do_not_take_the_raw_path(tmp_path: Path) -> None:
+    """The other half of the gate, and the half that decides what "banded" costs.
+
+    A banded item fills one output range PER ROW, and the raw path takes an item's output as a
+    single contiguous claim -- so it can serve a band only where the item holds one row. Rows
+    scattered across chunks each give a one-row item, which is why the test above takes the
+    raw path; rows sharing a chunk give one item of several rows, which cannot.
+
+    Named so that widening the gate to split a banded claim per row has to change this test
+    rather than quietly pass it.
+    """
     path = tmp_path / "bands.zarr"
     values = np.arange(SHAPE[0] * SHAPE[1], dtype=np.float32).reshape(SHAPE)
     zarr.create_array(
         path,
         dtype=values.dtype,
         shape=values.shape,
-        chunks=(8, 16),
+        chunks=(8, 32),
         shards=(32, 64),
         compressors=None,
     )[:] = values
 
-    rows = np.array([1, 40, 91, 200])
-    got, raw, chunk = _read(path, (rows, slice(20, 36)))
+    # All inside inner chunk (0, 0): one item, three rows, a 16-wide band of each.
+    rows = np.array([1, 2, 3])
+    got, raw, chunk = _read(path, (rows, slice(8, 24)))
 
-    np.testing.assert_array_equal(got, values[np.ix_(rows, np.arange(20, 36))])
+    np.testing.assert_array_equal(got, values[np.ix_(rows, np.arange(8, 24))])
     assert raw == 0, "a multi-row band is not one contiguous output claim"
     assert chunk > 0

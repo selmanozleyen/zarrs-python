@@ -84,11 +84,11 @@ def get_codec_pipeline_impl(
             # Read at OPEN, like `num_threads` and the chunk-concurrency bounds beside them.
             # They size process-wide pools that only the first read builds, so offering them
             # per call would be offering a choice that cannot be honoured.
-            read_worker_ceiling=config.get("codec_pipeline.read_worker_ceiling", None),
-            decode_worker_ceiling=config.get(
-                "codec_pipeline.decode_worker_ceiling", None
+            read_pool_size=config.get("codec_pipeline.read_pool_size", None),
+            decode_pool_size=config.get(
+                "codec_pipeline.decode_pool_size", None
             ),
-            # Under `strict`, a ceiling the process cannot give is an error rather than a
+            # Under `strict`, a size the process cannot give is an error rather than a
             # warning -- the same switch that turns a decline into a raise.
             strict=strict,
             store_is_read_only=store.read_only,
@@ -268,7 +268,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             retrieve = self.impl.retrieve_chunk_items_and_apply_index
             # Per call because it IS a per-call decision: a threshold on how many byte-range
             # reads one chunk is worth, not a size that something was built at. The two pool
-            # ceilings are not here -- they were read when the array was opened.
+            # pool sizes are not here -- they were read when the array was opened.
             await asyncio.to_thread(
                 retrieve,
                 desc,

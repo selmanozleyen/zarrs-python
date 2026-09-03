@@ -1,6 +1,6 @@
-"""A ceiling that cannot be honoured must say so.
+"""A size that cannot be honoured must say so.
 
-The two pools are process-wide and sized by the FIRST read in the process. The ceilings are
+The two pools are process-wide and sized by the FIRST read in the process. The sizes are
 read when an ARRAY IS OPENED -- like `num_threads` and the chunk-concurrency bounds beside
 them -- so an array opened later, asking for a different width, gets the pools that exist.
 
@@ -50,7 +50,7 @@ def _read(path: Path, values: np.ndarray) -> None:
     )
 
 
-def test_a_ceiling_asked_for_after_the_pools_exist_warns(sharded_1d) -> None:
+def test_a_size_asked_for_after_the_pools_exist_warns(sharded_1d) -> None:
     path, values = sharded_1d
     with zarr.config.set(PIPELINE):
         _read(path, values)
@@ -60,11 +60,11 @@ def test_a_ceiling_asked_for_after_the_pools_exist_warns(sharded_1d) -> None:
     )
 
     # A size no earlier read can have built, so the mismatch does not depend on what ran
-    # first. The array is opened INSIDE the block: that is when the ceiling is read.
+    # first. The array is opened INSIDE the block: that is when the size is read.
     absurd = built_read + 1_000
     with (
-        zarr.config.set(PIPELINE | {"codec_pipeline.read_worker_ceiling": absurd}),
-        pytest.warns(UserWarning, match=rf"read_worker_ceiling = {absurd} was ignored"),
+        zarr.config.set(PIPELINE | {"codec_pipeline.read_pool_size": absurd}),
+        pytest.warns(UserWarning, match=rf"read_pool_size = {absurd} was ignored"),
     ):
         _read(path, values)
 
@@ -81,32 +81,32 @@ def test_strict_makes_it_an_error(sharded_1d) -> None:
     absurd = built_read + 1_000
 
     strict = PIPELINE | {
-        "codec_pipeline.read_worker_ceiling": absurd,
+        "codec_pipeline.read_pool_size": absurd,
         "codec_pipeline.strict": True,
     }
     with zarr.config.set(strict), pytest.raises(ValueError, match="was ignored"):
         _read(path, values)
 
 
-def test_the_ceiling_actually_in_force_is_silent(sharded_1d) -> None:
+def test_the_size_actually_in_force_is_silent(sharded_1d) -> None:
     """No warning when the ask matches what was built -- or the signal is noise."""
     path, values = sharded_1d
     with zarr.config.set(PIPELINE):
         _read(path, values)
     built_read, _ = pool_sizes()
 
-    with zarr.config.set(PIPELINE | {"codec_pipeline.read_worker_ceiling": built_read}):
+    with zarr.config.set(PIPELINE | {"codec_pipeline.read_pool_size": built_read}):
         with warnings.catch_warnings(record=True) as record:
             warnings.simplefilter("always", UserWarning)
             _read(path, values)
         assert [str(w.message) for w in record] == []
 
 
-def test_the_decode_ceiling_is_checked_too(sharded_1d) -> None:
+def test_the_decode_pool_size_is_checked_too(sharded_1d) -> None:
     """The two knobs are checked by one loop, and only one of them had a test.
 
     A copy-paste in the decode row -- reporting the READ pool's size against the decode ask --
-    would have been invisible: every case here set `read_worker_ceiling`, so the row that was
+    would have been invisible: every case here set `read_pool_size`, so the row that was
     wrong was also the row that never ran.
     """
     path, values = sharded_1d
@@ -117,9 +117,9 @@ def test_the_decode_ceiling_is_checked_too(sharded_1d) -> None:
 
     absurd = built_decode + 1_000
     with (
-        zarr.config.set(PIPELINE | {"codec_pipeline.decode_worker_ceiling": absurd}),
+        zarr.config.set(PIPELINE | {"codec_pipeline.decode_pool_size": absurd}),
         pytest.warns(
-            UserWarning, match=rf"decode_worker_ceiling = {absurd} was ignored"
+            UserWarning, match=rf"decode_pool_size = {absurd} was ignored"
         ),
     ):
         _read(path, values)

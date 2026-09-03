@@ -20,7 +20,7 @@ class ChunkItem:
     ) -> ChunkItem:
         r"""
         `coords` is always `None` here -- it is not a parameter, so this constructor cannot
-        build a chunk-unit item. `ChunkItems::push_entry` builds those.
+        build a chunk-unit item. `ChunkItems::push_indices` builds those.
         """
 
 @typing.final
@@ -33,7 +33,7 @@ class ChunkItems:
     """
     def __new__(cls) -> ChunkItems: ...
     def __len__(self) -> builtins.int: ...
-    def push_entry(
+    def push_indices(
         self,
         key: builtins.str,
         chunk_shape: typing.Sequence[builtins.int],
@@ -138,8 +138,8 @@ class CodecPipelineImpl:
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
         store_is_read_only: builtins.bool = False,
-        read_worker_ceiling: builtins.int | None = None,
-        decode_worker_ceiling: builtins.int | None = None,
+        read_pool_size: builtins.int | None = None,
+        decode_pool_size: builtins.int | None = None,
         strict: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
     def retrieve_chunk_items_and_apply_index(
@@ -171,7 +171,7 @@ def pool_sizes() -> tuple[builtins.int | None, builtins.int | None]:
     r"""
     The sizes the two worker pools were BUILT with, or `None` where one has not been built.
 
-    Pools are sized by the first read in the process, so a ceiling set later is silently
+    Pools are sized by the first read in the process, so a size set later is silently
     ignored. A benchmark that sets one and reports a number has to be able to say which of the
     two happened -- the repo's rule that a knob which was set is not a knob that arrived.
     """
