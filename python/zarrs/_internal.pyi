@@ -189,11 +189,6 @@ def read_unit_stats() -> tuple[builtins.int, builtins.int]:
     the same values, so a gate that refuses everything passes every values test.
     """
 
-def reset_shard_index_cache_stats() -> None:
-    r"""
-    Zero the counters, so one test's numbers are its own.
-    """
-
 def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
     r"""
     `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
