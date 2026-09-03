@@ -37,6 +37,7 @@ A `NotImplementedError` will be raised if a store is not supported.
 Standard `zarr.config` options control some functionality (see the defaults in the [config.py](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py) of `zarr-python`):
 - `threading.max_workers`: the maximum number of threads used internally by the `ZarrsCodecPipeline` on the Rust side.
   - Defaults to the number of threads in the global `rayon` thread pool if set to `None`, which is [typically the number of logical CPUs](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
+  - **Writes only.** Reads run on the two pools below, and a read never consults this. A process that performs one read holds `read_pool_size + decode_pool_size` threads for its lifetime, whatever this is set to.
 - `array.write_empty_chunks`: whether or not to store empty chunks.
   - Defaults to false if `None`. Note that checking for emptiness has some overhead, see [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#store-empty-chunks) for more info.
 
@@ -61,7 +62,7 @@ A read of a sharded array **remembers each shard's decoded index** for the durat
   - **They are read when the FIRST read in the process starts, and fix the pool sizes for the life of the process.** Setting them later, or inside a `zarr.config.set` block, has no effect on pools that already exist.
 
 - `codec_pipeline.max_row_reads_per_chunk`: how many separate reads a chunk's wanted rows may become before the fast "read the row's bytes, not the chunk" path is declined for that chunk.
-  - Defaults to `2`, and applies only where an inner chunk is a plain byte tiling (no compression), since that is what makes a row's bytes addressable inside it.
+  - Defaults to `2`. It applies only where the array is **sharded**, the sharding codec's inner chain is exactly the `bytes` codec (no filter, no compressor), and the stored byte order is the platform's. Any of those failing makes the knob inert: an unsharded uncompressed array never takes this path.
   - It trades bytes for requests. A row costs nearly as much to fetch as the whole chunk containing it, so a scattered selection that would become many small reads is served better by one large one — hence a per-chunk gate rather than an array-wide switch.
   - `0` disables the path entirely. On an uncompressed store with a scattered row draw that costs about 75% of throughput, so raise it rather than disable it unless you are measuring.
   - Unlike the two pool sizes above, this is honoured on every read, so `zarr.config.set` scopes it as expected.
@@ -69,6 +70,8 @@ A read of a sharded array **remembers each shard's decoded index** for the durat
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
   - Defaults to `False`.
+  - Read when the **array is opened**, so setting it inside a `zarr.config.set` block around a read on an already-open array does nothing.
+  - It also turns an ignored `read_pool_size` / `decode_pool_size` into a `ValueError` rather than a `UserWarning` — same principle, applied to a size the process cannot give.
 
 For example:
 ```python
@@ -90,9 +93,14 @@ zarr.config.set({
 })
 ```
 
-If the `ZarrsCodecPipeline` is pickled, and then un-pickled, and during that time one of `chunk_concurrent_minimum`, `chunk_concurrent_maximum`, or `num_threads` has changed, the newly un-pickled version will pick up the new value.  However, once a `ZarrsCodecPipeline` object has been instantiated, these values are then fixed.  This may change in the future as guidance from the `zarr` community becomes clear.
+If the `ZarrsCodecPipeline` is pickled, and then un-pickled, and during that time any of the options above has changed — `chunk_concurrent_minimum`, `chunk_concurrent_maximum`, `num_threads`, `read_pool_size`, `decode_pool_size`, `file_handle_cache_size` or `strict` — the newly un-pickled version will pick up the new value. (`read_pool_size` and `decode_pool_size` are an exception in practice: they size pools the process has already built, so the new value is read and then reported as ignored.)  However, once a `ZarrsCodecPipeline` object has been instantiated, these values are then fixed.  This may change in the future as guidance from the `zarr` community becomes clear.
 
 ## Concurrency
+
+**This section describes WRITES.** Read concurrency is `codec_pipeline.read_pool_size` and
+`codec_pipeline.decode_pool_size` above: two process-wide pools, sized by the first read, one
+issuing byte-range requests and one decoding. Neither `threading.max_workers` nor the two
+`chunk_concurrent_*` bounds applies to a read.
 
 Concurrency can be classified into two types:
 - chunk (outer) concurrency: the number of chunks retrieved/stored concurrently.
@@ -111,7 +119,31 @@ Chunk concurrency is typically favored because:
 
 ## Supported Indexing Methods
 
-The following methods will trigger use with the old zarr-python pipeline:
+**Reads and writes differ, and the list below is the WRITE list.**
+
+A *read* is served by this pipeline when the selection is one of: a contiguous span; a
+non-decreasing integer array on the first axis; a paired point selection; or a grid — the same
+positions taken from every selected index — at any rank, including rank 3 and 4. Anything else
+falls back to `zarr-python`, which returns identical values more slowly.
+
+Because a fallback is correct and only slower, it is invisible unless you ask.
+`zarrs.read_stats()` returns `(served, declined)` read batches since import, so take a delta
+around the read you care about:
+
+```python
+import zarrs
+before = zarrs.read_stats()
+values = arr[rows]
+served, declined = (n - w for n, w in zip(zarrs.read_stats(), before))
+```
+
+`zarrs.read_unit_stats()` then says which read unit served it — rows read as their own byte
+ranges against whole inner chunks — and `zarrs.pool_sizes()` says what the two pools were
+actually built with. `codec_pipeline.strict` answers the same question by raising instead of
+falling back, but it is all-or-nothing and is read when the array is opened.
+
+A *write* still requires every selector to be describable as a slice. The following will
+trigger use with the old zarr-python pipeline:
 
 1. Any `oindex` or `vindex` integer `np.ndarray` indexing with dimensionality >=3 i.e.,
 
@@ -142,7 +174,7 @@ The following methods will trigger use with the old zarr-python pipeline:
    ```
 
 
-Furthermore, using anything except contiguous (i.e., slices or consecutive integer) `np.ndarray` for numeric data will fall back to the default `zarr-python` implementation.
+Furthermore, using anything except contiguous (i.e., slices or consecutive integer) `np.ndarray` for numeric data will fall back to the default `zarr-python` implementation **on writes**. On reads, any non-decreasing integer array is served; only a decreasing or strided one declines.
 
 Please file an issue if you believe we have more holes in our coverage than we are aware of or you wish to contribute!  For example, we have an [issue in zarrs for integer-array indexing](https://github.com/LDeakin/zarrs/issues/52) that would unblock a lot the use of the rust pipeline for that use-case (very useful for mini-batch training perhaps!).
 
