@@ -288,17 +288,17 @@ def test_the_contiguity_rule() -> None:
     contiguous, which is silently wrong output rather than an error -- so it is asserted
     directly rather than only through the shapes the fixtures happen to build.
     """
-    from zarrs.utils import _contiguous_offset
+    from zarrs.utils import _is_contiguous_box
 
     # One trailing axis: any sub-range of it is contiguous.
-    assert _contiguous_offset([8], [16], (48,)) == 8
-    assert _contiguous_offset([0], [48], (48,)) == 0
-    # Partial middle axis, last axis whole: still one run, offset in whole last-axis rows.
-    assert _contiguous_offset([2, 0], [3, 10], (5, 10)) == 20
+    assert _is_contiguous_box([16], (48,))
+    assert _is_contiguous_box([48], (48,))
+    # Partial middle axis, last axis whole: still one run.
+    assert _is_contiguous_box([3, 10], (5, 10))
     # Partial LAST axis with a wider axis ahead of it: 5 blocks of 4, strided. Decline.
-    assert _contiguous_offset([0, 2], [5, 4], (5, 10)) is None
+    assert not _is_contiguous_box([5, 4], (5, 10))
     # The same partial last axis is fine once the axis ahead of it takes exactly one.
-    assert _contiguous_offset([3, 2], [1, 4], (5, 10)) == 32
+    assert _is_contiguous_box([1, 4], (5, 10))
 
 
 def test_full_width_matches_zarr_python(
