@@ -9,6 +9,8 @@ import pytest
 from zarr import config
 from zarr.storage import FsspecStore, LocalStore, MemoryStore, ZipStore
 
+from zarrs._internal import CodecPipelineImpl
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
@@ -23,6 +25,34 @@ class ArrayRequest:
     shape: tuple[int, ...]
     dtype: str
     order: MemoryOrder
+
+
+@pytest.fixture
+def entries(monkeypatch) -> dict[str, int]:
+    """Counts of batches served by each Rust entry point.
+
+    The whole point of this fixture is that a test asserting `handle == 0` -- a selection
+    DECLINES -- means what it says. An earlier version looked the entry point up with
+    `getattr(..., None)` and skipped it when absent, so a rename would have left every such
+    assertion vacuously true: the counter no test could increment is also the counter every
+    decline test compares against zero. That is this project's own "a knob that was set is not
+    a knob that arrived", inside the fixture built to prevent it. So it patches, or it fails.
+
+    There was a second entry point, `retrieve_chunks_and_apply_index` -- the fused path, which
+    an audit of the public indexing surface found nothing reaching, so it was removed. Its
+    counter is gone with it; that it no longer exists is asserted once, in
+    `test_the_fused_path_is_gone`, rather than fifteen times as a zero that cannot move.
+    """
+    counts = {"handle": 0}
+    name = "retrieve_chunk_items_and_apply_index"
+    original = getattr(CodecPipelineImpl, name)
+
+    def wrapper(self, *args, _original=original, **kwargs):
+        counts["handle"] += 1
+        return _original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CodecPipelineImpl, name, wrapper)
+    return counts
 
 
 @pytest.fixture(autouse=True)

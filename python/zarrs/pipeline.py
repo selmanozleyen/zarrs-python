@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, TypedDict
 from warnings import warn
 
 import numpy as np
 from zarr.abc.codec import Codec, CodecPipeline
+from zarr.codecs import ShardingCodec
 from zarr.codecs._v2 import V2Codec
 from zarr.core import BatchedCodecPipeline
 from zarr.core.config import config
@@ -79,6 +81,16 @@ def get_codec_pipeline_impl(
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
             ),
+            # Read at OPEN, like `num_threads` and the chunk-concurrency bounds beside them.
+            # They size process-wide pools that only the first read builds, so offering them
+            # per call would be offering a choice that cannot be honoured.
+            read_pool_size=config.get("codec_pipeline.read_pool_size", None),
+            decode_pool_size=config.get(
+                "codec_pipeline.decode_pool_size", None
+            ),
+            # Under `strict`, a size the process cannot give is an error rather than a
+            # warning -- the same switch that turns a decline into a raise.
+            strict=strict,
             store_is_read_only=store.read_only,
         )
     except TypeError as e:
@@ -151,6 +163,59 @@ class ZarrsCodecPipeline(CodecPipeline):
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
 
+    @cached_property
+    def _inner_chunk_shape(self) -> tuple[int, ...] | None:
+        """The shape of the INNERMOST unit the codec chain decodes.
+
+        Three answers, and the difference matters: a tuple is the inner chunk of a sharded
+        array; `()` means the array is NOT sharded, so its chunk is its own decode unit and
+        only an entry knows that shape; `None` means refuse.
+
+        Descends through nested sharding: the first `chunk_shape` found is the outer shard's,
+        not the decode unit.
+
+        `isinstance` and DIRECT attribute access, not `getattr(codec, "chunk_shape", None)`.
+        This is a reach into zarr-python's internals, and the two ways it can age apart are
+        not equally bad: a missing attribute read through `getattr` returns `None`, which this
+        function reports as "not sharded", which makes `_chunk_unit_args` take the SHARD shape
+        as the decode unit and describe items spanning several inner chunks -- a wrong read,
+        or the uncaught `PyRuntimeError` described at `utils.py`'s `_chunk_unit_args`.
+        Written this way, the same rename is an `AttributeError` when the array is opened.
+        """
+        # This one getattr stays: `ArrayV2Metadata` genuinely has no `codecs`, so its absence
+        # is a fact about the array rather than a fact about zarr's internals.
+        codecs = getattr(self.metadata, "codecs", ()) or ()
+        shape = None
+        while True:
+            nested = None
+            for position, codec in enumerate(codecs):
+                if not isinstance(codec, ShardingCodec):
+                    continue
+                # THE SHARDING CODEC HAS TO BE THE WHOLE CHAIN AT THIS LEVEL.
+                #
+                # A codec AFTER it compresses the whole shard, so the shard index's byte
+                # ranges no longer address the shard, and one inner chunk cannot be read on
+                # its own. A codec BEFORE it -- a `transpose`, say -- is an array-to-array
+                # step, so the elements inside an inner chunk are not in the order the
+                # selection was described against.
+                #
+                # Both decline, and the second one must, because `ShardInfo::from_codec_chain`
+                # already refuses it in Rust. Accepting it here built a handle for an array
+                # whose read then failed with "this array presents no sharding codec", and
+                # that call runs outside `read`'s `try`, so it was an uncatchable
+                # `PyRuntimeError` rather than a fallback.
+                # position == 0 == len - 1, spelled once.
+                if len(codecs) != 1:
+                    return None
+                shape = tuple(int(s) for s in codec.chunk_shape)
+                nested = codec.codecs or ()
+                break
+            if nested is None:
+                # No sharding codec anywhere in the chain: not an error, just a plain chunked
+                # array, whose chunk is what gets decoded.
+                return () if shape is None else shape
+            codecs = nested
+
     @property
     def supports_partial_decode(self) -> bool:
         return False
@@ -197,7 +262,9 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = chunk_info_for_read(batch_info, drop_axes, out.shape)
+            chunks_desc = chunk_info_for_read(
+                batch_info, drop_axes, out.shape, self._inner_chunk_shape
+            )
         except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
@@ -205,11 +272,12 @@ class ZarrsCodecPipeline(CodecPipeline):
             return None
         else:
             out: NDArrayLike = out.as_ndarray_like()
-            await asyncio.to_thread(
-                self.impl.retrieve_chunks_and_apply_index,
-                chunks_desc.chunk_info_with_indices,
-                out,
-            )
+            desc = chunks_desc.chunk_info_with_indices
+            # One entry point. `chunk_info_for_read` either produces a handle or raises, and
+            # the raise is caught above as a fall back to zarr-python -- there is no second
+            # Rust read path to choose between any more.
+            retrieve = self.impl.retrieve_chunk_items_and_apply_index
+            await asyncio.to_thread(retrieve, desc, out)
             return None
 
     async def write(
