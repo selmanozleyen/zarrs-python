@@ -9,8 +9,8 @@ knob did not pay" and "the knob never arrived" are the same observation. So the 
 and under `codec_pipeline.strict` it raises -- the same switch that turns a decline into a
 raise rather than a quiet fallback.
 
-One file, because the pools are process-wide `OnceLock`s: the first read here builds them and
-everything after is measured against that.
+One file, because the pools are process-wide: the first read here builds them and everything
+after is measured against that.
 """
 
 from __future__ import annotations
@@ -100,3 +100,26 @@ def test_the_ceiling_actually_in_force_is_silent(sharded_1d) -> None:
             warnings.simplefilter("always", UserWarning)
             _read(path, values)
         assert [str(w.message) for w in record] == []
+
+
+def test_the_decode_ceiling_is_checked_too(sharded_1d) -> None:
+    """The two knobs are checked by one loop, and only one of them had a test.
+
+    A copy-paste in the decode row -- reporting the READ pool's size against the decode ask --
+    would have been invisible: every case here set `read_worker_ceiling`, so the row that was
+    wrong was also the row that never ran.
+    """
+    path, values = sharded_1d
+    with zarr.config.set(PIPELINE):
+        _read(path, values)
+    _, built_decode = pool_sizes()
+    assert built_decode is not None
+
+    absurd = built_decode + 1_000
+    with (
+        zarr.config.set(PIPELINE | {"codec_pipeline.decode_worker_ceiling": absurd}),
+        pytest.warns(
+            UserWarning, match=rf"decode_worker_ceiling = {absurd} was ignored"
+        ),
+    ):
+        _read(path, values)

@@ -347,18 +347,21 @@ impl CodecPipelineImpl {
                 let output = Self::nparray_to_unsafe_cell_slice(value, element_size)?;
                 let output_len = output.len();
                 py.detach(|| {
-                    let Some((_, codec_options)) =
-                        chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
-                    else {
-                        return Ok(Vec::new());
-                    };
+                    // The pipeline's own options, NOT
+                    // `get_chunk_concurrent_limit_and_codec_options`. That helper's whole
+                    // product is a concurrent target for a chunk-at-a-time codec loop, and
+                    // this path has no such loop -- `retrieve_chunk_units` overrides the
+                    // target to 1 because parallelism here comes from the two pools, one job
+                    // per inner chunk. Calling it would have priced `recommended_concurrency`
+                    // on the codec chain once per batch to produce a number thrown away on
+                    // the next line.
                     self.retrieve_chunk_units(
                         shard,
                         chunk_descriptions,
                         output,
                         output_len,
                         config,
-                        &codec_options,
+                        &self.codec_options,
                     )
                 })?
             };

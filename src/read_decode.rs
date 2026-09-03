@@ -154,13 +154,19 @@ impl CodecPipelineImpl {
         // slow shard starves every decode in the process.
         //
         // The scopes nest so a reader hands its chunk straight to the decode pool, and
-        // `in_place_scope` runs the calling thread as a worker rather than leaving it idle.
+        // `in_place_scope` keeps the caller ON this thread: only work it spawns runs in the
+        // pool, and the caller blocks until the scope ends rather than stealing from it. That
+        // is deliberate and load-bearing. An owner thread that DID steal is what deadlocked an
+        // earlier design -- it picked up a decode task and parked on a channel only it could
+        // have drained. Do not "fix" this to `scope`, and do not call this from inside a rayon
+        // worker, which flips the same latch to the stealing form.
         // Both scopes block until their tasks finish, which is what keeps `&'a mut [u8]` into
         // the caller's numpy buffer valid without a raw pointer or a completion latch.
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
-        decode_pool(config.decode_ceiling).in_place_scope(|dec| {
-            read_pool(config.read_ceiling).in_place_scope(|rd| {
+        let (read_pool, decode_pool) = pools(config.read_ceiling, config.decode_ceiling);
+        decode_pool.in_place_scope(|dec| {
+            read_pool.in_place_scope(|rd| {
                 for job in jobs {
                     let (failure, ctx) = (&failure, &ctx);
                     rd.spawn(move |_| read_one(job, dec, failure, ctx));
@@ -624,7 +630,7 @@ fn raw_row_jobs<'a>(
     ctx: &'a JobContext,
     jobs: &mut Vec<Job<'a>>,
 ) -> PyResult<()> {
-    let ByteRange::FromStart(base, _) = range else {
+    let ByteRange::FromStart(base, chunk_bytes) = range else {
         return Err(PyRuntimeError::new_err(format!(
             "{}: the raw path needs a FromStart range, got {range:?}",
             item.key
@@ -644,8 +650,24 @@ fn raw_row_jobs<'a>(
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: run too large", item.key)))?;
         let (run_out, tail) = rest.split_at_mut(span.min(rest.len()));
         rest = tail;
+        let within = coords[run.start] * element_size as u64;
+        // THE SOURCE SIDE, which nothing else checks. The output side is checked below (a
+        // short piece leaves `rest` non-empty) and the chunk EXTENTS are checked in
+        // `chunk_item.rs` as the description is built. But a chunk's bytes sit inside a shard,
+        // so a coordinate past this chunk's own end still lands on real bytes -- the next
+        // chunk's -- and comes back with exactly the length asked for. `decode_one`'s raw
+        // branch compares only lengths, so that read would be silently wrong data rather than
+        // an error. One comparison here is what makes it an error instead.
+        if let Some(len) = chunk_bytes
+            && within.saturating_add(span as u64) > len
+        {
+            return Err(PyRuntimeError::new_err(format!(
+                "{}: a run at byte {within} of {span} runs past the {len} bytes the chunk holds",
+                item.key
+            )));
+        }
         let at = base
-            .checked_add(coords[run.start] * element_size as u64)
+            .checked_add(within)
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: offset overflow", item.key)))?;
         jobs.push(Job {
             key: item.key.clone(),
@@ -795,8 +817,30 @@ fn default_ceiling() -> usize {
 /// are read from `zarr.config` per call, but only the FIRST call's values build the pools; a
 /// later `with zarr.config.set(...)` around a read resizes nothing. [`pool_sizes`] reports
 /// what was actually built, so a caller can assert rather than assume.
-static READ_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-static DECODE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+/// REBUILT AFTER A FORK, which is the difference between a slow child and a hung one.
+///
+/// `fork()` copies the parent's memory but only the calling thread. A child that inherits a
+/// built pool inherits worker threads that do not exist, and the first `in_place_scope` parks
+/// the calling thread on a latch nothing will ever signal -- a permanent hang, not a
+/// slowdown. This is not a corner case: the workload this path exists for is minibatch
+/// loading, and `torch.utils.data.DataLoader(num_workers > 0)` forks by default on Linux. It
+/// only hangs when the parent read BEFORE forking, so it is data-dependent and passes every
+/// test that does not fork.
+///
+/// Keyed on the process id instead: a child sees a mismatch and builds its own. `OnceLock`
+/// cannot express that -- it has no reset reachable from a `static` -- so this is a `Mutex`
+/// around the pair, taken once per call to clone two `Arc`s.
+///
+/// The old pools are FORGOTTEN rather than dropped. `ThreadPool::drop` joins its workers, and
+/// in the child those workers were never created, so dropping is the same hang by another
+/// route. Leaking them is correct: they are a copy of memory this process never owned.
+struct Pools {
+    pid: u32,
+    read: Arc<rayon::ThreadPool>,
+    decode: Arc<rayon::ThreadPool>,
+}
+
+static POOLS: Mutex<Option<Pools>> = Mutex::new(None);
 
 fn build_pool(size: usize, name: &'static str) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
@@ -806,14 +850,26 @@ fn build_pool(size: usize, name: &'static str) -> rayon::ThreadPool {
         .expect("a thread pool of a positive size")
 }
 
-/// Threads that BLOCK on storage. Sized independently of the core count for that reason.
-fn read_pool(size: usize) -> &'static rayon::ThreadPool {
-    READ_POOL.get_or_init(|| build_pool(size, "read"))
-}
-
-/// Threads that occupy a core. This is the one genuinely bounded by parallelism.
-fn decode_pool(size: usize) -> &'static rayon::ThreadPool {
-    DECODE_POOL.get_or_init(|| build_pool(size, "decode"))
+/// The two pools, building them on first use in THIS process.
+///
+/// `read` blocks on storage and is sized independently of the core count for that reason;
+/// `decode` occupies a core and is the one genuinely bounded by parallelism.
+fn pools(read_size: usize, decode_size: usize) -> (Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>) {
+    let mut guard = POOLS.lock().expect("the pool lock is never held across a panic");
+    let pid = std::process::id();
+    if guard.as_ref().is_none_or(|p| p.pid != pid) {
+        // See `Pools`: forget, never drop. Dropping joins threads that do not exist here.
+        if let Some(stale) = guard.take() {
+            std::mem::forget(stale);
+        }
+        *guard = Some(Pools {
+            pid,
+            read: Arc::new(build_pool(read_size, "read")),
+            decode: Arc::new(build_pool(decode_size, "decode")),
+        });
+    }
+    let built = guard.as_ref().expect("just built");
+    (Arc::clone(&built.read), Arc::clone(&built.decode))
 }
 
 /// What the pools were actually BUILT with, or `None` where one has not been built yet.
@@ -822,12 +878,16 @@ fn decode_pool(size: usize) -> &'static rayon::ThreadPool {
 /// old value silently. Reporting the built size is what lets a benchmark tell "the knob did
 /// not pay" from "the knob never arrived".
 pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
-    (
-        READ_POOL.get().map(rayon::ThreadPool::current_num_threads),
-        DECODE_POOL
-            .get()
-            .map(rayon::ThreadPool::current_num_threads),
-    )
+    let guard = POOLS.lock().expect("the pool lock is never held across a panic");
+    match guard.as_ref() {
+        // A pool built by a PARENT process is not this process's pool, and reporting its size
+        // here would be the same lie `check_ceiling_arrived` exists to prevent.
+        Some(p) if p.pid == std::process::id() => (
+            Some(p.read.current_num_threads()),
+            Some(p.decode.current_num_threads()),
+        ),
+        _ => (None, None),
+    }
 }
 
 /// Say so when a ceiling asked for is not the one the pools were built with.
@@ -881,9 +941,9 @@ pub(crate) fn check_ceiling_arrived(
 /// What ONE call reads from `zarr.config` when it starts.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadConfig {
-    /// Only the FIRST call's value is used -- see [`READ_POOL`].
+    /// Only the FIRST call's value in this process is used -- see [`Pools`].
     pub(crate) read_ceiling: usize,
-    /// Only the FIRST call's value is used -- see [`READ_POOL`].
+    /// Only the FIRST call's value in this process is used -- see [`Pools`].
     pub(crate) decode_ceiling: usize,
     /// Reads a chunk may become before the raw path is declined for it; see [`RAW_MAX_READS`].
     /// Per call, and honoured on every call rather than only the first.
@@ -997,8 +1057,10 @@ fn spawn_decode<'scope, 'env>(
     'env: 'scope,
 {
     // EVERY job goes to the pool, including a raw one whose "decode" is only a
-    // `copy_from_slice`. Running raw jobs inline on the reader was tried and reverted: it cost
-    // 82% on `dense_r` cs=1 and 85% on `dense_c` strided, and was negative on 10 of 12 cells.
+    // `copy_from_slice`. Running raw jobs inline on the reader was tried and reverted. An
+    // earlier version of this comment gave magnitudes for that; they measured a different
+    // build and were retracted. Re-measured properly the effect is inside the noise floor, so
+    // the reason to keep the hand-off is the argument below, not a number.
     //
     // The argument for inlining was that a hand-off buys a queue push, a steal and a wake in
     // order to memcpy bytes already in this core's cache. That much is true and it is not the
@@ -1236,8 +1298,8 @@ mod tests {
     /// after the first read is silently ignored, so `pool_sizes` has to report what was built
     /// rather than what was asked for.
     ///
-    /// One test rather than several because the pools are process-wide `OnceLock`s and
-    /// separate `#[test]` functions run concurrently in one process, so they would race.
+    /// One test rather than several because the pools are process-wide and separate `#[test]`
+    /// functions run concurrently in one process, so they would race.
     #[test]
     fn a_pool_is_built_once_at_the_size_asked_for() {
         assert_eq!(
@@ -1246,24 +1308,25 @@ mod tests {
             "no read has run, so neither pool should exist yet"
         );
 
-        let pool = read_pool(3);
-        assert_eq!(pool.current_num_threads(), 3);
-        assert_eq!(pool_sizes().0, Some(3));
-
-        // Asking again with a different size returns the pool already built. This is the
-        // documented one-shot behaviour, not an accident, and it is why the size is reported.
-        assert_eq!(read_pool(64).current_num_threads(), 3);
-        assert_eq!(pool_sizes().0, Some(3));
-
-        // THE TWO POOLS ARE SEPARATE. The read pool is built here; the decode pool must not
-        // have been dragged into existence with it, or a read-side default would silently
-        // become the decode width.
-        assert_eq!(
-            pool_sizes().1,
-            None,
-            "building the read pool must not build the decode pool"
-        );
-        assert_eq!(decode_pool(2).current_num_threads(), 2);
+        let (read, decode) = pools(3, 2);
+        assert_eq!(read.current_num_threads(), 3);
+        assert_eq!(decode.current_num_threads(), 2);
         assert_eq!(pool_sizes(), (Some(3), Some(2)));
+
+        // Asking again with different sizes returns the pair already built. This is the
+        // documented one-shot behaviour, not an accident, and it is why the size is reported.
+        let (read, decode) = pools(64, 64);
+        assert_eq!(read.current_num_threads(), 3);
+        assert_eq!(decode.current_num_threads(), 2);
+        assert_eq!(pool_sizes(), (Some(3), Some(2)));
+
+        // BOTH OR NEITHER. An earlier version built each pool on its own first use, and a
+        // test pinned that they stayed independent. They never were in practice -- the one
+        // caller asks for both in the same line -- and keying them on a pid means one record
+        // with one answer for "was this built in THIS process".
+        assert!(
+            pool_sizes().0.is_some() == pool_sizes().1.is_some(),
+            "the pair is built together, so neither half can exist alone"
+        );
     }
 }

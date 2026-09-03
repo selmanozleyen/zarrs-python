@@ -131,3 +131,56 @@ def test_the_gate_is_a_config_knob(tmp_path: Path):
 
     np.testing.assert_array_equal(off, values[rows, :])
     np.testing.assert_array_equal(on, values[rows, :])
+
+
+def test_a_column_sub_box_is_read_raw_from_the_right_columns(tmp_path: Path) -> None:
+    """A partial trailing axis, which is the one live raw arm no values test covered.
+
+    The gate admits an item with ONE output piece, and a column sub-box gives one piece per
+    row -- so the only banded shape that reaches the raw path is a SINGLE row. There the
+    offset arithmetic changes meaning: `coords[0]` is the column offset inside the row rather
+    than a whole row's start, and `run_len` is the BAND width rather than the row width.
+
+    Every other raw test reads full width, so both of those could have been wrong and still
+    returned the right NUMBER of bytes -- which is all `decode_one`'s raw branch checks.
+    Values from the wrong columns, no error.
+    """
+    path = tmp_path / "band.zarr"
+    values = np.arange(SHAPE[0] * SHAPE[1], dtype=np.float32).reshape(SHAPE)
+    zarr.create_array(
+        path,
+        dtype=values.dtype,
+        shape=values.shape,
+        chunks=(8, 16),
+        shards=(32, 64),
+        compressors=None,
+    )[:] = values
+
+    selection = (np.array([11]), slice(20, 36))
+    got, raw, chunk = _read(path, selection)
+
+    np.testing.assert_array_equal(got, values[np.ix_([11], np.arange(20, 36))])
+    assert raw > 0, "a single banded row is the one banded shape the gate admits"
+    assert chunk == 0, f"{chunk} jobs still read a whole chunk"
+
+
+def test_many_banded_rows_do_not_take_the_raw_path(tmp_path: Path) -> None:
+    """The other half: more than one row of a column sub-box is one piece PER ROW, which the
+    gate refuses. Named so that widening the gate has to change a test rather than pass one."""
+    path = tmp_path / "bands.zarr"
+    values = np.arange(SHAPE[0] * SHAPE[1], dtype=np.float32).reshape(SHAPE)
+    zarr.create_array(
+        path,
+        dtype=values.dtype,
+        shape=values.shape,
+        chunks=(8, 16),
+        shards=(32, 64),
+        compressors=None,
+    )[:] = values
+
+    rows = np.array([1, 40, 91, 200])
+    got, raw, chunk = _read(path, (rows, slice(20, 36)))
+
+    np.testing.assert_array_equal(got, values[np.ix_(rows, np.arange(20, 36))])
+    assert raw == 0, "a multi-row band is not one contiguous output claim"
+    assert chunk > 0
