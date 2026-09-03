@@ -81,6 +81,12 @@ def row_span_selection(indptr: np.ndarray, rows: np.ndarray) -> np.ndarray:
     return np.concatenate([np.arange(indptr[r], indptr[r + 1]) for r in rows])
 
 
+# TWO of the three configs ask for a size the pools were not built at, and saying so is what
+# `check_pool_size_arrived` exists for -- so the warning here is the knob working, not a fault.
+# Left unfiltered it is a latent CI failure: `pyproject.toml` turns zarr-namespace warnings into
+# errors, and WHICH of these three runs first (so builds the pools, so stays silent) depends on
+# how xdist happens to distribute them.
+@pytest.mark.filterwarnings("ignore:.*pool_size = .* was ignored:UserWarning")
 @pytest.mark.parametrize("config", list(CONFIGS), ids=list(CONFIGS))
 @pytest.mark.parametrize(
     "n_rows",
