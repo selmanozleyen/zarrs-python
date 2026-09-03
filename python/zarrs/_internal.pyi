@@ -189,6 +189,15 @@ def read_unit_stats() -> tuple[builtins.int, builtins.int]:
     the same values, so a gate that refuses everything passes every values test.
     """
 
+def release_pools_for_fork() -> None:
+    r"""
+    Drop the two worker pools, so a `fork()` about to happen cannot inherit a held lock.
+
+    Registered from Python with `os.register_at_fork(before=...)`. See
+    [`read_decode::release_pools_for_fork`] for why the pid check inside `pools` is not enough
+    on its own: it runs under the very lock that `fork` would copy as held.
+    """
+
 def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
     r"""
     `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
