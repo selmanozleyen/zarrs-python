@@ -128,6 +128,16 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
 
     /// Every byte of every piece was written. The caller's buffer is `np.empty`, so a piece
     /// left short returns whatever was already in memory, as data.
+    /// Bytes written so far, and bytes the pieces hold. Only for the error `finished` fails
+    /// with -- a mismatch that reports neither number tells a reader nothing they can act on.
+    pub(crate) fn written(&self) -> usize {
+        self.pieces[..self.piece].iter().map(|p| p.len()).sum::<usize>() + self.at
+    }
+
+    pub(crate) fn total(&self) -> usize {
+        self.pieces.iter().map(|p| p.len()).sum()
+    }
+
     pub(crate) fn finished(&self) -> bool {
         // Everything before `piece` was filled to its end by construction, so only the
         // current piece and whatever follows it can be short.
@@ -166,7 +176,12 @@ pub(crate) fn gather(
         return Err("run length must be greater than zero".to_string());
     }
     if element_offsets.len().checked_mul(run) != Some(out.len()) {
-        return Err("output region does not match the coordinate count".to_string());
+        return Err(format!(
+            "{} offsets of {run} bytes each fill {} bytes, but the output is {}",
+            element_offsets.len(),
+            element_offsets.len().saturating_mul(run),
+            out.len()
+        ));
     }
     for (n, &c) in element_offsets.iter().enumerate() {
         // Checked, and not because a coordinate can be that large today -- they are all
@@ -212,7 +227,12 @@ pub(crate) fn gather_pieces(
     }
     let total: usize = pieces.iter().map(|p| p.len()).sum();
     if element_offsets.len().checked_mul(run) != Some(total) {
-        return Err("output pieces do not match the coordinate count".to_string());
+        return Err(format!(
+            "{} offsets of {run} bytes each fill {} bytes, but the {} pieces hold {total}",
+            element_offsets.len(),
+            element_offsets.len().saturating_mul(run),
+            pieces.len()
+        ));
     }
     let mut writer = PieceWriter::new(pieces);
     // Consecutive coordinates name ONE contiguous span of the decode and are copied as one.
@@ -237,7 +257,12 @@ pub(crate) fn gather_pieces(
         writer.write(region)?;
     }
     if !writer.finished() {
-        return Err("the gather left part of the output unwritten".to_string());
+        return Err(format!(
+            "the gather wrote {} of the {} bytes the pieces hold, leaving the rest as the \
+             caller's buffer had them",
+            writer.written(),
+            writer.total()
+        ));
     }
     Ok(())
 }
@@ -274,7 +299,12 @@ pub(crate) fn gather_runs(
         return Err("the gathered rows are too large to address".to_string());
     };
     if element_offsets.len().checked_mul(row) != Some(out.len()) {
-        return Err("output region does not match the coordinate count".to_string());
+        return Err(format!(
+            "{} offsets of {row} bytes each fill {} bytes, but the output is {}",
+            element_offsets.len(),
+            element_offsets.len().saturating_mul(row),
+            out.len()
+        ));
     }
     for (n, &c) in element_offsets.iter().enumerate() {
         for (j, &start) in starts.iter().enumerate() {

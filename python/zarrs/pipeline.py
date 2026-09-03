@@ -57,6 +57,48 @@ FALLBACK_TO_ZARR_PYTHON = (
 )
 
 
+#: `[served, declined]` read batches since import. See `read_stats`.
+_READ_COUNTS = [0, 0]
+
+
+def read_stats() -> tuple[int, int]:
+    """`(served, declined)` read batches since import.
+
+    THE THIRD READ OUTCOME. `read_unit_stats()` counts row jobs against whole-chunk jobs, and
+    both of those are *inside* this pipeline; a selection it cannot describe is handed to
+    zarr-python instead, which returns identical values more slowly. From the outside that is
+    indistinguishable from working -- which, for a pipeline whose only failure mode is "correct
+    but slow", is the one thing worth being able to ask.
+
+    Process-wide and monotonic, like the other counters here, so a caller takes a delta around
+    the read it cares about rather than resetting a global that another thread is using.
+
+    `codec_pipeline.strict` answers a nearby question -- it turns a decline into an exception --
+    but it is read when the array is opened and is all-or-nothing, so it cannot profile a mixed
+    workload.
+    """
+    served, declined = _READ_COUNTS
+    return served, declined
+
+
+def _int_knob(name: str, default: int | None) -> int | None:
+    """A `codec_pipeline.*` integer, checked HERE where its name is still in scope.
+
+    Every one of these is handed to pyo3 as a keyword argument, and pyo3 raises `TypeError`
+    for a value of the wrong type -- which the caller catches and reports as "Array is
+    unsupported by ZarrsCodecPipeline". So `read_pool_size: 8.0` disabled the whole pipeline
+    for that array, permanently and silently, and blamed the one thing the user could not
+    change. A negative value was worse: `OverflowError` is not a `TypeError`, so it escaped
+    naming no key at all.
+    """
+    value = config.get(f"codec_pipeline.{name}", default)
+    if value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+        return value
+    raise ValueError(
+        f"codec_pipeline.{name} must be a non-negative integer or None, got {value!r}"
+    )
+
+
 def get_codec_pipeline_impl(
     metadata: ArrayMetadata, store: Store, *, strict: bool
 ) -> CodecPipelineImpl | None:
@@ -70,24 +112,16 @@ def get_codec_pipeline_impl(
             array_metadata_json,
             store_config=store,
             validate_checksums=validate_checksums,
-            chunk_concurrent_minimum=config.get(
-                "codec_pipeline.chunk_concurrent_minimum", None
-            ),
-            chunk_concurrent_maximum=config.get(
-                "codec_pipeline.chunk_concurrent_maximum", None
-            ),
+            chunk_concurrent_minimum=_int_knob("chunk_concurrent_minimum", None),
+            chunk_concurrent_maximum=_int_knob("chunk_concurrent_maximum", None),
             num_threads=config.get("threading.max_workers", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
-            file_handle_cache_size=config.get(
-                "codec_pipeline.file_handle_cache_size", 0
-            ),
+            file_handle_cache_size=_int_knob("file_handle_cache_size", 0),
             # Read at OPEN, like `num_threads` and the chunk-concurrency bounds beside them.
             # They size process-wide pools that only the first read builds, so offering them
             # per call would be offering a choice that cannot be honoured.
-            read_pool_size=config.get("codec_pipeline.read_pool_size", None),
-            decode_pool_size=config.get(
-                "codec_pipeline.decode_pool_size", None
-            ),
+            read_pool_size=_int_knob("read_pool_size", None),
+            decode_pool_size=_int_knob("decode_pool_size", None),
             # Under `strict`, a size the process cannot give is an error rather than a
             # warning -- the same switch that turns a decline into a raise.
             strict=strict,
@@ -188,7 +222,7 @@ class ZarrsCodecPipeline(CodecPipeline):
         shape = None
         while True:
             nested = None
-            for position, codec in enumerate(codecs):
+            for codec in codecs:
                 if not isinstance(codec, ShardingCodec):
                     continue
                 # THE SHARDING CODEC HAS TO BE THE WHOLE CHAIN AT THIS LEVEL.
@@ -204,7 +238,6 @@ class ZarrsCodecPipeline(CodecPipeline):
                 # whose read then failed with "this array presents no sharding codec", and
                 # that call runs outside `read`'s `try`, so it was an uncatchable
                 # `PyRuntimeError` rather than a fallback.
-                # position == 0 == len - 1, spelled once.
                 if len(codecs) != 1:
                     return None
                 shape = tuple(int(s) for s in codec.chunk_shape)
@@ -266,11 +299,13 @@ class ZarrsCodecPipeline(CodecPipeline):
                 batch_info, drop_axes, out.shape, self._inner_chunk_shape
             )
         except FALLBACK_TO_ZARR_PYTHON:
+            _READ_COUNTS[1] += 1
             if self.python_impl is None:
                 raise
             await self.python_impl.read(batch_info, out, drop_axes)
             return None
         else:
+            _READ_COUNTS[0] += 1
             out: NDArrayLike = out.as_ndarray_like()
             desc = chunks_desc.chunk_info_with_indices
             # One entry point. `chunk_info_for_read` either produces a handle or raises, and
@@ -284,7 +319,7 @@ class ZarrsCodecPipeline(CodecPipeline):
                 retrieve,
                 desc,
                 out,
-                config.get("codec_pipeline.max_row_reads_per_chunk", None),
+                _int_knob("max_row_reads_per_chunk", None),
             )
             return None
 

@@ -656,6 +656,17 @@ fn read_unit_stats() -> (u64, u64) {
     )
 }
 
+/// Drop the two worker pools, so a `fork()` about to happen cannot inherit a held lock.
+///
+/// Registered from Python with `os.register_at_fork(before=...)`. See
+/// [`read_decode::release_pools_for_fork`] for why the pid check inside `pools` is not enough
+/// on its own: it runs under the very lock that `fork` would copy as held.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn release_pools_for_fork() {
+    read_decode::release_pools_for_fork();
+}
+
 /// The sizes the two worker pools were BUILT with, or `None` where one has not been built.
 ///
 /// Pools are sized by the first read in the process, so a size set later is silently
@@ -673,6 +684,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(shard_index_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(read_unit_stats, m)?)?;
     m.add_function(wrap_pyfunction!(pool_sizes, m)?)?;
+    m.add_function(wrap_pyfunction!(release_pools_for_fork, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
     m.add_class::<chunk_item::ChunkItems>()?;

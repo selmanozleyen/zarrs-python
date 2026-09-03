@@ -475,8 +475,20 @@ pub(crate) fn build_chunk_unit_items(
                 index_at(b - 1)?
             )));
         }
-        let out_lo = out_starts[0] + a as u64;
-        let out_hi = out_starts[0] + b as u64;
+        // CHECKED. `out_starts` and `out_widths` arrive raw from `push_indices`, which is a
+        // `#[pymethods]` taking arbitrary vectors -- so these are the same trust boundary the
+        // extent checks above guard, and every other bound in this file is already checked.
+        // Unchecked, a large start wraps to a small one in release and the comparison below
+        // then passes.
+        let span = |start: u64, offset: u64| -> PyResult<u64> {
+            start.checked_add(offset).ok_or_else(|| {
+                PyErr::new::<PyValueError, _>(format!(
+                    "an output range at {start} of {offset} is too large to address"
+                ))
+            })
+        };
+        let out_lo = span(out_starts[0], a as u64)?;
+        let out_hi = span(out_starts[0], b as u64)?;
         if out_hi > out_extent {
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "output subset {out_lo}..{out_hi} is past the output extent {out_extent}",
@@ -488,19 +500,14 @@ pub(crate) fn build_chunk_unit_items(
         // landed on inner chunk 0, which is correct only while a shard holds exactly one.
         let mut chunk_ranges = Vec::with_capacity(chunk_shape.len());
         chunk_ranges.push(lo..hi);
-        chunk_ranges.extend(
-            trailing
-                .iter()
-                .map(|(start, width)| *start..*start + *width),
-        );
+        for (start, width) in &trailing {
+            chunk_ranges.push(*start..span(*start, *width)?);
+        }
         let mut out_ranges = Vec::with_capacity(shape.len());
         out_ranges.push(out_lo..out_hi);
-        out_ranges.extend(
-            out_starts[1..]
-                .iter()
-                .zip(&out_widths[1..])
-                .map(|(start, width)| *start..start + width),
-        );
+        for (start, width) in out_starts[1..].iter().zip(&out_widths[1..]) {
+            out_ranges.push(*start..span(*start, *width)?);
+        }
         items.push(ChunkItem {
             key: key.clone(),
             chunk_subset: ArraySubset::new_with_ranges(&chunk_ranges),

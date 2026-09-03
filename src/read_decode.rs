@@ -163,7 +163,7 @@ impl CodecPipelineImpl {
         // the caller's numpy buffer valid without a raw pointer or a completion latch.
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
-        let (read_pool, decode_pool) = pools(config.read_pool_size, config.decode_pool_size);
+        let (read_pool, decode_pool) = pools(config.read_pool_size, config.decode_pool_size)?;
         decode_pool.in_place_scope(|dec| {
             read_pool.in_place_scope(|rd| {
                 for job in jobs {
@@ -790,8 +790,17 @@ impl<'a> DisjointBytes<'a> {
 /// An absent chunk contributes only fill value, repeated.
 fn fill(out: &mut [u8], fill_value: &FillValue, size: usize) -> Result<(), String> {
     let bytes = fill_value.as_ne_bytes();
+    if size == 0 {
+        // Both the modulo and the `chunks_exact_mut` below divide by this. No real data type
+        // reaches here with a zero size, but this is the last divisor in the file that is not
+        // a `NonZeroU64`, and the guard below would let a zero-length fill value through.
+        return Err("an element size of zero has no fill".to_string());
+    }
     if bytes.len() != size {
-        return Err("the fill value is not one element wide".to_string());
+        return Err(format!(
+            "the fill value is {} bytes wide, not the {size} one element holds",
+            bytes.len()
+        ));
     }
     // `chunks_exact_mut` would leave `out.len() % size` bytes exactly as `np.empty` gave
     // them and still return Ok -- uninitialised memory handed back as fill value. Every piece
@@ -812,7 +821,13 @@ fn fill(out: &mut [u8], fill_value: &FillValue, size: usize) -> Result<(), Strin
 fn element_offsets_of(item: &ChunkItem) -> PyResult<&Arc<[u64]>> {
     item.element_offsets
         .as_ref()
-        .ok_or("this path requires chunk-unit items, which carry coordinates")
+        .ok_or_else(|| {
+            format!(
+                "{}: this path requires chunk-unit items, and this one carries no element \
+                 offsets -- it was built by `ChunkItem::new`, which only the write path uses",
+                item.key
+            )
+        })
         .map_py_err::<PyRuntimeError>()
 }
 
@@ -888,36 +903,83 @@ struct Pools {
 
 static POOLS: Mutex<Option<Pools>> = Mutex::new(None);
 
-fn build_pool(size: usize, name: &'static str) -> rayon::ThreadPool {
+/// A size the operating system cannot give is the CALLER'S ERROR, not a process-ending panic.
+///
+/// `ThreadPoolBuilder::build` fails whenever a worker thread cannot be spawned --
+/// `read_pool_size = 10_000_000`, or a modest value under a cgroup `pids.max`, which Slurm and
+/// Kubernetes both set. This used to `expect`, and the panic unwound through the live `POOLS`
+/// guard: the mutex was then poisoned, and every later read in the process died on an
+/// `.expect("the pool lock is never held across a panic")` asserting the opposite of what had
+/// happened. Lowering the config did not recover it; only a new interpreter did.
+fn build_pool(size: usize, name: &'static str) -> PyResult<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(size)
         .thread_name(move |i| format!("zarrs-{name}-{i}"))
         .build()
-        .expect("a thread pool of a positive size")
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "codec_pipeline.{name}_pool_size = {size} could not be built: {e}"
+            ))
+        })
+}
+
+/// The `POOLS` guard, recovering rather than dying if some earlier caller poisoned it.
+///
+/// Poison means a panic happened while the lock was held. The data behind it is a
+/// `Option<Pools>` -- there is no half-updated state a panic can leave, because the only write
+/// is a whole-struct assignment -- so continuing is safe and refusing is not more correct, it
+/// is just a second failure on top of the first.
+fn pools_guard() -> std::sync::MutexGuard<'static, Option<Pools>> {
+    POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The two pools, building them on first use in THIS process.
 ///
 /// `read` blocks on storage and is sized independently of the core count for that reason;
 /// `decode` occupies a core and is the one genuinely bounded by parallelism.
-fn pools(read_size: usize, decode_size: usize) -> (Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>) {
-    let mut guard = POOLS
-        .lock()
-        .expect("the pool lock is never held across a panic");
+fn pools(
+    read_size: usize,
+    decode_size: usize,
+) -> PyResult<(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>)> {
+    let mut guard = pools_guard();
     let pid = std::process::id();
     if guard.as_ref().is_none_or(|p| p.pid != pid) {
+        // Both BEFORE either is stored, so a failure to build the second leaves the slot empty
+        // rather than half-filled, and the next call retries from a clean state.
+        let read = Arc::new(build_pool(read_size, "read")?);
+        let decode = Arc::new(build_pool(decode_size, "decode")?);
         // See `Pools`: forget, never drop. Dropping joins threads that do not exist here.
         if let Some(stale) = guard.take() {
             std::mem::forget(stale);
         }
         *guard = Some(Pools {
             pid,
-            read: Arc::new(build_pool(read_size, "read")),
-            decode: Arc::new(build_pool(decode_size, "decode")),
+            read,
+            decode,
         });
     }
     let built = guard.as_ref().expect("just built");
-    (Arc::clone(&built.read), Arc::clone(&built.decode))
+    Ok((Arc::clone(&built.read), Arc::clone(&built.decode)))
+}
+
+/// Drop the pools so a `fork()` cannot inherit a LOCKED mutex, or threads that do not exist.
+///
+/// The pid check in [`pools`] rebuilds in a child -- but it runs INSIDE `POOLS.lock()`, and
+/// `fork` copies a held mutex as held, with an owner thread that does not exist in the child.
+/// A child that forked while any thread was inside `pools` therefore blocks on that lock for
+/// ever, and the pid check never gets to run. `tests/test_fork_safety.py` cannot see this: it
+/// forks with no read in flight.
+///
+/// So the fix is upstream of the lock. `python/zarrs/pipeline.py` registers this with
+/// `os.register_at_fork(before=...)`, which `multiprocessing` and therefore
+/// `torch.utils.data.DataLoader` both honour. It blocks until no thread holds the lock, empties
+/// the slot, and releases -- so the fork sees a free, empty mutex and both sides rebuild on
+/// next use. Dropping here is correct and cheap: this is the PARENT, its workers exist, and a
+/// fork happens once per epoch against pools that cost microseconds to rebuild.
+pub(crate) fn release_pools_for_fork() {
+    let mut guard = pools_guard();
+    // Dropped, not forgotten -- the opposite of the child case. See `Pools`.
+    *guard = None;
 }
 
 /// What the pools were actually BUILT with, or `None` where one has not been built yet.
@@ -926,9 +988,7 @@ fn pools(read_size: usize, decode_size: usize) -> (Arc<rayon::ThreadPool>, Arc<r
 /// old value silently. Reporting the built size is what lets a benchmark tell "the knob did
 /// not pay" from "the knob never arrived".
 pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
-    let guard = POOLS
-        .lock()
-        .expect("the pool lock is never held across a panic");
+    let guard = pools_guard();
     match guard.as_ref() {
         // A pool built by a PARENT process is not this process's pool, and reporting its size
         // here would be the same lie `check_pool_size_arrived` exists to prevent.
@@ -957,12 +1017,15 @@ pub(crate) fn check_pool_size_arrived(
     config: ReadConfig,
     strict: bool,
 ) -> PyResult<()> {
+    // ONE acquisition of the pool lock, not one per knob. This runs on every read, and the
+    // loop below used to call `pool_sizes()` in each arm.
+    let (built_read, built_decode) = pool_sizes();
     for (built, asked, knob) in [
-        (pool_sizes().0, config.read_pool_size, "read_pool_size"),
-        (pool_sizes().1, config.decode_pool_size, "decode_pool_size"),
+        (built_read, config.read_pool_size, "read_pool_size"),
+        (built_decode, config.decode_pool_size, "decode_pool_size"),
     ] {
         // Only when a pool EXISTS and differs. Before the first read there is nothing to
-        // contradict, and the ordinary case costs one atomic load per pool per call.
+        // contradict.
         let Some(built) = built.filter(|built| *built != asked) else {
             continue;
         };
@@ -970,7 +1033,7 @@ pub(crate) fn check_pool_size_arrived(
             "codec_pipeline.{knob} = {asked} was ignored: the pool was built with {built} \
              threads by the first read in this process and cannot be resized. Set it before \
              the array that does the first read is opened, or call \
-             zarrs._internal.pool_sizes() for what was built."
+             zarrs.pool_sizes() for what was built."
         );
         // `codec_pipeline.strict` already means "do not paper over what this pipeline cannot
         // do" -- it turns a decline into a raise instead of a silent fallback to zarr-python.
@@ -1169,7 +1232,13 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
 
     let shape = ctx.decode_shape.as_slice();
     let elements: u64 = shape.iter().map(|s| s.get()).product();
-    let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
+    // CHECKED, because this number sizes the buffer an `unsafe` view is built over below: the
+    // view's safety obligation is that the slice holds at least `product(shape) * size` bytes,
+    // and a wrapped `needed` makes the view describe more elements than exist.
+    let needed = elements
+        .checked_mul(size as u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| format!("a decode unit of {elements} elements of {size} bytes cannot be addressed"))?;
     // GROW only. `clear()` then `resize(needed, 0)` zero-fills the whole buffer, and
     // `decode_into` below writes every byte of it -- the view is built over
     // `new_with_shape`, the entire chunk -- so the fill is overwritten without ever being
@@ -1193,8 +1262,23 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     // returns `Ok` without filling it would already be broken; this makes such a bug quieter
     // rather than causing one.
     if scratch.len() < needed {
+        // `try_reserve`, then resize. A plain `resize` that cannot allocate goes through
+        // `handle_alloc_error`, which ABORTS -- it kills the interpreter with no Python
+        // traceback and no chance to fall back. `needed` comes from array metadata, which
+        // nothing here validates against the machine's memory.
+        scratch
+            .try_reserve(needed - scratch.len())
+            .map_err(|e| format!("could not hold a decode unit of {needed} bytes: {e}"))?;
         scratch.resize(needed, 0);
     }
+    // Debug builds POISON the reused region. Grow-only scratch means a codec that returns
+    // `Ok` without filling its target leaves the PREVIOUS chunk's elements showing through --
+    // and because the buffer belongs to a rayon worker, that chunk may be from an earlier
+    // call, on a different array. Zeros would be an obvious wrong answer; real values from
+    // somewhere else are a plausible one. This makes a test able to see the difference,
+    // without costing a release build anything.
+    #[cfg(debug_assertions)]
+    scratch[..needed].fill(0xAA);
     let scratch = &mut scratch[..needed];
 
     let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
@@ -1367,14 +1451,14 @@ mod tests {
             "no read has run, so neither pool should exist yet"
         );
 
-        let (read, decode) = pools(3, 2);
+        let (read, decode) = pools(3, 2).expect("a pool of three threads");
         assert_eq!(read.current_num_threads(), 3);
         assert_eq!(decode.current_num_threads(), 2);
         assert_eq!(pool_sizes(), (Some(3), Some(2)));
 
         // Asking again with different sizes returns the pair already built. This is the
         // documented one-shot behaviour, not an accident, and it is why the size is reported.
-        let (read, decode) = pools(64, 64);
+        let (read, decode) = pools(64, 64).expect("already built");
         assert_eq!(read.current_num_threads(), 3);
         assert_eq!(decode.current_num_threads(), 2);
         assert_eq!(pool_sizes(), (Some(3), Some(2)));

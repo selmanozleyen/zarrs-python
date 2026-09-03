@@ -217,6 +217,25 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
+def _split_axis_ok(indices: np.ndarray, out_axis_sel: Any) -> bool:
+    """Whether axis 0's indices can be served against this output selection.
+
+    Three predicates that have to hold together, and did hold together in three different
+    orders at three call sites. They are a WRONG-DATA gate, not a performance one: a descending
+    selection against a contiguous output slice puts the right rows at the wrong offsets, and a
+    negative index reaches `push_indices` as an enormous unsigned one.
+
+    `indices.size == 0` is not checked here -- `_chunk_unit_args` treats an empty axis as
+    nothing to describe while `_point_unit_args` has already refused it by then, and folding
+    that difference in would make one of them wrong.
+    """
+    return (
+        _is_sorted_integer_axis(indices, out_axis_sel)
+        and not (indices < 0).any()
+        and _output_run_matches(indices, out_axis_sel)
+    )
+
+
 def _is_whole_axis(sel: Any, extent: int) -> bool:
     """Does this selector take the axis whole, start to finish, step 1?"""
     return (
@@ -474,14 +493,12 @@ def _chunk_unit_args(
         # A sub-box on a trailing axis makes each index its own run, so the span form does
         # not describe it and the elements are named after all.
         indices = np.arange(span[0], span[1], dtype=np.int64)
-    if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
+    if indices.size == 0:
         return None
     indices = indices.astype(np.int64, copy=False)
-    if (indices < 0).any():
+    if not _split_axis_ok(indices, out_axis_sel):
         return None
     start = out_axis_sel.start or 0
-    if not _output_run_matches(indices, out_axis_sel):
-        return None
 
     pushes = []
     # One item per combination of bands across the trailing axes. Rank 1 has no lanes, so the
@@ -502,10 +519,11 @@ def _chunk_unit_args(
         # length, so nothing but reading it could have caught it.
         if not _is_contiguous_box(band_widths, tuple(shape[1:])):
             return None
-        # Gate only. Rust re-derives the offset from these same starts and rechecks the shape,
-        # because `push_indices` is reachable from Python with arbitrary arguments and a single
-        # fused offset is not a checkable thing.
-        within = [s % int(inner_shape[a + 1]) for a, s in enumerate(band_starts)]
+        # The same rule against the INNER extents, which is what actually gets decoded. Rust
+        # re-derives the in-chunk offset from these same starts and rechecks the shape --
+        # `push_indices` is reachable from Python with arbitrary arguments and a single fused
+        # offset is not a checkable thing -- so this is a gate and nothing more. An earlier
+        # version computed the reduced starts here as well and never read them.
         if not _is_contiguous_box(band_widths, tuple(inner_shape[1:])):
             return None
         pushes.append(
@@ -571,9 +589,7 @@ def _point_unit_args(
         return None
     rows = chunk_sel[0].astype(np.int64, copy=False)
     out_axis_sel = out_sel[0]
-    if not _is_sorted_integer_axis(rows, out_axis_sel):
-        return None
-    if (rows < 0).any() or not _output_run_matches(rows, out_axis_sel):
+    if not _split_axis_ok(rows, out_axis_sel):
         return None
     # Still the GRID condition: one subchunk on every axis after the split, or `locate`
     # cannot keep walking axis 0 alone.
@@ -674,9 +690,7 @@ def _grid_unit_args(
     out_axis_sel = out_sel[0]
     if rows is None or rows.size == 0:
         return None
-    if not _is_sorted_integer_axis(rows, out_axis_sel):
-        return None
-    if (rows < 0).any() or not _output_run_matches(rows, out_axis_sel):
+    if not _split_axis_ok(rows, out_axis_sel):
         return None
 
     sels = []
