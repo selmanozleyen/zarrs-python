@@ -82,7 +82,9 @@ fn inner_chunk_is_plain_bytes(array_metadata_json: &str) -> bool {
         // here means the chunk cannot be entered part-way, which is the whole reason the
         // chunk is the read unit. Matched as ONE codec rather than by collecting the names
         // that parse, so a codec carrying no `name` cannot be skipped over silently.
-        let [only] = inner.as_slice() else { return false };
+        let [only] = inner.as_slice() else {
+            return false;
+        };
         if only.get("name").and_then(|n| n.as_str()) != Some("bytes") {
             return false;
         }
@@ -664,7 +666,6 @@ fn read_unit_stats() -> (u64, u64) {
 fn pool_sizes() -> (Option<usize>, Option<usize>) {
     read_decode::pool_sizes()
 }
-
 
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -23,8 +23,7 @@ use pyo3::{PyResult, Python};
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
     ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
-    CodecOptions, FillValue,
-    ravel_indices,
+    CodecOptions, FillValue, ravel_indices,
 };
 use zarrs::storage::byte_range::ByteRange;
 use zarrs::storage::{MaybeBytes, ReadableWritableListableStorage, StoreKey};
@@ -36,8 +35,8 @@ use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 
 use crate::utils::{
-    PyCodecErrExt as _, PyErrExt as _, offset_runs, gather, gather_pieces, gather_runs,
-    key_partial_decoder,
+    PyCodecErrExt as _, PyErrExt as _, gather, gather_pieces, gather_runs, key_partial_decoder,
+    offset_runs,
 };
 
 /// The per-array state a decode needs, shared by every job of a call.
@@ -286,14 +285,19 @@ impl CodecPipelineImpl {
             }
 
             let decoder = if depth == 0 {
-                self.decoder_or_read(&self.shard_decoders, &mut decoders.shards, &item.key, || {
-                    shard.level_decoder(
-                        0,
-                        key_partial_decoder(&self.store, &item.key),
-                        item.shape.clone(),
-                        &ctx.codec_options,
-                    )
-                })?
+                self.decoder_or_read(
+                    &self.shard_decoders,
+                    &mut decoders.shards,
+                    &item.key,
+                    || {
+                        shard.level_decoder(
+                            0,
+                            key_partial_decoder(&self.store, &item.key),
+                            item.shape.clone(),
+                            &ctx.codec_options,
+                        )
+                    },
+                )?
             } else {
                 // A subshard's index is not its shard's, so the path taken to reach it is
                 // part of the key.
@@ -348,8 +352,7 @@ impl CodecPipelineImpl {
             return Err(PyRuntimeError::new_err(format!(
                 "{}: the item starts {} into its inner chunk on the split axis, so the extent \
                  it was grouped by is not the one that gets decoded",
-                item.key,
-                offset[0],
+                item.key, offset[0],
             )));
         }
         let held = item.chunk_subset.shape();
@@ -493,7 +496,9 @@ fn carve<'a>(
         // Nothing ties the two together: `ChunkItem` is constructible from Python and skips
         // the element-count check when element_offsets are present. If they disagree, a piece is
         // carved at the wrong offset and the read returns the right number of wrong elements.
-        if (element_offsets.len() as u64).checked_mul(item.run_len) != Some(item.subset.num_elements()) {
+        if (element_offsets.len() as u64).checked_mul(item.run_len)
+            != Some(item.subset.num_elements())
+        {
             return Err(PyRuntimeError::new_err(format!(
                 "{} wants {} coordinates of {} elements but its output subset holds {}",
                 item.key,
@@ -896,7 +901,9 @@ fn build_pool(size: usize, name: &'static str) -> rayon::ThreadPool {
 /// `read` blocks on storage and is sized independently of the core count for that reason;
 /// `decode` occupies a core and is the one genuinely bounded by parallelism.
 fn pools(read_size: usize, decode_size: usize) -> (Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>) {
-    let mut guard = POOLS.lock().expect("the pool lock is never held across a panic");
+    let mut guard = POOLS
+        .lock()
+        .expect("the pool lock is never held across a panic");
     let pid = std::process::id();
     if guard.as_ref().is_none_or(|p| p.pid != pid) {
         // See `Pools`: forget, never drop. Dropping joins threads that do not exist here.
@@ -919,7 +926,9 @@ fn pools(read_size: usize, decode_size: usize) -> (Arc<rayon::ThreadPool>, Arc<r
 /// old value silently. Reporting the built size is what lets a benchmark tell "the knob did
 /// not pay" from "the knob never arrived".
 pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
-    let guard = POOLS.lock().expect("the pool lock is never held across a panic");
+    let guard = POOLS
+        .lock()
+        .expect("the pool lock is never held across a panic");
     match guard.as_ref() {
         // A pool built by a PARENT process is not this process's pool, and reporting its size
         // here would be the same lie `check_pool_size_arrived` exists to prevent.
@@ -950,11 +959,7 @@ pub(crate) fn check_pool_size_arrived(
 ) -> PyResult<()> {
     for (built, asked, knob) in [
         (pool_sizes().0, config.read_pool_size, "read_pool_size"),
-        (
-            pool_sizes().1,
-            config.decode_pool_size,
-            "decode_pool_size",
-        ),
+        (pool_sizes().1, config.decode_pool_size, "decode_pool_size"),
     ] {
         // Only when a pool EXISTS and differs. Before the first read there is nothing to
         // contradict, and the ordinary case costs one atomic load per pool per call.
@@ -1228,7 +1233,9 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     // can straddle two pieces.
     let result = if let [piece] = &mut job.out[..] {
         match job.grid {
-            Some((starts, run)) => gather_runs(&scratch[..], job.element_offsets, starts, run, piece, size),
+            Some((starts, run)) => {
+                gather_runs(&scratch[..], job.element_offsets, starts, run, piece, size)
+            }
             None => gather(&scratch[..], job.element_offsets, job.run_len, piece, size),
         }
     } else if job.grid.is_some() {
@@ -1236,7 +1243,13 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         // construction. Reaching here means an item was built with both, which nothing does.
         Err("a grid selection cannot also span several output pieces".to_string())
     } else {
-        gather_pieces(&scratch[..], job.element_offsets, job.run_len, &mut job.out, size)
+        gather_pieces(
+            &scratch[..],
+            job.element_offsets,
+            job.run_len,
+            &mut job.out,
+            size,
+        )
     };
     result.map_err(|e| format!("{}: {e}", job.key))
 }

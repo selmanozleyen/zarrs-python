@@ -211,7 +211,9 @@ fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u6
     // does not touch.
     let box_ = ArraySubset::new_with_start_shape(starts.to_vec(), widths.to_vec())
         .map_py_err::<PyValueError>()?;
-    let runs = box_.contiguous_indices(extents).map_py_err::<PyValueError>()?;
+    let runs = box_
+        .contiguous_indices(extents)
+        .map_py_err::<PyValueError>()?;
     if runs.len() != 1 {
         return Err(PyErr::new::<PyValueError, _>(format!(
             "selecting {widths:?} of {extents:?} is strided within one index, and an \

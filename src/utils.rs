@@ -59,7 +59,10 @@ pub fn is_whole_chunk(item: &ChunkItem) -> bool {
 ///
 /// `offset_runs`, not `runs`: a run of COORDINATES is not `gather_runs`' run of elements
 /// inside one index's row, and this file needs both words in the same loop.
-pub(crate) fn offset_runs(element_offsets: &[u64], run_len: u64) -> impl Iterator<Item = Range<usize>> + '_ {
+pub(crate) fn offset_runs(
+    element_offsets: &[u64],
+    run_len: u64,
+) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut start = 0usize;
     std::iter::from_fn(move || {
         if start >= element_offsets.len() {
@@ -67,7 +70,9 @@ pub(crate) fn offset_runs(element_offsets: &[u64], run_len: u64) -> impl Iterato
         }
         let mut end = start + 1;
         // Checked: a coordinate near u64::MAX must end the run, not wrap into the next one.
-        while end < element_offsets.len() && element_offsets[end - 1].checked_add(run_len) == Some(element_offsets[end]) {
+        while end < element_offsets.len()
+            && element_offsets[end - 1].checked_add(run_len) == Some(element_offsets[end])
+        {
             end += 1;
         }
         let run = start..end;

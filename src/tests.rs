@@ -520,7 +520,10 @@ fn test_raw_runs_counts_reads_not_rows() {
     );
     // A DUPLICATE steps by 0, so it breaks the run: the same row twice is two output
     // pieces and cannot be served by one read.
-    assert_eq!(crate::read_decode::row_read_count(&c(&[3, 3, 4]), run_len), 2);
+    assert_eq!(
+        crate::read_decode::row_read_count(&c(&[3, 3, 4]), run_len),
+        2
+    );
 }
 
 /// The row path may only be taken when the stored bytes are already in this machine's order.
@@ -552,13 +555,17 @@ fn test_raw_is_refused_for_a_foreign_byte_order() {
     );
     // No `endian` at all is only legal for a single-byte element, which has no order to get
     // wrong -- so it stays eligible.
-    assert!(crate::inner_chunk_is_plain_bytes(&meta(r#"{"name":"bytes"}"#)));
+    assert!(crate::inner_chunk_is_plain_bytes(&meta(
+        r#"{"name":"bytes"}"#
+    )));
     // A codec beside the byte reinterpretation still declines, and one carrying no name
     // cannot be skipped past to reach that conclusion.
     assert!(!crate::inner_chunk_is_plain_bytes(&meta(
         r#"{"name":"bytes"},{"name":"crc32c"}"#
     )));
-    assert!(!crate::inner_chunk_is_plain_bytes(&meta(r#"{"configuration":{}}"#)));
+    assert!(!crate::inner_chunk_is_plain_bytes(&meta(
+        r#"{"configuration":{}}"#
+    )));
 }
 
 /// A coordinate near the top of the range ENDS a run instead of starting the next one.
