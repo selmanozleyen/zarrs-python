@@ -1122,20 +1122,28 @@ def test_the_fused_path_is_gone() -> None:
     )
 
 
+
+# zarr warns that this layout disables partial reads. That IS the layout under test.
+@pytest.mark.filterwarnings("ignore:Combining a `sharding_indexed` codec")
 def test_a_codec_BEFORE_sharding_is_refused(
     tmp_path: Path, entries: dict[str, int]
 ) -> None:
-    """A `transpose` ahead of the sharding codec is ordinary, legal Zarr v3 -- and it reorders
-    the elements inside an inner chunk, so a selection described against the array's own axis
-    order does not name the bytes it thinks it does.
+    """A `transpose` OUTSIDE the sharding codec reorders the elements of the whole shard, so a
+    selection described against the array's own axis order does not name the bytes it thinks
+    it does.
 
-    Rust already refused it: `ShardInfo::from_codec_chain` returns `None` for any chain that is
-    not exactly one sharding codec. Python did not -- it only looked for a codec AFTER the
-    sharding one -- so it built a handle for an array the read could not serve, and the read
-    raised "this array presents no sharding codec". That call runs outside `read`'s `try`, so
-    it was an uncatchable `PyRuntimeError` where the base pipeline simply read the array.
+    Rust already refused it -- `ShardInfo::from_codec_chain` takes a chain that is exactly one
+    sharding codec. Python only looked for a codec AFTER the sharding one, so it built a
+    handle for an array the read could not serve and the read raised "this array presents no
+    sharding codec". That call runs outside `read`'s `try`, so it was an uncatchable
+    `PyRuntimeError` where the base pipeline simply read the array.
+
+    `serializer=` is what puts the transpose outside. The ordinary spelling -- `shards=` with
+    `filters=` -- nests it INSIDE the shard, where the inner chunk still decodes to the
+    array's own order and the chunk-unit path serves it correctly; that case is covered by
+    `test_transpose[with_sharding=True]`.
     """
-    from zarr.codecs import TransposeCodec
+    from zarr.codecs import BytesCodec, ShardingCodec, TransposeCodec
 
     values = np.arange(64 * 32, dtype=np.float32).reshape(64, 32)
     path = tmp_path / "transposed.zarr"
@@ -1143,10 +1151,9 @@ def test_a_codec_BEFORE_sharding_is_refused(
         path,
         shape=values.shape,
         dtype=values.dtype,
-        chunks=(8, 32),
-        shards=(32, 32),
+        chunks=(32, 32),
         filters=[TransposeCodec(order=(1, 0))],
-        compressors=None,
+        serializer=ShardingCodec(chunk_shape=(8, 32), codecs=[BytesCodec()]),
     )[:] = values
 
     rows = np.array([1, 9, 40, 63])
