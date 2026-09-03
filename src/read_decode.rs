@@ -930,7 +930,9 @@ fn build_pool(size: usize, name: &'static str) -> PyResult<rayon::ThreadPool> {
 /// is a whole-struct assignment -- so continuing is safe and refusing is not more correct, it
 /// is just a second failure on top of the first.
 fn pools_guard() -> std::sync::MutexGuard<'static, Option<Pools>> {
-    POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    POOLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The two pools, building them on first use in THIS process.
@@ -952,11 +954,7 @@ fn pools(
         if let Some(stale) = guard.take() {
             std::mem::forget(stale);
         }
-        *guard = Some(Pools {
-            pid,
-            read,
-            decode,
-        });
+        *guard = Some(Pools { pid, read, decode });
     }
     let built = guard.as_ref().expect("just built");
     Ok((Arc::clone(&built.read), Arc::clone(&built.decode)))
@@ -1238,7 +1236,9 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let needed = elements
         .checked_mul(size as u64)
         .and_then(|n| usize::try_from(n).ok())
-        .ok_or_else(|| format!("a decode unit of {elements} elements of {size} bytes cannot be addressed"))?;
+        .ok_or_else(|| {
+            format!("a decode unit of {elements} elements of {size} bytes cannot be addressed")
+        })?;
     // GROW only. `clear()` then `resize(needed, 0)` zero-fills the whole buffer, and
     // `decode_into` below writes every byte of it -- the view is built over
     // `new_with_shape`, the entire chunk -- so the fill is overwritten without ever being

@@ -131,7 +131,11 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
     /// Bytes written so far, and bytes the pieces hold. Only for the error `finished` fails
     /// with -- a mismatch that reports neither number tells a reader nothing they can act on.
     pub(crate) fn written(&self) -> usize {
-        self.pieces[..self.piece].iter().map(|p| p.len()).sum::<usize>() + self.at
+        self.pieces[..self.piece]
+            .iter()
+            .map(|p| p.len())
+            .sum::<usize>()
+            + self.at
     }
 
     pub(crate) fn total(&self) -> usize {
