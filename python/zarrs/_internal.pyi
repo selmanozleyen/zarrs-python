@@ -147,7 +147,10 @@ class CodecPipelineImpl:
         strict: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
     def retrieve_chunk_items_and_apply_index(
-        self, chunk_items: ChunkItems, value: numpy.typing.NDArray[typing.Any]
+        self,
+        chunk_items: ChunkItems,
+        value: numpy.typing.NDArray[typing.Any],
+        max_row_reads_per_chunk: builtins.int | None = None,
     ) -> None:
         r"""
         The one read entry point.
@@ -177,6 +180,13 @@ def pool_sizes() -> tuple[builtins.int | None, builtins.int | None]:
     two happened -- the repo's rule that a knob which was set is not a knob that arrived.
     """
 
+def read_unit_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    `(row, chunk)` jobs since the run began: rows read as their own byte range, against whole
+    inner chunks read and decoded.
+
+    Exposed so a test can assert the row path was TAKEN. Correctness cannot: both paths return
+    the same values, so a gate that refuses everything passes every values test.
     """
 
 def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
