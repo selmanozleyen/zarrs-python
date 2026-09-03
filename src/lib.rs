@@ -577,7 +577,6 @@ fn pool_sizes() -> (Option<usize>, Option<usize>) {
     read_decode::pool_sizes()
 }
 
-
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
