@@ -331,8 +331,17 @@ impl CodecPipelineImpl {
         // `ChunkItems` handle; anything it cannot describe raises and falls back to
         // zarr-python in Python. The check stays because this is a `#[pymethods]` boundary,
         // and what it guards is an exclusive output slice.
+        // An empty batch is a read of NOTHING -- `X[[]]` -- and nothing is servable. There is
+        // no output to leave uninitialised, so this returns rather than falling to the refusal
+        // below, which is where it used to land. Python serves it too (`chunk_info_for_read`
+        // hands back an empty handle); both halves have to agree or the fix is half a fix.
+        if chunk_descriptions.is_empty() {
+            return Ok(());
+        }
         if let (true, Some(shard)) = (
-            !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.element_offsets.is_some()),
+            chunk_descriptions
+                .iter()
+                .all(|i| i.element_offsets.is_some()),
             self.shard.as_ref(),
         ) {
             // Confined to this block so no live `&mut` exists when the fallback below takes
@@ -389,9 +398,7 @@ impl CodecPipelineImpl {
         Err(PyRuntimeError::new_err(format!(
             "a batch of {} items could not be served: {}",
             chunk_descriptions.len(),
-            if chunk_descriptions.is_empty() {
-                "it is empty"
-            } else if self.shard.is_none() {
+            if self.shard.is_none() {
                 "this array presents no sharding codec, so there is no decode unit to group by"
             } else {
                 "an item arrived without coordinates"

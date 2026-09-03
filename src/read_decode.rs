@@ -338,6 +338,20 @@ impl CodecPipelineImpl {
         // 48 elements that chunk holds. In bounds, wrong data, no error. `push_indices` takes
         // arbitrary arguments from Python, so this is a trust boundary rather than an
         // invariant the caller can be assumed to keep.
+        // AXIS 0 MUST START AT THE CHUNK. Every correct caller groups by the real inner
+        // extent, so a group's first index is a multiple of it and this offset is zero. A
+        // caller passing an extent that DIVIDES the real one -- inner 4 where the chunk is 8
+        // -- gets a group at `lo = 4`, which fits inside the chunk and so passes the extent
+        // check below, but whose element offsets were built for a 4-row unit and address the
+        // FIRST four rows of an eight-row chunk. In bounds, wrong data, no error.
+        if offset.first().is_some_and(|at| *at != 0) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{}: the item starts {} into its inner chunk on the split axis, so the extent \
+                 it was grouped by is not the one that gets decoded",
+                item.key,
+                offset[0],
+            )));
+        }
         let held = item.chunk_subset.shape();
         if held.len() != offset.len()
             || held
@@ -658,7 +672,16 @@ fn row_jobs<'a>(
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: run too large", item.key)))?;
         let (run_out, tail) = rest.split_at_mut(span.min(rest.len()));
         rest = tail;
-        let within = element_offsets[run.start] * element_size as u64;
+        // `checked_mul`, like every other offset computation here. A wrap would produce a
+        // small `within` that then PASSES the bound below, land inside a real chunk, and come
+        // back at exactly the length asked for -- which is all `decode_one`'s row branch
+        // compares. No selection builds offsets that large, but `push_indices` is reachable
+        // from Python with arbitrary arguments.
+        let within = element_offsets[run.start]
+            .checked_mul(element_size as u64)
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!("{}: element offset overflow", item.key))
+            })?;
         // THE SOURCE SIDE, which nothing else checks. The output side is checked below (a
         // short piece leaves `rest` non-empty) and the chunk EXTENTS are checked in
         // `chunk_item.rs` as the description is built. But a chunk's bytes sit inside a shard,
@@ -764,6 +787,16 @@ fn fill(out: &mut [u8], fill_value: &FillValue, size: usize) -> Result<(), Strin
     let bytes = fill_value.as_ne_bytes();
     if bytes.len() != size {
         return Err("the fill value is not one element wide".to_string());
+    }
+    // `chunks_exact_mut` would leave `out.len() % size` bytes exactly as `np.empty` gave
+    // them and still return Ok -- uninitialised memory handed back as fill value. Every piece
+    // reaching here is a whole number of elements today, because `output_pieces` builds them
+    // as `contiguous_elements * element_size`; this is what keeps that true.
+    if out.len() % size != 0 {
+        return Err(format!(
+            "a fill piece of {} bytes is not a whole number of {size}-byte elements",
+            out.len()
+        ));
     }
     for slot in out.chunks_exact_mut(size) {
         slot.copy_from_slice(bytes);

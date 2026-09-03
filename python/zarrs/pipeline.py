@@ -191,10 +191,21 @@ class ZarrsCodecPipeline(CodecPipeline):
             for position, codec in enumerate(codecs):
                 if not isinstance(codec, ShardingCodec):
                     continue
-                # A codec AFTER the sharding codec compresses the whole shard, so the shard
-                # index's byte ranges no longer address the shard. One inner chunk cannot be
-                # read on its own; decline.
-                if position != len(codecs) - 1:
+                # THE SHARDING CODEC HAS TO BE THE WHOLE CHAIN AT THIS LEVEL.
+                #
+                # A codec AFTER it compresses the whole shard, so the shard index's byte
+                # ranges no longer address the shard, and one inner chunk cannot be read on
+                # its own. A codec BEFORE it -- a `transpose`, say -- is an array-to-array
+                # step, so the elements inside an inner chunk are not in the order the
+                # selection was described against.
+                #
+                # Both decline, and the second one must, because `ShardInfo::from_codec_chain`
+                # already refuses it in Rust. Accepting it here built a handle for an array
+                # whose read then failed with "this array presents no sharding codec", and
+                # that call runs outside `read`'s `try`, so it was an uncatchable
+                # `PyRuntimeError` rather than a fallback.
+                # position == 0 == len - 1, spelled once.
+                if len(codecs) != 1:
                     return None
                 shape = tuple(int(s) for s in codec.chunk_shape)
                 nested = codec.codecs or ()
