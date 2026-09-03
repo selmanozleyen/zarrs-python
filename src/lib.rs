@@ -658,21 +658,11 @@ fn pool_sizes() -> (Option<usize>, Option<usize>) {
     read_decode::pool_sizes()
 }
 
-/// Zero the counters, so one test's numbers are its own.
-#[gen_stub_pyfunction]
-#[pyfunction]
-fn reset_shard_index_cache_stats() {
-    use std::sync::atomic::Ordering;
-    read_decode::INDEX_CALL_HITS.store(0, Ordering::Relaxed);
-    read_decode::INDEX_ARRAY_HITS.store(0, Ordering::Relaxed);
-    read_decode::INDEX_BUILDS.store(0, Ordering::Relaxed);
-}
 
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(shard_index_cache_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(reset_shard_index_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(read_unit_stats, m)?)?;
     m.add_function(wrap_pyfunction!(pool_sizes, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;

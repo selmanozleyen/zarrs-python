@@ -41,19 +41,23 @@ class ChunkItems:
         indices: numpy.typing.NDArray[numpy.int64],
         out_starts: typing.Sequence[builtins.int],
         out_widths: typing.Sequence[builtins.int],
-        inner: typing.Sequence[builtins.int],
+        inner_shape: typing.Sequence[builtins.int],
         elem_starts: typing.Sequence[builtins.int] = [],
     ) -> None:
         r"""
         Build one batch entry's items and append them.
 
         `indices` select along AXIS 0 and are checked here: non-negative, non-decreasing, and
-        inside the chunk extent. So is `out_start` -- entries must be pushed in increasing
-        order, and one that would reuse output another entry already owns is refused.
+        inside the chunk extent.
 
-        Axes after the first are taken WHOLE and must be the same extent in `chunk_shape` and
-        in `shape`; that is checked too. It is what makes one index one contiguous run, and
-        the rank-N case the 1-D case with a run length.
+        `out_starts` is NOT checked against entries already pushed. It was once -- see the
+        comment in the body for why that check could not judge a banded entry and was removed.
+        Disjointness is enforced downstream instead, by `DisjointBytes`, which vends every
+        output range from a forward-only cursor and so cannot hand the same byte out twice.
+
+        Axes after the first may be taken WHOLE or as one contiguous band, described by
+        `out_starts`, `out_widths` and `elem_starts` -- so one selected index is still one
+        contiguous run, and the rank-N case is the 1-D case with a run length.
 
         One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
         since the output subset is bounded against it. A larger one describes bytes the buffer
@@ -67,7 +71,7 @@ class ChunkItems:
         first: builtins.int,
         count: builtins.int,
         out_start: builtins.int,
-        inner: builtins.int,
+        inner_extent: builtins.int,
     ) -> None:
         r"""
         Push a contiguous SPAN of the split axis, without naming its elements.
@@ -93,7 +97,7 @@ class ChunkItems:
         starts: numpy.typing.NDArray[numpy.uint64],
         run: builtins.int,
         out_start: builtins.int,
-        inner: builtins.int,
+        inner_extent: builtins.int,
     ) -> None:
         r"""
         Push a GRID selection: the same columns taken from every selected index.
@@ -111,7 +115,7 @@ class ChunkItems:
         indices: numpy.typing.NDArray[numpy.int64],
         offsets: numpy.typing.NDArray[numpy.uint64],
         out_start: builtins.int,
-        inner: builtins.int,
+        inner_extent: builtins.int,
     ) -> None:
         r"""
         Push a POINT selection: one element per index, each naming its own offset inside that

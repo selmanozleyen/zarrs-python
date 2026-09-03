@@ -18,6 +18,8 @@ import numpy as np
 import pytest
 import zarr
 
+from zarrs._internal import shard_index_cache_stats
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -26,6 +28,16 @@ CHUNK = 1_024
 SHARD = 4_096
 
 ZARRS = {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}
+
+
+def cache_delta(before: tuple[int, int, int]) -> tuple[int, int, int]:
+    """`(call_hits, array_hits, builds)` since `before`.
+
+    A DELTA rather than a reset, so these assertions survive anything else in the process
+    touching the same counters -- another test, another array, a different worker. The
+    row-unit counters are read the same way, and for the same reason.
+    """
+    return tuple(now - was for now, was in zip(shard_index_cache_stats(), before, strict=True))
 
 
 @pytest.fixture
@@ -62,14 +74,29 @@ def test_repeated_integer_reads_agree(
     path, truth = array
     selection = np.sort(np.random.default_rng(0).choice(N, size=300, replace=False))
 
+    before = shard_index_cache_stats()
     with zarr.config.set(ZARRS):
         z = zarr.open_array(path, mode="r")
         first = z[selection]
+        after_first = cache_delta(before)
         for _ in range(3):
             np.testing.assert_array_equal(z[selection], first)
     np.testing.assert_array_equal(first, truth[selection])
     # Otherwise every test here would pass while the cache was never consulted.
     assert entries["handle"] > 0
+
+    # AND SO WOULD EVERY TEST HERE if the cache never engaged: values and timing are both
+    # identical whether an index is remembered or re-read. `N // SHARD` shards are touched, so
+    # the first read builds each one once and the three after it must build nothing.
+    _, _, first_builds = after_first
+    _, array_hits, builds = cache_delta(before)
+    assert first_builds == N // SHARD, (
+        f"the first read built {first_builds} indexes for {N // SHARD} shards"
+    )
+    assert builds == first_builds, (
+        f"{builds - first_builds} indexes were rebuilt on a read-only array"
+    )
+    assert array_hits > 0, "nothing was served from the per-array cache"
 
 
 @pytest.mark.parametrize("mode", ["r+", "a"])
@@ -83,6 +110,7 @@ def test_a_partial_write_then_an_integer_read(
     touched = np.arange(CHUNK, CHUNK + 200)
     untouched = np.arange(N - 200, N)
 
+    before = shard_index_cache_stats()
     with zarr.config.set(ZARRS):
         z = zarr.open_array(path, mode=mode)
         np.testing.assert_array_equal(z[touched], expected[touched])
@@ -93,6 +121,16 @@ def test_a_partial_write_then_an_integer_read(
         np.testing.assert_array_equal(z[touched], expected[touched])
         np.testing.assert_array_equal(z[untouched], expected[untouched])
         np.testing.assert_array_equal(z[:], expected)
+
+    # The values above are right whether or not a stale index was used, because the write did
+    # not move any bytes. What makes this test about the cache is that nothing was remembered
+    # ACROSS the reads: the per-array cache is the one that could go stale, and on a writable
+    # store it must never fill.
+    _, array_hits, builds = cache_delta(before)
+    assert array_hits == 0, (
+        f"{array_hits} indexes came from the per-array cache on a mode={mode!r} array"
+    )
+    assert builds > 0, "no index was read at all, so the counter proves nothing"
 
 
 def test_a_write_that_falls_back_to_zarr_python(array: tuple[Path, np.ndarray]) -> None:
