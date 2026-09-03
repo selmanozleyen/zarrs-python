@@ -279,7 +279,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             retrieve = self.impl.retrieve_chunk_items_and_apply_index
             # Per call because it IS a per-call decision: a threshold on how many byte-range
             # reads one chunk is worth, not a size that something was built at. The two pool
-            # pool sizes are not here -- they were read when the array was opened.
+            # sizes are not here -- they were read when the array was opened.
             await asyncio.to_thread(
                 retrieve,
                 desc,
