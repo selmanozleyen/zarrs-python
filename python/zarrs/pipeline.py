@@ -9,6 +9,7 @@ from warnings import warn
 
 import numpy as np
 from zarr.abc.codec import Codec, CodecPipeline
+from zarr.codecs import ShardingCodec
 from zarr.codecs._v2 import V2Codec
 from zarr.core import BatchedCodecPipeline
 from zarr.core.config import config
@@ -172,22 +173,31 @@ class ZarrsCodecPipeline(CodecPipeline):
 
         Descends through nested sharding: the first `chunk_shape` found is the outer shard's,
         not the decode unit.
+
+        `isinstance` and DIRECT attribute access, not `getattr(codec, "chunk_shape", None)`.
+        This is a reach into zarr-python's internals, and the two ways it can age apart are
+        not equally bad: a missing attribute read through `getattr` returns `None`, which this
+        function reports as "not sharded", which makes `_chunk_unit_args` take the SHARD shape
+        as the decode unit and describe items spanning several inner chunks -- a wrong read,
+        or the uncaught `PyRuntimeError` described at `utils.py`'s `_chunk_unit_args`.
+        Written this way, the same rename is an `AttributeError` when the array is opened.
         """
+        # This one getattr stays: `ArrayV2Metadata` genuinely has no `codecs`, so its absence
+        # is a fact about the array rather than a fact about zarr's internals.
         codecs = getattr(self.metadata, "codecs", ()) or ()
         shape = None
         while True:
             nested = None
             for position, codec in enumerate(codecs):
-                chunk_shape = getattr(codec, "chunk_shape", None)
-                if chunk_shape is None:
+                if not isinstance(codec, ShardingCodec):
                     continue
                 # A codec AFTER the sharding codec compresses the whole shard, so the shard
                 # index's byte ranges no longer address the shard. One inner chunk cannot be
                 # read on its own; decline.
                 if position != len(codecs) - 1:
                     return None
-                shape = tuple(int(s) for s in chunk_shape)
-                nested = getattr(codec, "codecs", ()) or ()
+                shape = tuple(int(s) for s in codec.chunk_shape)
+                nested = codec.codecs or ()
                 break
             if nested is None:
                 # No sharding codec anywhere in the chain: not an error, just a plain chunked

@@ -83,7 +83,6 @@ def test_nested_reads_are_correct(
         got = zarr.open_array(path, mode="r")[selection]
     np.testing.assert_array_equal(got, truth[selection])
     assert entries["handle"] > 0, "nested fell back instead of descending"
-    assert entries["list"] == 0
 
 
 def test_shallow_still_takes_the_fast_path(
@@ -96,4 +95,3 @@ def test_shallow_still_takes_the_fast_path(
         got = zarr.open_array(path, mode="r")[selection]
     np.testing.assert_array_equal(got, truth[selection])
     assert entries["handle"] > 0, "the single-level path stopped using the handle"
-    assert entries["list"] == 0

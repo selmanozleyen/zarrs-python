@@ -775,13 +775,20 @@ def chunk_info_for_read(
     # A generator would be consumed by the eligibility test, and the ordinary route needs
     # to read the same entries again if that test fails.
     entries = list(_as_int64_batch_info(batch_info))
+    if not entries:
+        # `X[np.array([], dtype=int)]` is a valid read of nothing, not a selection this path
+        # cannot serve. Every pass below is `all(...)` over the entries, which is vacuously
+        # true on an empty list -- but the guards read `unit_args and all(...)`, so an empty
+        # batch fell past all three to the raise, and under `codec_pipeline.strict` that is
+        # an error where zarr-python returns an empty array.
+        return RustChunkInfo(ChunkItems(), write_empty_chunks=True)
 
     # All or nothing: one ineligible entry sends the whole batch down the ordinary route.
     unit_args = [
         _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
         for entry in entries
     ]
-    if unit_args and all(args is not None for args in unit_args):
+    if all(args is not None for args in unit_args):
         handle = ChunkItems()
         # An entry straddling an inner-chunk boundary on a trailing axis describes one item
         # per band, so this is a list of lists.
@@ -801,7 +808,7 @@ def chunk_info_for_read(
         _point_unit_args(entry, shape, drop_axes, inner_chunk_shape)
         for entry in entries
     ]
-    if point_args and all(args is not None for args in point_args):
+    if all(args is not None for args in point_args):
         handle = ChunkItems()
         for args in point_args:
             handle.push_points(*args)
@@ -811,7 +818,7 @@ def chunk_info_for_read(
     grid_args = [
         _grid_unit_args(entry, shape, drop_axes, inner_chunk_shape) for entry in entries
     ]
-    if grid_args and all(args is not None for args in grid_args):
+    if all(args is not None for args in grid_args):
         handle = ChunkItems()
         for args in grid_args:
             handle.push_grid(*args)

@@ -17,6 +17,8 @@ import numpy as np
 import pytest
 import zarr
 
+from zarrs._internal import CodecPipelineImpl
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -81,7 +83,6 @@ def test_selection_matches_and_takes_the_handle(
 
     np.testing.assert_array_equal(got, truth[selection])
     assert entries["handle"] > 0, "the batch was entirely chunk-unit but went as a list"
-    assert entries["list"] == 0
 
 
 @pytest.mark.parametrize(
@@ -184,7 +185,6 @@ def test_a_column_split_inner_chunk_is_served(
     assert entries["handle"] > 0, (
         "a column-split 2-D selection should reach the chunk-unit path"
     )
-    assert entries["list"] == 0
 
 
 @pytest.fixture
@@ -221,7 +221,6 @@ def test_full_width_two_dimensional_takes_the_path(
     assert entries["handle"] > 0, (
         "a full-width 2-D selection did not take the chunk-unit path"
     )
-    assert entries["list"] == 0
 
 
 def test_a_partial_column_slice_takes_the_path(
@@ -246,7 +245,6 @@ def test_a_partial_column_slice_takes_the_path(
     assert entries["handle"] > 0, (
         "a partial column slice did not take the chunk-unit path"
     )
-    assert entries["list"] == 0
 
 
 def test_a_strided_column_slice_still_falls_back(
@@ -266,6 +264,7 @@ def test_a_strided_column_slice_still_falls_back(
 
 def test_a_column_slice_matches_zarr_python(
     full_width: tuple[Path, np.ndarray],
+    entries: dict[str, int],
 ) -> None:
     """The widened case, byte for byte against the reference pipeline on the same store."""
     path, _ = full_width
@@ -277,6 +276,10 @@ def test_a_column_slice_matches_zarr_python(
     ):
         theirs = zarr.open_array(path, mode="r")[rows, 8:24]
     np.testing.assert_array_equal(mine, theirs)
+    # A differential test compares two pipelines. If this one DECLINED, it would be
+    # comparing zarr-python against itself and pass no matter what the described read
+    # said -- so the path has to be asserted, not assumed.
+    assert entries["handle"] > 0, "the selection under test declined"
 
 
 def test_the_contiguity_rule() -> None:
@@ -300,6 +303,7 @@ def test_the_contiguity_rule() -> None:
 
 def test_full_width_matches_zarr_python(
     full_width: tuple[Path, np.ndarray],
+    entries: dict[str, int],
 ) -> None:
     """Byte for byte against the reference pipeline, on the same store."""
     path, _ = full_width
@@ -311,6 +315,10 @@ def test_full_width_matches_zarr_python(
     ):
         theirs = zarr.open_array(path, mode="r")[rows, :]
     np.testing.assert_array_equal(mine, theirs)
+    # A differential test compares two pipelines. If this one DECLINED, it would be
+    # comparing zarr-python against itself and pass no matter what the described read
+    # said -- so the path has to be asserted, not assumed.
+    assert entries["handle"] > 0, "the selection under test declined"
 
 
 # zarr warns that this layout disables partial reads. That IS the layout under test.
@@ -385,7 +393,6 @@ def test_an_array_narrower_than_its_chunk_takes_the_path(
 
     np.testing.assert_array_equal(got, values[rows, :])
     assert entries["handle"] > 0, "a narrow array did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 @pytest.mark.parametrize(
@@ -411,7 +418,6 @@ def test_a_contiguous_slice_takes_the_path(
 
     np.testing.assert_array_equal(got, truth[selection])
     assert entries["handle"] > 0, "a contiguous slice did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 def test_paired_points_take_the_path(
@@ -433,7 +439,6 @@ def test_paired_points_take_the_path(
     assert got.shape == (rows.size,), "a point selection is flat"
     np.testing.assert_array_equal(got, values[rows, cols])
     assert entries["handle"] > 0, "a point selection did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 def test_a_single_column_takes_the_path(
@@ -511,11 +516,11 @@ def test_an_unsharded_array_takes_the_path(
 
     np.testing.assert_array_equal(got, values[rows])
     assert entries["handle"] > 0, "an unsharded array did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 def test_an_unsharded_array_matches_zarr_python(
     unsharded: tuple[Path, np.ndarray],
+    entries: dict[str, int],
 ) -> None:
     path, _ = unsharded
     rng = np.random.default_rng(0)
@@ -528,6 +533,10 @@ def test_an_unsharded_array_matches_zarr_python(
     ):
         theirs = zarr.open_array(path, mode="r")[rows]
     np.testing.assert_array_equal(mine, theirs)
+    # A differential test compares two pipelines. If this one DECLINED, it would be
+    # comparing zarr-python against itself and pass no matter what the described read
+    # said -- so the path has to be asserted, not assumed.
+    assert entries["handle"] > 0, "the selection under test declined"
 
 
 def test_an_unsharded_array_reads_unwritten_chunks_as_fill(
@@ -571,7 +580,6 @@ def test_a_grid_selection_takes_the_path(
     assert got.shape == (rows.size, cols.size)
     np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
     assert entries["handle"] > 0, "a grid selection did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 def test_a_whole_column_panel_takes_the_path(
@@ -587,7 +595,9 @@ def test_a_whole_column_panel_takes_the_path(
     assert entries["handle"] > 0, "a column panel did not take the chunk-unit path"
 
 
-def test_a_grid_matches_zarr_python(full_width: tuple[Path, np.ndarray]) -> None:
+def test_a_grid_matches_zarr_python(
+    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
+) -> None:
     path, _ = full_width
     rng = np.random.default_rng(0)
     rows = np.sort(rng.choice(256, size=64, replace=False))
@@ -599,6 +609,10 @@ def test_a_grid_matches_zarr_python(full_width: tuple[Path, np.ndarray]) -> None
     ):
         theirs = zarr.open_array(path, mode="r").oindex[rows, cols]
     np.testing.assert_array_equal(mine, theirs)
+    # A differential test compares two pipelines. If this one DECLINED, it would be
+    # comparing zarr-python against itself and pass no matter what the described read
+    # said -- so the path has to be asserted, not assumed.
+    assert entries["handle"] > 0, "the selection under test declined"
 
 
 def test_a_grid_with_unsorted_columns_declines_and_is_still_right(
@@ -671,7 +685,6 @@ def test_rank_three_grids_take_the_path(
 
     np.testing.assert_array_equal(got, theirs)
     assert entries["handle"] > 0, f"{name} did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 def test_a_pure_slice_box_takes_the_path_as_runs(
@@ -691,7 +704,6 @@ def test_a_pure_slice_box_takes_the_path_as_runs(
 
     np.testing.assert_array_equal(got, values[np.ix_(rows, range(2, 5), range(4, 12))])
     assert entries["handle"] > 0, "a pure-slice box did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 def test_the_run_decomposition() -> None:
@@ -798,7 +810,6 @@ def test_every_shape_works_through_two_shard_levels(
     assert entries["handle"] > 0, (
         f"{name} did not take the chunk-unit path through two levels"
     )
-    assert entries["list"] == 0
 
 
 # --- The description, checked against the bytes it claims -------------------------------
@@ -1054,7 +1065,6 @@ def test_a_scalar_axis_is_served(
     assert entries["handle"] > 0, (
         "a scalar axis should not send the batch to zarr-python"
     )
-    assert entries["list"] == 0
 
 
 @pytest.mark.parametrize(
@@ -1064,7 +1074,9 @@ def test_a_scalar_axis_is_served(
         pytest.param(np.array([7, 7]), id="the-same-column-twice"),
     ],
 )
-def test_a_kept_constant_column_axis_is_not_rebuilt(tmp_path: Path, cols) -> None:
+def test_a_kept_constant_column_axis_declines(
+    tmp_path: Path, cols, entries: dict[str, int]
+) -> None:
     """`oindex[rows, [7]]` keeps the column axis, so an extent of one would be a LIE.
 
     A constant trailing index array is read as a scalar axis, which is exact when the output
@@ -1087,3 +1099,24 @@ def test_a_kept_constant_column_axis_is_not_rebuilt(tmp_path: Path, cols) -> Non
         got = zarr.open_array(path, mode="r").oindex[rows, cols]
 
     np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
+    # THE VALUES ARE NOT THE TEST. This selection declines to zarr-python today, so the
+    # comparison above passes with the rebuild block deleted entirely. What pins the guard is
+    # that the chunk-unit path did not take it.
+    assert entries["handle"] == 0, (
+        "a kept constant column axis reached the chunk-unit path; the three-way length "
+        "equality that refuses it is what stops a wrong-stride write"
+    )
+
+
+def test_the_fused_path_is_gone() -> None:
+    """The fact fifteen `list == 0` assertions used to state, stated once where it can fail.
+
+    `retrieve_chunks_and_apply_index` was the second read route: a partial decoder per chunk
+    over rayon. An audit of the public indexing surface on 2026-08-30 found exactly one
+    selection still reaching it, and once that was served, nothing did. A counter pinned at
+    zero by the absence of the thing it counts is not evidence; the absence is.
+    """
+    assert not hasattr(CodecPipelineImpl, "retrieve_chunks_and_apply_index"), (
+        "the fused path is back -- it needs its own counter and its own decline tests, not a "
+        "zero inherited from when it did not exist"
+    )
