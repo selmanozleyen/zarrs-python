@@ -99,15 +99,18 @@ One pool for both means a thread parked on input/output is unavailable to decomp
 core busy decompressing is not issuing reads. Two pools with work-stealing let each side run at
 its own rate.
 
-**What was tried and lost:** per-call worker threads drawing an equal share of a global ceiling.
+**What was tried and lost:** per-call worker threads drawing an equal share of a global budget.
 Three reasons it failed, all in the doc comments: the share is a snapshot taken when every
 caller has just arrived and is never recomputed; integer division strands capacity outright; and
 a partition blocked on input/output cannot lend to one that is starved.
 
 **The consequence a reviewer should push on:** the pools are process-wide and sized by the
-*first* read. That is why the ceilings are read when an array is opened rather than per call —
-offering a per-call choice that cannot be honoured is worse than not offering it. A ceiling that
-cannot be honoured now warns, or raises under `codec_pipeline.strict`.
+*first* read. That is why the two sizes are read when an array is opened rather than per call —
+offering a per-call choice that cannot be honoured is worse than not offering it. A size that
+cannot be honoured now warns, or raises under `codec_pipeline.strict`. The knobs are
+`codec_pipeline.read_pool_size` and `codec_pipeline.decode_pool_size`; `0` on either means "as
+many threads as the machine has", which is the opposite of what `0` means on the two knobs
+beside them, and the README now says so.
 
 ### Decision 3: describe a selection as runs, not as elements
 
@@ -151,7 +154,7 @@ is then arithmetic, so you can fetch just that row's bytes and skip decoding ent
 **What it trades:** bytes for requests. A row costs nearly what the chunk holding it costs to
 *fetch* — the request count is the same either way, only the volume differs. So it is gated per
 item: take the path only where a chunk's wanted rows collapse to a handful of reads.
-`raw_max_reads_per_chunk` is that threshold, default 2, and zero disables the path.
+`max_row_reads_per_chunk` is that threshold, default 2, and zero disables the path.
 
 The counter that matters is **reads, not rows**: 64 consecutive rows are one read, 64 scattered
 ones are 64. Consecutive rows are merged into one range — without that, a selection of 8-row
@@ -206,11 +209,38 @@ nothing checks that an output box fits its output row; `_step1_span` in Python i
 enforcement. A band spilling past its row would be silent. Cheap to close, and should be closed
 when the band split grows.
 
+**A `transpose` outside the sharding codec declines.** Legal Zarr v3, and the elements inside a
+shard are then not in the array's own order. It reads through zarr-python instead. (A transpose
+*inside* the shard — the ordinary `filters=` spelling — is served normally.)
+
 **Formatting has never been run on this branch** — `cargo fmt` was applied only to the stack's
 own new code, and the repository's own continuous integration rewrites files and then fails on
 the diff. That job does not currently run on the fork, so nothing is red today.
 
 ---
+
+## What review has already found and closed
+
+Kept short, because a reviewer's time is better spent on what is still open. Every one of these
+came from a review pass with no context, and every one is fixed with a test that fails without
+the fix:
+
+- **A `fork()`ed child hung forever.** The pools are process-wide, and `fork` copies memory but
+  only the calling thread — so a child inherited worker threads that do not exist and parked on
+  a latch nothing would signal. `DataLoader(num_workers>0)` forks by default. Keyed on the
+  process id now, and the stale pair is forgotten rather than dropped (dropping joins those same
+  absent threads).
+- **Big-endian arrays read wrong on the row path.** The `bytes` codec reverses multi-byte
+  elements when the array's order is not the platform's; the row path copies verbatim. The gate
+  now requires native order.
+- **The row path checked its output side and not its source.** A chunk's bytes sit inside a
+  shard, so an offset past this chunk's end lands on the next chunk's bytes at exactly the length
+  asked for.
+- **`X[[]]` raised under `strict`** where zarr-python returns an empty array — three
+  all-or-nothing passes each also required a non-empty list, and `all()` over an empty list is
+  already true.
+- **Fifteen assertions could not fail**, and the fixture they used would have gone silently
+  vacuous on a rename — inside the fixture written to prevent exactly that.
 
 ## What a reviewer should attack first
 
@@ -220,7 +250,7 @@ the diff. That job does not currently run on the fork, so nothing is red today.
    whether that argument holds.
 2. **Process-wide pools.** They are sized by the first read and never resized. Ask what happens
    under a PyTorch `DataLoader` with worker processes, or when two arrays with different
-   ceilings are open at once.
+   pool sizes are open at once.
 3. **Scope.** Roughly how much of 5,912 lines helps anyone who is not reading scattered rows
    from sharded two-dimensional arrays? That is a fair question and the answer is honestly "less
    than half".
