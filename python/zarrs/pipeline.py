@@ -277,15 +277,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             # the raise is caught above as a fall back to zarr-python -- there is no second
             # Rust read path to choose between any more.
             retrieve = self.impl.retrieve_chunk_items_and_apply_index
-            # Per call because it IS a per-call decision: a threshold on how many byte-range
-            # reads one chunk is worth, not a size that something was built at. The two pool
-            # pool sizes are not here -- they were read when the array was opened.
-            await asyncio.to_thread(
-                retrieve,
-                desc,
-                out,
-                config.get("codec_pipeline.max_row_reads_per_chunk", None),
-            )
+            await asyncio.to_thread(retrieve, desc, out)
             return None
 
     async def write(
