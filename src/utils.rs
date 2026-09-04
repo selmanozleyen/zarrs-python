@@ -210,7 +210,10 @@ pub(crate) fn gather(
         };
         // The END of the run_bytes is what has to be in bounds, not its start: a coordinate inside
         // `scratch` whose run_bytes walks off the end would otherwise read past the decode.
-        let Some(element) = src.checked_add(run_bytes).and_then(|end| scratch.get(src..end)) else {
+        let Some(element) = src
+            .checked_add(run_bytes)
+            .and_then(|end| scratch.get(src..end))
+        else {
             return Err(format!(
                 "coordinate {c} plus {run_len} elements is outside the {} decoded",
                 scratch.len() / size

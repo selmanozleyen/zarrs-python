@@ -98,11 +98,7 @@ struct CallDecoders {
 /// at `lo = 4`, which fits inside the chunk and so passes the first check, but whose element
 /// offsets were built for a four-row unit and address the FIRST four rows of an eight-row
 /// chunk. In bounds, wrong data, no error again.
-fn item_is_one_decode_unit(
-    item: &ChunkItem,
-    offset: &[u64],
-    unit: &[NonZeroU64],
-) -> PyResult<()> {
+fn item_is_one_decode_unit(item: &ChunkItem, offset: &[u64], unit: &[NonZeroU64]) -> PyResult<()> {
     if offset.first().is_some_and(|at| *at != 0) {
         return Err(PyRuntimeError::new_err(format!(
             "{}: the item starts {} into its inner chunk on the split axis, so the extent it \
