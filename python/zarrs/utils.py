@@ -50,10 +50,20 @@ def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
             # A boolean mask is not an index array; its positions are what it means.
             if sel.dtype.kind == "b":
                 return np.flatnonzero(sel).astype(np.int64, copy=False)
-            # "f" is required: a uint64 selection arrives as float64 (uint64 - int64 promotes).
             if sel.dtype.kind not in "iuf":
                 raise DiscontiguousArrayError(sel.dtype)
-            return sel.astype(np.int64, copy=False)
+            out = sel.astype(np.int64, copy=False)
+            # FLOAT IS ACCEPTED FOR EXACTLY ONE REASON: a `uint64` selection reaches this
+            # pipeline as float64, because zarr subtracts the chunk offset first
+            # (`IntArrayDimIndexer.__iter__`, `self.dim_sel[start:stop] - dim_offset`) and
+            # `uint64 - intp` promotes to float64 under NEP 50. Verified: numpy 2.5.2 gives
+            # int64 for uint8/16/32 and float64 for uint64.
+            #
+            # It is NOT a licence to truncate. `astype` would turn 3.7 into 3 in silence, where
+            # zarr-python raises for a fractional index. One comparison keeps that a refusal.
+            if sel.dtype.kind == "f" and not np.array_equal(out, sel):
+                raise DiscontiguousArrayError(sel.dtype)
+            return out
         if isinstance(sel, tuple) and any(isinstance(s, np.ndarray) for s in sel):
             return tuple(map(cast, sel))
         return sel
@@ -78,12 +88,29 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
             ls.append(slice(int(dim_selection), int(dim_selection) + 1, 1))
         elif isinstance(dim_selection, np.ndarray):
             dim_selection = dim_selection.ravel()
+            if len(dim_selection) == 0:
+                # `flatnonzero` on an all-False mask is the first thing in this codebase that
+                # can produce one, and `dim_selection[0]` below would be an `IndexError` --
+                # which is not in `FALLBACK_TO_ZARR_PYTHON`, so it would escape `read` rather
+                # than decline. zarr skips chunks that select nothing, so this is unreachable
+                # today; declining costs one comparison and does not depend on that staying so.
+                raise DiscontiguousArrayError(dim_selection)
             if len(dim_selection) == 1:
                 ls.append(
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                # Callers must normalise to int64 first: an unsigned diff wraps a decrease into +1.
+                # NORMALISED HERE, not merely required of callers. This function is public in
+                # the module and imported directly by tests, and the rule it needs -- that a
+                # difference between two indices is signed -- is one line to enforce and
+                # invisible to get wrong: on a raw unsigned array `[7, 5]` differences to 254,
+                # not -2, and `254 != 1` still refuses, but `[255, 0]` differences to exactly 1
+                # and would be accepted as a run.
+                #
+                # In practice zarr has already promoted (it subtracts the chunk offset, and
+                # `uint - intp` gives int64), so this is a guard against a future caller rather
+                # than against zarr. `copy=False` makes it free when it is already int64.
+                dim_selection = dim_selection.astype(np.int64, copy=False)
                 steps = dim_selection[1:] - dim_selection[:-1]
                 if (steps != 1).any() and (steps != 0).any():
                     raise DiscontiguousArrayError(steps)

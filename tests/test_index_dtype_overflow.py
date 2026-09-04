@@ -1,10 +1,22 @@
 """An index array's dtype must not change which selections are accepted.
 
-Subtracting in the incoming dtype inverts the comparison, because on an unsigned array a
-decrease wraps to a large positive step -- ``np.diff(np.array([255, 0], "uint8"))`` is
-``[1]``, so the most extreme possible decrease reads as consecutive and the slice built
-from it, ``slice(255, 1)``, is empty. uint64 is worse than wrong: it reaches us promoted
-to float64 (zarr subtracts an int64 chunk offset) and loses exactness above 2**53.
+WHAT ACTUALLY REACHES THIS PIPELINE. zarr subtracts the chunk offset before handing an index
+array over -- `IntArrayDimIndexer.__iter__`, `self.dim_sel[start:stop] - dim_offset`, where the
+offset is an `intp`. Under NEP 50 that promotes `uint8`, `uint16` and `uint32` to **int64**, so
+those never arrive unsigned; `uint64` promotes to **float64**. Measured on numpy 2.5.2, not
+assumed.
+
+So the bug that bit was `uint64`: a float64 index array built `slice(np.float64(3.0),
+np.float64(6.0), 1)`, and the first `.indices()` call on it raised `TypeError: slice indices
+must be integers`. `TypeError` is not in `FALLBACK_TO_ZARR_PYTHON`, so it reached the user in
+both strict and non-strict mode rather than declining to zarr-python.
+
+The unsigned wrap is real but is NOT that bug, and this file used to say it was. On a raw
+unsigned array a decrease wraps to a large positive step -- `np.diff(np.array([255, 0],
+"uint8"))` is `[1]`, so the most extreme possible decrease reads as consecutive. It is
+unreachable from zarr for the promotion reason above, and where it IS still live is upstream,
+in zarr's own `Order.check`, which calls `np.diff` on the raw array and tests `>= 0`. This
+pipeline guards its own arithmetic anyway, because `make_slice_selection` is module-public.
 """
 
 from __future__ import annotations
@@ -105,3 +117,58 @@ def test_sorted_selections_never_produce_a_negative_bound(sharded) -> None:
         for _ in range(50):
             rows = np.sort(rng.choice(32, size=rng.integers(1, 8), replace=False))
             np.testing.assert_array_equal(array[rows, :], values[rows, :])
+
+
+def test_a_uint64_selection_does_not_crash_on_a_float_slice() -> None:
+    """THE BUG THIS FILE EXISTS FOR, named directly rather than reached through a read.
+
+    zarr subtracts the chunk offset before this pipeline sees an index array
+    (`IntArrayDimIndexer.__iter__`: `self.dim_sel[start:stop] - dim_offset`, where the offset
+    is an `intp`). Under NEP 50 that promotes `uint8`/`uint16`/`uint32` to `int64` -- so those
+    never arrive unsigned at all -- and `uint64` to **float64**. Measured on numpy 2.5.2.
+
+    A float64 index array then builds `slice(np.float64(3.0), np.float64(6.0), 1)`, and the
+    first thing that calls `.indices()` on it raises `TypeError: slice indices must be
+    integers`. `TypeError` is not in `FALLBACK_TO_ZARR_PYTHON`, so it reached the user in both
+    strict and non-strict mode rather than declining.
+    """
+    arriving_as_zarr_hands_it_over = np.array([7, 8, 9], dtype="uint64") - np.intp(4)
+    assert arriving_as_zarr_hands_it_over.dtype == np.float64, (
+        "if numpy stops promoting uint64 to float64 here, this test is measuring nothing"
+    )
+
+    selection = (arriving_as_zarr_hands_it_over,)
+    ((_, _, chunk_selection, _, _),) = _as_int64_batch_info(
+        [(None, None, selection, selection, True)]
+    )
+    (result,) = make_slice_selection(chunk_selection)
+    assert result == slice(3, 6, 1)
+    # The thing that used to raise.
+    assert result.indices(100) == (3, 6, 1)
+
+
+def test_a_fractional_index_is_refused_rather_than_truncated() -> None:
+    """Float is accepted for uint64 and for nothing else.
+
+    `astype(np.int64)` would turn 3.7 into 3 in silence, where zarr-python raises for a
+    fractional index. The uint64 values that legitimately arrive as float are whole.
+    """
+    selection = (np.array([3.7, 4.7], dtype="float64"),)
+    with pytest.raises(DiscontiguousArrayError):
+        next(iter(_as_int64_batch_info([(None, None, selection, selection, True)])))
+
+
+def test_an_all_false_mask_declines_rather_than_raising_IndexError() -> None:
+    """`flatnonzero` is the first construct here that can produce an empty index array.
+
+    `dim_selection[0]` on one is an `IndexError`, which is not in `FALLBACK_TO_ZARR_PYTHON` --
+    so it would escape `read` uncaught instead of declining. zarr skips chunks that select
+    nothing, so nothing produces this today; the guard does not depend on that staying true.
+    """
+    selection = (np.zeros(8, dtype=bool),)
+    ((_, _, chunk_selection, _, _),) = _as_int64_batch_info(
+        [(None, None, selection, selection, True)]
+    )
+    assert chunk_selection[0].size == 0
+    with pytest.raises(DiscontiguousArrayError):
+        make_slice_selection(chunk_selection)
