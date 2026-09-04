@@ -107,7 +107,10 @@ fn item_is_one_decode_unit(item: &ChunkItem, offset: &[u64], unit: &[NonZeroU64]
         )));
     }
     let held = item.chunk_subset.shape();
+    // All THREE, not two: the `zip` below truncates to the shortest, so a short `unit` would
+    // leave trailing axes silently unchecked in the function whose whole job is checking them.
     if held.len() != offset.len()
+        || held.len() != unit.len()
         || held
             .iter()
             .zip(offset.iter())
@@ -158,11 +161,33 @@ impl CodecPipelineImpl {
                 |shape| shape.to_vec(),
             ),
         };
+        // "UNIFORM ACROSS AN ARRAY" is true of every batch Python builds and is not checked
+        // anywhere else. `decode_shape` is taken once per CALL, from the first item, while the
+        // fit check runs per ITEM against that item's own shape -- so a hand-built batch mixing
+        // two chunk shapes of equal element count, say (4,6) and (6,4), passes both and decodes
+        // the second against the first's geometry. With a plain byte tiling the layout is the
+        // same and the values survive; with a shape-sensitive codec they do not.
+        //
+        // One slice compare per item, against a rank-sized vector, on a path that already walks
+        // every item.
+        if let Some(first) = items.first() {
+            if let Some(odd) = items.iter().find(|i| i.shape != first.shape) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{}: this batch mixes chunk shapes -- {:?} against {:?} -- and one decode \
+                     shape is taken for the whole call",
+                    odd.key,
+                    odd.shape.iter().map(|d| d.get()).collect::<Vec<_>>(),
+                    first.shape.iter().map(|d| d.get()).collect::<Vec<_>>(),
+                )));
+            }
+        }
 
         let located = self.locate_chunks(shard, items, &ctx)?;
-        if located.is_empty() {
-            return Ok(());
-        }
+        // NO EARLY RETURN HERE. `locate_chunks` pushes one entry per item, so this can only be
+        // empty when `items` is -- which the caller has already refused against a non-empty
+        // output. An early return would sit above the coverage check below, which is the same
+        // shape of hole the empty-batch return had: skip it and `np.empty` contents go back as
+        // data. `carve` and the pools handle an empty list without help.
 
         // The length comes FROM the slice, never beside it. `DisjointBytes::take` refuses a
         // range past `self.len`, and that refusal is what the `unsafe` inside it rests on --

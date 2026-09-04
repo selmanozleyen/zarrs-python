@@ -157,7 +157,12 @@ def _is_sorted_integer_axis(indices: Any, out_axis_sel: Any) -> bool:
 def _output_run_matches(indices: np.ndarray, out_axis_sel: slice) -> bool:
     """Does the output slice hold exactly one element per index."""
     start = out_axis_sel.start or 0
-    return out_axis_sel.stop - start == indices.size
+    # `stop is None` is a slice `_is_sorted_integer_axis` admits -- it constrains only the step
+    # -- and subtracting from it is a `TypeError`, which is not in `FALLBACK_TO_ZARR_PYTHON`, so
+    # it would escape `read` uncaught instead of declining. Both siblings handle it (`_step1_span`
+    # and `_is_whole_axis`); this is a decline gate, whose entire contract is to return False.
+    stop = out_axis_sel.stop
+    return stop is not None and stop - start == indices.size
 
 
 def resulting_shape_from_index(
