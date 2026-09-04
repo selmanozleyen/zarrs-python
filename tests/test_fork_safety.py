@@ -24,6 +24,8 @@ import numpy as np
 import pytest
 import zarr
 
+import zarrs
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -90,4 +92,42 @@ def test_a_read_in_a_forked_child_finishes(sharded_1d) -> None:
     status = _wait(pid)
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, (
         f"the child read failed or crashed: waitpid status {status}"
+    )
+
+
+# Asking for a width the pools were not built at is the point of the second block, and saying
+# so is what the warning is for -- so it is expected here, not a fault.
+@pytest.mark.filterwarnings("ignore:.*pool_size = .* was ignored:UserWarning")
+def test_the_pool_sizes_survive_a_fork(sharded_1d) -> None:
+    """A fork must not silently resize the parent's pools.
+
+    The before-fork hook empties the slot so a child cannot inherit a held lock. Written
+    without remembering the sizes, that also RESIZED the parent: pools built at one width for
+    the array that did the first read were rebuilt at whatever the next array asked for, so
+    `pool_sizes()` began reporting the new width and the "was ignored" warning began firing for
+    an array that had been honoured right up until an unrelated fork.
+
+    The function whose whole job is to make "the knob arrived" checkable would have been the one
+    lying, and only on a workload that forks -- which is the workload this path exists for.
+    """
+    path, values = sharded_1d
+    absurd = 3  # small, specific, and nothing else in this file asks for it
+
+    with zarr.config.set(PIPELINE | {"codec_pipeline.read_pool_size": absurd}):
+        _read(path, values)
+    built = zarrs.pool_sizes()
+    assert built != (None, None), "a read must have built the pools"
+
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+
+    # The fork dropped them; the next read rebuilds. It must come back at the SAME width, not
+    # at whatever this block asks for.
+    with zarr.config.set(PIPELINE | {"codec_pipeline.read_pool_size": absurd + 40}):
+        _read(path, values)
+    assert zarrs.pool_sizes() == built, (
+        "the fork resized the parent's pools, so pool_sizes() no longer describes the array "
+        "that did the first read"
     )
