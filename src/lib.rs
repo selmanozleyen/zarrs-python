@@ -349,9 +349,13 @@ impl CodecPipelineImpl {
 
         let chunk_concurrent_minimum =
             chunk_concurrent_minimum.unwrap_or(global_config().chunk_concurrent_minimum());
-        let chunk_concurrent_maximum =
-            chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
-        let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
+        // `available_parallelism`, not `rayon::current_num_threads`: READING that number
+        // starts rayon's global pool, and the read path here never uses it -- so opening an
+        // array spawned a set of threads nothing ran on, once per process. The write path
+        // still uses the global pool and still builds it on demand.
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let chunk_concurrent_maximum = chunk_concurrent_maximum.unwrap_or(cores);
+        let num_threads = num_threads.unwrap_or(cores);
 
         // Both default to the available parallelism: more readers than that is defensible (a
         // blocked reader costs no CPU) but not a library's call to make unasked. Set
