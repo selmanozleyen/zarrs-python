@@ -288,8 +288,8 @@ pub(crate) fn build_chunk_unit_items(
             "an inner chunk {inner:?} cannot be larger than the shard {chunk_shape:?} it divides"
         )));
     }
-    // Rejects a zero extent on any axis, which is what the scalar check used to do for one.
-    // Checked in place rather than through `to_nonzero_u64_vec`: that allocates a Vec, and
+    // Rejects a zero extent on any axis. Checked in place rather than through
+    // `to_nonzero_u64_vec`: that allocates a Vec, and
     // `inner.to_vec()` allocates another, both per entry. A scattered batch pushes thousands
     // of entries per call, and the only thing wanted out of them is `inner[0]`.
     if let Some(axis) = inner.iter().position(|e| *e == 0) {

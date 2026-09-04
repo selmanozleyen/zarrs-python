@@ -471,8 +471,8 @@ def _chunk_unit_args(
                 (int(shape[0]), *band_widths),
                 # The whole inner chunk, not just the split extent. Every trailing stride Rust
                 # computes is a product of these, and the decoded buffer is the inner chunk --
-                # so handing it the shard's extents is right only while a shard holds one
-                # inner chunk on each trailing axis, which is no longer required.
+                # so handing it the shard's extents would be right only for a shard holding
+                # one inner chunk on each trailing axis.
                 tuple(int(v) for v in inner_shape),
                 # Shard-relative: this is what steers `locate` to the right inner chunk.
                 # Rust reduces it into the inner chunk for the coordinate.

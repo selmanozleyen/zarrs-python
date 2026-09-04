@@ -44,8 +44,7 @@ def test_asking_above_what_the_process_builds_warns(sharded_1d) -> None:
         "a read through the chunk-unit path must build the pools"
     )
 
-    # Above `pool_max`, which is the one width masking still cannot give: the pools are
-    # built once and cannot grow.
+    # Above `pool_max`: the pools are built once and cannot grow.
     absurd = built_read + 1_000
     with (
         zarr.config.set(PIPELINE | {"codec_pipeline.read_workers": absurd}),
@@ -73,11 +72,9 @@ def test_strict_makes_it_an_error(sharded_1d) -> None:
 
 
 def test_a_width_below_the_maximum_is_honoured_after_the_pools_exist(sharded_1d) -> None:
-    """The point of masking: a later array asking for FEWER workers gets them, silently.
+    """A later array asking for FEWER workers gets them, silently.
 
-    Under the previous design the pools were sized by the first read, so this asked for a
-    width that could never arrive and warned. Now the pools are built wide once and each call
-    takes the slice it asked for, so two arrays can differ.
+    Each call takes the slice of the pool it asked for, so two arrays can differ.
     """
     path, values = sharded_1d
     with zarr.config.set(PIPELINE):
