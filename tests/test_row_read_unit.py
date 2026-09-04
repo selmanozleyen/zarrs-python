@@ -196,3 +196,35 @@ def test_several_banded_rows_in_ONE_chunk_do_not_take_the_row_path(tmp_path: Pat
     np.testing.assert_array_equal(got, values[np.ix_(rows, np.arange(8, 24))])
     assert row == 0, "a multi-row band is not one contiguous output claim"
     assert chunk > 0
+
+
+def test_the_row_path_on_a_shard_that_DIVIDES_a_trailing_axis(tmp_path: Path) -> None:
+    """The one intersection no test covered: the row unit and a divided shard together.
+
+    Every other test here uses a shard holding one inner chunk across the trailing axis, and
+    the divided-shard tests all use compressed arrays, where this path is never eligible. So
+    the arithmetic that has to hold in both at once -- an element offset reduced modulo the
+    INNER extent on a trailing axis, then used as a byte offset inside a chunk that is a plain
+    byte tiling -- was only ever exercised one half at a time.
+
+    (16, 24) with shards (16, 24) and chunks (4, 12): two inner chunks across the row, so a
+    read of columns 14:20 lands in the second one at an in-chunk offset of 2.
+    """
+    path = tmp_path / "divided.zarr"
+    values = np.arange(16 * 24, dtype=np.float32).reshape(16, 24)
+    zarr.create_array(
+        path,
+        dtype=values.dtype,
+        shape=values.shape,
+        chunks=(4, 12),
+        shards=(16, 24),
+        compressors=None,
+    )[:] = values
+
+    # One row per inner chunk on axis 0, so each item is a single banded row -- the only
+    # banded shape the gate admits.
+    rows = np.array([1, 5, 9, 13])
+    got, row, chunk = _read(path, (rows, slice(14, 20)))
+
+    np.testing.assert_array_equal(got, values[np.ix_(rows, np.arange(14, 20))])
+    assert row > 0, "a divided shard must not by itself disqualify the row path"

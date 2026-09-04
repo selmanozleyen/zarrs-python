@@ -82,6 +82,54 @@ struct CallDecoders {
     subshards: HashMap<(StoreKey, Vec<u64>), Arc<ShardingPartialDecoder>>,
 }
 
+/// Refuse an item that does not name exactly one decode unit.
+///
+/// TWO CHECKS, and both guard a trust boundary rather than an invariant: `push_indices` is a
+/// `#[pymethods]` taking arbitrary vectors, so the description reaching here can say anything.
+///
+/// FIRST, the item must FIT. Without this, an item claiming rows 0..8 x cols 0..12 of a shard
+/// whose inner chunk is 8x6 locates chunk (0,0), and its element offsets -- built for a
+/// 12-wide row -- address exactly the 48 elements that chunk holds. In bounds, wrong data, no
+/// error.
+///
+/// SECOND, axis 0 must START at the chunk. Every correct caller groups by the real inner
+/// extent, so a group's first index is a multiple of it and this offset is zero. A caller
+/// passing an extent that DIVIDES the real one -- inner 4 where the chunk is 8 -- gets a group
+/// at `lo = 4`, which fits inside the chunk and so passes the first check, but whose element
+/// offsets were built for a four-row unit and address the FIRST four rows of an eight-row
+/// chunk. In bounds, wrong data, no error again.
+fn item_is_one_decode_unit(
+    item: &ChunkItem,
+    offset: &[u64],
+    unit: &[NonZeroU64],
+) -> PyResult<()> {
+    if offset.first().is_some_and(|at| *at != 0) {
+        return Err(PyRuntimeError::new_err(format!(
+            "{}: the item starts {} into its inner chunk on the split axis, so the extent it \
+             was grouped by is not the one that gets decoded",
+            item.key, offset[0],
+        )));
+    }
+    let held = item.chunk_subset.shape();
+    if held.len() != offset.len()
+        || held
+            .iter()
+            .zip(offset.iter())
+            .zip(unit.iter())
+            .any(|((want, at), extent)| at + want > extent.get())
+    {
+        return Err(PyRuntimeError::new_err(format!(
+            "{}: the item spans {} from {:?} within an inner chunk of {:?}, so it is not one \
+             decode unit",
+            item.key,
+            item.chunk_subset,
+            offset,
+            unit.iter().map(|d| d.get()).collect::<Vec<_>>()
+        )));
+    }
+    Ok(())
+}
+
 impl CodecPipelineImpl {
     /// Read and decode `items`, one job per innermost chunk, on workers scoped to this call.
     ///
@@ -124,11 +172,18 @@ impl CodecPipelineImpl {
         let output = DisjointBytes::new(output, output_len);
         let (jobs, absent) = carve(&output, &located, element_size, &ctx)?;
         // Disjointness is proven above; COVERAGE is not. zarr hands us a buffer from
-        // `np.empty`, so a byte no job owns is returned as whatever was in that memory.
+        // `np.empty`, so a byte no job owns is returned as whatever was in that memory. That
+        // makes this the guard the whole path rests on: disjoint pieces summing to `len` must
+        // tile `[0, len)` exactly, so the two together prove an exact partition.
         //
-        // Only when nothing was DECLINED: a declined item's bytes are written by the fused
-        // path afterwards, so a partial batch legitimately covers part of the output here.
-        if declined.is_empty() && output.covered() != output_len {
+        // `declined` is EMPTY here, always. It dates from when a declined item was handed to a
+        // second Rust path that filled its bytes afterwards; that path is gone, and
+        // `retrieve_items_and_apply_index` now refuses the whole batch unless every item
+        // carries element offsets -- which is the only thing `locate_chunks` declines for. The
+        // condition stayed and made this guard READ as optional, which is worse than useless:
+        // a future decline reason would silently switch off the check for the whole batch.
+        debug_assert!(declined.is_empty(), "nothing declines any more; see above");
+        if output.covered() != output_len {
             return Err(PyRuntimeError::new_err(format!(
                 "the batch covers {} of {output_len} output bytes; the rest would be returned \
                  uninitialised",
@@ -247,7 +302,16 @@ impl CodecPipelineImpl {
         // Not sharded: there is no index to read and nothing to descend -- the store value is
         // the chunk. Whether the key EXISTS is the read's business, and a missing one comes
         // back as absent bytes there, exactly as a never-written shard entry does here.
+        //
+        // The trust-boundary checks still run. They used to sit only after the descent, so an
+        // unsharded array skipped them entirely -- while `push_indices`'s own docstring cites
+        // them as what makes an arbitrary Python `inner_shape` safe. Unreachable in practice,
+        // because `_inner_chunk_shape` returns a real inner shape only where it found a
+        // sharding codec and `ShardInfo::from_codec_chain` reads the same metadata -- but
+        // "unreachable because two functions agree about some JSON" is exactly the kind of
+        // guarantee this file checks rather than assumes.
         if shard.depth() == 0 {
+            item_is_one_decode_unit(item, start, &item.shape)?;
             return Ok(Some(ByteRange::FromStart(0, None)));
         }
         let file = key_partial_decoder(&self.store, &item.key);
@@ -332,46 +396,8 @@ impl CodecPipelineImpl {
                 path.extend_from_slice(&grid_index);
             }
         }
-        // The item must lie inside the ONE inner chunk just located. `offset` is now its
-        // position within that chunk, and `shard_shape` the chunk's own extent.
-        //
-        // Checked here rather than left to the caller, and it is not a weaker check than
-        // descending axis 0 with whole trailing axes would be. Without it an
-        // item claiming rows 0..8 x cols 0..12 of a shard whose inner chunk is 8x6 locates
-        // chunk (0,0), and its coordinates -- built for a 12-wide row -- address exactly the
-        // 48 elements that chunk holds. In bounds, wrong data, no error. `push_indices` takes
-        // arbitrary arguments from Python, so this is a trust boundary rather than an
-        // invariant the caller can be assumed to keep.
-        // AXIS 0 MUST START AT THE CHUNK. Every correct caller groups by the real inner
-        // extent, so a group's first index is a multiple of it and this offset is zero. A
-        // caller passing an extent that DIVIDES the real one -- inner 4 where the chunk is 8
-        // -- gets a group at `lo = 4`, which fits inside the chunk and so passes the extent
-        // check below, but whose element offsets were built for a 4-row unit and address the
-        // FIRST four rows of an eight-row chunk. In bounds, wrong data, no error.
-        if offset.first().is_some_and(|at| *at != 0) {
-            return Err(PyRuntimeError::new_err(format!(
-                "{}: the item starts {} into its inner chunk on the split axis, so the extent \
-                 it was grouped by is not the one that gets decoded",
-                item.key, offset[0],
-            )));
-        }
-        let held = item.chunk_subset.shape();
-        if held.len() != offset.len()
-            || held
-                .iter()
-                .zip(offset.iter())
-                .zip(shard_shape.iter())
-                .any(|((want, at), extent)| at + want > extent.get())
-        {
-            return Err(PyRuntimeError::new_err(format!(
-                "{}: the item spans {} from {:?} within an inner chunk of {:?}, so it is not \
-                 one decode unit",
-                item.key,
-                item.chunk_subset,
-                offset,
-                shard_shape.iter().map(|d| d.get()).collect::<Vec<_>>()
-            )));
-        }
+        // One decode unit, checked here rather than trusted -- see the function.
+        item_is_one_decode_unit(item, &offset, &shard_shape)?;
         Ok(extent.map(|(base, len)| ByteRange::FromStart(base, Some(len))))
     }
 
@@ -675,6 +701,13 @@ fn row_jobs<'a>(
         let span = row_bytes
             .checked_mul(run.len())
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: run too large", item.key)))?;
+        // `.min(rest.len())` TRUNCATES rather than erroring, and the `!rest.is_empty()` check
+        // at the end catches only the opposite case -- a piece longer than its runs. A short
+        // one cannot happen: `carve` has already required the offsets and `run_len` to
+        // multiply out to the subset's element count, and `output_pieces` gives an admitted
+        // item exactly one piece of that width. If it ever did, `decode_one` catches it: it
+        // compares the bytes read against the TRUNCATED piece while the range asked for the
+        // full span.
         let (run_out, tail) = rest.split_at_mut(span.min(rest.len()));
         rest = tail;
         // `checked_mul`, like every other offset computation here. A wrap would produce a

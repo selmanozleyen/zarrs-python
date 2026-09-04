@@ -93,7 +93,13 @@ fn inner_chunk_is_plain_bytes(array_metadata_json: &str) -> bool {
         // the chunk path swaps and the row path -- which copies the stored bytes verbatim --
         // does not. Same array, two answers, no error, and big-endian is legal Zarr V3.
         //
-        // Absent is only legal for a single-byte element, which has no order to get wrong.
+        // Absent is treated as native. The spec only permits omitting `endian` for a
+        // single-byte element, which has no order to get wrong -- but nothing here VERIFIES
+        // that, so on a big-endian host, metadata that omits it on a multi-byte element would
+        // take this path while the chunk path byte-swaps. Left as is: it needs a big-endian
+        // host AND invalid metadata, and `read` refuses a non-native output dtype before any
+        // of this. Written down because the comment used to state the guarantee as if the
+        // code checked it.
         let endian = only
             .get("configuration")
             .and_then(|c| c.get("endian"))

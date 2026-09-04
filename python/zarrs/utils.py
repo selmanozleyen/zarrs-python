@@ -494,11 +494,14 @@ def _chunk_unit_args(
         # A sub-box on a trailing axis makes each index its own run, so the span form does
         # not describe it and the elements are named after all.
         indices = np.arange(span[0], span[1], dtype=np.int64)
-    if indices.size == 0:
+    # `_split_axis_ok` FIRST, because its own first predicate is an `isinstance` check and
+    # `.size` is not. A bare Python `int` here used to decline cleanly and would now be an
+    # `AttributeError` -- which is not in `FALLBACK_TO_ZARR_PYTHON`, so it would escape `read`
+    # uncaught instead of falling back. Nothing produces that shape today (the scalar rebuild
+    # above turns an integer axis 0 into a one-element slice), but the ordering was free.
+    if not _split_axis_ok(indices, out_axis_sel) or indices.size == 0:
         return None
     indices = indices.astype(np.int64, copy=False)
-    if not _split_axis_ok(indices, out_axis_sel):
-        return None
     start = out_axis_sel.start or 0
 
     pushes = []

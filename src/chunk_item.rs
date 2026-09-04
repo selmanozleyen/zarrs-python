@@ -515,8 +515,13 @@ pub(crate) fn build_chunk_unit_items(
             shape: chunk_shape.clone(),
             num_elements,
             array_shape: shape.clone(),
-            // Relative to the chunk subset, because that is the buffer gathered from,
-            // scaled by `row_stride` -- one index's worth of THAT buffer -- and stepped by
+            // Relative to the INNER CHUNK, which is the buffer gathered from -- not to
+            // `chunk_subset`, whose trailing starts are shard-relative. The two agree on
+            // axis 0 only because `locate` requires the item to start at the chunk there;
+            // on a trailing axis they genuinely differ, and `trailing_layout` reduces the
+            // band start modulo the inner extent to get this one.
+            //
+            // Scaled by `row_stride` -- one index's worth of that buffer -- and stepped by
             // the offset to where this selection starts inside the row. With the trailing
             // axes whole the offset is 0 and the stride is the run.
             //
