@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, TypedDict
@@ -57,8 +58,15 @@ FALLBACK_TO_ZARR_PYTHON = (
 )
 
 
-#: `[served, declined]` read batches since import. See `read_stats`.
+#: `[served, declined]` read batches since import, under `_READ_LOCK`. See `read_stats`.
+#:
+#: A LOCK, because `_READ_COUNTS[i] += 1` is a read-modify-write and reads run on threads
+#: (`asyncio.to_thread` in `read`). The GIL does not make that atomic -- it can be released
+#: between the load and the store -- so concurrent reads would undercount, in a counter whose
+#: whole purpose is to be trustworthy about how often the fast path was taken. It is taken
+#: twice per BATCH, next to work measured in milliseconds.
 _READ_COUNTS = [0, 0]
+_READ_LOCK = threading.Lock()
 
 
 def read_stats() -> tuple[int, int]:
@@ -76,7 +84,8 @@ def read_stats() -> tuple[int, int]:
     but it is read when the array is opened and is all-or-nothing, so it cannot profile a mixed
     workload.
     """
-    served, declined = _READ_COUNTS
+    with _READ_LOCK:
+        served, declined = _READ_COUNTS
     return served, declined
 
 
@@ -304,13 +313,15 @@ class ZarrsCodecPipeline(CodecPipeline):
                 batch_info, drop_axes, out.shape, self._inner_chunk_shape
             )
         except FALLBACK_TO_ZARR_PYTHON:
-            _READ_COUNTS[1] += 1
+            with _READ_LOCK:
+                _READ_COUNTS[1] += 1
             if self.python_impl is None:
                 raise
             await self.python_impl.read(batch_info, out, drop_axes)
             return None
         else:
-            _READ_COUNTS[0] += 1
+            with _READ_LOCK:
+                _READ_COUNTS[0] += 1
             out: NDArrayLike = out.as_ndarray_like()
             desc = chunks_desc.chunk_info_with_indices
             # One entry point. `chunk_info_for_read` either produces a handle or raises, and
