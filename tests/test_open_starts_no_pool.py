@@ -30,6 +30,7 @@ def test_opening_an_array_starts_no_threads(tmp_path) -> None:
     # one thread per core, in every process that opens an array, used by no read.
     assert _threads() - before < 4, "opening an array started a pool"
 
-    # ... and the read path still has its own, so the read itself does work.
+    # ... and the read path still works, on the two pools it builds for itself. How many
+    # threads THAT adds is not asserted: the pools are per-process and built once, so a
+    # worker that has already read has them, and the count would depend on test order.
     np.testing.assert_array_equal(np.asarray(array[:]), np.zeros((64, 64), dtype="float32"))
-    assert _threads() > before, "the read path built no pool at all"
