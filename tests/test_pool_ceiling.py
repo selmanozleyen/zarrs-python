@@ -1,18 +1,3 @@
-"""A ceiling that cannot be honoured must say so.
-
-The two pools are process-wide and sized by the FIRST read in the process. The ceilings are
-read when an ARRAY IS OPENED -- like `num_threads` and the chunk-concurrency bounds beside
-them -- so an array opened later, asking for a different width, gets the pools that exist.
-
-That is the accepted cost of persistence. Doing it silently is not: from the outside, "the
-knob did not pay" and "the knob never arrived" are the same observation. So the read warns,
-and under `codec_pipeline.strict` it raises -- the same switch that turns a decline into a
-raise rather than a quiet fallback.
-
-One file, because the pools are process-wide `OnceLock`s: the first read here builds them and
-everything after is measured against that.
-"""
-
 from __future__ import annotations
 
 import warnings
@@ -59,8 +44,8 @@ def test_a_ceiling_asked_for_after_the_pools_exist_warns(sharded_1d) -> None:
         "a read through the chunk-unit path must build the pools"
     )
 
-    # A size no earlier read can have built, so the mismatch does not depend on what ran
-    # first. The array is opened INSIDE the block: that is when the ceiling is read.
+    # A size no earlier read can have built. The array is opened inside the block, which is
+    # when the ceiling is read.
     absurd = built_read + 1_000
     with (
         zarr.config.set(PIPELINE | {"codec_pipeline.read_worker_ceiling": absurd}),
@@ -68,12 +53,11 @@ def test_a_ceiling_asked_for_after_the_pools_exist_warns(sharded_1d) -> None:
     ):
         _read(path, values)
 
-    # The warning is not a resize, and it must not have built the OTHER pool either.
+    # The warning is not a resize, and must not have built the other pool either.
     assert pool_sizes() == (built_read, built_decode)
 
 
 def test_strict_makes_it_an_error(sharded_1d) -> None:
-    """`codec_pipeline.strict` is already "tell me rather than paper over it"."""
     path, values = sharded_1d
     with zarr.config.set(PIPELINE):
         _read(path, values)
@@ -89,7 +73,7 @@ def test_strict_makes_it_an_error(sharded_1d) -> None:
 
 
 def test_the_ceiling_actually_in_force_is_silent(sharded_1d) -> None:
-    """No warning when the ask matches what was built -- or the signal is noise."""
+    """No warning when the ask matches what was built, or the signal is noise."""
     path, values = sharded_1d
     with zarr.config.set(PIPELINE):
         _read(path, values)

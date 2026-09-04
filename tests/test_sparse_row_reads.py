@@ -1,11 +1,3 @@
-"""Reading sampled rows of a CSR matrix, the way AnnData stores one.
-
-`X` is `indptr`, `indices` and `data`, three 1-D arrays. Sampling rows batches into one sorted
-selection whose runs are the rows' nnz spans -- variable length, at offsets with no relation to
-the chunk grid. That is what differs from the dense case: long runs instead of single elements,
-and unaligned boundaries.
-"""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -22,12 +14,8 @@ N_VAR = 5000
 CHUNK = 4096
 SHARD = 16384
 
-# The answer must not depend on the pool sizes. Note what this can and cannot assert: the
-# pools are built by the FIRST read in the process and sized from its config, so whichever of
-# these runs first is the one whose numbers actually take effect -- the rest are read and
-# ignored. That makes this a test that VALUES are width-independent, which is the property
-# worth having, and not a test that each config was applied. `pool_sizes()` is what reports
-# the sizes that were really built.
+# Values must not depend on the pool sizes. Only the first read builds them, so this asserts
+# width-independence, not that each config was applied.
 CONFIGS = {
     "default": {},
     "one worker": {
@@ -84,8 +72,7 @@ def row_span_selection(indptr: np.ndarray, rows: np.ndarray) -> np.ndarray:
 @pytest.mark.parametrize("config", list(CONFIGS), ids=list(CONFIGS))
 @pytest.mark.parametrize(
     "n_rows",
-    # 1 row is a single run; 256 of 400 is dense enough that runs share inner chunks. Values
-    # between take no branch neither endpoint takes.
+    # 1 row is a single run; 256 of 400 is dense enough that runs share inner chunks.
     [1, 256],
 )
 def test_sampled_rows_match(
@@ -105,16 +92,13 @@ def test_sampled_rows_match(
         for name in ("indices", "data"):
             got = zarr.open_array(path / name, mode="r")[selection]
             np.testing.assert_array_equal(got, truth[name][selection])
-    # Values alone would pass a silent fallback all the way to zarr-python, which is the
-    # thing this file exists to catch: the loader shape reaching zarrs at all.
-    assert entries["handle"] > 0
+    assert entries["handle"] > 0, "the loader shape fell back to zarr-python"
 
 
 def test_a_single_row_spanning_a_chunk_boundary(
     csr: tuple[Path, dict[str, np.ndarray]], entries: dict[str, int]
 ) -> None:
-    """A row's span has nothing to do with the chunk grid, so some rows straddle an inner-chunk
-    boundary -- where one run becomes several reads."""
+    """A row's span ignores the chunk grid, so some rows straddle an inner-chunk boundary."""
     path, truth = csr
     indptr = truth["indptr"]
     straddling = [

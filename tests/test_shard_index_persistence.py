@@ -1,15 +1,3 @@
-"""Shard indexes are remembered for the life of a READ-ONLY array, and not otherwise.
-
-Reading a shard index is a full-latency round trip on the calling thread, so a shard is worth
-paying for once per array. The pipeline is built per array, so its lifetime is the array's.
-
-Gated on the store being read-only rather than invalidated on write: a stale byte range does
-not raise, it returns plausible data from a valid file. `mode="r"` gives a read-only store;
-`mode="r+"` and `mode="a"` do not. An external writer can still move the bytes, the same
-limitation `file_handle_cache_size` documents. Every selection below is an integer array
-because that is the only path that consults the cache.
-"""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -47,8 +35,7 @@ def array(tmp_path: Path) -> tuple[Path, np.ndarray]:
 def test_the_gate_signal_still_means_what_it_did(
     array: tuple[Path, np.ndarray],
 ) -> None:
-    """`store.read_only` is what decides whether anything is cached, so a zarr change that
-    flipped it would silently turn the cache on for writable arrays."""
+    """`store.read_only` decides whether anything is cached, so a zarr change would matter."""
     path, _ = array
     assert zarr.open_array(path, mode="r").store.read_only is True
     assert zarr.open_array(path, mode="r+").store.read_only is False
@@ -68,16 +55,14 @@ def test_repeated_integer_reads_agree(
         for _ in range(3):
             np.testing.assert_array_equal(z[selection], first)
     np.testing.assert_array_equal(first, truth[selection])
-    # Otherwise every test here would pass while the cache was never consulted.
-    assert entries["handle"] > 0
+    assert entries["handle"] > 0, "the cache was never consulted"
 
 
 @pytest.mark.parametrize("mode", ["r+", "a"])
 def test_a_partial_write_then_an_integer_read(
     array: tuple[Path, np.ndarray], mode: str
 ) -> None:
-    """Where a write is possible nothing is remembered: one inner chunk rewritten, then the
-    touched and untouched regions both read back through the path that would have cached."""
+    """Where a write is possible nothing is remembered, so a rewritten chunk reads back new."""
     path, truth = array
     expected = truth.copy()
     touched = np.arange(CHUNK, CHUNK + 200)
@@ -96,9 +81,7 @@ def test_a_partial_write_then_an_integer_read(
 
 
 def test_a_write_that_falls_back_to_zarr_python(array: tuple[Path, np.ndarray]) -> None:
-    """A write zarrs cannot describe is performed by zarr-python's pipeline instead, so
-    `store_chunks_with_indices` never runs. Nothing is remembered for a writable store, so
-    that path needs no invalidation of its own."""
+    """A write zarrs cannot describe goes to zarr-python, so nothing here needs invalidating."""
     path, truth = array
     expected = truth.copy()
     selection = np.sort(np.random.default_rng(2).choice(N, size=200, replace=False))

@@ -31,11 +31,8 @@ class ArrayRequest:
 def entries(monkeypatch) -> dict[str, int]:
     """Counts of batches served by each Rust entry point.
 
-    "list" was the FUSED path, which no longer exists -- an audit of the public indexing
-    surface found nothing reaching it, so it was removed along with the only rayon on the read
-    side. The key stays and stays at zero, because a test asserting `list == 0` is asserting
-    something true and should keep passing, and because a future second path would want the
-    same shape of check.
+    Values alone cannot tell a served read from one that fell back to zarr-python and got the
+    same answer. "list" is the removed fused path: absent today, so its count stays at zero.
     """
     counts = {"handle": 0, "list": 0}
     for name, key in (

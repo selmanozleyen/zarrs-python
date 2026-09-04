@@ -1,17 +1,3 @@
-"""What an index array IS, before anything tries to read with it.
-
-Every array index in a batch is normalised to int64 positions on the way in. Three cases
-decide what that means, and each of them read the wrong data or crashed before it:
-
-  - an unsigned DECREASE wraps to +1 under a consecutive-difference test, so a descending
-    selection reads as consecutive;
-  - a uint64 selection arrives as float64, because uint64 - int64 promotes;
-  - a boolean MASK is not an index array at all -- its positions are what it means.
-
-These are dtype questions, so they are tested through the smallest read that reaches the
-description, plus two direct calls on the collapse itself.
-"""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -29,8 +15,8 @@ from zarrs.utils import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-# No fallback to hide behind: a selection zarrs cannot serve must raise rather than be
-# served correctly by zarr-python and look like a passing test.
+# No fallback to hide behind: an unservable selection must raise rather than be served
+# correctly by zarr-python and look like a passing test.
 STRICT = {
     "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
     "codec_pipeline.strict": True,
@@ -66,8 +52,7 @@ def test_consecutive_unsigned_still_collapses(dtype: str) -> None:
 def test_unsigned_rows_read_the_same_as_signed(dtype: str, sharded) -> None:
     """A selection's dtype is not part of its meaning."""
     path, values = sharded
-    # Spanning shards, so this is a scattered selection rather than one run -- the shape the
-    # chunk-unit path exists for. A dtype must not change which of them is served.
+    # Spanning shards, so this is scattered rather than one run.
     rows = [3, 4, 5, 11, 12, 27]
     with zarr.config.set(STRICT):
         array = zarr.open_array(path, mode="r")
@@ -78,11 +63,7 @@ def test_unsigned_rows_read_the_same_as_signed(dtype: str, sharded) -> None:
 
 
 def test_a_boolean_mask_reads_the_rows_it_marks(sharded) -> None:
-    """A mask's POSITIONS are the selection.
-
-    Cast elementwise instead, and an all-True mask becomes [1, 1, ...]: non-decreasing, the
-    right length, and every row read is row 1. That returned wrong data with no error.
-    """
+    """A mask's positions are the selection."""
     path, values = sharded
     mask = np.zeros(len(values), dtype=bool)
     mask[4:8] = True
@@ -92,25 +73,14 @@ def test_a_boolean_mask_reads_the_rows_it_marks(sharded) -> None:
 
 
 def test_an_unreadable_index_dtype_is_declined() -> None:
-    """Not guessed at: a dtype that is not an integer, unsigned or float position.
-
-    Called directly. zarr's own `BasicIndexer` refuses a string selection before the
-    pipeline is handed one, so no read can reach this branch -- and the branch still has to
-    hold, because the next thing it would do is cast something that is not a position.
-    """
+    """A dtype that is no kind of position at all, rather than guessed at."""
     batch = [(None, None, np.array([3, 4], dtype="complex128"), slice(0, 2), False)]
     with pytest.raises(DiscontiguousArrayError):
         list(_as_int64_batch_info(batch))
 
 
 def test_a_uint64_selection_arrives_as_float_and_is_served() -> None:
-    """The reason float is accepted at all, named rather than assumed.
-
-    zarr subtracts the chunk offset before this pipeline sees an index array
-    (`IntArrayDimIndexer.__iter__`: `self.dim_sel[start:stop] - dim_offset`, offset an `intp`).
-    Under NEP 50 that promotes uint8/uint16/uint32 to int64 -- so those never arrive unsigned --
-    and uint64 to float64. Measured on numpy 2.5.2.
-    """
+    """The reason float is accepted at all."""
     arriving = np.array([7, 8, 9], dtype="uint64") - np.intp(4)
     assert arriving.dtype == np.float64, (
         "if numpy stops promoting uint64 to float64 here, this test measures nothing"
@@ -121,7 +91,6 @@ def test_a_uint64_selection_arrives_as_float_and_is_served() -> None:
     )
     assert chunk_selection[0].dtype == np.int64
     (result,) = make_slice_selection(chunk_selection)
-    # The thing that used to raise `TypeError: slice indices must be integers`.
     assert result.indices(100) == (3, 6, 1)
 
 
@@ -132,27 +101,18 @@ def test_a_uint64_selection_arrives_as_float_and_is_served() -> None:
         [3.0, 4.5, 5.0],  # one fractional among whole
         [np.nan, 1.0],
         [np.inf, 1.0],
-        [2.0**63, 1.0],  # outside int64, and it CASTS without complaint
+        [2.0**63, 1.0],  # outside int64, and it casts without complaint
     ],
 )
 def test_a_float_index_that_is_not_a_whole_position_is_refused(values) -> None:
-    """`astype(np.int64)` would turn 3.7 into 3 in silence, where zarr-python raises.
-
-    Checked BEFORE the cast rather than by comparing against it: that comparison happens in
-    float64, so `2.0**63` casts to `i64::MAX` and then compares equal to what it came from.
-    """
+    """`astype(np.int64)` would turn 3.7 into 3 in silence, where zarr-python raises."""
     selection = (np.array(values, dtype="float64"),)
     with pytest.raises(DiscontiguousArrayError):
         next(iter(_as_int64_batch_info([(None, None, selection, selection, True)])))
 
 
 def test_an_all_false_mask_declines_rather_than_raising_IndexError() -> None:
-    """`flatnonzero` is the first construct here that can produce an empty index array.
-
-    `dim_selection[0]` on one is an `IndexError`, which is not in `FALLBACK_TO_ZARR_PYTHON` --
-    so it would escape `read` uncaught instead of declining. zarr skips chunks that select
-    nothing, so nothing produces this today; the guard does not depend on that staying true.
-    """
+    """`dim_selection[0]` on an empty index array raises `IndexError`, which never declines."""
     selection = (np.zeros(8, dtype=bool),)
     ((_, _, chunk_selection, _, _),) = _as_int64_batch_info(
         [(None, None, selection, selection, True)]
@@ -164,24 +124,14 @@ def test_an_all_false_mask_declines_rather_than_raising_IndexError() -> None:
 
 @pytest.mark.parametrize("dtype", UNSIGNED)
 def test_unsigned_descending_rows_are_refused(dtype: str, sharded) -> None:
-    """Rows 27 and 3 land in different shards, so each arrives alone and looks orderable.
-
-    What refuses them is the negative bound: zarr makes 3 chunk-relative against shard 1
-    and hands over [-13]. Signed dtypes are unaffected, which is why this is dtype-specific.
-    """
+    """Rows 27 and 3 land in different shards, so each arrives alone and looks orderable."""
     path, _ = sharded
     with zarr.config.set(STRICT), pytest.raises(DiscontiguousArrayError):
         zarr.open_array(path, mode="r")[np.array([27, 3], dtype=dtype), :]
 
 
-# A negative index is refused in two places on the live path: `_chunk_unit_args` declines one
-# (`utils.py`, `(indices < 0).any()`) and `build_chunk_unit_items` errors on one
-# (`chunk_item.rs`, "index {} is negative"). Tested through the read below rather than by
-# calling either directly, so the test survives a change of spelling.
-
-
 def test_sorted_selections_never_produce_a_negative_bound(sharded) -> None:
-    """The guard above must not be firing on ordinary reads."""
+    """The negative-index guards must not fire on ordinary reads."""
     path, values = sharded
     rng = np.random.default_rng(0)
     with zarr.config.set(STRICT):

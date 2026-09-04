@@ -110,7 +110,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
     })
 }
 
-/// `push_entry` must ACCUMULATE, not replace: a selection spanning two shards is two entries,
+/// `push_entry` must accumulate, not replace: a selection spanning two shards is two entries,
 /// and the second entry's output starts where the first left off.
 #[test]
 fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
@@ -155,8 +155,8 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
 /// Two entries may not claim the same output bytes.
 ///
 /// `push_entry` is `#[pymethods]` with a caller-chosen `out_start`, and the read path writes
-/// items CONCURRENTLY through views whose safety contract is that their subsets are disjoint.
-/// Overlap there is a data race, so it has to be refused where the entries are accumulated --
+/// items concurrently through views whose safety contract is that their subsets are disjoint.
+/// Overlap there is a data race, so it has to be refused where the entries are accumulated;
 /// nothing downstream sees both.
 #[test]
 fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
@@ -178,13 +178,11 @@ fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
             vec![],
         )?;
 
-        // `a` produced two items covering output 0..2, so an entry starting at 1 gives two
-        // items the same byte. `push_entry` no longer refuses that: the check it used could
-        // not judge a banded entry, where two bands of one read share an axis-0 start and
-        // overlap nothing, and a guard that quietly stops covering the newest shape is worse
-        // than none. The overlap is refused at read instead, by the forward-only cursor in
-        // `DisjointBytes` -- see `read_decode::tests::bytes_are_vended_once_and_forwards`,
-        // which pins that directly.
+        // `a` produced two items covering output 0..2, so an entry starting at 1 gives two items
+        // the same byte. `push_entry` does not refuse that: no check here can judge a banded entry,
+        // whose two bands share an axis-0 start and overlap nothing. The read refuses it instead,
+        // through `DisjointBytes`'s forward-only cursor; see
+        // `read_decode::tests::bytes_are_vended_once_and_forwards`.
         handle.push_entry(
             "c/1",
             vec![95],
@@ -267,7 +265,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
     })
 }
 
-/// A trailing selection that is STRIDED within one index is refused, not silently trusted:
+/// A trailing selection that is strided within one index is refused, not silently trusted:
 /// `gather` copies one contiguous run per coordinate, so a strided box would be filled with
 /// whatever happened to sit consecutively after its start.
 #[test]
@@ -292,8 +290,8 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             narrower.is_ok(),
             "a contiguous column subset is served, not refused"
         );
-        // 2 of 4 rows by 5 of 10 columns is 2 runs of 5 at a stride of 10 -- not one range.
-        // A fused offset could not see this; the per-axis starts can.
+        // 2 of 4 rows by 5 of 10 columns is 2 runs of 5 at a stride of 10, not one range. A fused
+        // offset could not see this; the per-axis starts can.
         let strided = crate::chunk_item::build_chunk_unit_items(
             "c/0/0/0",
             vec![10, 4, 10],
@@ -320,7 +318,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             wraps.is_err(),
             "a run leaving its own sub-row must be refused"
         );
-        // Differing ARITY is refused too -- a 1-D chunk against a 2-D output.
+        // Differing arity is refused too: a 1-D chunk against a 2-D output.
         let ranks = crate::chunk_item::build_chunk_unit_items(
             "c/0",
             vec![10],
@@ -354,8 +352,8 @@ fn test_gather_copies_by_coordinate_and_refuses_the_rest() {
     assert!(crate::utils::gather(&scratch, &[0, 1, 2], 1, &mut out, 2).is_err());
 }
 
-/// With a run length, one coordinate is a whole row -- and the END of the run is what has to
-/// be in bounds, which a start-only check would miss.
+/// With a run length, one coordinate is a whole row, and the end of the run is what has to be in
+/// bounds, which a start-only check would miss.
 #[test]
 fn test_gather_copies_a_run_per_coordinate() {
     let scratch: Vec<u8> = (0..12u8).collect(); // 6 elements of 2 bytes, as 2 rows of 3
@@ -370,7 +368,7 @@ fn test_gather_copies_a_run_per_coordinate() {
     crate::utils::gather(&scratch, &[0, 3], 3, &mut out, 2).expect("in bounds");
     assert_eq!(out, (0..12u8).collect::<Vec<_>>());
 
-    // A coordinate INSIDE the buffer whose run walks off the end. The start alone is fine,
+    // A coordinate inside the buffer whose run walks off the end. The start alone is fine,
     // which is exactly why the check is on the end.
     let mut out = vec![0u8; 6];
     assert!(crate::utils::gather(&scratch, &[4], 3, &mut out, 2).is_err());
@@ -380,10 +378,10 @@ fn test_gather_copies_a_run_per_coordinate() {
     assert!(crate::utils::gather(&scratch, &[0], 0, &mut out, 2).is_err());
 }
 
-/// `push_points` is `#[pymethods]`, so its arguments are whatever Python passed. Two things
-/// it must refuse rather than trust: a point whose offset leaves its own index's elements --
-/// `gather` only knows the whole decoded buffer, so that would return the NEXT index's
-/// element under this point's name -- and an offset array of the wrong length.
+/// `push_points` is `#[pymethods]`, so its arguments are whatever Python passed. Two things it must
+/// refuse rather than trust: a point whose offset leaves its own index's elements (`gather` only
+/// knows the whole decoded buffer, so that would return the next index's element under this point's
+/// name) and an offset array of the wrong length.
 #[test]
 fn test_push_points_refuses_offsets_that_leave_their_row() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
@@ -442,7 +440,7 @@ fn test_push_points_refuses_offsets_that_leave_their_row() -> PyResult<()> {
 }
 
 /// `push_grid` is `#[pymethods]` too. A column past the row it belongs to would have
-/// `gather_runs` read the NEXT row's element under this column's name, so it is refused
+/// `gather_runs` read the next row's element under this column's name, so it is refused
 /// here rather than trusted from the gate.
 #[test]
 fn test_push_grid_refuses_runs_outside_the_row() -> PyResult<()> {

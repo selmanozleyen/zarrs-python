@@ -35,19 +35,19 @@ struct JobContext {
     codec_options: CodecOptions,
     element_size: usize,
     /// What an absent chunk contributes. Needed in the workers, not just at carve time,
-    /// because an UNSHARDED chunk's absence is only discovered by the read.
+    /// because an unsharded chunk's absence is only discovered by the read.
     fill_value: FillValue,
     /// Whether missing bytes are ordinary. A shard index that named a chunk which is then
     /// missing means the store changed under the read, and that is worth failing on; an
     /// unsharded chunk has no index to consult, so its key simply may not exist yet.
     may_be_absent: bool,
-    /// The unit decoded into scratch: the shard's inner chunk where the array is sharded, the
-    /// CHUNK where it is not. Also per call -- an array's chunks are all one shape -- so it is
-    /// resolved once here from the first item rather than carried on every `Job`.
+    /// The unit decoded into scratch: the shard's inner chunk where the array is sharded, the chunk
+    /// where it is not. Also per call (an array's chunks are all one shape) so it is resolved once
+    /// here from the first item rather than carried on every `Job`.
     decode_shape: Vec<NonZeroU64>,
 }
 
-/// Shard and subshard decoders built during ONE call.
+/// Shard and subshard decoders built during one call.
 #[derive(Default)]
 struct CallDecoders {
     shards: HashMap<StoreKey, Arc<ShardingPartialDecoder>>,
@@ -77,8 +77,8 @@ impl CodecPipelineImpl {
             element_size,
             fill_value: self.fill_value.clone(),
             may_be_absent: shard.depth() == 0,
-            // Sharded: the shard says. Not sharded: any item does, because chunk shapes are
-            // uniform across an array -- and an empty batch never reaches a decode.
+            // Sharded: the shard says. Not sharded: any item does, because chunk shapes are uniform
+            // across an array, and an empty batch never reaches a decode.
             decode_shape: shard.subchunk_shape.as_ref().map_or_else(
                 || items.first().map(|i| i.shape.clone()).unwrap_or_default(),
                 |shape| shape.to_vec(),
@@ -89,7 +89,7 @@ impl CodecPipelineImpl {
 
         let output = DisjointBytes::new(output, output_len);
         let (jobs, absent) = carve(&output, &located, element_size, &ctx)?;
-        // Disjointness is proven above; COVERAGE is not. zarr hands us a buffer from
+        // Disjointness is proven above; coverage is not. zarr hands us a buffer from
         // `np.empty`, so a byte no job owns is returned as whatever was in that memory.
         //
         if output.covered() != output_len {
@@ -108,13 +108,12 @@ impl CodecPipelineImpl {
             return Ok(());
         }
 
-        // Two persistent work-stealing pools, and capacity is never divided between calls: a
-        // free worker takes the next task, whoever queued it, so a call with more chunks
-        // simply gets more workers.
+        // Two persistent work-stealing pools, capacity never divided between calls: a free
+        // worker takes the next task whoever queued it.
         //
-        // READS AND DECODES ARE SEPARATE POOLS. A read blocks on storage; a decode occupies a
-        // core. A reader parked on Lustre must occupy a READER, never a decode worker, or one
-        // slow shard starves every decode in the process.
+        // Reads and decodes get separate pools. A read blocks on storage, a decode occupies a
+        // core, and a reader parked on Lustre must never hold a decode worker or one slow shard
+        // starves every decode in the process.
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
         decode_pool(config.decode_ceiling).in_place_scope(|dec| {
@@ -184,26 +183,26 @@ impl CodecPipelineImpl {
         ctx: &JobContext,
         decoders: &mut CallDecoders,
     ) -> PyResult<Option<ByteRange>> {
-        // Not sharded: there is no index to read and nothing to descend -- the store value is
-        // the chunk. Whether the key EXISTS is the read's business, and a missing one comes
-        // back as absent bytes there, exactly as a never-written shard entry does here.
+        // Not sharded: there is no index to read and nothing to descend, the store value is the
+        // chunk. Whether the key exists is the read's business, and a missing one comes back as
+        // absent bytes there, exactly as a never-written shard entry does here.
         if shard.depth() == 0 {
             return Ok(Some(ByteRange::FromStart(0, None)));
         }
         let file = key_partial_decoder(&self.readable_store, &item.key);
         let mut shard_shape = item.shape.clone();
         let mut offset: Vec<u64> = start.to_vec();
-        // (offset, length) of the level being descended INTO, absolute in the store value.
+        // (offset, length) of the level being descended into, absolute in the store value.
         let mut extent: Option<(u64, u64)> = None;
         // The subchunk indices taken so far. Only built below depth 0.
         let mut path: Vec<u64> = Vec::new();
 
         for depth in 0..shard.depth() {
             let level_shape = shard.subchunk_shape_at(depth);
-            // The descent walks EVERY axis. `subchunk_byte_range` has always taken a full
-            // grid index; this used to fill axis 0 and leave the rest zero, which addressed
-            // the right subchunk only when every other axis held exactly one -- the guard
-            // that made a shard dividing a trailing axis decline outright.
+            // The descent walks every axis. `subchunk_byte_range` has always taken a full grid
+            // index; this used to fill axis 0 and leave the rest zero, which addressed the right
+            // subchunk only when every other axis held exactly one: the guard that made a shard
+            // dividing a trailing axis decline outright.
             if level_shape.len() != shard_shape.len() || level_shape.len() != offset.len() {
                 return Err(PyRuntimeError::new_err(format!(
                     "{}: level {depth} has {} axes against a chunk of {} and a position of {}",
@@ -257,22 +256,18 @@ impl CodecPipelineImpl {
 
             shard_shape.clone_from(shard.subchunk_shape_at(depth));
             if depth + 1 < shard.depth() {
-                // Every axis, not just the split. The path is the cache key for a
-                // subshard's decoder, and two positions differing only on a trailing axis
-                // would otherwise collide on it -- returning the wrong subshard's index.
+                // Every axis, not just the split. The path is the cache key for a subshard's
+                // decoder, and two positions differing only on a trailing axis would otherwise
+                // collide on it: returning the wrong subshard's index.
                 path.extend_from_slice(&grid_index);
             }
         }
-        // The item must lie inside the ONE inner chunk just located. `offset` is now its
-        // position within that chunk, and `shard_shape` the chunk's own extent.
-        //
-        // Checked here rather than left to the caller, and it is not a weaker check than
-        // descending axis 0 with whole trailing axes would be. Without it an
-        // item claiming rows 0..8 x cols 0..12 of a shard whose inner chunk is 8x6 locates
-        // chunk (0,0), and its coordinates -- built for a 12-wide row -- address exactly the
-        // 48 elements that chunk holds. In bounds, wrong data, no error. `push_entry` takes
-        // arbitrary arguments from Python, so this is a trust boundary rather than an
-        // invariant the caller can be assumed to keep.
+        // The item must lie inside the one inner chunk just located: `offset` is its position
+        // within that chunk, `shard_shape` the chunk's own extent. Without this an item claiming
+        // rows 0..8 x cols 0..12 of a shard whose inner chunk is 8x6 locates chunk (0,0) and
+        // addresses exactly the 48 elements it holds: in bounds, wrong data, no error. `push_entry`
+        // takes arbitrary arguments from Python, so this is a trust boundary rather than a caller
+        // invariant.
         let held = item.chunk_subset.shape();
         if held.len() != offset.len()
             || held
@@ -330,19 +325,15 @@ fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, 
             item.key, item.subset
         )));
     }
-    // The arithmetic itself is zarrs': `contiguous_linearised_indices` walks the subset in C
-    // order and merges whole trailing axes into one run exactly as this did by hand -- the
-    // reverse stride fold, the `elem_offset`, and the whole-trailing special case are all
-    // that walk. It also rechecks that `full` encapsulates the subset, which is the bounds
-    // half of the guard above.
+    // The arithmetic is zarrs': `contiguous_linearised_indices` walks the subset in C order, merges
+    // whole trailing axes into one run, and rechecks that `full` encapsulates the subset, the
+    // bounds half of the guard above.
     //
-    // zarrs does not REFUSE a strided sub-box, it emits more runs for one -- so the refusal
-    // below is a COUNT, read off the walk zarrs already did rather than predicted by a second
-    // copy of the contiguity rule. An item's output is one run per axis-0 index, or a single
-    // run when the trailing axes are whole and the rows are therefore adjacent. Anything else
-    // is strided within a row, and vending it as one run per index would claim bytes belonging
-    // to the next item -- which `DisjointBytes` reports as a backwards claim, naming the
-    // symptom rather than this.
+    // It does not refuse a strided sub-box, it emits more runs for one, so the refusal below is a
+    // count read off that walk rather than a second copy of the contiguity rule. An item's output
+    // is one run per axis-0 index, or a single run when whole trailing axes make the rows adjacent;
+    // anything else is strided within a row, and vending it as one run per index would claim the
+    // next item's bytes.
     let runs = item
         .subset
         .contiguous_linearised_indices(&full)
@@ -391,7 +382,7 @@ fn carve<'a>(
     let mut plan: Vec<(usize, Vec<(usize, usize)>)> = Vec::with_capacity(located.len());
     for (i, (item, _)) in located.iter().enumerate() {
         let coords = coords_of(item)?;
-        // WHERE a piece starts comes from `subset`, and HOW LONG it is comes from `coords`.
+        // where a piece starts comes from `subset`, and how long it is comes from `coords`.
         // Nothing ties the two together: `ChunkItem` is constructible from Python and skips
         // the element-count check when coords are present. If they disagree, a piece is
         // carved at the wrong offset and the read returns the right number of wrong elements.
@@ -407,7 +398,7 @@ fn carve<'a>(
         plan.push((i, output_pieces(item, element_size)?));
     }
 
-    // Pass 2: vend every piece of every item in ASCENDING output order.
+    // Pass 2: vend every piece of every item in ascending output order.
     let mut vend: Vec<(usize, usize, usize)> = plan
         .iter()
         .flat_map(|(i, pieces)| pieces.iter().map(move |&(at, len)| (at, len, *i)))
@@ -460,7 +451,7 @@ fn carve<'a>(
 struct DisjointBytes<'a> {
     slice: UnsafeCellSlice<'a, u8>,
     len: usize,
-    /// A `Cell` so `take` can vend from a SHARED reference. It has to: each piece borrows
+    /// A `Cell` so `take` can vend from a shared reference. It has to: each piece borrows
     /// from `&self`, and `&mut self` would allow only one to be alive at a time.
     cursor: Cell<usize>,
     /// Bytes actually vended. Separate from `cursor` because `cursor` jumps over a gap and
@@ -478,7 +469,7 @@ impl<'a> DisjointBytes<'a> {
         }
     }
 
-    /// How many bytes have actually been handed out. NOT `cursor`: that is the end of the
+    /// How many bytes have actually been handed out. not `cursor`: that is the end of the
     /// last range, so it counts a gap as covered and the completeness check would pass with
     /// a hole in the middle of the output.
     fn covered(&self) -> usize {
@@ -490,7 +481,7 @@ impl<'a> DisjointBytes<'a> {
     /// Callers must therefore ask in non-decreasing order of `start`, which `carve` does by
     /// sorting first.
     // Making a `&mut` from a `&` is the whole job, and the lint cannot see why it is sound:
-    // the guarantee is `cursor`, not the type. `UnsafeCellSlice::get_mut` carries the same
+    // The guarantee is `cursor`, not the type. `UnsafeCellSlice::get_mut` carries the same
     // allow for the same reason.
     #[allow(clippy::mut_from_ref)]
     fn take(&self, start: usize, len: usize) -> Option<&mut [u8]> {
@@ -525,13 +516,11 @@ fn coords_of(item: &ChunkItem) -> PyResult<&Arc<[u64]>> {
         .map_py_err::<PyRuntimeError>()
 }
 
-/// Where an item's elements land in the output, as a FLAT element offset.
+/// Where an item's elements land in the output, as a flat element offset.
 ///
-/// The C-order ravel of the subset's start, which is `ravel_indices`. This used to be the row
-/// index times the row length, on the grounds that an item spans every axis after the first
-/// whole -- but `output_pieces` admits a BANDED item, whose trailing start is not zero, and
-/// two bands of one row then sorted equal. It orders jobs and never places bytes, so that was
-/// harmless; the ravel is exact and does not need the invariant to hold.
+/// The C-order ravel of the subset's start (`ravel_indices`), rather than the row index times
+/// the row length: `output_pieces` admits a banded item, whose trailing start is not zero, and
+/// two bands of one row would sort equal. Used to order jobs, never to place bytes.
 fn output_offset(item: &ChunkItem) -> u64 {
     let shape = bytemuck::must_cast_slice::<_, u64>(&item.array_shape);
     ravel_indices(item.subset.start(), shape).unwrap_or(u64::MAX)
@@ -560,7 +549,7 @@ fn build_pool(size: usize, name: &'static str) -> rayon::ThreadPool {
         .expect("a thread pool of a positive size")
 }
 
-/// Threads that BLOCK on storage. Sized independently of the core count for that reason.
+/// Threads that block on storage. Sized independently of the core count for that reason.
 fn read_pool(size: usize) -> &'static rayon::ThreadPool {
     READ_POOL.get_or_init(|| build_pool(size, "read"))
 }
@@ -570,7 +559,7 @@ fn decode_pool(size: usize) -> &'static rayon::ThreadPool {
     DECODE_POOL.get_or_init(|| build_pool(size, "decode"))
 }
 
-/// What the pools were actually BUILT with, or `None` where one has not been built yet.
+/// What the pools were actually built with, or `None` where one has not been built yet.
 pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
     (
         READ_POOL.get().map(rayon::ThreadPool::current_num_threads),
@@ -583,9 +572,9 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
 /// Say so when a ceiling asked for is not the one the pools were built with.
 ///
 /// A warning, not an error. The read is correct at the width already built, and a process that
-/// opens a second array wanting a different width is doing something legitimate -- refusing it
-/// would turn a sizing hint into a failed read. A caller needing the guarantee asserts on
-/// [`pool_sizes`], which is what the benchmark does.
+/// opens a second array wanting a different width is doing something legitimate: refusing it would
+/// turn a sizing hint into a failed read. A caller needing the guarantee asserts on [`pool_sizes`],
+/// which is what the benchmark does.
 pub(crate) fn check_ceiling_arrived(
     py: Python<'_>,
     config: ReadConfig,
@@ -599,7 +588,7 @@ pub(crate) fn check_ceiling_arrived(
             "decode_worker_ceiling",
         ),
     ] {
-        // Only when a pool EXISTS and differs. Before the first read there is nothing to
+        // Only when a pool exists and differs. Before the first read there is nothing to
         // contradict, and the ordinary case costs one atomic load per pool per call.
         let Some(built) = built.filter(|built| *built != asked) else {
             continue;
@@ -610,10 +599,10 @@ pub(crate) fn check_ceiling_arrived(
              the array that does the first read is opened, or call \
              zarrs._internal.pool_sizes() for what was built."
         );
-        // `codec_pipeline.strict` already means "do not paper over what this pipeline cannot
-        // do" -- it turns a decline into a raise instead of a silent fallback to zarr-python.
-        // A width the process cannot give is the same kind of thing, and a caller who asked
-        // for strictness would rather find out here than infer it from a throughput number.
+        // `codec_pipeline.strict` already means "do not paper over what this pipeline cannot do":
+        // it turns a decline into a raise instead of a silent fallback to zarr-python. A width the
+        // process cannot give is the same kind of thing, and a caller who asked for strictness
+        // would rather find out here than infer it from a throughput number.
         if strict {
             return Err(PyValueError::new_err(message));
         }
@@ -622,18 +611,18 @@ pub(crate) fn check_ceiling_arrived(
     Ok(())
 }
 
-/// What ONE call reads from `zarr.config` when it starts.
+/// What one call reads from `zarr.config` when it starts.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadConfig {
-    /// Only the FIRST call's value is used -- see [`READ_POOL`].
+    /// Only the first call's value is used: see [`READ_POOL`].
     pub(crate) read_ceiling: usize,
-    /// Only the FIRST call's value is used -- see [`READ_POOL`].
+    /// Only the first call's value is used: see [`READ_POOL`].
     pub(crate) decode_ceiling: usize,
 }
 
 /// A ceiling as the pipeline will use it: zero or absent means "as much as the machine has".
 ///
-/// Public so the pipeline can resolve at OPEN, which is when these are read.
+/// Public so the pipeline can resolve at open, which is when these are read.
 pub(crate) fn resolve_ceiling(ceiling: Option<usize>) -> usize {
     ceiling.filter(|c| *c > 0).unwrap_or_else(default_ceiling)
 }
@@ -652,21 +641,21 @@ struct Job<'a> {
     key: StoreKey,
     /// The chunk's byte range within its shard.
     range: ByteRange,
-    /// The output ranges this chunk fills, ascending. ONE range while every axis after the
-    /// first is taken whole -- which is every rank-1 read, so the CSR path always has one.
-    /// A shard that divides a trailing axis gives an item one range per row instead.
+    /// The output ranges this chunk fills, ascending. one range while every axis after the first is
+    /// taken whole, which is every rank-1 read, so the CSR path always has one. A shard that
+    /// divides a trailing axis gives an item one range per row instead.
     out: Vec<&'a mut [u8]>,
     coords: &'a [u64],
     /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
     run_len: u64,
-    /// Where each RUN starts inside a coordinate's elements, and how long a run is, when the
-    /// wanted elements are not one consecutive span -- `oindex[rows, cols]` and any rank-N
-    /// grid. `None` is a single contiguous run, which is every other case.
+    /// Where each run starts inside a coordinate's elements, and how long a run is, when the wanted
+    /// elements are not one consecutive span: `oindex[rows, cols]` and any rank-N grid. `None` is a
+    /// single contiguous run, which is every other case.
     grid: Option<(&'a [u64], u64)>,
     ctx: &'a JobContext,
 }
 
-/// Keep the FIRST failure; later ones are usually consequences of it.
+/// Keep the first failure; later ones are usually consequences of it.
 fn record(failure: &Mutex<Option<String>>, message: String) {
     let mut slot = failure.lock().expect("failure slot poisoned");
     if slot.is_none() {
@@ -676,10 +665,10 @@ fn record(failure: &Mutex<Option<String>>, message: String) {
 
 // Decode scratch, owned by the worker and kept for the life of the process.
 //
-// A decode decompresses a whole inner chunk (366 KiB sparse, 512 KiB dense here) before the
-// wanted rows are copied out. Above glibc's 128 KiB threshold that allocation is an mmap, a
-// memset and a fault per page, so it must not be paid per chunk. A rayon worker lives for the
-// process, so its own buffer is the reuse -- no lock, and no way for it to silently not run.
+// A decode decompresses a whole inner chunk (366 KiB sparse, 512 KiB dense here) before the wanted
+// rows are copied out. Above glibc's 128 KiB threshold that allocation is an mmap, a memset and a
+// fault per page, so it must not be paid per chunk. A rayon worker lives for the process, so its
+// own buffer is the reuse: no lock, and no way for it to silently not run.
 thread_local! {
     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -694,9 +683,9 @@ fn read_one<'scope, 'env>(
     'env: 'scope,
 {
     match ctx.store.get_partial(&job.key, job.range) {
-        // `None` means the KEY is absent, which is a different thing from a range coming back
-        // empty. `decode_one` already knows what an absent chunk contributes -- the fill
-        // value, or an error where a shard index named it -- so that logic stays in one place.
+        // `None` means the key is absent, which is a different thing from a range coming back
+        // empty. `decode_one` already knows what an absent chunk contributes (the fill value, or an
+        // error where a shard index named it) so that logic stays in one place.
         Ok(bytes) => spawn_decode(dec, job, bytes, failure),
         Err(e) => record(failure, format!("read {} failed: {e}", job.key)),
     }
@@ -711,7 +700,7 @@ fn spawn_decode<'scope, 'env>(
 ) where
     'env: 'scope,
 {
-    // EVERY job goes to the pool: the reader hands off, it never decodes.
+    // every job goes to the pool: the reader hands off, it never decodes.
     dec.spawn(move |_| {
         SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
@@ -739,22 +728,14 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let shape = ctx.decode_shape.as_slice();
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
-    // GROW only. `clear()` then `resize(needed, 0)` zero-fills the whole buffer, and
-    // `decode_into` below writes every byte of it -- the view is built over
-    // `new_with_shape`, the entire chunk -- so the fill is overwritten without ever being
-    // read. At an inner chunk of 91,549 f32 that is 366 KiB memset per decode, and a
-    // chunk_size 64 preload decodes ~2,800 chunks: about a gigabyte of zeroing per preload,
-    // thrown away.
+    // grow only. `clear()` + `resize(needed, 0)` zero-fills a buffer `decode_into` then writes
+    // every byte of: at an inner chunk of 91,549 f32 that is 366 KiB memset per decode, ~1 GiB per
+    // chunk_size 64 preload, thrown away.
     //
-    // What this DOES change is the failure mode if `decode_into` ever leaves part of the
-    // target unwritten: the gap now carries the PREVIOUS chunk's decoded elements rather
-    // than zeros, so it reads as plausible values instead of an obvious block of nothing.
-    // The worker's buffer outlives the call, so that previous chunk may belong to an earlier
-    // CALL rather than to this one -- the same class of staleness, over a wider provenance. It
-    // is still bounded by the same condition: the view below is the whole chunk, so any codec
-    // that can leave a gap is already broken, whoever wrote the bytes that show through.
-    // The view below is built over `new_with_shape` -- the whole chunk -- so a codec that
-    // returns `Ok` without filling it would already be broken; this makes such a bug quieter
+    // If `decode_into` ever left part of the target unwritten the gap would now show a previous
+    // chunk's elements rather than zeros: plausible values instead of an obvious block of nothing,
+    // and from an earlier call, since the worker's buffer outlives this one. The view below is the
+    // whole chunk, so a codec that can leave a gap is already broken; this makes such a bug quieter
     // rather than causing one.
     if scratch.len() < needed {
         scratch.resize(needed, 0);
@@ -777,13 +758,10 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         ctx.shard
             .inner_chain
             .decode_into(
-                // BORROWED. `ArrayBytesRaw` is `Cow<'_, [u8]>` and `Bytes` derefs to
-                // `[u8]`, so the decode can read the fetched buffer where it lies.
-                // `Cow::Owned(bytes.into())` converted it to a `Vec` first -- an allocation
-                // and, whenever the `Bytes` does not uniquely own its buffer, a copy of the
-                // whole compressed chunk. At ~90 KiB compressed and ~2,800 chunks that is a
-                // quarter of a gigabyte per preload, to hand the decoder bytes it already
-                // had.
+                // borrowed. `ArrayBytesRaw` is `Cow<'_, [u8]>` and `Bytes` derefs to `[u8]`,
+                // so the decode reads the fetched buffer where it lies. `Cow::Owned` would
+                // allocate, and copy the whole compressed chunk whenever the `Bytes` is not
+                // uniquely owned: ~250 MiB per preload to hand the decoder bytes it had.
                 Cow::Borrowed(&bytes),
                 shape,
                 ArrayBytesDecodeIntoTarget::Fixed(&mut view),
@@ -814,7 +792,7 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
 mod tests {
     use super::*;
 
-    /// An item's output must be ONE RUN per axis-0 index, and `output_pieces` is where that
+    /// An item's output must be one run per axis-0 index, and `output_pieces` is where that
     /// is enforced.
     #[test]
     fn output_pieces_refuses_a_strided_sub_box() {
@@ -835,16 +813,16 @@ mod tests {
             output_pieces(&strided, 8).is_err(),
             "a strided output sub-box must be refused, not modelled as one run"
         );
-        // Taking ALL of axis 1 and part of axis 2 is also strided -- ten runs of five, not
-        // one run of fifty. Written out because it is the case I got wrong first: "only the
-        // last axis is partial" is not the rule; "every axis before the last partial one
-        // takes a single element" is.
+        // Taking all of axis 1 and part of axis 2 is also strided: ten runs of five, not one run of
+        // fifty. Written out because it is the case I got wrong first: "only the last axis is
+        // partial" is not the rule; "every axis before the last partial one takes a single element"
+        // is.
         let wide_then_partial = item(&[0..2, 0..10, 0..5], &[6, 10, 10]);
         assert!(
             output_pieces(&wide_then_partial, 8).is_err(),
             "a full axis above a partial one is still strided"
         );
-        // One element on axis 1 and part of axis 2 IS one run per index, and is served.
+        // One element on axis 1 and part of axis 2 is one run per index, and is served.
         let one_run = item(&[0..2, 3..4, 0..5], &[6, 10, 10]);
         assert!(
             output_pieces(&one_run, 8).is_ok(),
@@ -886,9 +864,9 @@ mod tests {
         );
         assert!(bytes.take(8, 9).is_none(), "past the end of the buffer");
         assert!(bytes.take(usize::MAX, 1).is_none(), "start + len overflows");
-        // Vending over a gap is allowed -- the caller may skip bytes it does not own -- but
-        // it must not COUNT as covered, or the completeness check in `retrieve_chunk_units`
-        // would pass with a hole and hand `np.empty` contents back as data.
+        // Vending over a gap is allowed (the caller may skip bytes it does not own) but it must not
+        // count as covered, or the completeness check in `retrieve_chunk_units` would pass with a
+        // hole and hand `np.empty` contents back as data.
         assert!(bytes.take(12, 4).is_some(), "forwards over a gap");
         assert_eq!(
             bytes.covered(),
@@ -900,7 +878,7 @@ mod tests {
         assert_eq!(buffer[4], 2);
     }
 
-    /// The pools are built at the size asked for, and the size is ONE-SHOT.
+    /// The pools are built at the size asked for, and the size is one-shot.
     #[test]
     fn a_pool_is_built_once_at_the_size_asked_for() {
         assert_eq!(
@@ -918,7 +896,7 @@ mod tests {
         assert_eq!(read_pool(64).current_num_threads(), 3);
         assert_eq!(pool_sizes().0, Some(3));
 
-        // THE TWO POOLS ARE SEPARATE. The read pool is built here; the decode pool must not
+        // The two pools are separate. The read pool is built here; the decode pool must not
         // have been dragged into existence with it, or a read-side default would silently
         // become the decode width.
         assert_eq!(

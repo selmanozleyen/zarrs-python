@@ -99,10 +99,6 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
     }
 }
 
-/// Copy one RUN of `run_len` elements per coordinate out of `scratch` into `out`, in
-/// coordinate order.
-///
-/// `out` must be exactly `coords.len() * run_len * size` bytes.
 /// Bytes in one index's run of elements. Refuses zero and overflow.
 fn run_bytes(run_len: u64, size: usize) -> Result<usize, String> {
     let Some(bytes) = usize::try_from(run_len)
@@ -117,7 +113,7 @@ fn run_bytes(run_len: u64, size: usize) -> Result<usize, String> {
     Ok(bytes)
 }
 
-/// Maximal runs of CONSECUTIVE coordinates, as index ranges into `coords`.
+/// Maximal runs of consecutive coordinates, as index ranges into `coords`.
 pub(crate) fn coord_runs(coords: &[u64], run_len: u64) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut start = 0usize;
     std::iter::from_fn(move || {
@@ -147,14 +143,14 @@ pub(crate) fn gather(
         return Err("output region does not match the coordinate count".to_string());
     }
     for (n, &c) in coords.iter().enumerate() {
-        // Checked, and not because a coordinate can be that large today -- they are all
-        // below the inner chunk extent. Unchecked, a large one wraps in release and can land
-        // back INSIDE scratch, so `get` succeeds and the wrong element is copied: exactly
-        // the silent-wrong-data mode this function's bounds check exists to refuse.
+        // Checked, and not because a coordinate can be that large today: they are all below the
+        // inner chunk extent. Unchecked, a large one wraps in release and can land back inside
+        // scratch, so `get` succeeds and the wrong element is copied: exactly the silent-wrong-data
+        // mode this function's bounds check exists to refuse.
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
-        // The END of the run is what has to be in bounds, not its start: a coordinate inside
+        // The end of the run is what has to be in bounds, not its start: a coordinate inside
         // `scratch` whose run walks off the end would otherwise read past the decode.
         let Some(element) = src.checked_add(run).and_then(|end| scratch.get(src..end)) else {
             return Err(format!(
@@ -181,9 +177,9 @@ pub(crate) fn gather_pieces(
         return Err("output pieces do not match the coordinate count".to_string());
     }
     let mut writer = PieceWriter::new(pieces);
-    // Consecutive coordinates name ONE contiguous span of the decode and are copied as one.
+    // Consecutive coordinates name one contiguous span of the decode and are copied as one.
     // The pieces are written in order, so a merged span still lands correctly when it
-    // straddles two of them. (`gather`, the single-piece path, does NOT merge: it writes into
+    // straddles two of them. (`gather`, the single-piece path, does not merge: it writes into
     // one slice at a fixed stride, where a copy per coordinate costs nothing extra.)
     for r in coord_runs(coords, run_len) {
         let c = coords[r.start];
@@ -208,7 +204,7 @@ pub(crate) fn gather_pieces(
     Ok(())
 }
 
-/// Gather `starts.len()` RUNS of `run` elements per coordinate, rather than one contiguous
+/// Gather `starts.len()` runs of `run` elements per coordinate, rather than one contiguous
 /// span.
 pub(crate) fn gather_runs(
     scratch: &[u8],
@@ -233,7 +229,7 @@ pub(crate) fn gather_runs(
     for (n, &c) in coords.iter().enumerate() {
         for (j, &start) in starts.iter().enumerate() {
             // Checked for the reason the contiguous gather checks: unchecked, a large value
-            // wraps in release and can land back INSIDE scratch, so the read succeeds and
+            // wraps in release and can land back inside scratch, so the read succeeds and
             // returns the wrong elements rather than failing.
             let Some(src) = c
                 .checked_add(start)

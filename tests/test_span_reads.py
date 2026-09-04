@@ -1,25 +1,11 @@
-"""A contiguous span must read what naming its elements read.
-
-`_chunk_unit_args` describes `X[a:b]` as a run -- `push_span`, one coordinate and a length
-per inner chunk -- rather than expanding it to one index per element. The two describe the
-same bytes, so they must return the same values, and the boundary arithmetic is where that
-could quietly stop being true: `push_span` computes which inner chunks a span crosses by
-division, where the element path derived it by walking sorted indices. An off-by-one there
-returns the right AMOUNT of data from the wrong place, which reads as plausible numbers
-rather than as a crash.
-
-The 1-D case is the one that matters most: a backed CSR `data`/`indices` read is exactly
-this shape, and it is where the description cost was two thirds of the read.
-"""
-
 from __future__ import annotations
 
 import numpy as np
 import pytest
 import zarr
 
-# One shard holds several inner chunks, so a span crosses boundaries WITHIN a shard as well
-# as between them -- both splits `push_span` has to get right.
+# One shard holds several inner chunks, so a span crosses boundaries within a shard as well
+# as between them.
 INNER = 8
 SHARD = 32
 LENGTH = 200
@@ -28,8 +14,6 @@ LENGTH = 200
 @pytest.fixture
 def sharded_1d(tmp_path):
     values = np.arange(LENGTH, dtype=np.float64)
-    # `chunks` is the INNER chunk and `shards` the outer one, so a shard holds SHARD/INNER
-    # of them -- the geometry a backed CSR `data` array actually has.
     array = zarr.create_array(
         store=tmp_path / "1d.zarr",
         shape=(LENGTH,),
@@ -86,9 +70,7 @@ def test_the_span_path_is_actually_taken(sharded_1d):
 
     def watched(*args, **kwargs):
         out = original(*args, **kwargs)
-        # A list of pushes, one per band -- so the KIND is the first field of each, not the
-        # first element of the return. Reading `out[0]` collected whole tuples and the
-        # membership test below then quietly never matched.
+        # A list of pushes, one per band, so the kind is the first field of each.
         seen.extend(push[0] for push in out or ())
         return out
 

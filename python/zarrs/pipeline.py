@@ -43,8 +43,8 @@ class UnsupportedMetadataError(Exception):
     pass
 
 
-#: What sends a batch to zarr-python instead. `read` and `write` must use the same set:
-#: a member in one and not the other falls back on read and raises on write.
+# : What sends a batch to zarr-python instead. `read` and `write` must use the same set:
+# : a member in one and not the other falls back on read and raises on write.
 FALLBACK_TO_ZARR_PYTHON = (
     UnsupportedMetadataError,
     DiscontiguousArrayError,
@@ -78,7 +78,7 @@ def get_codec_pipeline_impl(
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
             ),
-            # Read at OPEN, like `num_threads` and the chunk-concurrency bounds beside them.
+            # Read at open, like `num_threads` and the chunk-concurrency bounds beside them.
             # They size process-wide pools that only the first read builds, so offering them
             # per call would be offering a choice that cannot be honoured.
             read_worker_ceiling=config.get("codec_pipeline.read_worker_ceiling", None),
@@ -86,7 +86,7 @@ def get_codec_pipeline_impl(
                 "codec_pipeline.decode_worker_ceiling", None
             ),
             # Under `strict`, a ceiling the process cannot give is an error rather than a
-            # warning -- the same switch that turns a decline into a raise.
+            # warning, the same switch that turns a decline into a raise.
             strict=strict,
         )
     except TypeError as e:
@@ -230,9 +230,9 @@ class ZarrsCodecPipeline(CodecPipeline):
         else:
             out: NDArrayLike = out.as_ndarray_like()
             desc = chunks_desc.chunk_info_with_indices
-            # One entry point. `chunk_info_for_read` either produces a handle or raises, and
-            # the raise is caught above as a fall back to zarr-python -- there is no second
-            # Rust read path to choose between any more.
+            # One entry point. `chunk_info_for_read` either produces a handle or raises, and the
+            # raise is caught above as a fall back to zarr-python: there is no second Rust read
+            # path to choose between any more.
             retrieve = self.impl.retrieve_chunk_items_and_apply_index
             await asyncio.to_thread(retrieve, desc, out)
             return None
