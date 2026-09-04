@@ -36,6 +36,7 @@ pub(crate) struct ChunkItem {
     pub chunk_subset: ArraySubset,
     pub subset: ArraySubset,
     pub shape: Vec<NonZeroU64>,
+    /// Elements in the WHOLE chunk, not in `chunk_subset`. Write path only.
     pub num_elements: u64,
     pub array_shape: Vec<NonZeroU64>,
     /// Indices within `chunk_subset`, when this item is a whole inner chunk plus the
@@ -270,8 +271,8 @@ fn trailing_zeros(out_start: u64, rank: usize) -> Vec<u64> {
 /// Axes after the first may be taken whole or as a CONTIGUOUS sub-box, described by
 /// `elem_starts` against the output's trailing extents -- so one selected index is still one
 /// contiguous run, of `run_len` elements starting `elem_offset` into that index. That restriction is what
-/// lets `locate` keep descending on axis 0 alone: with a single subchunk on every other
-/// axis, the raveled chunk-grid index IS the axis-0 index. `locate` rechecks it per level.
+/// lets `locate` land the item inside ONE inner chunk on every axis; it rechecks that per
+/// level and refuses the item otherwise.
 // Every one of these is a distinct fact about the batch and none has a default worth
 // guessing; a struct for a single call site would move the same arguments behind a name.
 #[allow(clippy::too_many_arguments)]
@@ -594,22 +595,6 @@ impl ChunkItems {
         }
     }
 
-    /// Refuse an output start behind the last entry's end.
-    ///
-    /// `push_span`, `push_grid` and `push_points` each own one contiguous output range, so a
-    /// start behind the cursor is two entries claiming the same bytes. `push_indices` does NOT
-    /// call this -- see its doc comment: two bands of one read legitimately share an axis-0
-    /// start, and disjointness for that one is proven downstream by `DisjointBytes`.
-    fn refuse_backwards(&self, out_start: u64) -> PyResult<()> {
-        if out_start < self.out_end {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "output starting at {out_start} overlaps an entry already pushed, which ends \
-                 at {}",
-                self.out_end
-            )));
-        }
-        Ok(())
-    }
 
     /// Build one batch entry's items and append them.
     ///
@@ -676,11 +661,7 @@ impl ChunkItems {
     /// This is the whole point. Describing the span as elements instead -- `np.arange(a, b)`,
     /// on the grounds that a contiguous slice IS a sorted integer axis spelled differently --
     /// costs one `u64` per ELEMENT, built in numpy and walked one at a time here. Described as
-    /// a run it is one coordinate and a length, whatever the span. The measurement behind that
-    /// is in the commit message, not here: this doc comment is copied verbatim into
-    /// `zarrs/_internal.pyi` by `pyo3-stub-gen`, so it is what `help()` shows a user, and
-    /// milliseconds from a dataset they do not have belong in the history rather than in
-    /// their terminal.
+    /// a run it is one coordinate and a length, whatever the span.
     #[pyo3(signature = (key, chunk_shape, shape, first, count, out_start, inner_extent))]
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn push_span(
@@ -851,6 +832,26 @@ impl ChunkItems {
 }
 
 impl ChunkItems {
+    // NOT in the `#[pymethods]` block. It was, and pyo3 exported it regardless of the Rust
+    // `fn` visibility -- so it appeared in `_internal.pyi` as callable API whose docstring
+    // names `DisjointBytes`, a type no Python caller has. Its only callers are in this crate.
+    /// Refuse an output start behind the last entry's end.
+    ///
+    /// `push_span`, `push_grid` and `push_points` each own one contiguous output range, so a
+    /// start behind the cursor is two entries claiming the same bytes. `push_indices` does NOT
+    /// call this -- see its doc comment: two bands of one read legitimately share an axis-0
+    /// start, and disjointness for that one is proven downstream by `DisjointBytes`.
+    fn refuse_backwards(&self, out_start: u64) -> PyResult<()> {
+        if out_start < self.out_end {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "output starting at {out_start} overlaps an entry already pushed, which ends \
+                 at {}",
+                self.out_end
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn as_slice(&self) -> &[ChunkItem] {
         &self.items
     }

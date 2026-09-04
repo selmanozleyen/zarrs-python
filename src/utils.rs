@@ -87,8 +87,8 @@ pub(crate) fn offset_runs(
 /// other would be a wrong-length copy rather than a compile error. Called once per job, not
 /// per element.
 ///
-/// Named for its unit. In this file `run` on its own means elements in `gather_runs` and bytes
-/// in the two callers here -- eleven lines apart, which is how a reader loses an afternoon.
+/// Named for its unit. `run` on its own means ELEMENTS in `gather_runs`, and every byte count
+/// in this file says `bytes` -- which is the convention this function exists to keep.
 fn run_bytes(run_len: u64, size: usize) -> Result<usize, String> {
     let Some(bytes) = usize::try_from(run_len)
         .ok()
@@ -307,14 +307,14 @@ pub(crate) fn gather_runs(
     let Some(span) = usize::try_from(run).ok().and_then(|r| r.checked_mul(size)) else {
         return Err(format!("a run of {run} elements is too large to address"));
     };
-    let Some(row) = starts.len().checked_mul(span) else {
+    let Some(row_bytes) = starts.len().checked_mul(span) else {
         return Err("the gathered rows are too large to address".to_string());
     };
-    if element_offsets.len().checked_mul(row) != Some(out.len()) {
+    if element_offsets.len().checked_mul(row_bytes) != Some(out.len()) {
         return Err(format!(
-            "{} offsets of {row} bytes each fill {} bytes, but the output is {}",
+            "{} offsets of {row_bytes} bytes each fill {} bytes, but the output is {}",
             element_offsets.len(),
-            element_offsets.len().saturating_mul(row),
+            element_offsets.len().saturating_mul(row_bytes),
             out.len()
         ));
     }
@@ -338,7 +338,7 @@ pub(crate) fn gather_runs(
                     scratch.len() / size
                 ));
             };
-            let at = n * row + j * span;
+            let at = n * row_bytes + j * span;
             out[at..at + span].copy_from_slice(piece);
         }
     }

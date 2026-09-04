@@ -61,7 +61,7 @@ struct JobContext {
     /// twice per job, ~8,000 times a call.
     may_be_absent: bool,
     /// See [`MAX_ROW_READS`]. Per call, so a caller can disable the row path for one read.
-    max_row_reads: usize,
+    max_row_reads_per_chunk: usize,
     /// The unit decoded into scratch: the shard's inner chunk where the array is sharded, the
     /// CHUNK where it is not. Also per call -- an array's chunks are all one shape -- so it is
     /// resolved once here from the first item rather than carried on every `Job`.
@@ -127,9 +127,9 @@ fn item_is_one_decode_unit(item: &ChunkItem, offset: &[u64], unit: &[NonZeroU64]
 }
 
 impl CodecPipelineImpl {
-    /// Read and decode `items`, one job per innermost chunk, on workers scoped to this call.
+    /// Read and decode `items`, one job per READ, on workers scoped to this call.
     ///
-    /// `items` must be chunk-unit items: one whole innermost chunk each, carrying the element
+    /// `items` must be chunk-unit items: each inside ONE innermost chunk, carrying the element
     /// offsets wanted from it. There is no second path to hand an item to, so anything this
     /// cannot take is an ERROR rather than a value the caller has to remember to check --
     /// which is what it used to be, and the check had already become vacuous.
@@ -144,7 +144,7 @@ impl CodecPipelineImpl {
         let element_size = self.element_size()?;
         let ctx = JobContext {
             by_row: self.inner_chunk_is_plain_bytes,
-            max_row_reads: config.max_row_reads,
+            max_row_reads_per_chunk: config.max_row_reads_per_chunk,
             shard: shard.clone(),
             store: self.store.clone(),
             codec_options: (*codec_options).with_concurrent_target(1),
@@ -570,7 +570,8 @@ fn carve<'a>(
             // One job per ROW, each reading exactly its own bytes.
             //
             // Only when the chunk is a plain byte tiling, so a row's offset inside it is
-            // arithmetic: `coord` is already the row's element offset within the chunk, and
+            // arithmetic: `element_offsets[i]` is already the row's element offset within the
+            // chunk, and
             // `run_len` its length. Measured at scale, 8,192 rows this way take 628 ms
             // against 1121 for the chunks holding them -- the request COUNT is the same
             // either way, so all that changes is how many bytes each one moves.
@@ -595,10 +596,10 @@ fn carve<'a>(
                     // set to refuse. Nothing builds such an item today -- `push_span` returns
                     // early on an empty count -- so this makes the documented behaviour true
                     // by construction rather than by the absence of a caller.
-                    && ctx.max_row_reads > 0
+                    && ctx.max_row_reads_per_chunk > 0
                     && pieces.len() == 1
                     && item.grid.is_none()
-                    && row_read_count(element_offsets_of(item)?, item.run_len) <= ctx.max_row_reads =>
+                    && row_read_count(element_offsets_of(item)?, item.run_len) <= ctx.max_row_reads_per_chunk =>
             {
                 let piece = pieces.into_iter().next().expect("length checked");
                 row_jobs(
@@ -662,7 +663,8 @@ const MAX_ROW_READS: usize = 2;
 /// One job per RUN of consecutive rows, each reading exactly its own bytes, for a chunk that
 /// is a plain byte tiling.
 ///
-/// `coord` is already the row's element offset within the chunk and `run_len` its length, so
+/// `element_offsets[i]` is already the row's element offset within the chunk and `run_len`
+/// its length, so
 /// the row's byte range is arithmetic. Measured at scale, 8,192 rows read this way take
 /// 628 ms against 1121 for the chunks holding them: the request COUNT is the same either way,
 /// and only the bytes each one moves change.
@@ -1117,7 +1119,7 @@ pub(crate) struct ReadConfig {
     pub(crate) decode_pool_size: usize,
     /// Reads a chunk may become before the row path is declined for it; see [`MAX_ROW_READS`].
     /// Per call, and honoured on every call rather than only the first.
-    pub(crate) max_row_reads: usize,
+    pub(crate) max_row_reads_per_chunk: usize,
 }
 
 /// A pool size as the pipeline will use it.
@@ -1138,12 +1140,12 @@ impl ReadConfig {
     pub(crate) fn from_open(
         read_pool_size: usize,
         decode_pool_size: usize,
-        max_row_reads: Option<usize>,
+        max_row_reads_per_chunk: Option<usize>,
     ) -> Self {
         Self {
             read_pool_size,
             decode_pool_size,
-            max_row_reads: max_row_reads.unwrap_or(MAX_ROW_READS),
+            max_row_reads_per_chunk: max_row_reads_per_chunk.unwrap_or(MAX_ROW_READS),
         }
     }
 }
@@ -1321,9 +1323,6 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     // CALL rather than to this one -- the same class of staleness, over a wider provenance. It
     // is still bounded by the same condition: the view below is the whole chunk, so any codec
     // that can leave a gap is already broken, whoever wrote the bytes that show through.
-    // The view below is built over `new_with_shape` -- the whole chunk -- so a codec that
-    // returns `Ok` without filling it would already be broken; this makes such a bug quieter
-    // rather than causing one.
     if scratch.len() < needed_bytes {
         // `try_reserve`, then resize. A plain `resize` that cannot allocate goes through
         // `handle_alloc_error`, which ABORTS -- it kills the interpreter with no Python

@@ -214,8 +214,14 @@ def pool_sizes() -> tuple[builtins.int | None, builtins.int | None]:
 
 def read_unit_stats() -> tuple[builtins.int, builtins.int]:
     r"""
-    `(row, chunk)` jobs since the run began: rows read as their own byte range, against whole
-    inner chunks read and decoded.
+    `(row_reads, chunk_reads)` since the run began.
+
+    THE TWO ARE NOT THE SAME UNIT, and the obvious ratio between them is wrong. A chunk served
+    by the row path contributes ONE PER RUN of consecutive rows -- up to
+    `max_row_reads_per_chunk` of them, two by default -- while a chunk served the ordinary way
+    contributes exactly one. So a batch in which half the chunks took the row path reports
+    something nearer 2:1 than 1:1, and `row / (row + chunk)` is not the fraction of chunks that
+    took it. Read them as what they are: how many byte-range requests each path issued.
 
     Exposed so a test can assert the row path was TAKEN. Correctness cannot: both paths return
     the same values, so a gate that refuses everything passes every values test.
@@ -223,7 +229,7 @@ def read_unit_stats() -> tuple[builtins.int, builtins.int]:
 
 def release_pools_for_fork() -> None:
     r"""
-    Drop the two worker pools, so a `fork()` about to happen cannot inherit a held lock.
+    Drop every process-wide thread pool, so a `fork()` cannot inherit a held lock.
 
     Registered from Python with `os.register_at_fork(before=...)`. See
     [`read_decode::release_pools_for_fork`] for why the pid check inside `pools` is not enough

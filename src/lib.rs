@@ -57,7 +57,7 @@ const NATIVE_ENDIAN: &str = if cfg!(target_endian = "little") {
 /// WITHOUT reading the chunk around it.
 ///
 /// Read off the metadata JSON the pipeline is constructed from, rather than taken as another
-/// constructor flag -- that argument list already carries three bools and nine parameters.
+/// constructor flag -- that argument list already carries four bools and twelve parameters.
 ///
 /// AND NOT off the bound codec chain, which `ShardInfo` already holds and which would make this
 /// a second derivation of a fact one owner has -- exactly the pattern removed for the inner
@@ -131,7 +131,7 @@ pub struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
-    /// Present only for a singly-sharded array: the concurrent path locates chunks itself,
+    /// Present unless this array's codec chain is refused outright: the concurrent path locates
     /// so it needs the shard's index codecs and the codecs inside a shard. `None` means this
     /// array cannot take that path at all.
     pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
@@ -385,7 +385,7 @@ impl CodecPipelineImpl {
             }
             return Ok(());
         }
-        // The array must present a sharding codec; `chunk_info_for_read` is the only route to a
+        // The codec chain must be one this path accepts; `chunk_info_for_read` is the only route to a
         // `ChunkItems` handle and it refuses anything else, but this is a `#[pymethods]`
         // boundary and what it guards is an exclusive output slice.
         //
@@ -424,15 +424,16 @@ impl CodecPipelineImpl {
             }
             return Ok(());
         }
-        // No second path to fall through to. Reaching here means the array presents no
-        // sharding codec, and the output buffer is exactly as `np.empty` left it -- so
+        // No second path to fall through to. Reaching here means the codec chain was REFUSED
+        // -- a codec beside the sharding codec -- and the output buffer is exactly as
+        // `np.empty` left it, so
         // returning Ok would hand the caller uninitialised memory and call it data. Python
         // declines this before it gets here (`_inner_chunk_shape` returns `None` for the same
         // chains `ShardInfo::from_codec_chain` refuses); this is the assertion that says so,
         // rather than a silence that looks like success.
         Err(PyRuntimeError::new_err(format!(
-            "a batch of {} items could not be served: this array presents no sharding codec, \
-             so there is no decode unit to group by",
+            "a batch of {} items could not be served: this array carries a codec beside its \
+             sharding codec, so the shard index no longer addresses the bytes on disk",
             chunk_descriptions.len(),
         )))
     }
@@ -557,16 +558,13 @@ impl CodecPipelineImpl {
     /// at all -- a codec beside the sharding codec, which leaves the shard index addressing
     /// bytes that are no longer there.
     ///
-    /// ASKED HERE RATHER THAN DERIVED TWICE. Python used to answer this itself by walking
-    /// zarr's codec OBJECTS while `ShardInfo::from_codec_chain` answered it from the bound
-    /// chain, and the two could disagree -- at which point Python built a description this
-    /// side refuses, and the refusal surfaced as an uncaught `PyRuntimeError` from a call made
-    /// outside `read`'s `try`, where the base pipeline would simply have read the array. A
-    /// third-party codec registered for `sharding_indexed` reopens that gap however carefully
-    /// the Python walk is written, because the two are answering from different data.
-    ///
-    /// It is also less code: the reach into `zarr.codecs.ShardingCodec`, `.chunk_shape` and
-    /// `.codecs` goes away with it.
+    // ASKED HERE RATHER THAN DERIVED TWICE. Python used to answer this itself by walking
+    // zarr's codec OBJECTS while `ShardInfo::from_codec_chain` answered it from the bound
+    // chain, and the two could disagree -- at which point Python built a description this side
+    // refuses, and the refusal surfaced as an uncaught `PyRuntimeError` from a call made
+    // outside `read`'s `try`. A third-party codec registered for `sharding_indexed` reopens
+    // that gap however carefully the Python walk is written. `//` rather than `///`: this is
+    // why the function exists, not what it promises, and only the latter belongs in `help()`.
     #[getter]
     fn inner_chunk_shape(&self) -> Option<Vec<u64>> {
         self.shard.as_ref().map(|shard| {
@@ -585,10 +583,11 @@ impl CodecPipelineImpl {
     /// pyclass allocation per item on the way out of the builder and one extraction per item
     /// on the way in, where a handle costs one of each per call whatever the selection.
     ///
-    /// There was a second entry point until 2026-08-30 -- a partial decoder per chunk over
-    /// rayon, for selections this path declined. An audit of the public indexing surface found
-    /// nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
-    /// than a slower second Rust path.
+    // There was a second entry point -- a partial decoder per chunk over rayon, for selections
+    // this path declined. An audit of the public indexing surface found nothing reaching it, so
+    // it went, and a decline is now a fall back to zarr-python rather than a slower second Rust
+    // path. A `//` comment, not a doc one: this ships into `_internal.pyi` and thence into
+    // `help()`, and it is history rather than contract. `test_the_fused_path_is_gone` pins it.
     #[pyo3(signature = (chunk_items, value, max_row_reads_per_chunk=None))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
@@ -723,9 +722,9 @@ fn read_unit_stats() -> (u64, u64) {
 
 /// Drop every process-wide thread pool, so a `fork()` cannot inherit a held lock.
 ///
-/// Registered from Python with `os.register_at_fork(before=...)`. See
-/// [`read_decode::release_pools_for_fork`] for why the pid check inside `pools` is not enough
-/// on its own: it runs under the very lock that `fork` would copy as held.
+/// Registered from Python with `os.register_at_fork(before=...)`. The per-process check that
+/// rebuilds these in a child is not enough on its own: it runs under the very lock that `fork`
+/// would copy as held, so a child forked mid-read would block on it for ever.
 #[gen_stub_pyfunction]
 #[pyfunction]
 fn release_pools_for_fork() {

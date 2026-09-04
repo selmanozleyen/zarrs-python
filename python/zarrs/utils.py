@@ -239,7 +239,7 @@ def get_implicit_fill_value(dtype: ZDType, fill_value: Any) -> Any:
 
 @dataclass(frozen=True)
 class RustChunkInfo:
-    # A ChunkItems handle when the batch is entirely chunk-unit; a list otherwise.
+    # A ChunkItems handle on the read path, always; a list of items on the write path.
     chunk_info_with_indices: list[ChunkItem] | ChunkItems
     write_empty_chunks: bool
 
@@ -247,7 +247,7 @@ class RustChunkInfo:
 def _one_inner_chunk_after_split(inner_shape, chunk_shape) -> bool:
     """Whether the shard holds exactly ONE inner chunk on every axis after the split.
 
-    Axis 0 is the split, and `locate` walks it alone. If a trailing axis is divided too, an
+    Axis 0 is the split. If a trailing axis is divided too, an
     item that takes it whole spans several inner chunks and `locate` refuses the item -- from
     inside the read, where a refusal is a `PyRuntimeError` rather than a decline.
 

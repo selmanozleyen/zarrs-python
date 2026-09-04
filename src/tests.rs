@@ -152,12 +152,13 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
     })
 }
 
-/// Two entries may not claim the same output bytes.
+/// `push_indices` ACCEPTS an overlapping output start; the vendor refuses it later.
 ///
 /// `push_indices` is `#[pymethods]` with a caller-chosen `out_start`, and the read path writes
 /// items CONCURRENTLY through views whose safety contract is that their subsets are disjoint.
-/// Overlap there is a data race, so it has to be refused where the entries are accumulated --
-/// nothing downstream sees both.
+/// The check that used to sit here could not judge a BANDED entry -- two bands of one read
+/// share an axis-0 start and overlap nothing -- so disjointness is proven downstream instead,
+/// by the forward-only cursor in `DisjointBytes`. This pins that the push does not refuse it.
 #[test]
 fn test_push_indices_leaves_overlap_to_the_vendor() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
