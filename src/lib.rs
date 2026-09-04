@@ -13,7 +13,7 @@ use numpy::{PyArrayDescrMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_stub_gen::define_stub_info_gatherer;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
@@ -268,11 +268,7 @@ impl CodecPipelineImpl {
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
         let store: ReadableWritableListableStorage =
-            // NOT `map_py_err::<PyTypeError>()`. Every arm of this `TryFrom` already returns a
-            // typed `PyErr`, and flattening them to `TypeError` hands them to the
-            // "Array is unsupported by ZarrsCodecPipeline" handler in `pipeline.py`, which
-            // warns and silently falls back -- including for a runtime that could not start.
-            (&store_config).try_into()?;
+            (&store_config).try_into().map_py_err::<PyTypeError>()?;
         let writable_store = (!store_config.read_only).then(|| store.clone());
         let readable_store: ReadableStorage = store.readable();
 
@@ -495,19 +491,6 @@ impl CodecPipelineImpl {
 }
 
 /// A Python module implemented in Rust.
-/// Empty every process-wide slot a `fork()` must not inherit.
-///
-/// Registered from `python/zarrs/__init__.py` with `os.register_at_fork(before=...)`, which
-/// `multiprocessing` -- and so `torch.utils.data.DataLoader` -- honours. ONE function and one
-/// hook: anything else process-wide added later empties itself here, rather than registering a
-/// second handler whose order relative to this one nobody will remember.
-#[gen_stub_pyfunction]
-#[pyfunction]
-fn release_for_fork() {
-    runtime::release_for_fork();
-}
-
-/// A Python module implemented in Rust.
 #[pymodule]
 pub mod _internal {
     #[pymodule_export]
@@ -517,8 +500,6 @@ pub mod _internal {
     use super::CodecPipelineImpl;
     #[pymodule_export]
     use super::chunk_item::ChunkItem;
-    #[pymodule_export]
-    use super::release_for_fork;
 }
 
 define_stub_info_gatherer!(stub_info);
