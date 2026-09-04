@@ -752,10 +752,12 @@ fn row_jobs<'a>(
 
 /// Hands out each byte range of the output at most once.
 ///
-/// The output buffer is Python's, reached through a shared handle, so there is no `&mut` to
-/// take for the whole of it -- and taking one anyway would claim `noalias` over memory a
-/// Python caller may still hold (an `out=` array is theirs, not ours). This vends the pieces
-/// instead: each range is handed out once, and what comes back IS a `&mut [u8]`, so from
+/// The output buffer is Python's, and several threads write into it at once, so no `&mut` can
+/// be held over the whole of it while they do -- one would claim `noalias` over memory a
+/// Python caller may still hold (an `out=` array is theirs, not ours). `UnsafeCellSlice::new`
+/// does take a whole-buffer `&mut` for the instant it is constructed, on this thread, with the
+/// GIL held and nothing else running; what must not exist is a live one afterwards. This vends
+/// the pieces instead: each range is handed out once, and what comes back IS a `&mut [u8]`, so from
 /// that point the compiler enforces the disjointness rather than anyone asserting it.
 ///
 /// The one `unsafe` is inside `take`, and its argument is local: `cursor` only moves
@@ -1469,12 +1471,10 @@ mod tests {
     /// functions run concurrently in one process, so they would race.
     #[test]
     fn a_pool_is_built_once_at_the_size_asked_for() {
-        assert_eq!(
-            pool_sizes(),
-            (None, None),
-            "no read has run, so neither pool should exist yet"
-        );
-
+        // NO ASSERTION THAT THE POOLS ARE UNBUILT. This used to open with
+        // `assert_eq!(pool_sizes(), (None, None))`, which was true only because no other Rust
+        // test touches the pools -- and `#[test]`s run concurrently in one process, so the
+        // first one that does would have made this flake rather than fail honestly.
         let (read, decode) = pools(3, 2).expect("a pool of three threads");
         assert_eq!(read.current_num_threads(), 3);
         assert_eq!(decode.current_num_threads(), 2);

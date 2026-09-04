@@ -66,26 +66,58 @@ def test_a_bad_knob_names_the_knob(sharded) -> None:
     the one thing the user cannot change. A negative value was worse: `OverflowError` escaped
     naming no key at all.
     """
-    path, _ = sharded
+    path, values = sharded
+    rows = np.array([1, 2])
+
+    # UNDER `strict`, an error naming the key.
     for value in (8.0, -1, "eight"):
         with (
-            zarr.config.set(ZARRS | {"codec_pipeline.read_pool_size": value}),
+            zarr.config.set(
+                ZARRS
+                | {"codec_pipeline.read_pool_size": value, "codec_pipeline.strict": True}
+            ),
             pytest.raises(ValueError, match="codec_pipeline.read_pool_size"),
         ):
-            zarr.open_array(path, mode="r")[np.array([1, 2])]
+            zarr.open_array(path, mode="r")[rows]
+
+    # WITHOUT it, a warning naming the key and the default -- not a dead pipeline. An
+    # unconditional raise failed every array OPEN, including write-only workloads that never
+    # touch this knob, which contradicts what non-strict means everywhere else here.
+    with (
+        zarr.config.set(ZARRS | {"codec_pipeline.read_pool_size": 8.0}),
+        pytest.warns(UserWarning, match="codec_pipeline.read_pool_size"),
+    ):
+        got = zarr.open_array(path, mode="r")[rows]
+    np.testing.assert_array_equal(got, values[rows])
 
 
-def test_a_fork_hook_is_registered() -> None:
-    """The pools are emptied before a fork rather than rebuilt after one.
+def test_a_fork_drops_the_pools_in_the_PARENT(sharded) -> None:
+    """Which is the only externally visible proof the `before` hook ran.
 
-    The pid check that rebuilds them in a child runs INSIDE the mutex guarding them, and `fork`
-    copies a held mutex as held with an owner that does not exist -- so a child forked while a
-    read was in flight blocks there for ever and never reaches the check.
+    The pid check inside `pools` would rebuild in a CHILD anyway, so a child seeing no pools
+    proves nothing. The `before` handler empties the slot in the parent too -- so a parent that
+    still has pools after forking is a parent whose hook did not run.
 
-    Asserting the hook itself, because the race needs a fork to land inside a critical section
-    that lasts microseconds; a test that tried to hit it would pass by luck.
+    The hook exists because the pid check runs INSIDE the mutex that `fork` copies as held: a
+    child forked while a read was in flight blocks on it for ever and never reaches the check.
     """
     import os
 
-    assert hasattr(zarrs._internal, "release_pools_for_fork")
-    assert hasattr(os, "register_at_fork"), "POSIX only, and so is this test"
+    if not hasattr(os, "register_at_fork"):
+        pytest.skip("POSIX only, and so is the hook")
+
+    path, values = sharded
+    rows = np.array([1, 40, 91])
+    with zarr.config.set(ZARRS):
+        got = zarr.open_array(path, mode="r")[rows]
+    np.testing.assert_array_equal(got, values[rows])
+    assert zarrs.pool_sizes() != (None, None), "a read must have built the pools"
+
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+
+    assert zarrs.pool_sizes() == (None, None), (
+        "the fork left this process's pools in place, so the before-fork hook did not run"
+    )

@@ -81,7 +81,7 @@ def read_stats() -> tuple[int, int]:
     return served, declined
 
 
-def _int_knob(key: str, default: int | None) -> int | None:
+def _int_knob(key: str, default: int | None, *, strict: bool) -> int | None:
     """A config integer, checked HERE where its name is still in scope.
 
     THE FULL KEY IS PASSED IN, as a literal, rather than built from a short name. That is not
@@ -102,7 +102,16 @@ def _int_knob(key: str, default: int | None) -> int | None:
     value = config.get(key, default)
     if value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
         return value
-    raise ValueError(f"{key} must be a non-negative integer or None, got {value!r}")
+    message = f"{key} must be a non-negative integer or None, got {value!r}; using {default!r}"
+    # RAISING ONLY UNDER `strict`, which is this file's standing convention: non-strict means
+    # "do not fail a read over something this pipeline can work around". An unconditional raise
+    # here failed every array OPEN, including write-only workloads that never touch the knob.
+    # The warning still names the key, which was the whole point -- what it must not do is turn
+    # a typo in one option into an unopenable array.
+    if strict:
+        raise ValueError(message)
+    warn(message, category=UserWarning, stacklevel=2)
+    return default
 
 
 def get_codec_pipeline_impl(
@@ -112,22 +121,33 @@ def get_codec_pipeline_impl(
         array_metadata_json = json.dumps(metadata.to_dict())
         # Maintain old behavior: https://github.com/zarrs/zarrs-python/tree/b36ba797cafec77f5f41a25316be02c718a2b4f8?tab=readme-ov-file#configuration
         validate_checksums = config.get("codec_pipeline.validate_checksums", True)
+        max_workers = _int_knob("threading.max_workers", None, strict=strict)
         if validate_checksums is None:
             validate_checksums = True
         return CodecPipelineImpl(
             array_metadata_json,
             store_config=store,
             validate_checksums=validate_checksums,
-            chunk_concurrent_minimum=_int_knob("codec_pipeline.chunk_concurrent_minimum", None),
-            chunk_concurrent_maximum=_int_knob("codec_pipeline.chunk_concurrent_maximum", None),
-            num_threads=config.get("threading.max_workers", None),
+            chunk_concurrent_minimum=_int_knob("codec_pipeline.chunk_concurrent_minimum", None, strict=strict),
+            chunk_concurrent_maximum=_int_knob("codec_pipeline.chunk_concurrent_maximum", None, strict=strict),
+            num_threads=max_workers,
             direct_io=config.get("codec_pipeline.direct_io", False),
-            file_handle_cache_size=_int_knob("codec_pipeline.file_handle_cache_size", 0),
+            file_handle_cache_size=_int_knob("codec_pipeline.file_handle_cache_size", 0, strict=strict),
             # Read at OPEN, like `num_threads` and the chunk-concurrency bounds beside them.
             # They size process-wide pools that only the first read builds, so offering them
             # per call would be offering a choice that cannot be honoured.
-            read_pool_size=_int_knob("codec_pipeline.read_pool_size", None),
-            decode_pool_size=_int_knob("codec_pipeline.decode_pool_size", None),
+            # FALLING BACK TO `threading.max_workers` when neither is set. That knob used to
+            # bound everything this library did on the Rust side; the two pools took reads out
+            # from under it, so a user who had tuned it found it silently governing writes
+            # only. Each pool gets that many -- they are not interchangeable, and dividing one
+            # budget between a reader that waits and a decoder that computes is the design
+            # that was measured and lost (see `Pools` in `read_decode.rs`). The README says so.
+            read_pool_size=_int_knob(
+                "codec_pipeline.read_pool_size", max_workers, strict=strict
+            ),
+            decode_pool_size=_int_knob(
+                "codec_pipeline.decode_pool_size", max_workers, strict=strict
+            ),
             # Under `strict`, a size the process cannot give is an error rather than a
             # warning -- the same switch that turns a decline into a raise.
             strict=strict,
@@ -325,7 +345,11 @@ class ZarrsCodecPipeline(CodecPipeline):
                 retrieve,
                 desc,
                 out,
-                _int_knob("codec_pipeline.max_row_reads_per_chunk", None),
+                _int_knob(
+                    "codec_pipeline.max_row_reads_per_chunk",
+                    None,
+                    strict=config.get("codec_pipeline.strict", False),
+                ),
             )
             return None
 
