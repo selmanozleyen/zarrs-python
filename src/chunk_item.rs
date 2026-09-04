@@ -656,12 +656,14 @@ impl ChunkItems {
     /// order is ONE contiguous block per inner chunk -- so each item needs a single coordinate
     /// and a run, not a coordinate per element.
     ///
-    /// This is the whole point. `_chunk_unit_args` used to expand the span with
-    /// `np.arange(a, b)` because "a contiguous slice IS a sorted integer axis, spelled
-    /// differently" -- true, and it costs one u64 per ELEMENT. On a chunk_size 64 preload that
-    /// is 11.9M numbers, ~95 MB, built in numpy and walked one at a time here: measured at
-    /// 98 ms to build and 112 ms to hand over, against a preload of ~317 ms. Described as
-    /// runs, the same read is 0.69 ms.
+    /// This is the whole point. Describing the span as elements instead -- `np.arange(a, b)`,
+    /// on the grounds that a contiguous slice IS a sorted integer axis spelled differently --
+    /// costs one `u64` per ELEMENT, built in numpy and walked one at a time here. Described as
+    /// a run it is one coordinate and a length, whatever the span. The measurement behind that
+    /// is in the commit message, not here: this doc comment is copied verbatim into
+    /// `zarrs/_internal.pyi` by `pyo3-stub-gen`, so it is what `help()` shows a user, and
+    /// milliseconds from a dataset they do not have belong in the history rather than in
+    /// their terminal.
     #[pyo3(signature = (key, chunk_shape, shape, first, count, out_start, inner_extent))]
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn push_span(

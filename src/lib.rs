@@ -144,9 +144,8 @@ pub struct CodecPipelineImpl {
     /// compressor. Read off the array metadata this pipeline was built from.
     ///
     /// When it is, a row's bytes are addressable arithmetically and can be read WITHOUT
-    /// reading the chunk around them. Measured at scale: 8,192 rows as exact ranges take
-    /// 628 ms against 1121 for the chunks holding them, because the request COUNT is the
-    /// same either way and only the bytes differ.
+    /// reading the chunk around them. What that is worth, and the measurement behind it, is
+    /// stated once beside the code it justifies -- see `row_jobs` in `read_decode.rs`.
     pub(crate) inner_chunk_is_plain_bytes: bool,
     /// The pool sizes this array was OPENED with.
     ///
