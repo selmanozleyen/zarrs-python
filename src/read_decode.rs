@@ -69,6 +69,7 @@ impl CodecPipelineImpl {
         output: UnsafeCellSlice<'_, u8>,
         output_len: usize,
         config: ReadConfig,
+        pools: &(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>),
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
         let element_size = self.element_size()?;
@@ -125,7 +126,7 @@ impl CodecPipelineImpl {
         // behind a mutex: one lock in front of every job serialises what rayon's per-thread
         // deques keep contention-free, and at these widths that lock is the read path.
         let readers = config.read_workers.max(1);
-        let (read_pool, decode_pool) = pools();
+        let (read_pool, decode_pool) = pools;
         decode_pool.in_place_scope(|dec| {
             read_pool.install(|| {
                 let (failure, ctx) = (&failure, &ctx);
@@ -589,7 +590,11 @@ fn pool_max(multiplier: usize) -> usize {
 }
 
 /// Both pools, building them on first use and rebuilding them in a forked child.
-fn pools() -> (Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>) {
+///
+/// CALL THIS WITH THE GIL HELD. It takes a lock, and the GIL is what stops that lock from being
+/// held at the moment `os.register_at_fork` runs its handler and the process forks -- a child
+/// inherits a held mutex as held, owned by a thread it does not have.
+pub(crate) fn pools() -> (Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>) {
     let mut guard = POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let pid = std::process::id();
     if guard.as_ref().is_none_or(|p| p.pid != pid) {

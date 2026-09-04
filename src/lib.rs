@@ -265,6 +265,13 @@ impl CodecPipelineImpl {
             // vends the pieces from it, one range each, so each becomes a checkable `&mut [u8]`.
             let output = Self::nparray_to_unsafe_cell_slice(value, element_size)?;
             let output_len = output.len();
+            // BEFORE `detach`, deliberately. `pools()` takes a lock, and the GIL is what keeps
+            // that lock from being HELD when another thread runs `os.register_at_fork`'s
+            // handler and forks: a child inherits a held mutex as held, owned by a thread it
+            // does not have, and blocks on its first read -- the failure the handler exists to
+            // prevent. Every other caller of `pools`/`pool_sizes` is a `#[pyfunction]`, so this
+            // was the one site that reached the lock without the GIL.
+            let pools = read_decode::pools();
             py.detach(|| {
                 let Some((_, codec_options)) =
                     chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
@@ -277,6 +284,7 @@ impl CodecPipelineImpl {
                     output,
                     output_len,
                     config,
+                    &pools,
                     &codec_options,
                 )
             })?;
