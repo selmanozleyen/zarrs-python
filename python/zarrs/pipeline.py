@@ -346,6 +346,13 @@ class ZarrsCodecPipeline(CodecPipeline):
             # Rust read path to choose between any more.
             retrieve = self.impl.retrieve_chunk_items_and_apply_index
             await asyncio.to_thread(retrieve, desc, out)
+            # AFTER the read, not before it. Counting at the top of this branch counted a batch
+            # that described cleanly and then died in Rust -- a coverage shortfall, a `locate`
+            # refusal, a pool that could not be built -- as served. For a counter whose whole
+            # purpose is to be trustworthy about which path ran, that is the one thing it must
+            # not do.
+            with _READ_LOCK:
+                _READ_COUNTS[0] += 1
             return None
 
     async def write(
