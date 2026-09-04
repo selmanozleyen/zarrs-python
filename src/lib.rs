@@ -347,7 +347,10 @@ impl CodecPipelineImpl {
         let output = unsafe {
             // SAFETY: `array_data` points at `array_len` bytes of a C-contiguous, writable
             // array, checked above; `UnsafeCellSlice` is what makes the aliasing sound.
-            assert!(!array_data.is_null(), "numpy handed over a null data pointer");
+            assert!(
+                !array_data.is_null(),
+                "numpy handed over a null data pointer"
+            );
             std::slice::from_raw_parts_mut(array_data, array_len)
         };
         Ok(UnsafeCellSlice::new(output))
@@ -567,9 +570,12 @@ impl CodecPipelineImpl {
     #[getter]
     fn inner_chunk_shape(&self) -> Option<Vec<u64>> {
         self.shard.as_ref().map(|shard| {
-            shard.subchunk_shape.as_ref().map_or_else(Vec::new, |shape| {
-                shape.iter().map(|extent| extent.get()).collect()
-            })
+            shard
+                .subchunk_shape
+                .as_ref()
+                .map_or_else(Vec::new, |shape| {
+                    shape.iter().map(|extent| extent.get()).collect()
+                })
         })
     }
 
