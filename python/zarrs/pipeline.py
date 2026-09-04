@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, TypedDict
 from warnings import warn
 
@@ -29,7 +30,8 @@ from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
     UnsupportedVIndexingError,
-    chunk_info,
+    chunk_info_for_read,
+    chunk_info_for_write,
 )
 
 
@@ -76,6 +78,16 @@ def get_codec_pipeline_impl(
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
             ),
+            # Read at OPEN, like `num_threads` and the chunk-concurrency bounds beside them.
+            # They size process-wide pools that only the first read builds, so offering them
+            # per call would be offering a choice that cannot be honoured.
+            read_worker_ceiling=config.get("codec_pipeline.read_worker_ceiling", None),
+            decode_worker_ceiling=config.get(
+                "codec_pipeline.decode_worker_ceiling", None
+            ),
+            # Under `strict`, a ceiling the process cannot give is an error rather than a
+            # warning -- the same switch that turns a decline into a raise.
+            strict=strict,
         )
     except TypeError as e:
         if strict:
@@ -147,6 +159,20 @@ class ZarrsCodecPipeline(CodecPipeline):
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
 
+    @cached_property
+    def _inner_chunk_shape(self) -> tuple[int, ...] | None:
+        """The innermost unit the codec chain decodes, as Rust reports it.
+
+        A tuple is the inner chunk of a sharded array; `()` means the array is not sharded, so
+        its chunk is its own decode unit; `None` means refuse. Asked rather than derived: this
+        used to walk zarr's codec objects while Rust answered the same question from the bound
+        chain, and two derivations of one fact can disagree.
+        """
+        if self.impl is None:
+            return None
+        shape = self.impl.inner_chunk_shape()
+        return None if shape is None else tuple(shape)
+
     @property
     def supports_partial_decode(self) -> bool:
         return False
@@ -193,7 +219,9 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = chunk_info(batch_info, drop_axes, out.shape)
+            chunks_desc = chunk_info_for_read(
+                batch_info, drop_axes, out.shape, self._inner_chunk_shape
+            )
         except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
@@ -201,11 +229,12 @@ class ZarrsCodecPipeline(CodecPipeline):
             return None
         else:
             out: NDArrayLike = out.as_ndarray_like()
-            await asyncio.to_thread(
-                self.impl.retrieve_chunks_and_apply_index,
-                chunks_desc.chunk_info_with_indices,
-                out,
-            )
+            desc = chunks_desc.chunk_info_with_indices
+            # One entry point. `chunk_info_for_read` either produces a handle or raises, and
+            # the raise is caught above as a fall back to zarr-python -- there is no second
+            # Rust read path to choose between any more.
+            retrieve = self.impl.retrieve_chunk_items_and_apply_index
+            await asyncio.to_thread(retrieve, desc, out)
             return None
 
     async def write(
@@ -220,7 +249,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = chunk_info(batch_info, drop_axes, value.shape)
+            chunks_desc = chunk_info_for_write(batch_info, drop_axes, value.shape)
         except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
