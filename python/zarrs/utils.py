@@ -217,6 +217,21 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
+def _one_inner_chunk_after_split(inner_shape, chunk_shape) -> bool:
+    """Whether the shard holds exactly ONE inner chunk on every axis after the split.
+
+    Axis 0 is the split, and `locate` walks it alone. If a trailing axis is divided too, an
+    item that takes it whole spans several inner chunks and `locate` refuses the item -- from
+    inside the read, where a refusal is a `PyRuntimeError` rather than a decline.
+
+    The point and grid descriptions both need this and both spelled it out; it is a wrong-data
+    gate, so two copies drifting apart is the failure worth spending a function on.
+    """
+    return all(
+        inner_shape[axis] == chunk_shape[axis] for axis in range(1, len(chunk_shape))
+    )
+
+
 def _split_axis_ok(indices: np.ndarray, out_axis_sel: Any) -> bool:
     """Whether axis 0's indices can be served against this output selection.
 
@@ -595,11 +610,8 @@ def _point_unit_args(
     out_axis_sel = out_sel[0]
     if not _split_axis_ok(rows, out_axis_sel):
         return None
-    # Still the GRID condition: one subchunk on every axis after the split, or `locate`
-    # cannot keep walking axis 0 alone.
-    for axis in range(1, rank):
-        if inner_shape[axis] != chunk_spec.shape[axis]:
-            return None
+    if not _one_inner_chunk_after_split(inner_shape, chunk_spec.shape):
+        return None
     # A point's offset inside its own index is the C-order ravel of the trailing axes, which
     # is `np.ravel_multi_index` -- bounds check included, negatives included. Out of bounds is
     # a DECLINE here, not an error: the ordinary route serves the read.
@@ -696,6 +708,10 @@ def _grid_unit_args(
         return None
     if not _split_axis_ok(rows, out_axis_sel):
         return None
+    # Hoisted out of the per-axis loop below: independent of the checks there, and all of them
+    # decline, so which fires first cannot matter.
+    if not _one_inner_chunk_after_split(inner_shape, chunk_spec.shape):
+        return None
 
     sels = []
     for axis in range(1, rank):
@@ -706,10 +722,6 @@ def _grid_unit_args(
             return None
         # The output holds exactly what was selected, and the item fills all of it.
         if shape[axis] != idx.size or not _is_whole_axis(out_sel[axis], shape[axis]):
-            return None
-        # Still the GRID condition: one subchunk per axis after the split, or `locate` cannot
-        # keep walking axis 0 alone.
-        if inner_shape[axis] != chunk_spec.shape[axis]:
             return None
         sels.append(idx)
     # A sub-box is a set of RUNS in row-major order, not a set of elements, and saying so is

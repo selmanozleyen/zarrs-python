@@ -33,9 +33,11 @@ if hasattr(os, "register_at_fork"):
 
 __all__ = [
     "ZarrsCodecPipeline",
-    # Every member of `FALLBACK_TO_ZARR_PYTHON`, because under `codec_pipeline.strict` each of
-    # them reaches user code -- and `except zarrs.UnsupportedDataTypeError` could not name
-    # three of the five.
+    # Every member of `FALLBACK_TO_ZARR_PYTHON`, because under `codec_pipeline.strict` that is
+    # the set that can reach user code -- and `except zarrs.UnsupportedDataTypeError` could not
+    # name three of the five. `FillValueNoneError` is currently raised NOWHERE, so it reaches
+    # nobody today; it is exported with the others because it is in that tuple, and a caller
+    # writing `except` against the set should not have to know which members are live.
     "DiscontiguousArrayError",
     "FillValueNoneError",
     "UnsupportedDataTypeError",
