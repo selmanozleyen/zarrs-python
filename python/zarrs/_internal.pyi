@@ -32,6 +32,15 @@ class ChunkItems:
     `retrieve_chunk_items_and_apply_index`.
     """
     def __new__(cls) -> ChunkItems: ...
+    def refuse_backwards(self, out_start: builtins.int) -> None:
+        r"""
+        Refuse an output start behind the last entry's end.
+
+        `push_span`, `push_grid` and `push_points` each own one contiguous output range, so a
+        start behind the cursor is two entries claiming the same bytes. `push_indices` does NOT
+        call this -- see its doc comment: two bands of one read legitimately share an axis-0
+        start, and disjointness for that one is proven downstream by `DisjointBytes`.
+        """
     def push_indices(
         self,
         key: builtins.str,
@@ -131,6 +140,28 @@ class ChunkItems:
 
 @typing.final
 class CodecPipelineImpl:
+    @property
+    def inner_chunk_shape(self) -> builtins.list[builtins.int] | None:
+        r"""
+        The innermost unit this array's codec chain decodes, or `None` to refuse the array.
+
+        THREE ANSWERS, and Python needs all three: a shape is the inner chunk of a sharded
+        array; an EMPTY shape means the array is not sharded, so its chunk is its own decode
+        unit and only a batch entry knows that shape; `None` means this chain cannot be served
+        at all -- a codec beside the sharding codec, which leaves the shard index addressing
+        bytes that are no longer there.
+
+        ASKED HERE RATHER THAN DERIVED TWICE. Python used to answer this itself by walking
+        zarr's codec OBJECTS while `ShardInfo::from_codec_chain` answered it from the bound
+        chain, and the two could disagree -- at which point Python built a description this
+        side refuses, and the refusal surfaced as an uncaught `PyRuntimeError` from a call made
+        outside `read`'s `try`, where the base pipeline would simply have read the array. A
+        third-party codec registered for `sharding_indexed` reopens that gap however carefully
+        the Python walk is written, because the two are answering from different data.
+
+        It is also less code: the reach into `zarr.codecs.ShardingCodec`, `.chunk_shape` and
+        `.codecs` goes away with it.
+        """
     def __new__(
         cls,
         array_metadata: builtins.str,
