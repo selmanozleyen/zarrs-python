@@ -397,8 +397,8 @@ def _chunk_unit_args(
             return None
         # Keep the run rather than `np.arange`-ing it: with the trailing axes whole,
         # `first..first + count` on axis 0 is one contiguous block per inner chunk, so Rust needs
-        # a coordinate and a length instead of one u64 per element. A chunk_size 64 preload
-        # described ~130 runs as 11.9M numbers, ~95 MB, 98 ms to build against a ~317 ms preload.
+        # a coordinate and a length instead of one u64 per element. On a long sequential read
+        # those per-element indices are most of the description, and zarr already had the run.
         #
         # The span form has nowhere to put a trailing start, a width or a band: it says "the
         # whole trailing extent" on both sides and derives its row stride from the shard. So the

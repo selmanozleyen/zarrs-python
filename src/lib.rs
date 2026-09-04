@@ -369,9 +369,8 @@ impl CodecPipelineImpl {
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
         // Both default to the available parallelism: more readers than that is defensible (a
-        // blocked reader costs no CPU) but not a library's call to make unasked, and a sweep from
-        // 16 to 1024 readers measured flat. Set independently, so a caller who wants reads
-        // oversubscribed can raise one alone.
+        // blocked reader costs no CPU) but not a library's call to make unasked. Set
+        // independently, so a caller who wants reads oversubscribed can raise one alone.
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
         let writable_store = (!store_config.read_only).then(|| store.clone());

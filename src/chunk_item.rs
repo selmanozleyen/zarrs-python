@@ -388,8 +388,8 @@ pub(crate) fn build_chunk_unit_items(
     // Non-decreasing is assumed below: the grouping walks a run of equal chunk ids, so out of order
     // the same chunk is grouped twice, and the extent check trusts the last of a group to be its
     // largest. `push_entry` is `#[pymethods]` taking an arbitrary array, so it is enforced here as
-    // well as by Python's `_is_sorted_integer_axis`. Inside the walk rather than in a pass of its
-    // own: a separate pass cost 12%.
+    // well as by Python's `_is_sorted_integer_axis`. Inside the walk rather than in a pass of
+    // its own, which would walk the indices a second time.
     let mut items = Vec::new();
     let mut a = 0usize;
     let mut previous = 0u64;
@@ -472,9 +472,9 @@ pub(crate) fn build_chunk_unit_items(
             // this selection starts inside the row. With the trailing axes whole the offset is 0
             // and the stride is the run.
             //
-            // The shared cases step by a constant, so the offset lookup and its bounds check are
-            // hoisted out: this closure runs once per selected index, thousands of times a call,
-            // and doing loop-invariant work inside it cost 6% on the loader.
+            // The shared cases step by a constant, so the offset lookup and its bounds check
+            // are hoisted out: this closure runs once per selected index, and inside it that
+            // work is loop-invariant.
             coords: Some(match offsets {
                 Offsets::PerIndex(per) => (a..b)
                     .map(|i| {

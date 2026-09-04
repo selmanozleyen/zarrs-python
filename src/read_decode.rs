@@ -665,10 +665,10 @@ fn record(failure: &Mutex<Option<String>>, message: String) {
 
 // Decode scratch, owned by the worker and kept for the life of the process.
 //
-// A decode decompresses a whole inner chunk (366 KiB sparse, 512 KiB dense here) before the wanted
-// rows are copied out. Above glibc's 128 KiB threshold that allocation is an mmap, a memset and a
-// fault per page, so it must not be paid per chunk. A rayon worker lives for the process, so its
-// own buffer is the reuse: no lock, and no way for it to silently not run.
+// A decode decompresses a whole inner chunk before the wanted rows are copied out. Past glibc's
+// 128 KiB mmap threshold, which any inner chunk worth sharding is, that allocation is an mmap, a
+// memset and a fault per page, so it must not be paid per chunk. A rayon worker lives for the
+// process, so its own buffer is the reuse: no lock, and no way for it to silently not run.
 thread_local! {
     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -728,9 +728,8 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let shape = ctx.decode_shape.as_slice();
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
-    // grow only. `clear()` + `resize(needed, 0)` zero-fills a buffer `decode_into` then writes
-    // every byte of: at an inner chunk of 91,549 f32 that is 366 KiB memset per decode, ~1 GiB per
-    // chunk_size 64 preload, thrown away.
+    // Grow only. `clear()` + `resize(needed, 0)` would zero-fill a buffer that `decode_into`
+    // then writes every byte of: a whole-chunk memset per decode, thrown away.
     //
     // If `decode_into` ever left part of the target unwritten the gap would now show a previous
     // chunk's elements rather than zeros: plausible values instead of an obvious block of nothing,
@@ -758,10 +757,10 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         ctx.shard
             .inner_chain
             .decode_into(
-                // borrowed. `ArrayBytesRaw` is `Cow<'_, [u8]>` and `Bytes` derefs to `[u8]`,
+                // Borrowed. `ArrayBytesRaw` is `Cow<'_, [u8]>` and `Bytes` derefs to `[u8]`,
                 // so the decode reads the fetched buffer where it lies. `Cow::Owned` would
                 // allocate, and copy the whole compressed chunk whenever the `Bytes` is not
-                // uniquely owned: ~250 MiB per preload to hand the decoder bytes it had.
+                // uniquely owned, to hand the decoder bytes it already had.
                 Cow::Borrowed(&bytes),
                 shape,
                 ArrayBytesDecodeIntoTarget::Fixed(&mut view),
