@@ -76,12 +76,6 @@ pub(crate) struct CodecPipelineImpl {
     /// The pool sizes this array was OPENED with.
     pub(crate) read_ceiling: usize,
     pub(crate) decode_ceiling: usize,
-    /// Whether a ceiling that cannot be honoured is an ERROR rather than a warning.
-    ///
-    /// `codec_pipeline.strict` already means "do not paper over something this pipeline
-    /// cannot do" -- it turns a decline into a raise instead of a silent fallback. A ceiling
-    /// the process cannot give is the same kind of thing, so it answers to the same switch.
-    pub(crate) strict: bool,
 }
 
 impl CodecPipelineImpl {
@@ -268,68 +262,34 @@ impl CodecPipelineImpl {
         // `ChunkItems` handle; anything it cannot describe raises and falls back to
         // zarr-python in Python. The check stays because this is a `#[pymethods]` boundary,
         // and what it guards is an exclusive output slice.
-        if let (true, Some(shard)) = (
-            !chunk_descriptions.is_empty() && chunk_descriptions.iter().all(|i| i.coords.is_some()),
-            self.shard.as_ref(),
-        ) {
-            // Confined to this block so no live `&mut` exists when the fallback below takes
-            // its own view of the same array. The borrow checker will not catch that -- the
-            // `&mut` comes from a raw pointer -- so the block is a deliberate lexical
-            // guarantee rather than relying on the fallback staying unreachable.
+        if let Some(shard) = self.shard.as_ref() {
             let element_size = self.element_size()?;
-            let declined = {
-                // An aliasing wrapper: no `&mut` is claimed over the whole buffer.
-                // `DisjointBytes` vends the pieces from it, one range each, so each piece
-                // becomes a `&mut [u8]` the compiler can check.
-                let output = Self::nparray_to_unsafe_cell_slice(value, element_size)?;
-                let output_len = output.len();
-                py.detach(|| {
-                    let Some((_, codec_options)) =
-                        chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
-                    else {
-                        return Ok(Vec::new());
-                    };
-                    self.retrieve_chunk_units(
-                        shard,
-                        chunk_descriptions,
-                        output,
-                        output_len,
-                        config,
-                        &codec_options,
-                    )
-                })?
-            };
-            if declined.is_empty() {
-                return Ok(());
-            }
-            // Whatever that path could not take still has to be read, down the fused one.
-            let declined: Vec<chunk_item::ChunkItem> = declined.into_iter().cloned().collect();
-            // Unreachable: a read item always carries coordinates, because
-            // `chunk_info_for_read` only produces a `ChunkItems` handle and every route into
-            // that sets them. This was a hand-off to a second Rust path that no longer
-            // exists, so if it fires the invariant broke and silence is the wrong answer.
-            return Err(PyRuntimeError::new_err(format!(
-                "{} read items arrived without coordinates; there is no fallback path and \
-                 the caller should have declined to zarr-python instead",
-                declined.len()
-            )));
+            // An aliasing wrapper: no `&mut` is claimed over the whole buffer. `DisjointBytes`
+            // vends the pieces from it, one range each, so each becomes a checkable `&mut [u8]`.
+            let output = Self::nparray_to_unsafe_cell_slice(value, element_size)?;
+            let output_len = output.len();
+            py.detach(|| {
+                let Some((_, codec_options)) =
+                    chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
+                else {
+                    return Ok(());
+                };
+                self.retrieve_chunk_units(
+                    shard,
+                    chunk_descriptions,
+                    output,
+                    output_len,
+                    config,
+                    &codec_options,
+                )
+            })?;
+            return Ok(());
         }
-        // No second path to fall through to. Reaching here means either the batch was
-        // empty, or an item arrived without coordinates, or the array does not present a
-        // sharding codec -- and in every one of those cases the output buffer is exactly as
-        // `np.empty` left it, so returning Ok would hand the caller uninitialised memory and
-        // call it data. Python declines all three before they get here; this is the assertion
-        // that says so, rather than a silence that looks like success.
+        // Only one way to reach here now, and returning Ok would hand back `np.empty`.
         Err(PyRuntimeError::new_err(format!(
-            "a batch of {} items could not be served: {}",
-            chunk_descriptions.len(),
-            if chunk_descriptions.is_empty() {
-                "it is empty"
-            } else if self.shard.is_none() {
-                "this array presents no sharding codec, so there is no decode unit to group by"
-            } else {
-                "an item arrived without coordinates"
-            }
+            "a batch of {} items could not be served: this array presents no sharding codec, \
+             so there is no decode unit to group by",
+            chunk_descriptions.len()
         )))
     }
 }
@@ -337,6 +297,22 @@ impl CodecPipelineImpl {
 #[gen_stub_pymethods]
 #[pymethods]
 impl CodecPipelineImpl {
+    /// The innermost unit this array's codec chain decodes, or `None` to refuse the array.
+    ///
+    /// THREE ANSWERS: a shape is the inner chunk of a sharded array; an EMPTY shape means the
+    /// array is not sharded, so its chunk is its own decode unit; `None` means this chain
+    /// cannot be served at all.
+    fn inner_chunk_shape(&self) -> Option<Vec<u64>> {
+        let shard = self.shard.as_ref()?;
+        Some(
+            shard
+                .subchunk_shape
+                .as_ref()
+                .map(|s| s.iter().map(|d| d.get()).collect())
+                .unwrap_or_default(),
+        )
+    }
+
     #[pyo3(signature = (
         array_metadata,
         store_config,
@@ -349,7 +325,6 @@ impl CodecPipelineImpl {
         file_handle_cache_size=0,
         read_worker_ceiling=None,
         decode_worker_ceiling=None,
-        strict=false,
     ))]
     #[new]
     fn new(
@@ -363,7 +338,6 @@ impl CodecPipelineImpl {
         file_handle_cache_size: usize,
         read_worker_ceiling: Option<usize>,
         decode_worker_ceiling: Option<usize>,
-        strict: bool,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
@@ -441,7 +415,6 @@ impl CodecPipelineImpl {
             writable_store,
             read_ceiling: read_decode::resolve_ceiling(read_worker_ceiling),
             decode_ceiling: read_decode::resolve_ceiling(decode_worker_ceiling),
-            strict,
         })
     }
 
@@ -463,7 +436,6 @@ impl CodecPipelineImpl {
         let config = read_decode::ReadConfig::from_open(self.read_ceiling, self.decode_ceiling);
         // The pools are sized once, by the first read. A ceiling arriving after that cannot
         // be honoured, and a caller who is not told believes it was.
-        read_decode::check_ceiling_arrived(py, config, self.strict)?;
         self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, config)
     }
 

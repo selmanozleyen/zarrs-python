@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
 
-from ._internal import CodecPipelineImpl
+from ._internal import CodecPipelineImpl, pool_sizes
 from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
@@ -52,6 +52,30 @@ FALLBACK_TO_ZARR_PYTHON = (
     UnsupportedDataTypeError,
     FillValueNoneError,
 )
+
+
+def _warn_if_ceiling_was_ignored(*, strict: bool) -> None:
+    """The two pool ceilings are fixed by the first read in the process and cannot be resized.
+
+    Read from config HERE, not at array open: a `zarr.config.set` block around a read is the
+    case this exists for, and open-time values cannot see it.
+    """
+    for built, knob in zip(
+        pool_sizes(),
+        ("codec_pipeline.read_worker_ceiling", "codec_pipeline.decode_worker_ceiling"),
+        strict=True,
+    ):
+        asked = config.get(knob, None)
+        if built is None or asked is None or int(asked) == built:
+            continue
+        message = (
+            f"{knob} = {asked} was ignored: the pool was built with {built} threads by the "
+            f"first read in this process and cannot be resized. Set it before the array that "
+            f"does the first read is opened, or call zarrs._internal.pool_sizes()."
+        )
+        if strict:
+            raise ValueError(message)
+        warn(message, category=UserWarning, stacklevel=2)
 
 
 def get_codec_pipeline_impl(
@@ -85,9 +109,6 @@ def get_codec_pipeline_impl(
             decode_worker_ceiling=config.get(
                 "codec_pipeline.decode_worker_ceiling", None
             ),
-            # Under `strict`, a ceiling the process cannot give is an error rather than a
-            # warning -- the same switch that turns a decline into a raise.
-            strict=strict,
         )
     except TypeError as e:
         if strict:
@@ -161,36 +182,17 @@ class ZarrsCodecPipeline(CodecPipeline):
 
     @cached_property
     def _inner_chunk_shape(self) -> tuple[int, ...] | None:
-        """The shape of the INNERMOST unit the codec chain decodes.
+        """The innermost unit the codec chain decodes, as Rust reports it.
 
-        Three answers, and the difference matters: a tuple is the inner chunk of a sharded
-        array; `()` means the array is NOT sharded, so its chunk is its own decode unit and
-        only an entry knows that shape; `None` means refuse.
-
-        Descends through nested sharding: the first `chunk_shape` found is the outer shard's,
-        not the decode unit.
+        A tuple is the inner chunk of a sharded array; `()` means the array is not sharded, so
+        its chunk is its own decode unit; `None` means refuse. Asked rather than derived: this
+        used to walk zarr's codec objects while Rust answered the same question from the bound
+        chain, and two derivations of one fact can disagree.
         """
-        codecs = getattr(self.metadata, "codecs", ()) or ()
-        shape = None
-        while True:
-            nested = None
-            for position, codec in enumerate(codecs):
-                chunk_shape = getattr(codec, "chunk_shape", None)
-                if chunk_shape is None:
-                    continue
-                # A codec AFTER the sharding codec compresses the whole shard, so the shard
-                # index's byte ranges no longer address the shard. One inner chunk cannot be
-                # read on its own; decline.
-                if position != len(codecs) - 1:
-                    return None
-                shape = tuple(int(s) for s in chunk_shape)
-                nested = getattr(codec, "codecs", ()) or ()
-                break
-            if nested is None:
-                # No sharding codec anywhere in the chain: not an error, just a plain chunked
-                # array, whose chunk is what gets decoded.
-                return () if shape is None else shape
-            codecs = nested
+        if self.impl is None:
+            return None
+        shape = self.impl.inner_chunk_shape()
+        return None if shape is None else tuple(shape)
 
     @property
     def supports_partial_decode(self) -> bool:
@@ -254,6 +256,9 @@ class ZarrsCodecPipeline(CodecPipeline):
             # Rust read path to choose between any more.
             retrieve = self.impl.retrieve_chunk_items_and_apply_index
             await asyncio.to_thread(retrieve, desc, out)
+            _warn_if_ceiling_was_ignored(
+                strict=config.get("codec_pipeline.strict", False)
+            )
             return None
 
     async def write(

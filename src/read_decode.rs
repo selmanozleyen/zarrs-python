@@ -6,9 +6,8 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
-use pyo3::types::PyAnyMethods;
-use pyo3::{PyResult, Python};
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::PyResult;
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
     ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
@@ -58,18 +57,17 @@ impl CodecPipelineImpl {
     /// Read and decode `items`, one job per innermost chunk, on workers scoped to this call.
     ///
     /// `items` must be chunk-unit items: one whole innermost chunk each, carrying the
-    /// coordinates wanted from it. Returns the items this path could not take -- there is no
-    /// second path to hand them to, so the caller turns them into an error rather than leave
-    /// their output bytes unwritten.
-    pub(crate) fn retrieve_chunk_units<'a>(
+    /// coordinates wanted from it. There is no second path, so an item this cannot take is an
+    /// error rather than a hand-off.
+    pub(crate) fn retrieve_chunk_units(
         &self,
         shard: &Arc<ShardInfo>,
-        items: &'a [ChunkItem],
+        items: &[ChunkItem],
         output: UnsafeCellSlice<'_, u8>,
         output_len: usize,
         config: ReadConfig,
         codec_options: &CodecOptions,
-    ) -> PyResult<Vec<&'a ChunkItem>> {
+    ) -> PyResult<()> {
         let element_size = self.element_size()?;
         let ctx = JobContext {
             shard: shard.clone(),
@@ -86,19 +84,14 @@ impl CodecPipelineImpl {
             ),
         };
 
-        let (located, declined) = self.locate_chunks(shard, items, &ctx)?;
-        if located.is_empty() {
-            return Ok(declined);
-        }
+        let located = self.locate_chunks(shard, items, &ctx)?;
 
         let output = DisjointBytes::new(output, output_len);
         let (jobs, absent) = carve(&output, &located, element_size, &ctx)?;
         // Disjointness is proven above; COVERAGE is not. zarr hands us a buffer from
         // `np.empty`, so a byte no job owns is returned as whatever was in that memory.
         //
-        // Only when nothing was DECLINED: a declined item's bytes are written by the fused
-        // path afterwards, so a partial batch legitimately covers part of the output here.
-        if declined.is_empty() && output.covered() != output_len {
+        if output.covered() != output_len {
             return Err(PyRuntimeError::new_err(format!(
                 "the batch covers {} of {output_len} output bytes; the rest would be returned \
                  uninitialised",
@@ -111,7 +104,7 @@ impl CodecPipelineImpl {
             fill(piece, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
         }
         if jobs.is_empty() {
-            return Ok(declined);
+            return Ok(());
         }
 
         // Two persistent work-stealing pools, and capacity is never divided between calls: a
@@ -135,7 +128,7 @@ impl CodecPipelineImpl {
         if let Some(e) = failure.lock().expect("failure slot poisoned").take() {
             return Err(PyRuntimeError::new_err(e));
         }
-        Ok(declined)
+        Ok(())
     }
 
     /// A decoder from `call_cache`, then `array_cache`, or built and inserted into both.
@@ -306,22 +299,19 @@ impl CodecPipelineImpl {
         shard: &ShardInfo,
         items: &'a [ChunkItem],
         ctx: &JobContext,
-    ) -> PyResult<(Vec<(&'a ChunkItem, Option<ByteRange>)>, Vec<&'a ChunkItem>)> {
+    ) -> PyResult<Vec<(&'a ChunkItem, Option<ByteRange>)>> {
         let mut located = Vec::with_capacity(items.len());
-        let mut declined = Vec::new();
         let mut decoders = CallDecoders::default();
 
         for item in items {
-            if item.coords.is_none() {
-                declined.push(item);
-                continue;
-            }
+            // No second path to decline to, so this is an error where it is found.
+            coords_of(item)?;
             // The whole position, not just axis 0: the descent divides on every axis now,
             // so a shard that splits a trailing one is addressed rather than refused.
             let start = item.chunk_subset.start().to_vec();
             located.push((item, self.locate(shard, item, &start, ctx, &mut decoders)?));
         }
-        Ok((located, declined))
+        Ok(located)
     }
 }
 
@@ -589,47 +579,6 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
     )
 }
 
-/// Say so when a ceiling asked for is not the one the pools were built with.
-///
-/// A warning, not an error. The read is correct at the width already built, and a process that
-/// opens a second array wanting a different width is doing something legitimate -- refusing it
-/// would turn a sizing hint into a failed read. A caller needing the guarantee asserts on
-/// [`pool_sizes`], which is what the benchmark does.
-pub(crate) fn check_ceiling_arrived(
-    py: Python<'_>,
-    config: ReadConfig,
-    strict: bool,
-) -> PyResult<()> {
-    for (built, asked, knob) in [
-        (pool_sizes().0, config.read_ceiling, "read_worker_ceiling"),
-        (
-            pool_sizes().1,
-            config.decode_ceiling,
-            "decode_worker_ceiling",
-        ),
-    ] {
-        // Only when a pool EXISTS and differs. Before the first read there is nothing to
-        // contradict, and the ordinary case costs one atomic load per pool per call.
-        let Some(built) = built.filter(|built| *built != asked) else {
-            continue;
-        };
-        let message = format!(
-            "codec_pipeline.{knob} = {asked} was ignored: the pool was built with {built} \
-             threads by the first read in this process and cannot be resized. Set it before \
-             the array that does the first read is opened, or call \
-             zarrs._internal.pool_sizes() for what was built."
-        );
-        // `codec_pipeline.strict` already means "do not paper over what this pipeline cannot
-        // do" -- it turns a decline into a raise instead of a silent fallback to zarr-python.
-        // A width the process cannot give is the same kind of thing, and a caller who asked
-        // for strictness would rather find out here than infer it from a throughput number.
-        if strict {
-            return Err(PyValueError::new_err(message));
-        }
-        py.import("warnings")?.call_method1("warn", (message,))?;
-    }
-    Ok(())
-}
 
 /// What ONE call reads from `zarr.config` when it starts.
 #[derive(Clone, Copy)]
