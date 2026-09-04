@@ -601,7 +601,7 @@ impl CodecPipelineImpl {
 
         // Adjust the concurrency based on the codec chain and the first chunk description
         let Some((chunk_concurrent_limit, mut codec_options)) =
-            concurrency::chunk_concurrency(chunk_descriptions, self)?
+            concurrency::chunk_concurrency(&chunk_descriptions, self)?
         else {
             return Ok(());
         };
