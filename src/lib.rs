@@ -450,6 +450,33 @@ impl CodecPipelineImpl {
         })
     }
 
+    /// The innermost unit this array's codec chain decodes, or `None` to refuse the array.
+    ///
+    /// THREE ANSWERS, and Python needs all three: a shape is the inner chunk of a sharded
+    /// array; an EMPTY shape means the array is not sharded, so its chunk is its own decode
+    /// unit and only a batch entry knows that shape; `None` means this chain cannot be served
+    /// at all -- a codec beside the sharding codec, which leaves the shard index addressing
+    /// bytes that are no longer there.
+    ///
+    /// ASKED HERE RATHER THAN DERIVED TWICE. Python used to answer this itself by walking
+    /// zarr's codec OBJECTS while `ShardInfo::from_codec_chain` answered it from the bound
+    /// chain, and the two could disagree -- at which point Python built a description this
+    /// side refuses, and the refusal surfaced as an uncaught `PyRuntimeError` from a call made
+    /// outside `read`'s `try`, where the base pipeline would simply have read the array. A
+    /// third-party codec registered for `sharding_indexed` reopens that gap however carefully
+    /// the Python walk is written, because the two are answering from different data.
+    ///
+    /// It is also less code: the reach into `zarr.codecs.ShardingCodec`, `.chunk_shape` and
+    /// `.codecs` goes away with it.
+    #[getter]
+    fn inner_chunk_shape(&self) -> Option<Vec<u64>> {
+        self.shard.as_ref().map(|shard| {
+            shard.subchunk_shape.as_ref().map_or_else(Vec::new, |shape| {
+                shape.iter().map(|extent| extent.get()).collect()
+            })
+        })
+    }
+
     /// The one read entry point.
     ///
     /// Takes a `ChunkItems` handle rather than a `Vec<ChunkItem>`: the vector costs one
