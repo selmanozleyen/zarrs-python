@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
 
+    BatchInfo = Iterable[
+        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
+    ]
+
 
 # adapted from https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
 def get_max_threads() -> int:
@@ -38,6 +42,38 @@ class FillValueNoneError(Exception):
     pass
 
 
+def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
+    """Normalise the batch's array indices to int64 positions, lazily."""
+
+    def cast(sel: SelectorTuple) -> SelectorTuple:
+        if isinstance(sel, np.ndarray):
+            # A boolean mask is not an index array; its positions are what it means.
+            if sel.dtype.kind == "b":
+                return np.flatnonzero(sel).astype(np.int64, copy=False)
+            if sel.dtype.kind not in "iuf":
+                raise DiscontiguousArrayError(sel.dtype)
+            out = sel.astype(np.int64, copy=False)
+            # FLOAT IS ACCEPTED FOR EXACTLY ONE REASON: a `uint64` selection reaches this
+            # pipeline as float64, because zarr subtracts the chunk offset first
+            # (`IntArrayDimIndexer.__iter__`, `self.dim_sel[start:stop] - dim_offset`) and
+            # `uint64 - intp` promotes to float64 under NEP 50. Verified: numpy 2.5.2 gives
+            # int64 for uint8/16/32 and float64 for uint64.
+            #
+            # It is NOT a licence to truncate. `astype` would turn 3.7 into 3 in silence, where
+            # zarr-python raises for a fractional index. One comparison keeps that a refusal.
+            if sel.dtype.kind == "f" and not np.array_equal(out, sel):
+                raise DiscontiguousArrayError(sel.dtype)
+            return out
+        if isinstance(sel, tuple) and any(isinstance(s, np.ndarray) for s in sel):
+            return tuple(map(cast, sel))
+        return sel
+
+    return (
+        (byte_getter, chunk_spec, cast(chunk_sel), cast(out_sel), is_complete)
+        for byte_getter, chunk_spec, chunk_sel, out_sel, is_complete in batch_info
+    )
+
+
 # This is a (mostly) copy of the function from zarr.core.indexing that fixes:
 #   DeprecationWarning: Conversion of an array with ndim > 0 to a scalar is deprecated
 # TODO: Upstream this fix
@@ -48,15 +84,33 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
             ls.append(slice(int(dim_selection), int(dim_selection) + 1, 1))
         elif isinstance(dim_selection, np.ndarray):
             dim_selection = dim_selection.ravel()
+            if len(dim_selection) == 0:
+                # `flatnonzero` on an all-False mask is the first thing in this codebase that
+                # can produce one, and `dim_selection[0]` below would be an `IndexError` --
+                # which is not in `FALLBACK_TO_ZARR_PYTHON`, so it would escape `read` rather
+                # than decline. zarr skips chunks that select nothing, so this is unreachable
+                # today; declining costs one comparison and does not depend on that staying so.
+                raise DiscontiguousArrayError(dim_selection)
             if len(dim_selection) == 1:
                 ls.append(
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                diff = np.diff(dim_selection)
-                if (diff != 1).any() and (diff != 0).any():
-                    raise DiscontiguousArrayError(diff)
-                ls.append(slice(dim_selection[0], dim_selection[-1] + 1, 1))
+                # NORMALISED HERE, not merely required of callers. This function is public in
+                # the module and imported directly by tests, and the rule it needs -- that a
+                # difference between two indices is signed -- is one line to enforce and
+                # invisible to get wrong: on a raw unsigned array `[7, 5]` differences to 254,
+                # not -2, and `254 != 1` still refuses, but `[255, 0]` differences to exactly 1
+                # and would be accepted as a run.
+                #
+                # In practice zarr has already promoted (it subtracts the chunk offset, and
+                # `uint - intp` gives int64), so this is a guard against a future caller rather
+                # than against zarr. `copy=False` makes it free when it is already int64.
+                dim_selection = dim_selection.astype(np.int64, copy=False)
+                steps = dim_selection[1:] - dim_selection[:-1]
+                if (steps != 1).any() and (steps != 0).any():
+                    raise DiscontiguousArrayError(steps)
+                ls.append(slice(int(dim_selection[0]), int(dim_selection[-1]) + 1, 1))
         else:
             ls.append(dim_selection)
     return ls
@@ -153,13 +207,39 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
-def make_chunk_info_for_rust_with_indices(
-    batch_info: Iterable[
-        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
-    ],
+def chunk_info_for_write(
+    batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
 ) -> RustChunkInfo:
+    """Describe a write batch to Rust, one item per entry.
+
+    Never split: two items on one chunk key make the read-modify-writes race.
+    """
+    return _chunk_items(_as_int64_batch_info(batch_info), drop_axes, shape)
+
+
+def chunk_info_for_read(
+    batch_info: BatchInfo,
+    drop_axes: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> RustChunkInfo:
+    """Describe a read batch to Rust.
+
+    The same description as a write today. It is a separate function because a READ may
+    describe a selection a write must not -- one chunk key may be named by several items
+    when nothing writes back through them -- and that is what the next commit adds. The
+    call sites are already apart so that commit touches one body, not the pipeline.
+    """
+    return _chunk_items(_as_int64_batch_info(batch_info), drop_axes, shape)
+
+
+def _chunk_items(
+    batch_info: BatchInfo,
+    drop_axes: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> RustChunkInfo:
+    """One ChunkItem per batch entry."""
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True
