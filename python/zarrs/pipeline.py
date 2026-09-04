@@ -41,29 +41,78 @@ class UnsupportedMetadataError(Exception):
     pass
 
 
+def _int_knob(key: str, default: int | None, *, strict: bool) -> int | None:
+    """A config integer, checked HERE where its name is still in scope.
+
+    Every one of these is handed to pyo3 as a keyword argument, and pyo3 raises `TypeError` for
+    a value of the wrong type -- which the caller below catches and reports as "Array is
+    unsupported by ZarrsCodecPipeline". So `file_handle_cache_size: 8.0` disabled this pipeline
+    for that array, silently and permanently, and blamed the one thing the user could not
+    change. A negative value was worse: `OverflowError` is not a `TypeError`, so it escaped
+    naming no key at all.
+
+    THE FULL KEY IS PASSED IN, as a literal, rather than built from a short name. Anything
+    outside the process that wants to know which knobs a build reads has to look for the key in
+    the source, and an f-string leaves nothing to find.
+    """
+    value = config.get(key, default)
+    if value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+        return value
+    shown = "the default" if default is None else repr(default)
+    message = f"{key} must be a non-negative integer or None, got {value!r}; using {shown}"
+    # Raising only under `strict`, which is this file's standing convention: non-strict means
+    # "do not fail over something this pipeline can work around". An unconditional raise would
+    # fail every array OPEN, including write-only workloads that never touch the knob.
+    if strict:
+        raise ValueError(message)
+    warn(message, category=UserWarning, stacklevel=2)
+    return default
+
+
+def _bool_knob(key: str, default: bool, *, strict: bool) -> bool:
+    """A config boolean, checked the same way and for the same reason.
+
+    `isinstance(value, bool)` rather than truthiness on purpose: `"false"` is a true string, and
+    a knob that turns ON when you spell its value wrong is worse than one that refuses.
+    """
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    message = f"{key} must be a bool, got {value!r}; using {default!r}"
+    if strict:
+        raise ValueError(message)
+    warn(message, category=UserWarning, stacklevel=2)
+    return default
+
+
 def get_codec_pipeline_impl(
     metadata: ArrayMetadata, store: Store, *, strict: bool
 ) -> CodecPipelineImpl | None:
     try:
         array_metadata_json = json.dumps(metadata.to_dict())
         # Maintain old behavior: https://github.com/zarrs/zarrs-python/tree/b36ba797cafec77f5f41a25316be02c718a2b4f8?tab=readme-ov-file#configuration
-        validate_checksums = config.get("codec_pipeline.validate_checksums", True)
-        if validate_checksums is None:
+        # `None` keeps meaning True here -- that is the documented old behaviour linked above --
+        # so it is normalised before the type check rather than warned about.
+        if config.get("codec_pipeline.validate_checksums", True) is None:
             validate_checksums = True
+        else:
+            validate_checksums = _bool_knob(
+                "codec_pipeline.validate_checksums", True, strict=strict
+            )
         return CodecPipelineImpl(
             array_metadata_json,
             store_config=store,
             validate_checksums=validate_checksums,
-            chunk_concurrent_minimum=config.get(
-                "codec_pipeline.chunk_concurrent_minimum", None
+            chunk_concurrent_minimum=_int_knob(
+                "codec_pipeline.chunk_concurrent_minimum", None, strict=strict
             ),
-            chunk_concurrent_maximum=config.get(
-                "codec_pipeline.chunk_concurrent_maximum", None
+            chunk_concurrent_maximum=_int_knob(
+                "codec_pipeline.chunk_concurrent_maximum", None, strict=strict
             ),
-            num_threads=config.get("threading.max_workers", None),
-            direct_io=config.get("codec_pipeline.direct_io", False),
-            file_handle_cache_size=config.get(
-                "codec_pipeline.file_handle_cache_size", 0
+            num_threads=_int_knob("threading.max_workers", None, strict=strict),
+            direct_io=_bool_knob("codec_pipeline.direct_io", False, strict=strict),
+            file_handle_cache_size=_int_knob(
+                "codec_pipeline.file_handle_cache_size", 0, strict=strict
             ),
         )
     except TypeError as e:
