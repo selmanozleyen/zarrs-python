@@ -69,7 +69,15 @@ impl ShardInfo {
                     .array_to_bytes_codec()
                     .as_any()
                     .downcast_ref::<ShardingCodecBound>();
+                // THIS ORDER IS LOAD-BEARING. The `break` has to come first. Swap the two and
+                // every ordinary unsharded array with a compressor -- `[bytes, blosc]`, and
+                // every V2 array with `order="F"` -- refuses instead of answering "not
+                // sharded", which is a silent fallback to zarr-python for the common case with
+                // no test failing on values.
                 let Some(sharding) = sharding else { break };
+                // Beside a sharding codec, though, anything else is a refusal: a codec after it
+                // compresses the whole shard so the index no longer addresses it, and one
+                // before it reorders the elements inside an inner chunk.
                 if !current.array_to_array_codecs().is_empty()
                     || !current.bytes_to_bytes_codecs().is_empty()
                 {

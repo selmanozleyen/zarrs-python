@@ -37,7 +37,6 @@ mod store;
 mod tests;
 mod utils;
 
-use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
@@ -59,6 +58,18 @@ const NATIVE_ENDIAN: &str = if cfg!(target_endian = "little") {
 ///
 /// Read off the metadata JSON the pipeline is constructed from, rather than taken as another
 /// constructor flag -- that argument list already carries three bools and nine parameters.
+///
+/// AND NOT off the bound codec chain, which `ShardInfo` already holds and which would make this
+/// a second derivation of a fact one owner has -- exactly the pattern removed for the inner
+/// chunk shape. It cannot be: `CodecChainBound::array_to_bytes_codec` yields
+/// `Arc<dyn ArrayToBytesCodecTraits>`, whose supertraits stop short of `CodecTraits`, so there
+/// is no `name()` and no `configuration()` to ask; and `BytesCodecBound` is private, so
+/// `downcast_ref` is not available either. Only the UNBOUND chain exposes names, and reaching
+/// for that would be a third walk. Written down so the next reader does not rediscover the gap.
+///
+/// It fails safe in both directions regardless: where the two could disagree, `ShardInfo`
+/// refuses the chain and no read happens, or this returns false and the chunk path -- always
+/// correct -- is taken.
 ///
 /// Conservative by construction: anything unrecognised, unparsable or nested returns false
 /// and the read takes the ordinary chunk path, which is always correct.
@@ -359,7 +370,6 @@ impl CodecPipelineImpl {
                 // `DisjointBytes` vends the pieces from it, one range each, so each piece
                 // becomes a `&mut [u8]` the compiler can check.
                 let output = Self::nparray_to_unsafe_cell_slice(value, element_size)?;
-                let output_len = output.len();
                 py.detach(|| {
                     // The pipeline's own options, NOT
                     // `get_chunk_concurrent_limit_and_codec_options`. That helper's whole
@@ -373,7 +383,6 @@ impl CodecPipelineImpl {
                         shard,
                         chunk_descriptions,
                         output,
-                        output_len,
                         config,
                         &self.codec_options,
                     )
@@ -592,7 +601,7 @@ impl CodecPipelineImpl {
 
         // Adjust the concurrency based on the codec chain and the first chunk description
         let Some((chunk_concurrent_limit, mut codec_options)) =
-            chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
+            concurrency::chunk_concurrency(chunk_descriptions, self)?
         else {
             return Ok(());
         };

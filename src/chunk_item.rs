@@ -594,6 +594,23 @@ impl ChunkItems {
         }
     }
 
+    /// Refuse an output start behind the last entry's end.
+    ///
+    /// `push_span`, `push_grid` and `push_points` each own one contiguous output range, so a
+    /// start behind the cursor is two entries claiming the same bytes. `push_indices` does NOT
+    /// call this -- see its doc comment: two bands of one read legitimately share an axis-0
+    /// start, and disjointness for that one is proven downstream by `DisjointBytes`.
+    fn refuse_backwards(&self, out_start: u64) -> PyResult<()> {
+        if out_start < self.out_end {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "output starting at {out_start} overlaps an entry already pushed, which ends \
+                 at {}",
+                self.out_end
+            )));
+        }
+        Ok(())
+    }
+
     /// Build one batch entry's items and append them.
     ///
     /// `indices` select along AXIS 0 and are checked here: non-negative, non-decreasing, and
@@ -676,13 +693,7 @@ impl ChunkItems {
         out_start: u64,
         inner_extent: u64,
     ) -> PyResult<()> {
-        if out_start < self.out_end {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "output starting at {out_start} overlaps an entry already pushed, which ends \
-                 at {}",
-                self.out_end
-            )));
-        }
+        self.refuse_backwards(out_start)?;
         if count == 0 {
             return Ok(());
         }
@@ -872,13 +883,7 @@ impl ChunkItems {
         inner_extent: u64,
         offsets: Offsets<'_>,
     ) -> PyResult<()> {
-        if out_start < self.out_end {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "output starting at {out_start} overlaps an entry already pushed, which ends \
-                 at {}",
-                self.out_end
-            )));
-        }
+        self.refuse_backwards(out_start)?;
         // Before the call: `shape` is moved into it, and argument evaluation is left to right.
         let out_starts = trailing_zeros(out_start, shape.len());
         // These take the trailing axes whole, so the item's extent IS the output shape.
