@@ -1,6 +1,6 @@
 import os
 
-from ._internal import __version__, pool_sizes, read_unit_stats, release_pools_for_fork
+from ._internal import __version__, pool_sizes, release_pools_for_fork
 from .pipeline import (
     UnsupportedDataTypeError,
     UnsupportedMetadataError,
@@ -44,11 +44,10 @@ __all__ = [
     "UnsupportedMetadataError",
     "UnsupportedVIndexingError",
     # Ask what happened, rather than infer it from a throughput number. `read_stats` says
-    # whether a read was served here or handed to zarr-python; `read_unit_stats` says which
-    # read unit served it; `pool_sizes` says what the pools were actually built with, which is
-    # what the "was ignored" warning tells the caller to check.
+    # whether a read was served here or handed to zarr-python; `pool_sizes` says what the two
+    # pools were actually built with, which is what the "was ignored" warning tells the caller
+    # to check.
     "pool_sizes",
     "read_stats",
-    "read_unit_stats",
     "__version__",
 ]

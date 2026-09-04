@@ -71,8 +71,7 @@ _READ_LOCK = threading.Lock()
 def read_stats() -> tuple[int, int]:
     """`(served, declined)` read batches since import.
 
-    THE THIRD READ OUTCOME. `read_unit_stats()` counts row jobs against whole-chunk jobs, and
-    both of those are *inside* this pipeline; a selection it cannot describe is handed to
+    THE OUTCOME NOTHING ELSE COUNTS. A selection this pipeline cannot describe is handed to
     zarr-python instead, which returns identical values more slowly. From the outside that is
     indistinguishable from working -- which, for a pipeline whose only failure mode is "correct
     but slow", is the one thing worth being able to ask.
@@ -321,19 +320,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             # the raise is caught above as a fall back to zarr-python -- there is no second
             # Rust read path to choose between any more.
             retrieve = self.impl.retrieve_chunk_items_and_apply_index
-            # Per call because it IS a per-call decision: a threshold on how many byte-range
-            # reads one chunk is worth, not a size that something was built at. The two pool
-            # sizes are not here -- they were read when the array was opened.
-            await asyncio.to_thread(
-                retrieve,
-                desc,
-                out,
-                _int_knob(
-                    "codec_pipeline.max_row_reads_per_chunk",
-                    None,
-                    strict=config.get("codec_pipeline.strict", False),
-                ),
-            )
+            await asyncio.to_thread(retrieve, desc, out)
             return None
 
     async def write(
