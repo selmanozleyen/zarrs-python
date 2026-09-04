@@ -41,6 +41,85 @@ use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
+/// What `endian` in a `bytes` codec's configuration has to say for the stored bytes to be
+/// usable without conversion.
+const NATIVE_ENDIAN: &str = if cfg!(target_endian = "little") {
+    "little"
+} else {
+    "big"
+};
+
+/// Is an innermost chunk a plain byte tiling of its elements?
+///
+/// True only when the sharding codec's inner chain is exactly `bytes`: no filter, no
+/// compressor, nothing between an element and its bytes. Then a chunk's bytes are its
+/// elements in C order, the offset of any row inside it is arithmetic, and a row can be read
+/// WITHOUT reading the chunk around it.
+///
+/// Read off the metadata JSON the pipeline is constructed from, rather than taken as another
+/// constructor flag -- that argument list already carries four bools and twelve parameters.
+///
+/// AND NOT off the bound codec chain, which `ShardInfo` already holds and which would make this
+/// a second derivation of a fact one owner has -- exactly the pattern removed for the inner
+/// chunk shape. It cannot be: `CodecChainBound::array_to_bytes_codec` yields
+/// `Arc<dyn ArrayToBytesCodecTraits>`, whose supertraits stop short of `CodecTraits`, so there
+/// is no `name()` and no `configuration()` to ask; and `BytesCodecBound` is private, so
+/// `downcast_ref` is not available either. Only the UNBOUND chain exposes names, and reaching
+/// for that would be a third walk. Written down so the next reader does not rediscover the gap.
+///
+/// It fails safe in both directions regardless: where the two could disagree, `ShardInfo`
+/// refuses the chain and no read happens, or this returns false and the chunk path -- always
+/// correct -- is taken.
+///
+/// Conservative by construction: anything unrecognised, unparsable or nested returns false
+/// and the read takes the ordinary chunk path, which is always correct.
+fn inner_chunk_is_plain_bytes(array_metadata_json: &str) -> bool {
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(array_metadata_json) else {
+        return false;
+    };
+    let Some(codecs) = meta.get("codecs").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    for codec in codecs {
+        if codec.get("name").and_then(|n| n.as_str()) != Some("sharding_indexed") {
+            continue;
+        }
+        let inner = codec
+            .get("configuration")
+            .and_then(|c| c.get("codecs"))
+            .and_then(|c| c.as_array());
+        let Some(inner) = inner else { return false };
+        // Exactly the byte reinterpretation, and nothing beside it: a `crc32c` or a `blosc`
+        // here means the chunk cannot be entered part-way, which is the whole reason the
+        // chunk is the read unit. Matched as ONE codec rather than by collecting the names
+        // that parse, so a codec carrying no `name` cannot be skipped over silently.
+        let [only] = inner.as_slice() else {
+            return false;
+        };
+        if only.get("name").and_then(|n| n.as_str()) != Some("bytes") {
+            return false;
+        }
+        // AND in this machine's own byte order. The `bytes` codec REVERSES a multi-byte
+        // element when the array's order is not the platform's, so on a foreign-order array
+        // the chunk path swaps and the row path -- which copies the stored bytes verbatim --
+        // does not. Same array, two answers, no error, and big-endian is legal Zarr V3.
+        //
+        // Absent is treated as native. The spec only permits omitting `endian` for a
+        // single-byte element, which has no order to get wrong -- but nothing here VERIFIES
+        // that, so on a big-endian host, metadata that omits it on a multi-byte element would
+        // take this path while the chunk path byte-swaps. Left as is: it needs a big-endian
+        // host AND invalid metadata, and `read` refuses a non-native output dtype before any
+        // of this. Written down because the comment used to state the guarantee as if the
+        // code checked it.
+        let endian = only
+            .get("configuration")
+            .and_then(|c| c.get("endian"))
+            .and_then(serde_json::Value::as_str);
+        return endian.is_none_or(|e| e == NATIVE_ENDIAN);
+    }
+    false
+}
+
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct CodecPipelineImpl {
@@ -72,6 +151,13 @@ pub struct CodecPipelineImpl {
     /// Whether zarr-python opened this store read-only. Not inferable here: `StoreConfig`
     /// builds a writable Rust store whatever mode the array was opened in.
     pub(crate) store_is_read_only: bool,
+    /// Whether an innermost chunk is a plain byte tiling of its elements -- no filter, no
+    /// compressor. Read off the array metadata this pipeline was built from.
+    ///
+    /// When it is, a row's bytes are addressable arithmetically and can be read WITHOUT
+    /// reading the chunk around them. What that is worth, and the measurement behind it, is
+    /// stated once beside the code it justifies -- see `row_jobs` in `read_decode.rs`.
+    pub(crate) inner_chunk_is_plain_bytes: bool,
     /// The pool sizes this array was OPENED with.
     ///
     /// Read once, here, exactly as `num_threads` and the chunk-concurrency bounds are. They
@@ -456,6 +542,7 @@ impl CodecPipelineImpl {
             shard_decoders: Mutex::new(HashMap::new()),
             subshard_decoders: Mutex::new(HashMap::new()),
             cache_shard_indexes: store_is_read_only,
+            inner_chunk_is_plain_bytes: inner_chunk_is_plain_bytes(array_metadata),
             store_is_read_only,
             read_pool_size: read_decode::resolve_pool_size(read_pool_size),
             decode_pool_size: read_decode::resolve_pool_size(decode_pool_size),
@@ -496,20 +583,26 @@ impl CodecPipelineImpl {
     /// pyclass allocation per item on the way out of the builder and one extraction per item
     /// on the way in, where a handle costs one of each per call whatever the selection.
     ///
-    /// There was a second entry point until 2026-08-30 -- a partial decoder per chunk over
-    /// rayon, for selections this path declined. An audit of the public indexing surface found
-    /// nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
-    /// than a slower second Rust path.
-    #[pyo3(signature = (chunk_items, value))]
+    // There was a second entry point -- a partial decoder per chunk over rayon, for selections
+    // this path declined. An audit of the public indexing surface found nothing reaching it, so
+    // it went, and a decline is now a fall back to zarr-python rather than a slower second Rust
+    // path. A `//` comment, not a doc one: this ships into `_internal.pyi` and thence into
+    // `help()`, and it is history rather than contract. `test_the_fused_path_is_gone` pins it.
+    #[pyo3(signature = (chunk_items, value, max_row_reads_per_chunk=None))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,
         chunk_items: PyRef<'_, chunk_item::ChunkItems>,
         value: &Bound<'_, PyUntypedArray>,
+        max_row_reads_per_chunk: Option<usize>,
     ) -> PyResult<()> {
         // The pool sizes come from the array, not from this call: they were read when it was
-        // opened.
-        let config = read_decode::ReadConfig::from_open(self.read_pool_size, self.decode_pool_size);
+        // opened. The row threshold is a per-call decision and stays one.
+        let config = read_decode::ReadConfig::from_open(
+            self.read_pool_size,
+            self.decode_pool_size,
+            max_row_reads_per_chunk,
+        );
         // The pools are sized once, by the first read. A size arriving after that cannot
         // be honoured, and a caller who is not told believes it was.
         read_decode::check_pool_size_arrived(py, config, self.strict)?;
@@ -606,7 +699,28 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
-/// Drop the two worker pools, so a `fork()` about to happen cannot inherit a held lock.
+/// `(row_reads, chunk_reads)` since the run began.
+///
+/// THE TWO ARE NOT THE SAME UNIT, and the obvious ratio between them is wrong. A chunk served
+/// by the row path contributes ONE PER RUN of consecutive rows -- up to
+/// `max_row_reads_per_chunk` of them, two by default -- while a chunk served the ordinary way
+/// contributes exactly one. So a batch in which half the chunks took the row path reports
+/// something nearer 2:1 than 1:1, and `row / (row + chunk)` is not the fraction of chunks that
+/// took it. Read them as what they are: how many byte-range requests each path issued.
+///
+/// Exposed so a test can assert the row path was TAKEN. Correctness cannot: both paths return
+/// the same values, so a gate that refuses everything passes every values test.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn read_unit_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        read_decode::ROW_JOBS.load(Ordering::Relaxed),
+        read_decode::CHUNK_JOBS.load(Ordering::Relaxed),
+    )
+}
+
+/// Drop every process-wide thread pool, so a `fork()` cannot inherit a held lock.
 ///
 /// Registered from Python with `os.register_at_fork(before=...)`. The per-process check that
 /// rebuilds these in a child is not enough on its own: it runs under the very lock that `fork`
@@ -635,6 +749,7 @@ fn pool_sizes() -> (Option<usize>, Option<usize>) {
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(shard_index_cache_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(read_unit_stats, m)?)?;
     m.add_function(wrap_pyfunction!(pool_sizes, m)?)?;
     m.add_function(wrap_pyfunction!(release_pools_for_fork, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
