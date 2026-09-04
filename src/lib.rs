@@ -386,13 +386,13 @@ impl CodecPipelineImpl {
             // that sets them. This was a hand-off to a second Rust path that no longer
             // exists, so if it fires the invariant broke and silence is the wrong answer.
             return Err(PyRuntimeError::new_err(format!(
-                "{} read items arrived without coordinates; there is no fallback path and \
+                "{} read items arrived without element offsets; there is no fallback path and \
                  the caller should have declined to zarr-python instead",
                 declined.len()
             )));
         }
         // No second path to fall through to. Reaching here means either the batch was
-        // empty, or an item arrived without coordinates, or the array does not present a
+        // empty, or an item arrived without element offsets, or the array does not present a
         // sharding codec -- and in every one of those cases the output buffer is exactly as
         // `np.empty` left it, so returning Ok would hand the caller uninitialised memory and
         // call it data. Python declines all three before they get here; this is the assertion
@@ -403,7 +403,7 @@ impl CodecPipelineImpl {
             if self.shard.is_none() {
                 "this array presents no sharding codec, so there is no decode unit to group by"
             } else {
-                "an item arrived without coordinates"
+                "an item arrived without element offsets"
             }
         )))
     }

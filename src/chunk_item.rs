@@ -480,15 +480,15 @@ pub(crate) fn build_chunk_unit_items(
         // extent checks above guard, and every other bound in this file is already checked.
         // Unchecked, a large start wraps to a small one in release and the comparison below
         // then passes.
-        let span = |start: u64, offset: u64| -> PyResult<u64> {
+        let end_of = |start: u64, offset: u64| -> PyResult<u64> {
             start.checked_add(offset).ok_or_else(|| {
                 PyErr::new::<PyValueError, _>(format!(
                     "an output range at {start} of {offset} is too large to address"
                 ))
             })
         };
-        let out_lo = span(out_starts[0], a as u64)?;
-        let out_hi = span(out_starts[0], b as u64)?;
+        let out_lo = end_of(out_starts[0], a as u64)?;
+        let out_hi = end_of(out_starts[0], b as u64)?;
         if out_hi > out_extent {
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "output subset {out_lo}..{out_hi} is past the output extent {out_extent}",
@@ -501,12 +501,12 @@ pub(crate) fn build_chunk_unit_items(
         let mut chunk_ranges = Vec::with_capacity(chunk_shape.len());
         chunk_ranges.push(lo..hi);
         for (start, width) in &trailing {
-            chunk_ranges.push(*start..span(*start, *width)?);
+            chunk_ranges.push(*start..end_of(*start, *width)?);
         }
         let mut out_ranges = Vec::with_capacity(shape.len());
         out_ranges.push(out_lo..out_hi);
         for (start, width) in out_starts[1..].iter().zip(&out_widths[1..]) {
-            out_ranges.push(*start..span(*start, *width)?);
+            out_ranges.push(*start..end_of(*start, *width)?);
         }
         items.push(ChunkItem {
             key: key.clone(),
@@ -567,8 +567,11 @@ pub(crate) fn build_chunk_unit_items(
 #[pyclass]
 pub(crate) struct ChunkItems {
     items: Vec<ChunkItem>,
-    /// Where the last entry's output ended, so a later one cannot overlap it. Python drives
-    /// `push_indices` directly, and two entries sharing an `out_start` would give two items
+    /// Where the last entry's output ended. `push_span`, `push_grid` and `push_points` refuse
+    /// an `out_start` behind it; `push_indices` does NOT -- see its own doc comment, where two
+    /// bands of one read share an axis-0 start and overlap nothing, so disjointness for that
+    /// one is proven downstream by `DisjointBytes` instead. Two entries sharing an `out_start`
+    /// would give two items
     /// overlapping output ranges -- which the read path writes CONCURRENTLY through views
     /// whose safety contract is that they are disjoint. A wrong answer would be recoverable;
     /// this would be a data race.

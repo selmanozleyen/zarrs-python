@@ -501,7 +501,7 @@ fn test_push_grid_refuses_runs_outside_the_row() -> PyResult<()> {
 /// dense cases it should serve, and the read silently stays on the chunk path -- which reads
 /// as "the row path did not pay" rather than as "the row path was never taken".
 #[test]
-fn test_raw_runs_counts_reads_not_rows() {
+fn test_row_read_count_counts_reads_not_rows() {
     let run_len = 2u64;
     let c = |v: &[u64]| v.iter().map(|r| r * run_len).collect::<Vec<u64>>();
 
@@ -533,7 +533,7 @@ fn test_raw_runs_counts_reads_not_rows() {
 /// stored bytes verbatim and does not. Same array, two answers, no error -- and big-endian
 /// is legal Zarr V3 that nothing else here refuses.
 #[test]
-fn test_raw_is_refused_for_a_foreign_byte_order() {
+fn test_the_row_path_is_refused_for_a_foreign_byte_order() {
     let meta = |inner: &str| {
         format!(
             r#"{{"codecs":[{{"name":"sharding_indexed","configuration":{{"codecs":[{inner}]}}}}]}}"#
@@ -575,7 +575,7 @@ fn test_raw_is_refused_for_a_foreign_byte_order() {
 /// coordinate reads as CONSECUTIVE, which merges two reads that share no bytes. The checked
 /// walk is the only behaviour this de-duplication changed, so it is the one thing pinned here.
 #[test]
-fn test_coord_runs_do_not_wrap_at_the_top_of_the_range() {
+fn test_offset_runs_do_not_wrap_at_the_top_of_the_range() {
     let run_len = 4u64;
     // (u64::MAX - 1) + 4 wraps to 2. Unchecked, these two are one run.
     assert_eq!(

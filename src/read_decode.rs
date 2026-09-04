@@ -450,7 +450,7 @@ fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, 
         )));
     }
     // Fixed across the iteration by construction, so it is read once.
-    let width = usize::try_from(runs.contiguous_elements())
+    let piece_bytes = usize::try_from(runs.contiguous_elements())
         .ok()
         .and_then(|r| r.checked_mul(element_size))
         .ok_or_else(|| {
@@ -461,7 +461,7 @@ fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, 
             usize::try_from(index)
                 .ok()
                 .and_then(|i| i.checked_mul(element_size))
-                .map(|at| (at, width))
+                .map(|at| (at, piece_bytes))
                 .ok_or_else(|| {
                     PyRuntimeError::new_err(format!(
                         "{}: output offset too large to address",
@@ -609,7 +609,7 @@ fn carve<'a>(
     Ok((jobs, absent))
 }
 
-/// Jobs that took the RAW path, and jobs that read a whole chunk, since the run began.
+/// Jobs that took the ROW path, and jobs that read a whole chunk, since the run began.
 ///
 /// The project rule -- a knob that was set is not a knob that arrived -- applied to a code
 /// path. A gate that silently refuses everything is indistinguishable from a gate that is
@@ -875,7 +875,8 @@ fn default_pool_size() -> usize {
 /// capacity outright; and a partition blocked on I/O cannot lend to one that is starved.
 ///
 /// SIZED ONCE, and this is the honest cost. `read_pool_size` and `decode_pool_size`
-/// are read from `zarr.config` per call, but only the FIRST call's values build the pools; a
+/// are read from `zarr.config` when the ARRAY is opened, but only the first read in the
+/// process builds the pools; a
 /// later `with zarr.config.set(...)` around a read resizes nothing. [`pool_sizes`] reports
 /// what was actually built, so a caller can assert rather than assume.
 /// REBUILT AFTER A FORK, which is the difference between a slow child and a hung one.
@@ -968,7 +969,7 @@ fn pools(
 /// ever, and the pid check never gets to run. `tests/test_fork_safety.py` cannot see this: it
 /// forks with no read in flight.
 ///
-/// So the fix is upstream of the lock. `python/zarrs/pipeline.py` registers this with
+/// So the fix is upstream of the lock. `python/zarrs/__init__.py` registers this with
 /// `os.register_at_fork(before=...)`, which `multiprocessing` and therefore
 /// `torch.utils.data.DataLoader` both honour. It blocks until no thread holds the lock, empties
 /// the slot, and releases -- so the fork sees a free, empty mutex and both sides rebuild on
@@ -1045,7 +1046,8 @@ pub(crate) fn check_pool_size_arrived(
     Ok(())
 }
 
-/// What ONE call reads from `zarr.config` when it starts.
+/// One read's configuration: the pool sizes the ARRAY was opened with, plus this call's row
+/// threshold. The two are read at different times on purpose -- see the fields.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadConfig {
     /// Only the FIRST call's value in this process is used -- see [`Pools`].
@@ -1092,7 +1094,7 @@ struct Job<'a> {
     /// The chunk's byte range within its shard, or -- on the row path -- one run of rows'
     /// range inside that chunk.
     range: ByteRange,
-    /// Raw jobs carry the wanted bytes exactly: no decode, no scratch, no gather. Their
+    /// Row jobs carry the wanted bytes exactly: no decode, no scratch, no gather. Their
     /// `range` is the ROW's bytes inside the chunk rather than the whole chunk's.
     by_row: bool,
     /// The output ranges this chunk fills, ascending. ONE range while every axis after the
@@ -1232,14 +1234,14 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     // CHECKED, because this number sizes the buffer an `unsafe` view is built over below: the
     // view's safety obligation is that the slice holds at least `product(shape) * size` bytes,
-    // and a wrapped `needed` makes the view describe more elements than exist.
-    let needed = elements
+    // and a wrapped `needed_bytes` makes the view describe more elements than exist.
+    let needed_bytes = elements
         .checked_mul(size as u64)
         .and_then(|n| usize::try_from(n).ok())
         .ok_or_else(|| {
             format!("a decode unit of {elements} elements of {size} bytes cannot be addressed")
         })?;
-    // GROW only. `clear()` then `resize(needed, 0)` zero-fills the whole buffer, and
+    // GROW only. `clear()` then `resize(needed_bytes, 0)` zero-fills the whole buffer, and
     // `decode_into` below writes every byte of it -- the view is built over
     // `new_with_shape`, the entire chunk -- so the fill is overwritten without ever being
     // read. At an inner chunk of 91,549 f32 that is 366 KiB memset per decode, and a
@@ -1261,15 +1263,15 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     // The view below is built over `new_with_shape` -- the whole chunk -- so a codec that
     // returns `Ok` without filling it would already be broken; this makes such a bug quieter
     // rather than causing one.
-    if scratch.len() < needed {
+    if scratch.len() < needed_bytes {
         // `try_reserve`, then resize. A plain `resize` that cannot allocate goes through
         // `handle_alloc_error`, which ABORTS -- it kills the interpreter with no Python
-        // traceback and no chance to fall back. `needed` comes from array metadata, which
+        // traceback and no chance to fall back. `needed_bytes` comes from array metadata, which
         // nothing here validates against the machine's memory.
         scratch
-            .try_reserve(needed - scratch.len())
-            .map_err(|e| format!("could not hold a decode unit of {needed} bytes: {e}"))?;
-        scratch.resize(needed, 0);
+            .try_reserve(needed_bytes - scratch.len())
+            .map_err(|e| format!("could not hold a decode unit of {needed_bytes} bytes: {e}"))?;
+        scratch.resize(needed_bytes, 0);
     }
     // Debug builds POISON the reused region. Grow-only scratch means a codec that returns
     // `Ok` without filling its target leaves the PREVIOUS chunk's elements showing through --
@@ -1278,8 +1280,8 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     // somewhere else are a plausible one. This makes a test able to see the difference,
     // without costing a release build anything.
     #[cfg(debug_assertions)]
-    scratch[..needed].fill(0xAA);
-    let scratch = &mut scratch[..needed];
+    scratch[..needed_bytes].fill(0xAA);
+    let scratch = &mut scratch[..needed_bytes];
 
     let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
     {

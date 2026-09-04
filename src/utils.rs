@@ -126,10 +126,8 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
         Ok(())
     }
 
-    /// Every byte of every piece was written. The caller's buffer is `np.empty`, so a piece
-    /// left short returns whatever was already in memory, as data.
-    /// Bytes written so far, and bytes the pieces hold. Only for the error `finished` fails
-    /// with -- a mismatch that reports neither number tells a reader nothing they can act on.
+    /// Bytes written so far. Only for the error `finished` fails with -- a mismatch that
+    /// reports neither number gives a reader nothing to act on.
     pub(crate) fn written(&self) -> usize {
         self.pieces[..self.piece]
             .iter()
@@ -142,6 +140,8 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
         self.pieces.iter().map(|p| p.len()).sum()
     }
 
+    /// Every byte of every piece was written. The caller's buffer is `np.empty`, so a piece
+    /// left short returns whatever was already in memory, as data.
     pub(crate) fn finished(&self) -> bool {
         // Everything before `piece` was filled to its end by construction, so only the
         // current piece and whatever follows it can be short.

@@ -81,8 +81,16 @@ def read_stats() -> tuple[int, int]:
     return served, declined
 
 
-def _int_knob(name: str, default: int | None) -> int | None:
-    """A `codec_pipeline.*` integer, checked HERE where its name is still in scope.
+def _int_knob(key: str, default: int | None) -> int | None:
+    """A config integer, checked HERE where its name is still in scope.
+
+    THE FULL KEY IS PASSED IN, as a literal, rather than built from a short name. That is not
+    style: this project's rule is that a knob which was set is not a knob that arrived, and the
+    only way anything outside the process can check which knobs a build reads is to look for
+    the key in the source. An earlier version took `"read_pool_size"` and wrote
+    `f"codec_pipeline.{name}"`, so no literal key survived anywhere -- and two separate tools
+    that scan for one concluded this build read no knobs at all, then measured it against
+    another build at a different width.
 
     Every one of these is handed to pyo3 as a keyword argument, and pyo3 raises `TypeError`
     for a value of the wrong type -- which the caller catches and reports as "Array is
@@ -91,12 +99,10 @@ def _int_knob(name: str, default: int | None) -> int | None:
     change. A negative value was worse: `OverflowError` is not a `TypeError`, so it escaped
     naming no key at all.
     """
-    value = config.get(f"codec_pipeline.{name}", default)
+    value = config.get(key, default)
     if value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
         return value
-    raise ValueError(
-        f"codec_pipeline.{name} must be a non-negative integer or None, got {value!r}"
-    )
+    raise ValueError(f"{key} must be a non-negative integer or None, got {value!r}")
 
 
 def get_codec_pipeline_impl(
@@ -112,16 +118,16 @@ def get_codec_pipeline_impl(
             array_metadata_json,
             store_config=store,
             validate_checksums=validate_checksums,
-            chunk_concurrent_minimum=_int_knob("chunk_concurrent_minimum", None),
-            chunk_concurrent_maximum=_int_knob("chunk_concurrent_maximum", None),
+            chunk_concurrent_minimum=_int_knob("codec_pipeline.chunk_concurrent_minimum", None),
+            chunk_concurrent_maximum=_int_knob("codec_pipeline.chunk_concurrent_maximum", None),
             num_threads=config.get("threading.max_workers", None),
             direct_io=config.get("codec_pipeline.direct_io", False),
-            file_handle_cache_size=_int_knob("file_handle_cache_size", 0),
+            file_handle_cache_size=_int_knob("codec_pipeline.file_handle_cache_size", 0),
             # Read at OPEN, like `num_threads` and the chunk-concurrency bounds beside them.
             # They size process-wide pools that only the first read builds, so offering them
             # per call would be offering a choice that cannot be honoured.
-            read_pool_size=_int_knob("read_pool_size", None),
-            decode_pool_size=_int_knob("decode_pool_size", None),
+            read_pool_size=_int_knob("codec_pipeline.read_pool_size", None),
+            decode_pool_size=_int_knob("codec_pipeline.decode_pool_size", None),
             # Under `strict`, a size the process cannot give is an error rather than a
             # warning -- the same switch that turns a decline into a raise.
             strict=strict,
@@ -319,7 +325,7 @@ class ZarrsCodecPipeline(CodecPipeline):
                 retrieve,
                 desc,
                 out,
-                _int_knob("max_row_reads_per_chunk", None),
+                _int_knob("codec_pipeline.max_row_reads_per_chunk", None),
             )
             return None
 

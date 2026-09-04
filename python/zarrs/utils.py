@@ -306,7 +306,8 @@ def _bands(lo: int, hi: int, inner: int, out_lo: int) -> list[tuple[int, int, in
 def _chunk_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
 ) -> list[tuple] | None:
-    """Args for `ChunkItems.push_indices`, one per item, or None if this entry is not that shape.
+    """Args for one `ChunkItems` push per item, tagged `"span"` or `"indices"`, or None if
+    this entry is not that shape.
 
     Eligible: an integer axis at AXIS 0 -- non-negative, non-decreasing, against a contiguous
     output slice -- with every axis after it taken whole or as a contiguous sub-box.
@@ -779,8 +780,9 @@ def chunk_info_for_read(
 ) -> RustChunkInfo:
     """Describe a read batch to Rust, grouped by decode unit where the selection allows.
 
-    One item per inner chunk if every entry is eligible; otherwise one box per run of
-    consecutive indices, falling back to one item per entry.
+    One item per inner chunk if every entry is eligible; otherwise the point pass, then the
+    grid pass. There is no fourth fallback -- an unservable selection raises
+    `DiscontiguousArrayError`, which `pipeline.read` catches as a fall back to zarr-python.
     """
     # A generator would be consumed by the eligibility test, and the ordinary route needs
     # to read the same entries again if that test fails.
