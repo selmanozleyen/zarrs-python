@@ -125,3 +125,30 @@ class TestStrictMode:
         # Contiguous array indexing should work
         indices = np.array([1, 2, 3])
         assert np.array_equal(arr[indices, 0], data[indices, 0])
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=["store"])
+def test_an_empty_row_selection_reads_under_strict(store: Store) -> None:
+    """`X[[]]` is a read of NOTHING, and nothing is servable.
+
+    Under `strict` a decline is an error, so this is the one place where "we describe fewer
+    selections than upstream did" turns into a regression rather than a fallback. The
+    chunk-unit gate is three all-or-nothing passes over the batch's entries, and `all()` over
+    an empty list is true -- so an empty batch should have been served by the first pass. It
+    was not: each guard also required the list to be non-empty, and an empty batch fell past
+    all three to the raise.
+
+    Written against `strict=True` deliberately. Without it the fallback returns the same empty
+    array and the test cannot fail.
+    """
+    sp = StorePath(store, path="empty_selection")
+    values = np.arange(200, dtype=np.float64)
+    arr = zarr.create_array(
+        sp, shape=(200,), chunks=(8,), shards=(32,), dtype=values.dtype
+    )
+    arr[:] = values
+
+    with zarr.config.set({"codec_pipeline.strict": True}):
+        got = arr[np.array([], dtype=np.int64)]
+    assert got.shape == (0,)
+    assert got.dtype == values.dtype
