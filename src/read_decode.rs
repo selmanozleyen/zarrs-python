@@ -136,7 +136,6 @@ impl CodecPipelineImpl {
         shard: &Arc<ShardInfo>,
         items: &'a [ChunkItem],
         output: UnsafeCellSlice<'_, u8>,
-        output_len: usize,
         config: ReadConfig,
         codec_options: &CodecOptions,
     ) -> PyResult<Vec<&'a ChunkItem>> {
@@ -161,6 +160,12 @@ impl CodecPipelineImpl {
             return Ok(declined);
         }
 
+        // The length comes FROM the slice, never beside it. `DisjointBytes::take` refuses a
+        // range past `self.len`, and that refusal is what the `unsafe` inside it rests on --
+        // so a caller that could pass a length disagreeing with the buffer is the one way to
+        // defeat it. It used to be a parameter, computed by the single caller as `output.len()`
+        // two lines earlier.
+        let output_len = output.len();
         let output = DisjointBytes::new(output, output_len);
         let (jobs, absent) = carve(&output, &located, element_size, &ctx)?;
         // Disjointness is proven above; COVERAGE is not. zarr hands us a buffer from
@@ -298,10 +303,11 @@ impl CodecPipelineImpl {
         // The trust-boundary checks still run. They used to sit only after the descent, so an
         // unsharded array skipped them entirely -- while `push_indices`'s own docstring cites
         // them as what makes an arbitrary Python `inner_shape` safe. Unreachable in practice,
-        // because `_inner_chunk_shape` returns a real inner shape only where it found a
-        // sharding codec and `ShardInfo::from_codec_chain` reads the same metadata -- but
-        // "unreachable because two functions agree about some JSON" is exactly the kind of
-        // guarantee this file checks rather than assumes.
+        // because the inner chunk shape now has ONE owner -- Python asks
+        // `CodecPipelineImpl::inner_chunk_shape`, which reads the same `ShardInfo` this
+        // descent uses -- so a depth-0 array cannot be described with a sharded inner shape.
+        // That is a stronger argument than the one this comment used to make, and it is still
+        // an argument rather than a check, which is why the check is here.
         if shard.depth() == 0 {
             item_is_one_decode_unit(item, start, &item.shape)?;
             return Ok(Some(ByteRange::FromStart(0, None)));

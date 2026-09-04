@@ -37,7 +37,6 @@ mod store;
 mod tests;
 mod utils;
 
-use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
@@ -287,7 +286,6 @@ impl CodecPipelineImpl {
                 // `DisjointBytes` vends the pieces from it, one range each, so each piece
                 // becomes a `&mut [u8]` the compiler can check.
                 let output = Self::nparray_to_unsafe_cell_slice(value, element_size)?;
-                let output_len = output.len();
                 py.detach(|| {
                     // The pipeline's own options, NOT
                     // `get_chunk_concurrent_limit_and_codec_options`. That helper's whole
@@ -301,7 +299,6 @@ impl CodecPipelineImpl {
                         shard,
                         chunk_descriptions,
                         output,
-                        output_len,
                         config,
                         &self.codec_options,
                     )
@@ -531,7 +528,7 @@ impl CodecPipelineImpl {
 
         // Adjust the concurrency based on the codec chain and the first chunk description
         let Some((chunk_concurrent_limit, mut codec_options)) =
-            chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
+            concurrency::chunk_concurrency(chunk_descriptions, self)?
         else {
             return Ok(());
         };
