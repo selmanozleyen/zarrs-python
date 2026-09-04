@@ -32,15 +32,6 @@ class ChunkItems:
     `retrieve_chunk_items_and_apply_index`.
     """
     def __new__(cls) -> ChunkItems: ...
-    def refuse_backwards(self, out_start: builtins.int) -> None:
-        r"""
-        Refuse an output start behind the last entry's end.
-
-        `push_span`, `push_grid` and `push_points` each own one contiguous output range, so a
-        start behind the cursor is two entries claiming the same bytes. `push_indices` does NOT
-        call this -- see its doc comment: two bands of one read legitimately share an axis-0
-        start, and disjointness for that one is proven downstream by `DisjointBytes`.
-        """
     def push_indices(
         self,
         key: builtins.str,
@@ -92,11 +83,7 @@ class ChunkItems:
         This is the whole point. Describing the span as elements instead -- `np.arange(a, b)`,
         on the grounds that a contiguous slice IS a sorted integer axis spelled differently --
         costs one `u64` per ELEMENT, built in numpy and walked one at a time here. Described as
-        a run it is one coordinate and a length, whatever the span. The measurement behind that
-        is in the commit message, not here: this doc comment is copied verbatim into
-        `zarrs/_internal.pyi` by `pyo3-stub-gen`, so it is what `help()` shows a user, and
-        milliseconds from a dataset they do not have belong in the history rather than in
-        their terminal.
+        a run it is one coordinate and a length, whatever the span.
         """
     def push_grid(
         self,
@@ -150,17 +137,6 @@ class CodecPipelineImpl:
         unit and only a batch entry knows that shape; `None` means this chain cannot be served
         at all -- a codec beside the sharding codec, which leaves the shard index addressing
         bytes that are no longer there.
-
-        ASKED HERE RATHER THAN DERIVED TWICE. Python used to answer this itself by walking
-        zarr's codec OBJECTS while `ShardInfo::from_codec_chain` answered it from the bound
-        chain, and the two could disagree -- at which point Python built a description this
-        side refuses, and the refusal surfaced as an uncaught `PyRuntimeError` from a call made
-        outside `read`'s `try`, where the base pipeline would simply have read the array. A
-        third-party codec registered for `sharding_indexed` reopens that gap however carefully
-        the Python walk is written, because the two are answering from different data.
-
-        It is also less code: the reach into `zarr.codecs.ShardingCodec`, `.chunk_shape` and
-        `.codecs` goes away with it.
         """
     def __new__(
         cls,
@@ -190,11 +166,6 @@ class CodecPipelineImpl:
         Takes a `ChunkItems` handle rather than a `Vec<ChunkItem>`: the vector costs one
         pyclass allocation per item on the way out of the builder and one extraction per item
         on the way in, where a handle costs one of each per call whatever the selection.
-
-        There was a second entry point until 2026-08-30 -- a partial decoder per chunk over
-        rayon, for selections this path declined. An audit of the public indexing surface found
-        nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
-        than a slower second Rust path.
         """
     def store_chunks_with_indices(
         self,
@@ -231,9 +202,9 @@ def release_pools_for_fork() -> None:
     r"""
     Drop every process-wide thread pool, so a `fork()` cannot inherit a held lock.
 
-    Registered from Python with `os.register_at_fork(before=...)`. See
-    [`read_decode::release_pools_for_fork`] for why the pid check inside `pools` is not enough
-    on its own: it runs under the very lock that `fork` would copy as held.
+    Registered from Python with `os.register_at_fork(before=...)`. The per-process check that
+    rebuilds these in a child is not enough on its own: it runs under the very lock that `fork`
+    would copy as held, so a child forked mid-read would block on it for ever.
     """
 
 def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
