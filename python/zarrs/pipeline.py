@@ -89,6 +89,27 @@ def read_stats() -> tuple[int, int]:
     return served, declined
 
 
+def _bool_knob(key: str, default: bool, *, strict: bool) -> bool:
+    """A config boolean, checked where its name is still in scope.
+
+    The sibling of `_int_knob`, and it exists for the same reason: `direct_io: "yes"` reaches
+    pyo3 as a `str`, pyo3 raises `TypeError`, the constructor catches it and reports "Array is
+    unsupported by ZarrsCodecPipeline" -- disabling this pipeline for that array, silently and
+    permanently, over the one thing the user cannot change.
+
+    `isinstance(value, bool)` rather than truthiness on purpose: `"false"` is a true string, and
+    a knob that turns ON when you spell its value wrong is worse than one that refuses.
+    """
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    message = f"{key} must be a bool, got {value!r}; using {default!r}"
+    if strict:
+        raise ValueError(message)
+    warn(message, category=UserWarning, stacklevel=2)
+    return default
+
+
 def _int_knob(key: str, default: int | None, *, strict: bool) -> int | None:
     """A config integer, checked HERE where its name is still in scope.
 
@@ -110,7 +131,8 @@ def _int_knob(key: str, default: int | None, *, strict: bool) -> int | None:
     value = config.get(key, default)
     if value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
         return value
-    message = f"{key} must be a non-negative integer or None, got {value!r}; using {default!r}"
+    shown = "the default" if default is None else repr(default)
+    message = f"{key} must be a non-negative integer or None, got {value!r}; using {shown}"
     # RAISING ONLY UNDER `strict`, which is this file's standing convention: non-strict means
     # "do not fail a read over something this pipeline can work around". An unconditional raise
     # here failed every array OPEN, including write-only workloads that never touch the knob.
@@ -128,10 +150,15 @@ def get_codec_pipeline_impl(
     try:
         array_metadata_json = json.dumps(metadata.to_dict())
         # Maintain old behavior: https://github.com/zarrs/zarrs-python/tree/b36ba797cafec77f5f41a25316be02c718a2b4f8?tab=readme-ov-file#configuration
-        validate_checksums = config.get("codec_pipeline.validate_checksums", True)
-        max_workers = _int_knob("threading.max_workers", None, strict=strict)
-        if validate_checksums is None:
+        # `None` keeps meaning True here -- that is the documented old behaviour linked above,
+        # so it is normalised before the type check rather than warned about.
+        if config.get("codec_pipeline.validate_checksums", True) is None:
             validate_checksums = True
+        else:
+            validate_checksums = _bool_knob(
+                "codec_pipeline.validate_checksums", True, strict=strict
+            )
+        max_workers = _int_knob("threading.max_workers", None, strict=strict)
         return CodecPipelineImpl(
             array_metadata_json,
             store_config=store,
@@ -139,7 +166,7 @@ def get_codec_pipeline_impl(
             chunk_concurrent_minimum=_int_knob("codec_pipeline.chunk_concurrent_minimum", None, strict=strict),
             chunk_concurrent_maximum=_int_knob("codec_pipeline.chunk_concurrent_maximum", None, strict=strict),
             num_threads=max_workers,
-            direct_io=config.get("codec_pipeline.direct_io", False),
+            direct_io=_bool_knob("codec_pipeline.direct_io", False, strict=strict),
             file_handle_cache_size=_int_knob("codec_pipeline.file_handle_cache_size", 0, strict=strict),
             # Read at OPEN, like `num_threads` and the chunk-concurrency bounds beside them.
             # They size process-wide pools that only the first read builds, so offering them
@@ -313,8 +340,6 @@ class ZarrsCodecPipeline(CodecPipeline):
             await self.python_impl.read(batch_info, out, drop_axes)
             return None
         else:
-            with _READ_LOCK:
-                _READ_COUNTS[0] += 1
             out: NDArrayLike = out.as_ndarray_like()
             desc = chunks_desc.chunk_info_with_indices
             # One entry point. `chunk_info_for_read` either produces a handle or raises, and
@@ -334,6 +359,13 @@ class ZarrsCodecPipeline(CodecPipeline):
                     strict=config.get("codec_pipeline.strict", False),
                 ),
             )
+            # AFTER the read, not before it. Counting at the top of this branch counted a batch
+            # that described cleanly and then died in Rust -- a coverage shortfall, a `locate`
+            # refusal, a pool that could not be built -- as served. For a counter whose whole
+            # purpose is to be trustworthy about which path ran, that is the one thing it must
+            # not do.
+            with _READ_LOCK:
+                _READ_COUNTS[0] += 1
             return None
 
     async def write(

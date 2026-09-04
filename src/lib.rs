@@ -328,10 +328,26 @@ impl CodecPipelineImpl {
         value: &'a Bound<'_, PyUntypedArray>,
         element_size: usize,
     ) -> Result<UnsafeCellSlice<'a, u8>, PyErr> {
+        // WRITABLE, which `from_raw_parts_mut` requires and which nothing else established.
+        // A read-only target -- a read-only mmap, `arr.flags.writeable = False`, a view over an
+        // immutable buffer -- was written through anyway: a segfault, or a silently diverging
+        // copy-on-write page, neither of them a Python exception. Contiguity and the element
+        // size are both checked in `nparray_bytes`, which is what made this read as an
+        // oversight rather than a decision.
+        //
+        // HERE and not in `nparray_bytes`, because the write path reads its INPUT array through
+        // that same helper and a read-only source is perfectly legitimate there.
+        let array_object: &PyArrayObject = Self::py_untyped_array_to_array_object(value);
+        if array_object.flags & numpy::npyffi::NPY_ARRAY_WRITEABLE == 0 {
+            return Err(PyErr::new::<PyValueError, _>(
+                "the output array is not writable".to_string(),
+            ));
+        }
         let (array_data, array_len) = Self::nparray_bytes(value, element_size)?;
         let output = unsafe {
-            // SAFETY: array_data is a valid pointer to a u8 array of length array_len
-            debug_assert!(!array_data.is_null());
+            // SAFETY: `array_data` points at `array_len` bytes of a C-contiguous, writable
+            // array, checked above; `UnsafeCellSlice` is what makes the aliasing sound.
+            assert!(!array_data.is_null(), "numpy handed over a null data pointer");
             std::slice::from_raw_parts_mut(array_data, array_len)
         };
         Ok(UnsafeCellSlice::new(output))
@@ -344,11 +360,26 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         config: read_decode::ReadConfig,
     ) -> PyResult<()> {
-        // An empty batch is a read of NOTHING -- `X[[]]` -- and nothing is servable. There is
-        // no output to leave uninitialised, so this returns rather than falling to the refusal
-        // below, which is where it used to land. Python serves it too (`chunk_info_for_read`
-        // hands back an empty handle); both halves have to agree or the fix is half a fix.
+        // An empty batch is a read of NOTHING -- `X[[]]` -- and nothing is servable, so this
+        // returns rather than falling to the refusal below, which is where it used to land.
+        // Python serves it too (`chunk_info_for_read` hands back an empty handle); both halves
+        // have to agree or the fix is half a fix.
+        //
+        // AND THE OUTPUT MUST BE EMPTY TOO. This return skips `retrieve_chunk_units`, and with
+        // it the `covered() != output_len` check -- the one that stops `np.empty` contents
+        // being handed back as data. An earlier version returned unconditionally, so
+        // `push nothing` against a 1,000-element buffer was a silent success full of whatever
+        // was in that memory. Nothing Python builds reaches it (every describer refuses an
+        // empty index array), but this is a `#[pymethods]` boundary and that is the only
+        // reason the hole was ever closed elsewhere.
         if chunk_descriptions.is_empty() {
+            if value.len() != 0 {
+                return Err(PyRuntimeError::new_err(format!(
+                    "an empty batch cannot fill {} output elements; they would be returned \
+                     uninitialised",
+                    value.len()
+                )));
+            }
             return Ok(());
         }
         // The array must present a sharding codec; `chunk_info_for_read` is the only route to a
