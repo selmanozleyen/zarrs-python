@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::types::PyAnyMethods;
@@ -125,8 +125,9 @@ impl CodecPipelineImpl {
         // behind a mutex: one lock in front of every job serialises what rayon's per-thread
         // deques keep contention-free, and at these widths that lock is the read path.
         let readers = config.read_workers.max(1);
-        decode_pool().in_place_scope(|dec| {
-            read_pool().install(|| {
+        let (read_pool, decode_pool) = pools();
+        decode_pool.in_place_scope(|dec| {
+            read_pool.install(|| {
                 let (failure, ctx) = (&failure, &ctx);
                 iter_concurrent_limit!(readers, jobs, for_each, |job| {
                     read_one(job, dec, failure, ctx);
@@ -550,9 +551,19 @@ fn default_workers(readers: bool) -> usize {
     if readers { cores * 2 } else { cores }
 }
 
-/// The two pools, built once and shared by every call in the process.
-static READ_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-static DECODE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+/// The two pools, built once and shared by every call in the process, keyed on the process id.
+///
+/// A `OnceLock` would be the obvious shape and cannot be used: `fork()` copies this memory but
+/// only the calling thread, so a child inherits pools whose workers do not exist and its first
+/// `in_place_scope` parks on a latch nothing will ever signal. Recovering needs the slot to be
+/// emptied, and a `OnceLock` has no reset reachable from a `static`.
+static POOLS: Mutex<Option<Pools>> = Mutex::new(None);
+
+struct Pools {
+    pid: u32,
+    read: Arc<rayon::ThreadPool>,
+    decode: Arc<rayon::ThreadPool>,
+}
 
 fn build_pool(size: usize, name: &'static str) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
@@ -577,22 +588,47 @@ fn pool_max(multiplier: usize) -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) * multiplier
 }
 
-fn read_pool() -> &'static rayon::ThreadPool {
-    READ_POOL.get_or_init(|| build_pool(pool_max(READ_POOL_MAX), "read"))
+/// Both pools, building them on first use and rebuilding them in a forked child.
+fn pools() -> (Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>) {
+    let mut guard = POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pid = std::process::id();
+    if guard.as_ref().is_none_or(|p| p.pid != pid) {
+        // FORGOTTEN, not dropped. `ThreadPool::drop` joins its workers, and in a child those
+        // workers were never created, so dropping is the same hang by another route. What is
+        // leaked is a copy of memory this process never owned.
+        if let Some(stale) = guard.take() {
+            std::mem::forget(stale);
+        }
+        *guard = Some(Pools {
+            pid,
+            read: Arc::new(build_pool(pool_max(READ_POOL_MAX), "read")),
+            decode: Arc::new(build_pool(pool_max(DECODE_POOL_MAX), "decode")),
+        });
+    }
+    let built = guard.as_ref().expect("just built");
+    (built.read.clone(), built.decode.clone())
 }
 
-fn decode_pool() -> &'static rayon::ThreadPool {
-    DECODE_POOL.get_or_init(|| build_pool(pool_max(DECODE_POOL_MAX), "decode"))
+/// Drop the pools so a `fork()` cannot inherit threads that will not exist in the child.
+///
+/// The pid check in [`pools`] rebuilds in a child, but it runs INSIDE this lock -- and `fork`
+/// copies a held mutex as held, owned by a thread the child does not have. So the slot has to
+/// be emptied BEFORE the fork, which `python/zarrs/__init__.py` arranges with
+/// `os.register_at_fork(before=...)`. Dropping here is correct: this is the parent, and its
+/// workers exist.
+pub(crate) fn release_pools_for_fork() {
+    *POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
-/// What the pools were actually built with, or `None` where one has not been built yet.
+/// What the pools were actually built with, or `None` where they have not been built yet.
 pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
-    (
-        READ_POOL.get().map(rayon::ThreadPool::current_num_threads),
-        DECODE_POOL
-            .get()
-            .map(rayon::ThreadPool::current_num_threads),
-    )
+    let guard = POOLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.as_ref().map_or((None, None), |p| {
+        (
+            Some(p.read.current_num_threads()),
+            Some(p.decode.current_num_threads()),
+        )
+    })
 }
 
 /// Refuse a width above what the pools were BUILT with, the one width they cannot give.
@@ -905,24 +941,38 @@ mod tests {
             "no read has run, so neither pool should exist yet"
         );
 
-        // A call cannot size the pool -- it masks it. Whatever any caller wants, the pool is
-        // built at `pool_max`, which is what makes two arrays asking differently both work.
-        let pool = read_pool();
-        assert_eq!(pool.current_num_threads(), pool_max(READ_POOL_MAX));
-        assert_eq!(pool_sizes().0, Some(pool_max(READ_POOL_MAX)));
-
-        // Readers block on storage, so there are more of them than cores; decoders occupy a
-        // core, so there are exactly as many. Building one must not build the other, or a
-        // read-side width would silently become the decode width.
+        // A call cannot size the pools -- it masks them. Whatever any caller wants, they are
+        // built at `pool_max`, which is what lets two calls ask differently and both be served.
+        let (read, decode) = pools();
+        assert_eq!(read.current_num_threads(), pool_max(READ_POOL_MAX));
+        assert_eq!(decode.current_num_threads(), pool_max(DECODE_POOL_MAX));
         assert_eq!(
-            pool_sizes().1,
-            None,
-            "building the read pool must not build the decode pool"
+            pool_sizes(),
+            (
+                Some(pool_max(READ_POOL_MAX)),
+                Some(pool_max(DECODE_POOL_MAX))
+            )
         );
-        assert_eq!(decode_pool().current_num_threads(), pool_max(DECODE_POOL_MAX));
         assert!(
             pool_sizes().0 > pool_sizes().1,
-            "the read pool is deliberately wider than the decode pool"
+            "readers block on storage so there are more of them than cores; decoders occupy \
+             a core, so there are fewer"
         );
+
+        // EMPTIED, then REBUILT. Both halves matter: the fork hook has to leave nothing for a
+        // child to inherit, and the parent has to carry on afterwards at the same width.
+        release_pools_for_fork();
+        assert_eq!(
+            pool_sizes(),
+            (None, None),
+            "the fork hook must empty the slot, not merely mark it"
+        );
+        let (read, _) = pools();
+        assert_eq!(read.current_num_threads(), pool_max(READ_POOL_MAX));
+
+        // A child runs the same path against an already-empty slot.
+        release_pools_for_fork();
+        release_pools_for_fork();
+        assert_eq!(pool_sizes(), (None, None));
     }
 }

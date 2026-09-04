@@ -146,6 +146,14 @@ class CodecPipelineImpl:
         write_empty_chunks: builtins.bool,
     ) -> None: ...
 
+def release_pools_for_fork() -> None:
+    r"""
+    Drop the worker pools so a `fork()` cannot inherit threads the child will not have.
+
+    Registered from `python/zarrs/__init__.py` with `os.register_at_fork(before=...)`, which
+    `multiprocessing` -- and so `torch.utils.data.DataLoader` -- honours.
+    """
+
 def pool_sizes() -> tuple[builtins.int | None, builtins.int | None]:
     r"""
     The sizes the two worker pools were BUILT with, or `None` where one has not been built.

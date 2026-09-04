@@ -514,6 +514,16 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
+/// Drop the worker pools so a `fork()` cannot inherit threads the child will not have.
+///
+/// Registered from `python/zarrs/__init__.py` with `os.register_at_fork(before=...)`, which
+/// `multiprocessing` -- and so `torch.utils.data.DataLoader` -- honours.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn release_pools_for_fork() {
+    read_decode::release_pools_for_fork();
+}
+
 /// The sizes the two worker pools were built with, or `None` where one has not been built.
 #[gen_stub_pyfunction]
 #[pyfunction]
@@ -544,6 +554,8 @@ pub mod _internal {
     use super::chunk_item::ChunkItems;
     #[pymodule_export]
     use super::pool_sizes;
+    #[pymodule_export]
+    use super::release_pools_for_fork;
     #[pymodule_export]
     use super::reset_shard_index_cache_stats;
     #[pymodule_export]
