@@ -212,11 +212,30 @@ impl CodecPipelineImpl {
             ));
         }
         let array_object: &PyArrayObject = Self::py_untyped_array_to_array_object(value);
+        // WRITABLE, which `from_raw_parts_mut` requires and which nothing else established.
+        //
+        // This is the buffer a read DECODES INTO. numpy hands out read-only arrays in ordinary
+        // situations -- a read-only mmap, a view over an immutable `bytes`, anything with
+        // `flags.writeable = False` -- and writing through one is a segfault or a silently
+        // diverging copy-on-write page. Neither is a Python exception, so the caller gets no
+        // chance to fix it and no traceback saying what happened.
+        //
+        // Contiguity is checked four lines up, which is what makes the omission an oversight
+        // rather than a decision: both are preconditions of the same `unsafe`.
+        if array_object.flags & numpy::npyffi::NPY_ARRAY_WRITEABLE == 0 {
+            return Err(PyErr::new::<PyValueError, _>(
+                "the output array is not writable".to_string(),
+            ));
+        }
         let array_data = array_object.data.cast::<u8>();
         let array_len = value.len() * value.dtype().itemsize();
         let output = unsafe {
-            // SAFETY: array_data is a valid pointer to a u8 array of length array_len
-            debug_assert!(!array_data.is_null());
+            // SAFETY: `array_data` points at `array_len` bytes of a C-contiguous, writable
+            // array, both checked above.
+            //
+            // `assert!`, not `debug_assert!`: `from_raw_parts_mut` requires a non-null pointer
+            // even for a zero-length slice, and a release build is exactly where that matters.
+            assert!(!array_data.is_null(), "numpy handed over a null data pointer");
             std::slice::from_raw_parts_mut(array_data, array_len)
         };
         Ok(UnsafeCellSlice::new(output))
