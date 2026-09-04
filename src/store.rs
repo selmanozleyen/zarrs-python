@@ -131,6 +131,6 @@ fn opendal_builder_to_sync_store<B: Builder>(
         .map_py_err::<PyValueError>()?
         .finish();
     let store = Arc::new(zarrs_opendal::AsyncOpendalStore::new(operator));
-    let store = Arc::new(AsyncToSyncStorageAdapter::new(store, tokio_block_on()));
+    let store = Arc::new(AsyncToSyncStorageAdapter::new(store, tokio_block_on()?));
     Ok(store)
 }
