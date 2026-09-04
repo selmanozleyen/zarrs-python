@@ -123,6 +123,13 @@ impl ShardInfo {
         options: &CodecOptions,
     ) -> PyResult<ShardingPartialDecoder> {
         let level = &self.levels[depth];
+        // INDEX READS ONLY. `inner_chain` is the innermost chain, and it is handed to every
+        // level -- which is wrong for a nested array, where depth 0's true inner codec is the
+        // next sharding codec rather than the innermost chain. Harmless because the only thing
+        // asked of these decoders is `subchunk_byte_range`, which reads the cached index and
+        // never touches `inner_codecs`. The first caller that decodes THROUGH one of these
+        // would get the wrong chain silently, so: pass the correct per-level chain before
+        // adding one.
         ShardingPartialDecoder::new(
             input,
             shard_shape,

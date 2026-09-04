@@ -594,10 +594,6 @@ impl ChunkItems {
         }
     }
 
-    fn __len__(&self) -> usize {
-        self.items.len()
-    }
-
     /// Build one batch entry's items and append them.
     ///
     /// `indices` select along AXIS 0 and are checked here: non-negative, non-decreasing, and

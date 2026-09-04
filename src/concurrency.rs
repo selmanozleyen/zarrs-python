@@ -13,8 +13,10 @@ pub trait ChunkConcurrentLimitAndCodecOptions {
     ) -> PyResult<Option<(usize, CodecOptions)>>;
 }
 
-// For the slice, not the Vec: `Vec<ChunkItem>` still reaches it by deref, and the
-// ChunkItems handle hands out a slice.
+// For the slice, not the Vec, which is the more general target and costs nothing -- `Vec` still
+// reaches it by deref. The original reason was that the read path passed a slice out of the
+// `ChunkItems` handle; that path no longer calls this at all (see `lib.rs`, where the read uses
+// the pipeline's own `CodecOptions`), so the only caller left is the WRITE path, with a `Vec`.
 impl ChunkConcurrentLimitAndCodecOptions for [ChunkItem] {
     fn get_chunk_concurrent_limit_and_codec_options(
         &self,
