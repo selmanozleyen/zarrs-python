@@ -159,6 +159,10 @@ def test_a_read_only_output_is_refused(sharded) -> None:
     buffer -- was written through anyway: a segfault, or a silently diverging copy-on-write
     page. Neither is a Python exception. Contiguity and element size were both already checked
     two lines away, which is what made this read as an oversight.
+
+    A REAL batch, because the check sits beside the `unsafe` it guards and an empty batch
+    returns before the conversion. `push_span` is the cheapest way to build one: two rows of
+    the first shard, taken whole, which is what a `X[0:2]` read describes.
     """
     import numpy as np
 
@@ -169,7 +173,17 @@ def test_a_read_only_output_is_refused(sharded) -> None:
         array = zarr.open_array(path, mode="r")
         impl = array._async_array.codec_pipeline.impl
 
-    frozen = np.empty(0, dtype=values.dtype)
+    handle = ChunkItems()
+    # key, shard shape, output shape, first row, row count, output start, inner extent.
+    handle.push_span("c/0/0", [32, 8], [2, 8], 0, 2, 0, 8)
+
+    frozen = np.empty(2 * 8, dtype=values.dtype)
     frozen.flags.writeable = False
     with pytest.raises(ValueError, match="not writable"):
-        impl.retrieve_chunk_items_and_apply_index(ChunkItems(), frozen)
+        impl.retrieve_chunk_items_and_apply_index(handle, frozen)
+
+    # The same batch against a writable buffer is served, so the refusal above is the
+    # writability and not the description.
+    writable = np.empty(2 * 8, dtype=values.dtype)
+    impl.retrieve_chunk_items_and_apply_index(handle, writable)
+    np.testing.assert_array_equal(writable.reshape(2, 8), values[0:2])
