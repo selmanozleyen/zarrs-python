@@ -10,7 +10,6 @@ from warnings import warn
 
 import numpy as np
 from zarr.abc.codec import Codec, CodecPipeline
-from zarr.codecs import ShardingCodec
 from zarr.codecs._v2 import V2Codec
 from zarr.core import BatchedCodecPipeline
 from zarr.core.config import config
@@ -238,51 +237,24 @@ class ZarrsCodecPipeline(CodecPipeline):
 
         Three answers, and the difference matters: a tuple is the inner chunk of a sharded
         array; `()` means the array is NOT sharded, so its chunk is its own decode unit and
-        only an entry knows that shape; `None` means refuse.
+        only a batch entry knows that shape; `None` means refuse.
 
-        Descends through nested sharding: the first `chunk_shape` found is the outer shard's,
-        not the decode unit.
+        ONE OWNER, and it is Rust. This used to walk zarr's codec objects here -- an
+        `isinstance(codec, ShardingCodec)` descent reading `.chunk_shape` and `.codecs` --
+        while `ShardInfo::from_codec_chain` answered the same question from the bound codec
+        chain. Two derivations of one fact, and when they disagreed Python built a description
+        Rust refuses, which surfaces as an uncaught `PyRuntimeError`: the retrieve call is in
+        the `else:` branch of `read`, outside its `try`, so it does not fall back. A
+        third-party codec registered for `sharding_indexed` reopens that gap however carefully
+        this walk is written, because the two are reading different data.
 
-        `isinstance` and DIRECT attribute access, not `getattr(codec, "chunk_shape", None)`.
-        This is a reach into zarr-python's internals, and the two ways it can age apart are
-        not equally bad: a missing attribute read through `getattr` returns `None`, which this
-        function reports as "not sharded", which makes `_chunk_unit_args` take the SHARD shape
-        as the decode unit and describe items spanning several inner chunks -- a wrong read,
-        or the uncaught `PyRuntimeError` described at `utils.py`'s `_chunk_unit_args`.
-        Written this way, the same rename is an `AttributeError` when the array is opened.
+        `self.impl` is `None` when the array was refused at construction, which is the same
+        answer for the same reason.
         """
-        # This one getattr stays: `ArrayV2Metadata` genuinely has no `codecs`, so its absence
-        # is a fact about the array rather than a fact about zarr's internals.
-        codecs = getattr(self.metadata, "codecs", ()) or ()
-        shape = None
-        while True:
-            nested = None
-            for codec in codecs:
-                if not isinstance(codec, ShardingCodec):
-                    continue
-                # THE SHARDING CODEC HAS TO BE THE WHOLE CHAIN AT THIS LEVEL.
-                #
-                # A codec AFTER it compresses the whole shard, so the shard index's byte
-                # ranges no longer address the shard, and one inner chunk cannot be read on
-                # its own. A codec BEFORE it -- a `transpose`, say -- is an array-to-array
-                # step, so the elements inside an inner chunk are not in the order the
-                # selection was described against.
-                #
-                # Both decline, and the second one must, because `ShardInfo::from_codec_chain`
-                # already refuses it in Rust. Accepting it here built a handle for an array
-                # whose read then failed with "this array presents no sharding codec", and
-                # that call runs outside `read`'s `try`, so it was an uncatchable
-                # `PyRuntimeError` rather than a fallback.
-                if len(codecs) != 1:
-                    return None
-                shape = tuple(int(s) for s in codec.chunk_shape)
-                nested = codec.codecs or ()
-                break
-            if nested is None:
-                # No sharding codec anywhere in the chain: not an error, just a plain chunked
-                # array, whose chunk is what gets decoded.
-                return () if shape is None else shape
-            codecs = nested
+        if self.impl is None:
+            return None
+        shape = self.impl.inner_chunk_shape
+        return None if shape is None else tuple(shape)
 
     @property
     def supports_partial_decode(self) -> bool:
