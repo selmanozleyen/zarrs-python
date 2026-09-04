@@ -694,8 +694,14 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
-/// `(row, chunk)` jobs since the run began: rows read as their own byte range, against whole
-/// inner chunks read and decoded.
+/// `(row_reads, chunk_reads)` since the run began.
+///
+/// THE TWO ARE NOT THE SAME UNIT, and the obvious ratio between them is wrong. A chunk served
+/// by the row path contributes ONE PER RUN of consecutive rows -- up to
+/// `max_row_reads_per_chunk` of them, two by default -- while a chunk served the ordinary way
+/// contributes exactly one. So a batch in which half the chunks took the row path reports
+/// something nearer 2:1 than 1:1, and `row / (row + chunk)` is not the fraction of chunks that
+/// took it. Read them as what they are: how many byte-range requests each path issued.
 ///
 /// Exposed so a test can assert the row path was TAKEN. Correctness cannot: both paths return
 /// the same values, so a gate that refuses everything passes every values test.
@@ -709,7 +715,7 @@ fn read_unit_stats() -> (u64, u64) {
     )
 }
 
-/// Drop the two worker pools, so a `fork()` about to happen cannot inherit a held lock.
+/// Drop every process-wide thread pool, so a `fork()` cannot inherit a held lock.
 ///
 /// Registered from Python with `os.register_at_fork(before=...)`. See
 /// [`read_decode::release_pools_for_fork`] for why the pid check inside `pools` is not enough
@@ -718,6 +724,9 @@ fn read_unit_stats() -> (u64, u64) {
 #[pyfunction]
 fn release_pools_for_fork() {
     read_decode::release_pools_for_fork();
+    // The tokio runtime has the identical hazard and is reached by any object-store or HTTP
+    // backed array. Covering one and not the other is what makes a fork hook a false promise.
+    runtime::release_runtime_for_fork();
 }
 
 /// The sizes the two worker pools were BUILT with, or `None` where one has not been built.

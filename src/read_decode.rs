@@ -934,6 +934,12 @@ struct Pools {
 
 static POOLS: Mutex<Option<Pools>> = Mutex::new(None);
 
+/// The sizes the pools were FIRST built with, kept across the drop that precedes a fork.
+///
+/// See `pools`: this is what stops a fork from silently resizing the parent, and what keeps
+/// `pool_sizes()` telling the truth about the array that did the first read.
+static BUILT_SIZES: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
 /// A size the operating system cannot give is the CALLER'S ERROR, not a process-ending panic.
 ///
 /// `ThreadPoolBuilder::build` fails whenever a worker thread cannot be spawned --
@@ -977,6 +983,23 @@ fn pools(
     let mut guard = pools_guard();
     let pid = std::process::id();
     if guard.as_ref().is_none_or(|p| p.pid != pid) {
+        // THE FIRST SIZES WIN, and they outlive both a fork and the drop that precedes one.
+        //
+        // Without this, `release_pools_for_fork` silently RESIZED the parent: pools built at 32
+        // for array A were dropped at the fork and rebuilt at 8 by the next read of array B, so
+        // `pool_sizes()` started reporting 8 and `check_pool_size_arrived` started warning about
+        // A -- which had been honoured right up until an unrelated `DataLoader` forked. The one
+        // function whose job is to make "the knob arrived" checkable would have been the one
+        // lying, and only on a workload that forks.
+        //
+        // Remembered separately from `POOLS` because that slot is emptied before a fork by
+        // design. Not keyed on the pid: a child continuing the same workload wants the same
+        // widths, so "sized by the first read" becomes "sized by the first read in this process
+        // TREE", which is what a forking loader actually means by it.
+        let mut sizes = BUILT_SIZES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (read_size, decode_size) = *sizes.get_or_insert((read_size, decode_size));
         // Both BEFORE either is stored, so a failure to build the second leaves the slot empty
         // rather than half-filled, and the next call retries from a clean state.
         let read = Arc::new(build_pool(read_size, "read")?);
@@ -1005,6 +1028,14 @@ fn pools(
 /// the slot, and releases -- so the fork sees a free, empty mutex and both sides rebuild on
 /// next use. Dropping here is correct and cheap: this is the PARENT, its workers exist, and a
 /// fork happens once per epoch against pools that cost microseconds to rebuild.
+///
+/// The SIZES survive it -- see `BUILT_SIZES` -- so the parent rebuilds at the width it had,
+/// rather than at whatever the next array to be read happens to ask for.
+///
+/// WHAT THIS DOES NOT COVER, said plainly because a fork hook reads like a promise: the tokio
+/// runtime in `runtime.rs`, which an object-store or HTTP backed array builds and which has the
+/// same hazard, and the per-array shard-index caches in `CodecPipelineImpl`, whose locks are
+/// held only across a `HashMap` get-or-insert.
 pub(crate) fn release_pools_for_fork() {
     let mut guard = pools_guard();
     // Dropped, not forgotten -- the opposite of the child case. See `Pools`.

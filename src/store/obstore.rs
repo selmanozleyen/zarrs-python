@@ -26,7 +26,7 @@ impl TryInto<ReadableWritableListableStorage> for &ObStoreConfig {
         let async_store = Arc::new(AsyncObjectStore::new(self.store.clone()));
         let sync_store = Arc::new(AsyncToSyncStorageAdapter::new(
             async_store,
-            tokio_block_on(),
+            tokio_block_on()?,
         ));
         Ok(sync_store)
     }
