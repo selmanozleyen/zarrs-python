@@ -37,7 +37,7 @@ mod tests;
 mod utils;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
-use crate::store::StoreConfig;
+use crate::store::{StoreConfig, StoreKind};
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
@@ -57,6 +57,11 @@ pub(crate) struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
+    /// The process a REMOTE store was opened in -- `None` for a local one. A remote store
+    /// holds an HTTP connection pool, and the sockets in it belong to the process that
+    /// dialled them; a `fork()` child that reuses one waits for a reply that is delivered
+    /// to its parent. A filesystem store has no such state and is not tracked.
+    pub(crate) remote_opened_in: Option<u32>,
 }
 
 impl CodecPipelineImpl {
@@ -93,6 +98,23 @@ impl CodecPipelineImpl {
         self.writable_store.as_ref().ok_or_else(|| {
             PyValueError::new_err("store was opened in read-only mode and does not support writing")
         })
+    }
+
+    /// Refuse a remote store inherited across `fork()`; see [`Self::remote_opened_in`].
+    fn check_same_process(&self) -> PyResult<()> {
+        let here = std::process::id();
+        let Some(opened_in) = self.remote_opened_in else {
+            return Ok(());
+        };
+        if opened_in == here {
+            return Ok(());
+        }
+        Err(PyRuntimeError::new_err(format!(
+            "this array's store was opened in process {opened_in}, and process {here} \
+             inherited it across a fork: its connection pool belongs to the parent and a \
+             read here would block. Open the array inside the child process, or start \
+             worker processes with the 'spawn' or 'forkserver' method."
+        )))
     }
 
     fn store_chunk_bytes(
@@ -269,6 +291,11 @@ impl CodecPipelineImpl {
 
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
+        let remote_opened_in = matches!(
+            store_config.kind,
+            StoreKind::Http(_) | StoreKind::ObStore(_)
+        )
+        .then(std::process::id);
         let writable_store = (!store_config.read_only).then(|| store.clone());
         let readable_store: ReadableStorage = store.readable();
 
@@ -298,6 +325,7 @@ impl CodecPipelineImpl {
             fill_value,
             data_type,
             writable_store,
+            remote_opened_in,
         })
     }
 
@@ -307,6 +335,8 @@ impl CodecPipelineImpl {
         chunk_descriptions: Vec<chunk_item::ChunkItem>, // FIXME: Ref / iterable?
         value: &Bound<'_, PyUntypedArray>,
     ) -> PyResult<()> {
+        self.check_same_process()?;
+
         // Get input array
         let output = Self::nparray_to_unsafe_cell_slice(value)?;
 
@@ -420,6 +450,7 @@ impl CodecPipelineImpl {
         write_empty_chunks: bool,
     ) -> PyResult<()> {
         // Fail before decoding anything; the write site checks again by construction.
+        self.check_same_process()?;
         self.writable()?;
 
         enum InputValue<'a> {
