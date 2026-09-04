@@ -35,7 +35,7 @@ def _read(path: Path, values: np.ndarray) -> None:
     )
 
 
-def test_a_ceiling_asked_for_after_the_pools_exist_warns(sharded_1d) -> None:
+def test_asking_above_what_the_process_builds_warns(sharded_1d) -> None:
     path, values = sharded_1d
     with zarr.config.set(PIPELINE):
         _read(path, values)
@@ -44,12 +44,12 @@ def test_a_ceiling_asked_for_after_the_pools_exist_warns(sharded_1d) -> None:
         "a read through the chunk-unit path must build the pools"
     )
 
-    # A size no earlier read can have built. The array is opened inside the block, which is
-    # when the ceiling is read.
+    # Above `pool_max`, which is the one width masking still cannot give: the pools are
+    # built once and cannot grow.
     absurd = built_read + 1_000
     with (
-        zarr.config.set(PIPELINE | {"codec_pipeline.read_worker_ceiling": absurd}),
-        pytest.warns(UserWarning, match=rf"read_worker_ceiling = {absurd} was ignored"),
+        zarr.config.set(PIPELINE | {"codec_pipeline.read_workers": absurd}),
+        pytest.warns(UserWarning, match=rf"read_workers = {absurd} is above"),
     ):
         _read(path, values)
 
@@ -65,21 +65,43 @@ def test_strict_makes_it_an_error(sharded_1d) -> None:
     absurd = built_read + 1_000
 
     strict = PIPELINE | {
-        "codec_pipeline.read_worker_ceiling": absurd,
+        "codec_pipeline.read_workers": absurd,
         "codec_pipeline.strict": True,
     }
-    with zarr.config.set(strict), pytest.raises(ValueError, match="was ignored"):
+    with zarr.config.set(strict), pytest.raises(ValueError, match="is above"):
         _read(path, values)
 
 
-def test_the_ceiling_actually_in_force_is_silent(sharded_1d) -> None:
-    """No warning when the ask matches what was built, or the signal is noise."""
+def test_a_width_below_the_maximum_is_honoured_after_the_pools_exist(sharded_1d) -> None:
+    """The point of masking: a later array asking for FEWER workers gets them, silently.
+
+    Under the previous design the pools were sized by the first read, so this asked for a
+    width that could never arrive and warned. Now the pools are built wide once and each call
+    takes the slice it asked for, so two arrays can differ.
+    """
+    path, values = sharded_1d
+    with zarr.config.set(PIPELINE):
+        _read(path, values)
+    built_read, built_decode = pool_sizes()
+
+    with zarr.config.set(PIPELINE | {"codec_pipeline.read_workers": 2}):
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always", UserWarning)
+            _read(path, values)
+        assert [str(w.message) for w in record] == []
+
+    # Masking, not resizing: the pools are untouched by a call that used fewer of them.
+    assert pool_sizes() == (built_read, built_decode)
+
+
+def test_the_width_actually_in_force_is_silent(sharded_1d) -> None:
+    """No warning when the ask is servable, or the signal is noise."""
     path, values = sharded_1d
     with zarr.config.set(PIPELINE):
         _read(path, values)
     built_read, _ = pool_sizes()
 
-    with zarr.config.set(PIPELINE | {"codec_pipeline.read_worker_ceiling": built_read}):
+    with zarr.config.set(PIPELINE | {"codec_pipeline.read_workers": built_read}):
         with warnings.catch_warnings(record=True) as record:
             warnings.simplefilter("always", UserWarning)
             _read(path, values)

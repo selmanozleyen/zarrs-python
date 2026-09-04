@@ -114,9 +114,6 @@ class CodecPipelineImpl:
         num_threads: builtins.int | None = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
-        read_worker_ceiling: builtins.int | None = None,
-        decode_worker_ceiling: builtins.int | None = None,
-        strict: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
     def inner_chunk_shape(self) -> builtins.list[builtins.int] | None:
         r"""
@@ -130,7 +127,10 @@ class CodecPipelineImpl:
         self,
         chunk_items: ChunkItems,
         value: numpy.typing.NDArray[typing.Any],
+        read_workers: builtins.int | None = None,
+        decode_workers: builtins.int | None = None,
         raw_max_reads_per_chunk: builtins.int | None = None,
+        strict: builtins.bool = False,
     ) -> None:
         r"""
         The one read entry point.

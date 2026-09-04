@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::types::PyAnyMethods;
 use pyo3::{PyResult, Python};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
     ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
@@ -124,12 +126,22 @@ impl CodecPipelineImpl {
         // starves every decode in the process.
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
-        decode_pool(config.decode_ceiling).in_place_scope(|dec| {
-            read_pool(config.read_ceiling).in_place_scope(|rd| {
-                for job in jobs {
-                    let (failure, ctx) = (&failure, &ctx);
-                    rd.spawn(move |_| read_one(job, dec, failure, ctx));
-                }
+        // MASKED, not sized. The pools are built once at `pool_max` and a call takes at most
+        // `read_workers` of them, so two arrays asking for different widths both get what they
+        // asked for -- which sizing a process-wide `OnceLock` pool never could, since only the
+        // first read's value could ever win.
+        //
+        // `iter_concurrent_limit!` and NOT a queue behind a mutex. That was tried and measured
+        // 6.7x worse (7,696 -> 1,153 rows/s, 60 batches, cs=1): funnelling every job through
+        // one lock discards rayon's per-thread work-stealing deques, and at 128 readers the
+        // lock IS the read path. This is also the limiter the write path already uses.
+        let readers = config.read_workers.max(1);
+        decode_pool().in_place_scope(|dec| {
+            read_pool().install(|| {
+                let (failure, ctx) = (&failure, &ctx);
+                iter_concurrent_limit!(readers, jobs, for_each, |job| {
+                    read_one(job, dec, failure, ctx);
+                });
             });
         });
 
@@ -677,8 +689,14 @@ pub(crate) static INDEX_ARRAY_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 
 /// The default size of either pool: the machine's parallelism.
-fn default_ceiling() -> usize {
-    std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
+/// What a call uses when the knob is unset: cores for decoders, TWICE that for readers.
+///
+/// A decoder occupies a core, so more of them than cores only adds context switches. A reader
+/// blocks on storage, so the core count is not its limit and one-per-core leaves the device
+/// idle -- which is the whole reason the two pools are separate.
+fn default_workers(readers: bool) -> usize {
+    let cores = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
+    if readers { cores * 2 } else { cores }
 }
 
 /// The two pools, built once and shared by every call in the process.
@@ -694,13 +712,28 @@ fn build_pool(size: usize, name: &'static str) -> rayon::ThreadPool {
 }
 
 /// Threads that block on storage. Sized independently of the core count for that reason.
-fn read_pool(size: usize) -> &'static rayon::ThreadPool {
-    READ_POOL.get_or_init(|| build_pool(size, "read"))
+/// How wide the pools are BUILT -- deliberately generous, and NOT the default.
+///
+/// A maximum has to exist because a rayon pool cannot grow: it is built once, before any call
+/// says what it wants, and a mask only takes you down from it. So the build width is the
+/// largest ask that can ever be honoured, and the cost of setting it high is a parked thread
+/// per unused slot -- a stack, no CPU, no scheduling. Being stingy here buys nothing and makes
+/// legitimate asks unaskable, so it is set well above anything a caller is likely to want.
+///
+/// What a call actually uses is [`default_workers`] unless it says otherwise.
+const READ_POOL_MAX: usize = 8;
+const DECODE_POOL_MAX: usize = 4;
+
+fn pool_max(multiplier: usize) -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) * multiplier
 }
 
-/// Threads that occupy a core. This is the one genuinely bounded by parallelism.
-fn decode_pool(size: usize) -> &'static rayon::ThreadPool {
-    DECODE_POOL.get_or_init(|| build_pool(size, "decode"))
+fn read_pool() -> &'static rayon::ThreadPool {
+    READ_POOL.get_or_init(|| build_pool(pool_max(READ_POOL_MAX), "read"))
+}
+
+fn decode_pool() -> &'static rayon::ThreadPool {
+    DECODE_POOL.get_or_init(|| build_pool(pool_max(DECODE_POOL_MAX), "decode"))
 }
 
 /// What the pools were actually built with, or `None` where one has not been built yet.
@@ -713,41 +746,30 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
     )
 }
 
-/// Say so when a ceiling asked for is not the one the pools were built with.
+/// Refuse a width the pools cannot give, which under masking is only one case: asking for more
+/// than they were BUILT with.
 ///
-/// A warning, not an error. The read is correct at the width already built, and a process that
-/// opens a second array wanting a different width is doing something legitimate: refusing it would
-/// turn a sizing hint into a failed read. A caller needing the guarantee asserts on [`pool_sizes`],
-/// which is what the benchmark does.
-pub(crate) fn check_ceiling_arrived(
-    py: Python<'_>,
-    config: ReadConfig,
-    strict: bool,
-) -> PyResult<()> {
-    for (built, asked, knob) in [
-        (pool_sizes().0, config.read_ceiling, "read_worker_ceiling"),
+/// Not "different from what was built" -- masking makes those differ on purpose, and a call
+/// using fewer workers than the pool holds is the ordinary case, not a problem. What is still
+/// unhonourable is asking above `pool_max`, and unlike the old first-read-wins behaviour that
+/// is a constant, so the answer does not depend on which read ran first.
+pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyResult<()> {
+    for (limit, asked, knob) in [
+        (pool_max(READ_POOL_MAX), config.read_workers, "read_workers"),
         (
-            pool_sizes().1,
-            config.decode_ceiling,
-            "decode_worker_ceiling",
+            pool_max(DECODE_POOL_MAX),
+            config.decode_workers,
+            "decode_workers",
         ),
     ] {
-        // Only when a pool exists and differs. Before the first read there is nothing to
-        // contradict, and the ordinary case costs one atomic load per pool per call.
-        let Some(built) = built.filter(|built| *built != asked) else {
+        if asked <= limit {
             continue;
-        };
+        }
         let message = format!(
-            "codec_pipeline.{knob} = {asked} was ignored: the pool was built with {built} \
-             threads by the first read in this process and cannot be resized. Set it before \
-             the array that does the first read is opened, or call \
-             zarrs._internal.pool_sizes() for what was built."
+            "codec_pipeline.{knob} = {asked} is above the {limit} workers this process builds, \
+             so {limit} will be used. The pools are built once and cannot grow."
         );
-        // `codec_pipeline.strict` already means "do not paper over what this pipeline cannot do":
-        // it turns a decline into a raise instead of a silent fallback to zarr-python. A width the
-        // process cannot give is the same kind of thing, and a caller who asked for strictness
-        // would rather find out here than infer it from a throughput number.
-        if strict {
+        if config.strict {
             return Err(PyValueError::new_err(message));
         }
         py.import("warnings")?.call_method1("warn", (message,))?;
@@ -758,34 +780,39 @@ pub(crate) fn check_ceiling_arrived(
 /// What one call reads from `zarr.config` when it starts.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadConfig {
-    /// Only the first call's value is used: see [`READ_POOL`].
-    pub(crate) read_ceiling: usize,
-    /// Only the first call's value is used: see [`READ_POOL`].
-    pub(crate) decode_ceiling: usize,
+    /// Workers this call takes, out of the pool built at `pool_max`. Per call: masking means
+    /// a width no longer has to be fixed when the array is opened, so it is not.
+    pub(crate) read_workers: usize,
+    /// The same, for decodes.
+    pub(crate) decode_workers: usize,
     /// Reads a chunk may become before the raw path is declined for it; see [`RAW_MAX_READS`].
-    /// Per call, and honoured on every call rather than only the first.
     pub(crate) raw_max_reads: usize,
+    /// Whether a width above `pool_max` is an error rather than a warning.
+    pub(crate) strict: bool,
 }
 
 /// A ceiling as the pipeline will use it: zero or absent means "as much as the machine has".
 ///
 /// Public so the pipeline can resolve at open, which is when these are read.
-pub(crate) fn resolve_ceiling(ceiling: Option<usize>) -> usize {
-    ceiling.filter(|c| *c > 0).unwrap_or_else(default_ceiling)
+pub(crate) fn resolve_workers(asked: Option<usize>, readers: bool) -> usize {
+    asked.filter(|n| *n > 0).unwrap_or_else(|| default_workers(readers))
 }
 
 impl ReadConfig {
     /// The ceilings as the ARRAY was opened with, already resolved, plus this call's raw
     /// threshold. The two are read at different times on purpose -- see the fields.
-    pub(crate) fn from_open(
-        read_ceiling: usize,
-        decode_ceiling: usize,
+    /// Everything this call reads from `zarr.config`, resolved here.
+    pub(crate) fn from_call(
+        read_workers: Option<usize>,
+        decode_workers: Option<usize>,
         raw_max_reads: Option<usize>,
+        strict: bool,
     ) -> Self {
         Self {
-            read_ceiling,
-            decode_ceiling,
+            read_workers: resolve_workers(read_workers, true),
+            decode_workers: resolve_workers(decode_workers, false),
             raw_max_reads: raw_max_reads.unwrap_or(RAW_MAX_READS),
+            strict,
         }
     }
 }
@@ -1064,31 +1091,31 @@ mod tests {
 
     /// The pools are built at the size asked for, and the size is one-shot.
     #[test]
-    fn a_pool_is_built_once_at_the_size_asked_for() {
+    fn the_pools_are_built_at_pool_max_not_at_what_a_call_asks_for() {
         assert_eq!(
             pool_sizes(),
             (None, None),
             "no read has run, so neither pool should exist yet"
         );
 
-        let pool = read_pool(3);
-        assert_eq!(pool.current_num_threads(), 3);
-        assert_eq!(pool_sizes().0, Some(3));
+        // A call cannot size the pool -- it masks it. Whatever any caller wants, the pool is
+        // built at `pool_max`, which is what makes two arrays asking differently both work.
+        let pool = read_pool();
+        assert_eq!(pool.current_num_threads(), pool_max(READ_POOL_MAX));
+        assert_eq!(pool_sizes().0, Some(pool_max(READ_POOL_MAX)));
 
-        // Asking again with a different size returns the pool already built. This is the
-        // documented one-shot behaviour, not an accident, and it is why the size is reported.
-        assert_eq!(read_pool(64).current_num_threads(), 3);
-        assert_eq!(pool_sizes().0, Some(3));
-
-        // The two pools are separate. The read pool is built here; the decode pool must not
-        // have been dragged into existence with it, or a read-side default would silently
-        // become the decode width.
+        // Readers block on storage, so there are more of them than cores; decoders occupy a
+        // core, so there are exactly as many. Building one must not build the other, or a
+        // read-side width would silently become the decode width.
         assert_eq!(
             pool_sizes().1,
             None,
             "building the read pool must not build the decode pool"
         );
-        assert_eq!(decode_pool(2).current_num_threads(), 2);
-        assert_eq!(pool_sizes(), (Some(3), Some(2)));
+        assert_eq!(decode_pool().current_num_threads(), pool_max(DECODE_POOL_MAX));
+        assert!(
+            pool_sizes().0 > pool_sizes().1,
+            "the read pool is deliberately wider than the decode pool"
+        );
     }
 }

@@ -78,16 +78,6 @@ def get_codec_pipeline_impl(
             file_handle_cache_size=config.get(
                 "codec_pipeline.file_handle_cache_size", 0
             ),
-            # Read at open, like `num_threads` and the chunk-concurrency bounds beside them.
-            # They size process-wide pools that only the first read builds, so offering them
-            # per call would be offering a choice that cannot be honoured.
-            read_worker_ceiling=config.get("codec_pipeline.read_worker_ceiling", None),
-            decode_worker_ceiling=config.get(
-                "codec_pipeline.decode_worker_ceiling", None
-            ),
-            # Under `strict`, a ceiling the process cannot give is an error rather than a
-            # warning, the same switch that turns a decline into a raise.
-            strict=strict,
         )
     except TypeError as e:
         if strict:
@@ -237,11 +227,17 @@ class ZarrsCodecPipeline(CodecPipeline):
             # Per call because it IS a per-call decision: a threshold on how many byte-range
             # reads one chunk is worth, not a size that something was built at. The two pool
             # ceilings are not here -- they were read when the array was opened.
+            # PER CALL, all of it. The widths are a mask on pools built once, so nothing
+            # has to be fixed when the array is opened -- which means a `zarr.config.set`
+            # block around a read is honoured, rather than silently too late.
             await asyncio.to_thread(
                 retrieve,
                 desc,
                 out,
+                config.get("codec_pipeline.read_workers", None),
+                config.get("codec_pipeline.decode_workers", None),
                 config.get("codec_pipeline.raw_max_reads_per_chunk", None),
+                config.get("codec_pipeline.strict", False),
             )
             return None
 

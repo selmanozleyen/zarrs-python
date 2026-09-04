@@ -135,15 +135,6 @@ pub(crate) struct CodecPipelineImpl {
     /// Whether an innermost chunk is a plain byte tiling -- no filter, no compressor -- so a
     /// row's bytes are addressable arithmetically and readable without the chunk around them.
     pub(crate) inner_chunk_is_raw: bool,
-    /// The pool sizes this array was opened with.
-    pub(crate) read_ceiling: usize,
-    pub(crate) decode_ceiling: usize,
-    /// Whether a ceiling that cannot be honoured is an error rather than a warning.
-    ///
-    /// `codec_pipeline.strict` already means "do not paper over something this pipeline cannot do":
-    /// it turns a decline into a raise instead of a silent fallback. A ceiling the process cannot
-    /// give is the same kind of thing, so it answers to the same switch.
-    pub(crate) strict: bool,
 }
 
 impl CodecPipelineImpl {
@@ -391,9 +382,6 @@ impl CodecPipelineImpl {
         num_threads=None,
         direct_io=false,
         file_handle_cache_size=0,
-        read_worker_ceiling=None,
-        decode_worker_ceiling=None,
-        strict=false,
     ))]
     #[new]
     fn new(
@@ -405,9 +393,6 @@ impl CodecPipelineImpl {
         num_threads: Option<usize>,
         direct_io: bool,
         file_handle_cache_size: usize,
-        read_worker_ceiling: Option<usize>,
-        decode_worker_ceiling: Option<usize>,
-        strict: bool,
     ) -> PyResult<Self> {
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
@@ -483,32 +468,33 @@ impl CodecPipelineImpl {
             cache_shard_indexes: writable_store.is_none(),
             writable_store,
             inner_chunk_is_raw: inner_chunk_is_raw(array_metadata),
-            read_ceiling: read_decode::resolve_ceiling(read_worker_ceiling),
-            decode_ceiling: read_decode::resolve_ceiling(decode_worker_ceiling),
-            strict,
         })
     }
 
     /// The one read entry point. A selection this declines falls back to zarr-python; there is
     /// no second Rust path.
-    #[pyo3(signature = (chunk_items, value, raw_max_reads_per_chunk=None))]
+    #[pyo3(signature = (chunk_items, value, read_workers=None, decode_workers=None, raw_max_reads_per_chunk=None, strict=false))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,
         chunk_items: PyRef<'_, chunk_item::ChunkItems>,
         value: &Bound<'_, PyUntypedArray>,
+        read_workers: Option<usize>,
+        decode_workers: Option<usize>,
         raw_max_reads_per_chunk: Option<usize>,
+        strict: bool,
     ) -> PyResult<()> {
         // The ceilings come from the array, not from this call: they were read when it was
         // opened. The raw threshold is a per-call decision and stays one.
-        let config = read_decode::ReadConfig::from_open(
-            self.read_ceiling,
-            self.decode_ceiling,
+        let config = read_decode::ReadConfig::from_call(
+            read_workers,
+            decode_workers,
             raw_max_reads_per_chunk,
+            strict,
         );
         // The pools are sized once, by the first read. A ceiling arriving after that cannot
         // be honoured, and a caller who is not told believes it was.
-        read_decode::check_ceiling_arrived(py, config, self.strict)?;
+        read_decode::check_workers_arrived(py, config)?;
         self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, config)
     }
 
