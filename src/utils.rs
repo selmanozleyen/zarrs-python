@@ -1,5 +1,4 @@
 use std::fmt::Display;
-use std::ops::Range;
 use std::sync::Arc;
 
 use pyo3::{PyErr, PyResult, PyTypeInfo};
@@ -44,41 +43,6 @@ impl<T> PyCodecErrExt<T> for Result<T, CodecError> {
 pub fn is_whole_chunk(item: &ChunkItem) -> bool {
     item.chunk_subset.start().iter().all(|&o| o == 0)
         && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
-}
-
-/// The maximal runs of CONSECUTIVE coordinates, as index ranges into `element_offsets`.
-///
-/// `element_offsets` is non-decreasing and a run is a stretch stepping by exactly `run_len`, so one run
-/// names one contiguous span: it starts `element_offsets[r.start]` elements in and is `r.len() *
-/// run_len` elements long. A duplicate steps by 0, which breaks the run -- the same row twice
-/// is two output pieces and cannot be one span.
-///
-/// Written once because three callers want this same walk and had three copies of it: counting
-/// the reads a chunk becomes (`row_read_count`), emitting them (`row_jobs`), and merging copies
-/// out of a decoded chunk (`gather_pieces`).
-///
-/// `offset_runs`, not `runs`: a run of COORDINATES is not `gather_runs`' run of elements
-/// inside one index's row, and this file needs both words in the same loop.
-pub(crate) fn offset_runs(
-    element_offsets: &[u64],
-    run_len: u64,
-) -> impl Iterator<Item = Range<usize>> + '_ {
-    let mut start = 0usize;
-    std::iter::from_fn(move || {
-        if start >= element_offsets.len() {
-            return None;
-        }
-        let mut end = start + 1;
-        // Checked: a coordinate near u64::MAX must end the run, not wrap into the next one.
-        while end < element_offsets.len()
-            && element_offsets[end - 1].checked_add(run_len) == Some(element_offsets[end])
-        {
-            end += 1;
-        }
-        let run = start..end;
-        start = end;
-        Some(run)
-    })
 }
 
 /// How many BYTES one index's run of elements occupies, refusing zero and overflow.
@@ -251,22 +215,30 @@ pub(crate) fn gather_pieces(
     // The pieces are written in order, so a merged span still lands correctly when it
     // straddles two of them. (`gather`, the single-piece path, does NOT merge: it writes into
     // one slice at a fixed stride, where a copy per coordinate costs nothing extra.)
-    for r in offset_runs(element_offsets, run_len) {
-        let c = element_offsets[r.start];
+    let mut n = 0usize;
+    while n < element_offsets.len() {
+        let mut m = n + 1;
+        while m < element_offsets.len()
+            && element_offsets[m - 1].checked_add(run_len) == Some(element_offsets[m])
+        {
+            m += 1;
+        }
+        let c = element_offsets[n];
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
-        let Some(span) = r.len().checked_mul(run_bytes) else {
+        let Some(span) = (m - n).checked_mul(run_bytes) else {
             return Err("the gathered span is too large to address".to_string());
         };
         let Some(region) = src.checked_add(span).and_then(|end| scratch.get(src..end)) else {
             return Err(format!(
                 "coordinate {c} plus {} elements is outside the {} decoded",
-                r.len() as u64 * run_len,
+                (m - n) as u64 * run_len,
                 scratch.len() / size
             ));
         };
         writer.write(region)?;
+        n = m;
     }
     if !writer.finished() {
         return Err(format!(

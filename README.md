@@ -56,16 +56,11 @@ The `ZarrsCodecPipeline` specific options are:
 A read of a sharded array **remembers each shard's decoded index** for the duration of that read, so a shard whose index was already read is not read again per item. This is automatic and has no option. An array opened `mode="r"` keeps them for the life of the array instead, which assumes nothing else is rewriting it while it is open -- the same caveat as `file_handle_cache_size` above, for the same reason.
 
 - `codec_pipeline.read_pool_size` / `codec_pipeline.decode_pool_size`: the sizes of the two worker pools a read uses — one for fetching byte ranges, one for decoding chunks.
-  - Each defaults to `threading.max_workers`, and to the available parallelism when that is unset (the zarr default). `0` means the same as unset — these size a pool that has to run the read, so there is nothing for zero to mean here except the default. Note that this is the OPPOSITE of `max_row_reads_per_chunk` and `file_handle_cache_size` below, where `0` disables.
+  - Both default to the available parallelism, and so does `0` — these are the sizes of a pool that has to run the read, so there is nothing for zero to mean here except the default. Note that this is the OPPOSITE of `file_handle_cache_size` above, where `0` disables.
   - Separate, because a reader waits on storage while a decoder occupies a core: a value above the core count is defensible for readers and not for decoders. On high-latency storage more readers is usually better, up to the number of chunks a read touches.
   - The pools are process-wide and work-stealing, so capacity is shared rather than divided: a read that touches many chunks simply gets more workers than one that touches few.
   - **They are read when the FIRST read in the process starts, and fix the pool sizes for the life of the process.** Setting them later, or inside a `zarr.config.set` block, has no effect on pools that already exist.
 
-- `codec_pipeline.max_row_reads_per_chunk`: how many separate reads a chunk's wanted rows may become before the fast "read the row's bytes, not the chunk" path is declined for that chunk.
-  - Defaults to `2`. It applies only where the array is **sharded**, the sharding codec's inner chain is exactly the `bytes` codec (no filter, no compressor), and the stored byte order is the platform's. Any of those failing makes the knob inert: an unsharded uncompressed array never takes this path.
-  - It trades bytes for requests. A row costs nearly as much to fetch as the whole chunk containing it, so a scattered selection that would become many small reads is served better by one large one — hence a per-chunk gate rather than an array-wide switch.
-  - `0` disables the path entirely. On an uncompressed store with a scattered row draw that costs about 75% of throughput, so raise it rather than disable it unless you are measuring.
-  - Unlike the two pool sizes above, this is honoured on every read, so `zarr.config.set` scopes it as expected.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
@@ -86,7 +81,6 @@ zarr.config.set({
         "file_handle_cache_size": 0,
         "read_pool_size": None,
         "decode_pool_size": None,
-        "max_row_reads_per_chunk": 2,
         "direct_io": False,
         "strict": False
     }
