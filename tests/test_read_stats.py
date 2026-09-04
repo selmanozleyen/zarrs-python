@@ -121,3 +121,55 @@ def test_a_fork_drops_the_pools_in_the_PARENT(sharded) -> None:
     assert zarrs.pool_sizes() == (None, None), (
         "the fork left this process's pools in place, so the before-fork hook did not run"
     )
+
+
+def test_an_empty_batch_cannot_fill_a_non_empty_output(sharded) -> None:
+    """The guard the whole read path rests on is `covered() != output_len`, and the
+    empty-batch early return skips it.
+
+    That return exists so `X[[]]` is served rather than declined. Written unconditionally it
+    also made `push nothing` against a real buffer a silent success, handing back whatever
+    `np.empty` left in that memory. Nothing Python builds reaches it -- every describer refuses
+    an empty index array -- but `ChunkItems` is a `#[pymethods]` boundary, which is the only
+    reason the same hole was closed everywhere else.
+    """
+    import numpy as np
+
+    from zarrs._internal import ChunkItems
+
+    path, values = sharded
+    with zarr.config.set(ZARRS):
+        array = zarr.open_array(path, mode="r")
+        impl = array._async_array.codec_pipeline.impl
+
+    out = np.empty(64, dtype=values.dtype)
+    with pytest.raises(RuntimeError, match="empty batch cannot fill"):
+        impl.retrieve_chunk_items_and_apply_index(ChunkItems(), out)
+
+    # The zero-length case is the one it exists to serve, and still is.
+    impl.retrieve_chunk_items_and_apply_index(
+        ChunkItems(), np.empty(0, dtype=values.dtype)
+    )
+
+
+def test_a_read_only_output_is_refused(sharded) -> None:
+    """`from_raw_parts_mut` requires a writable target, and nothing established that.
+
+    A read-only `out=` -- a read-only mmap, `flags.writeable = False`, a view over an immutable
+    buffer -- was written through anyway: a segfault, or a silently diverging copy-on-write
+    page. Neither is a Python exception. Contiguity and element size were both already checked
+    two lines away, which is what made this read as an oversight.
+    """
+    import numpy as np
+
+    from zarrs._internal import ChunkItems
+
+    path, values = sharded
+    with zarr.config.set(ZARRS):
+        array = zarr.open_array(path, mode="r")
+        impl = array._async_array.codec_pipeline.impl
+
+    frozen = np.empty(0, dtype=values.dtype)
+    frozen.flags.writeable = False
+    with pytest.raises(ValueError, match="not writable"):
+        impl.retrieve_chunk_items_and_apply_index(ChunkItems(), frozen)
