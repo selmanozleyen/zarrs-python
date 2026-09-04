@@ -58,18 +58,17 @@ impl CodecPipelineImpl {
     /// Read and decode `items`, one job per innermost chunk, on workers scoped to this call.
     ///
     /// `items` must be chunk-unit items: one whole innermost chunk each, carrying the
-    /// coordinates wanted from it. Returns the items this path could not take -- there is no
-    /// second path to hand them to, so the caller turns them into an error rather than leave
-    /// their output bytes unwritten.
-    pub(crate) fn retrieve_chunk_units<'a>(
+    /// coordinates wanted from it. There is no second path, so an item this cannot take is an
+    /// error rather than a hand-off.
+    pub(crate) fn retrieve_chunk_units(
         &self,
         shard: &Arc<ShardInfo>,
-        items: &'a [ChunkItem],
+        items: &[ChunkItem],
         output: UnsafeCellSlice<'_, u8>,
         output_len: usize,
         config: ReadConfig,
         codec_options: &CodecOptions,
-    ) -> PyResult<Vec<&'a ChunkItem>> {
+    ) -> PyResult<()> {
         let element_size = self.element_size()?;
         let ctx = JobContext {
             shard: shard.clone(),
@@ -86,19 +85,14 @@ impl CodecPipelineImpl {
             ),
         };
 
-        let (located, declined) = self.locate_chunks(shard, items, &ctx)?;
-        if located.is_empty() {
-            return Ok(declined);
-        }
+        let located = self.locate_chunks(shard, items, &ctx)?;
 
         let output = DisjointBytes::new(output, output_len);
         let (jobs, absent) = carve(&output, &located, element_size, &ctx)?;
         // Disjointness is proven above; COVERAGE is not. zarr hands us a buffer from
         // `np.empty`, so a byte no job owns is returned as whatever was in that memory.
         //
-        // Only when nothing was DECLINED: a declined item's bytes are written by the fused
-        // path afterwards, so a partial batch legitimately covers part of the output here.
-        if declined.is_empty() && output.covered() != output_len {
+        if output.covered() != output_len {
             return Err(PyRuntimeError::new_err(format!(
                 "the batch covers {} of {output_len} output bytes; the rest would be returned \
                  uninitialised",
@@ -111,7 +105,7 @@ impl CodecPipelineImpl {
             fill(piece, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
         }
         if jobs.is_empty() {
-            return Ok(declined);
+            return Ok(());
         }
 
         // Two persistent work-stealing pools, and capacity is never divided between calls: a
@@ -135,7 +129,7 @@ impl CodecPipelineImpl {
         if let Some(e) = failure.lock().expect("failure slot poisoned").take() {
             return Err(PyRuntimeError::new_err(e));
         }
-        Ok(declined)
+        Ok(())
     }
 
     /// A decoder from `call_cache`, then `array_cache`, or built and inserted into both.
@@ -306,22 +300,19 @@ impl CodecPipelineImpl {
         shard: &ShardInfo,
         items: &'a [ChunkItem],
         ctx: &JobContext,
-    ) -> PyResult<(Vec<(&'a ChunkItem, Option<ByteRange>)>, Vec<&'a ChunkItem>)> {
+    ) -> PyResult<Vec<(&'a ChunkItem, Option<ByteRange>)>> {
         let mut located = Vec::with_capacity(items.len());
-        let mut declined = Vec::new();
         let mut decoders = CallDecoders::default();
 
         for item in items {
-            if item.coords.is_none() {
-                declined.push(item);
-                continue;
-            }
+            // No second path to decline to, so this is an error where it is found.
+            coords_of(item)?;
             // The whole position, not just axis 0: the descent divides on every axis now,
             // so a shard that splits a trailing one is addressed rather than refused.
             let start = item.chunk_subset.start().to_vec();
             located.push((item, self.locate(shard, item, &start, ctx, &mut decoders)?));
         }
-        Ok((located, declined))
+        Ok(located)
     }
 }
 

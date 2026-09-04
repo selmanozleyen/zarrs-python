@@ -230,6 +230,11 @@ class RustChunkInfo:
     write_empty_chunks: bool
 
 
+def _one_inner_chunk_after_split(inner_shape, chunk_shape) -> bool:
+    """One subchunk on every axis after the split, or `locate` cannot walk axis 0 alone."""
+    return all(inner_shape[a] == chunk_shape[a] for a in range(1, len(chunk_shape)))
+
+
 def _is_whole_axis(sel: Any, extent: int) -> bool:
     """Does this selector take the axis whole, start to finish, step 1?"""
     return (
@@ -575,11 +580,8 @@ def _point_unit_args(
         return None
     if (rows < 0).any() or not _output_run_matches(rows, out_axis_sel):
         return None
-    # Still the GRID condition: one subchunk on every axis after the split, or `locate`
-    # cannot keep walking axis 0 alone.
-    for axis in range(1, rank):
-        if inner_shape[axis] != chunk_spec.shape[axis]:
-            return None
+    if not _one_inner_chunk_after_split(inner_shape, chunk_spec.shape):
+        return None
     # A point's offset inside its own index is the C-order ravel of the trailing axes, which
     # is `np.ravel_multi_index` -- bounds check included, negatives included. Out of bounds is
     # a DECLINE here, not an error: the ordinary route serves the read.
@@ -679,6 +681,9 @@ def _grid_unit_args(
     if (rows < 0).any() or not _output_run_matches(rows, out_axis_sel):
         return None
 
+    if not _one_inner_chunk_after_split(inner_shape, chunk_spec.shape):
+        return None
+
     sels = []
     for axis in range(1, rank):
         idx = axis_indices(chunk_sel[axis], chunk_spec.shape[axis])
@@ -688,10 +693,6 @@ def _grid_unit_args(
             return None
         # The output holds exactly what was selected, and the item fills all of it.
         if shape[axis] != idx.size or not _is_whole_axis(out_sel[axis], shape[axis]):
-            return None
-        # Still the GRID condition: one subchunk per axis after the split, or `locate` cannot
-        # keep walking axis 0 alone.
-        if inner_shape[axis] != chunk_spec.shape[axis]:
             return None
         sels.append(idx)
     # A sub-box is a set of RUNS in row-major order, not a set of elements, and saying so is

@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::ops::Range;
 use std::sync::Arc;
 
 use pyo3::{PyErr, PyResult, PyTypeInfo};
@@ -102,6 +103,38 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
 /// coordinate order.
 ///
 /// `out` must be exactly `coords.len() * run_len * size` bytes.
+/// Bytes in one index's run of elements. Refuses zero and overflow.
+fn run_bytes(run_len: u64, size: usize) -> Result<usize, String> {
+    let Some(bytes) = usize::try_from(run_len)
+        .ok()
+        .and_then(|r| r.checked_mul(size))
+    else {
+        return Err(format!("run length {run_len} is too large to address"));
+    };
+    if bytes == 0 {
+        return Err("run length must be greater than zero".to_string());
+    }
+    Ok(bytes)
+}
+
+/// Maximal runs of CONSECUTIVE coordinates, as index ranges into `coords`.
+pub(crate) fn coord_runs(coords: &[u64], run_len: u64) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut start = 0usize;
+    std::iter::from_fn(move || {
+        if start >= coords.len() {
+            return None;
+        }
+        let mut end = start + 1;
+        // Checked: a coordinate near u64::MAX must end the run, not wrap into the next one.
+        while end < coords.len() && coords[end - 1].checked_add(run_len) == Some(coords[end]) {
+            end += 1;
+        }
+        let run = start..end;
+        start = end;
+        Some(run)
+    })
+}
+
 pub(crate) fn gather(
     scratch: &[u8],
     coords: &[u64],
@@ -109,15 +142,7 @@ pub(crate) fn gather(
     out: &mut [u8],
     size: usize,
 ) -> Result<(), String> {
-    let Some(run) = usize::try_from(run_len)
-        .ok()
-        .and_then(|r| r.checked_mul(size))
-    else {
-        return Err(format!("run length {run_len} is too large to address"));
-    };
-    if run == 0 {
-        return Err("run length must be greater than zero".to_string());
-    }
+    let run = run_bytes(run_len, size)?;
     if coords.len().checked_mul(run) != Some(out.len()) {
         return Err("output region does not match the coordinate count".to_string());
     }
@@ -150,15 +175,7 @@ pub(crate) fn gather_pieces(
     pieces: &mut [&mut [u8]],
     size: usize,
 ) -> Result<(), String> {
-    let Some(run) = usize::try_from(run_len)
-        .ok()
-        .and_then(|r| r.checked_mul(size))
-    else {
-        return Err(format!("run length {run_len} is too large to address"));
-    };
-    if run == 0 {
-        return Err("run length must be greater than zero".to_string());
-    }
+    let run = run_bytes(run_len, size)?;
     let total: usize = pieces.iter().map(|p| p.len()).sum();
     if coords.len().checked_mul(run) != Some(total) {
         return Err("output pieces do not match the coordinate count".to_string());
@@ -168,28 +185,22 @@ pub(crate) fn gather_pieces(
     // The pieces are written in order, so a merged span still lands correctly when it
     // straddles two of them. (`gather`, the single-piece path, does NOT merge: it writes into
     // one slice at a fixed stride, where a copy per coordinate costs nothing extra.)
-    let mut n = 0usize;
-    while n < coords.len() {
-        let mut m = n + 1;
-        while m < coords.len() && coords[m - 1].checked_add(run_len) == Some(coords[m]) {
-            m += 1;
-        }
-        let c = coords[n];
+    for r in coord_runs(coords, run_len) {
+        let c = coords[r.start];
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
-        let Some(span) = (m - n).checked_mul(run) else {
+        let Some(span) = r.len().checked_mul(run) else {
             return Err("the gathered span is too large to address".to_string());
         };
         let Some(region) = src.checked_add(span).and_then(|end| scratch.get(src..end)) else {
             return Err(format!(
                 "coordinate {c} plus {} elements is outside the {} decoded",
-                (m - n) as u64 * run_len,
+                r.len() as u64 * run_len,
                 scratch.len() / size
             ));
         };
         writer.write(region)?;
-        n = m;
     }
     if !writer.finished() {
         return Err("the gather left part of the output unwritten".to_string());

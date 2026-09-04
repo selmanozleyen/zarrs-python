@@ -118,6 +118,14 @@ class CodecPipelineImpl:
         decode_worker_ceiling: builtins.int | None = None,
         strict: builtins.bool = False,
     ) -> CodecPipelineImpl: ...
+    def inner_chunk_shape(self) -> builtins.list[builtins.int] | None:
+        r"""
+        The innermost unit this array's codec chain decodes, or `None` to refuse the array.
+
+        THREE ANSWERS: a shape is the inner chunk of a sharded array; an EMPTY shape means the
+        array is not sharded, so its chunk is its own decode unit; `None` means this chain
+        cannot be served at all.
+        """
     def retrieve_chunk_items_and_apply_index(
         self, chunk_items: ChunkItems, value: numpy.typing.NDArray[typing.Any]
     ) -> None:
