@@ -540,16 +540,24 @@ pub(crate) struct ChunkItems {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ChunkItems {
+    /// Output must not step backwards: the pieces are vended forward-only.
+    fn refuse_backwards(&self, out_start: u64) -> PyResult<()> {
+        if out_start < self.out_end {
+            return Err(PyErr::new::<PyValueError, _>(format!(
+                "output starting at {out_start} overlaps an entry already pushed, which ends \
+                 at {}",
+                self.out_end
+            )));
+        }
+        Ok(())
+    }
+
     #[new]
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
             out_end: 0,
         }
-    }
-
-    fn __len__(&self) -> usize {
-        self.items.len()
     }
 
     /// Build one batch entry's items and append them.
@@ -610,13 +618,7 @@ impl ChunkItems {
         out_start: u64,
         inner: u64,
     ) -> PyResult<()> {
-        if out_start < self.out_end {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "output starting at {out_start} overlaps an entry already pushed, which ends \
-                 at {}",
-                self.out_end
-            )));
-        }
+        self.refuse_backwards(out_start)?;
         if count == 0 {
             return Ok(());
         }
@@ -786,13 +788,7 @@ impl ChunkItems {
         inner: u64,
         offsets: Offsets<'_>,
     ) -> PyResult<()> {
-        if out_start < self.out_end {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "output starting at {out_start} overlaps an entry already pushed, which ends \
-                 at {}",
-                self.out_end
-            )));
-        }
+        self.refuse_backwards(out_start)?;
         // Before the call: `shape` is moved into it, and argument evaluation is left to right.
         let out_starts = trailing_zeros(out_start, shape.len());
         // These take the trailing axes whole, so the item's extent IS the output shape.

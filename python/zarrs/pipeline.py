@@ -161,36 +161,17 @@ class ZarrsCodecPipeline(CodecPipeline):
 
     @cached_property
     def _inner_chunk_shape(self) -> tuple[int, ...] | None:
-        """The shape of the INNERMOST unit the codec chain decodes.
+        """The innermost unit the codec chain decodes, as Rust reports it.
 
-        Three answers, and the difference matters: a tuple is the inner chunk of a sharded
-        array; `()` means the array is NOT sharded, so its chunk is its own decode unit and
-        only an entry knows that shape; `None` means refuse.
-
-        Descends through nested sharding: the first `chunk_shape` found is the outer shard's,
-        not the decode unit.
+        A tuple is the inner chunk of a sharded array; `()` means the array is not sharded, so
+        its chunk is its own decode unit; `None` means refuse. Asked rather than derived: this
+        used to walk zarr's codec objects while Rust answered the same question from the bound
+        chain, and two derivations of one fact can disagree.
         """
-        codecs = getattr(self.metadata, "codecs", ()) or ()
-        shape = None
-        while True:
-            nested = None
-            for position, codec in enumerate(codecs):
-                chunk_shape = getattr(codec, "chunk_shape", None)
-                if chunk_shape is None:
-                    continue
-                # A codec AFTER the sharding codec compresses the whole shard, so the shard
-                # index's byte ranges no longer address the shard. One inner chunk cannot be
-                # read on its own; decline.
-                if position != len(codecs) - 1:
-                    return None
-                shape = tuple(int(s) for s in chunk_shape)
-                nested = getattr(codec, "codecs", ()) or ()
-                break
-            if nested is None:
-                # No sharding codec anywhere in the chain: not an error, just a plain chunked
-                # array, whose chunk is what gets decoded.
-                return () if shape is None else shape
-            codecs = nested
+        if self.impl is None:
+            return None
+        shape = self.impl.inner_chunk_shape()
+        return None if shape is None else tuple(shape)
 
     @property
     def supports_partial_decode(self) -> bool:
