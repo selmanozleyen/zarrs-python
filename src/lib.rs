@@ -63,24 +63,24 @@ pub(crate) struct CodecPipelineImpl {
     /// array cannot take that path at all.
     pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
     /// Shard indexes read so far, for the life of the array. Reading one is a full-latency
-    /// round trip on the CALLING thread, so keeping the decoder costs a shard once per array
+    /// round trip on the calling thread, so keeping the decoder costs a shard once per array
     /// rather than once per call; a shard that does not exist is remembered too.
     pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Arc<ShardingPartialDecoder>>>,
-    /// The same, for levels BELOW the outermost, keyed by the path of subchunk indices that
+    /// The same, for levels below the outermost, keyed by the path of subchunk indices that
     /// reaches them. Empty and untouched unless the array is nested-sharded, which keeps the
     /// single-level path free of the key allocation this needs.
     pub(crate) subshard_indexes: Mutex<HashMap<(StoreKey, Vec<u64>), Arc<ShardingPartialDecoder>>>,
     /// Whether to remember shard indexes at all: true exactly when `writable_store`
     /// is `None`, so a store this pipeline can write through never caches.
     pub(crate) cache_shard_indexes: bool,
-    /// The pool sizes this array was OPENED with.
+    /// The pool sizes this array was opened with.
     pub(crate) read_ceiling: usize,
     pub(crate) decode_ceiling: usize,
-    /// Whether a ceiling that cannot be honoured is an ERROR rather than a warning.
+    /// Whether a ceiling that cannot be honoured is an error rather than a warning.
     ///
-    /// `codec_pipeline.strict` already means "do not paper over something this pipeline
-    /// cannot do" -- it turns a decline into a raise instead of a silent fallback. A ceiling
-    /// the process cannot give is the same kind of thing, so it answers to the same switch.
+    /// `codec_pipeline.strict` already means "do not paper over something this pipeline cannot do":
+    /// it turns a decline into a raise instead of a silent fallback. A ceiling the process cannot
+    /// give is the same kind of thing, so it answers to the same switch.
     pub(crate) strict: bool,
 }
 
@@ -305,7 +305,7 @@ impl CodecPipelineImpl {
 impl CodecPipelineImpl {
     /// The innermost unit this array's codec chain decodes, or `None` to refuse the array.
     ///
-    /// THREE ANSWERS: a shape is the inner chunk of a sharded array; an EMPTY shape means the
+    /// Three answers: a shape is the inner chunk of a sharded array; an empty shape means the
     /// array is not sharded, so its chunk is its own decode unit; `None` means this chain
     /// cannot be served at all.
     fn inner_chunk_shape(&self) -> Option<Vec<u64>> {
@@ -357,7 +357,7 @@ impl CodecPipelineImpl {
             ArrayMetadata::V3(v3) => Cow::Borrowed(v3),
         };
         // Parsed here, as before, so an array with both bad codec metadata and a bad fill
-        // value still reports the codec. Only the BINDING has to wait for the data type.
+        // value still reports the codec. Only the binding has to wait for the data type.
         let codec_chain =
             CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?;
         let codec_options = CodecOptions::default().with_validate_checksums(validate_checksums);
@@ -368,10 +368,10 @@ impl CodecPipelineImpl {
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
-        // Both default to the available parallelism -- more readers than that is defensible
-        // (a blocked reader costs no CPU) but not a library's call to make unasked, and a
-        // sweep from 16 to 1024 readers measured flat. Set independently, so a caller who
-        // wants reads oversubscribed can raise one alone.
+        // Both default to the available parallelism: more readers than that is defensible (a
+        // blocked reader costs no CPU) but not a library's call to make unasked, and a sweep from
+        // 16 to 1024 readers measured flat. Set independently, so a caller who wants reads
+        // oversubscribed can raise one alone.
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
         let writable_store = (!store_config.read_only).then(|| store.clone());
@@ -400,7 +400,7 @@ impl CodecPipelineImpl {
         let codec_chain = codec_chain
             .with_context(data_type.clone(), fill_value.clone())
             .map_py_err::<PyTypeError>()?;
-        // Read off the BOUND chain: it already holds the sharding codec with its inner and
+        // Read off the bound chain: it already holds the sharding codec with its inner and
         // index chains bound, so nothing has to be re-derived from the metadata.
         let shard = shard_index::ShardInfo::from_codec_chain(&codec_chain).map(Arc::new);
 
@@ -416,7 +416,7 @@ impl CodecPipelineImpl {
             shard,
             shard_indexes: Mutex::new(HashMap::new()),
             subshard_indexes: Mutex::new(HashMap::new()),
-            // Read BEFORE `writable_store` moves into the struct: a store this pipeline can
+            // Read before `writable_store` moves into the struct: a store this pipeline can
             // write through must not remember a shard index, because a write moves the bytes
             // that index addresses.
             cache_shard_indexes: writable_store.is_none(),
@@ -427,12 +427,8 @@ impl CodecPipelineImpl {
         })
     }
 
-    /// The one read entry point.
-    ///
-    /// There was a second entry point until 2026-08-30 -- a partial decoder per chunk over
-    /// rayon, for selections this path declined. An audit of the public indexing surface found
-    /// nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
-    /// than a slower second Rust path.
+    /// The one read entry point. A selection this declines falls back to zarr-python; there is
+    /// no second Rust path.
     #[pyo3(signature = (chunk_items, value))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
@@ -482,7 +478,7 @@ impl CodecPipelineImpl {
         codec_options.set_store_empty_chunks(write_empty_chunks);
 
         py.detach(move || {
-            // The two inputs differ in how the bytes are OBTAINED, not in what is done with
+            // The two inputs differ in how the bytes are obtained, not in what is done with
             // them, so the store call is written once below rather than in each arm.
             let store_chunk = |item: ChunkItem| {
                 let chunk_subset_bytes = match &input {
@@ -532,7 +528,7 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
-/// The sizes the two worker pools were BUILT with, or `None` where one has not been built.
+/// The sizes the two worker pools were built with, or `None` where one has not been built.
 #[gen_stub_pyfunction]
 #[pyfunction]
 fn pool_sizes() -> (Option<usize>, Option<usize>) {

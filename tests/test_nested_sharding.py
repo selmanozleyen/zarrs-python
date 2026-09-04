@@ -1,14 +1,3 @@
-"""Sharding inside sharding: the INNERMOST chunk is still the decode unit.
-
-Locating one innermost chunk means walking TWO offset/size tables -- the outer shard's index
-gives the subshard's extent, and the subshard's own index gives the chunk's. Treating the
-subshard as the unit would decode many chunks to keep the elements of one.
-
-zarr only produces this layout from a `ShardingCodec` serializer nesting another; `shards=`
-gives one level, and `compressors=None` keeps the compressor from landing OUTSIDE the sharding
-codec (which `test_a_codec_after_sharding_is_refused` covers, and this path refuses).
-"""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -64,10 +53,8 @@ def shallow(tmp_path: Path) -> tuple[Path, np.ndarray]:
 def selections() -> dict[str, np.ndarray]:
     rng = np.random.default_rng(0)
     return {
-        # Every element of one innermost chunk, at depth 2.
         "one inner chunk": np.arange(INNER, 2 * INNER),
-        # Scattered across subshards AND across outer shards, so both indexes are walked
-        # repeatedly -- which is what a single-subshard and a shard-crossing case each did once.
+        # Across subshards AND outer shards, so both indexes are walked repeatedly.
         "scattered": np.sort(rng.choice(N, size=500, replace=False)),
     }
 
@@ -76,7 +63,6 @@ def selections() -> dict[str, np.ndarray]:
 def test_nested_reads_are_correct(
     nested: tuple[Path, np.ndarray], entries: dict[str, int], name: str
 ) -> None:
-    """Values first, then the path: the fallback got the values right before the descent existed."""
     path, truth = nested
     selection = selections()[name]
     with zarr.config.set(ZARRS):
@@ -89,7 +75,7 @@ def test_nested_reads_are_correct(
 def test_shallow_still_takes_the_fast_path(
     shallow: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
-    """The regression guard. Nested support must not cost the single-level path its handle."""
+    """Nested support must not cost the single-level path its handle."""
     path, truth = shallow
     selection = np.sort(np.random.default_rng(2).choice(N, size=300, replace=False))
     with zarr.config.set(ZARRS):
