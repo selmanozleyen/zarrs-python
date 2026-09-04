@@ -227,7 +227,7 @@ pub(crate) fn gather_pieces(
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
-        let Some(span) = (m - n).checked_mul(run) else {
+        let Some(span) = (m - n).checked_mul(run_bytes) else {
             return Err("the gathered span is too large to address".to_string());
         };
         let Some(region) = src.checked_add(span).and_then(|end| scratch.get(src..end)) else {
