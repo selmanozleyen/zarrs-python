@@ -334,11 +334,6 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         config: read_decode::ReadConfig,
     ) -> PyResult<()> {
-        // Every item must be a chunk-unit item and the array must present a sharding codec.
-        // Both are guaranteed by `chunk_info_for_read`, which is the only route to a
-        // `ChunkItems` handle; anything it cannot describe raises and falls back to
-        // zarr-python in Python. The check stays because this is a `#[pymethods]` boundary,
-        // and what it guards is an exclusive output slice.
         // An empty batch is a read of NOTHING -- `X[[]]` -- and nothing is servable. There is
         // no output to leave uninitialised, so this returns rather than falling to the refusal
         // below, which is where it used to land. Python serves it too (`chunk_info_for_read`
@@ -346,18 +341,21 @@ impl CodecPipelineImpl {
         if chunk_descriptions.is_empty() {
             return Ok(());
         }
-        if let (true, Some(shard)) = (
-            chunk_descriptions
-                .iter()
-                .all(|i| i.element_offsets.is_some()),
-            self.shard.as_ref(),
-        ) {
+        // The array must present a sharding codec; `chunk_info_for_read` is the only route to a
+        // `ChunkItems` handle and it refuses anything else, but this is a `#[pymethods]`
+        // boundary and what it guards is an exclusive output slice.
+        //
+        // Whether every item is a CHUNK-UNIT item is no longer checked here. It used to be, and
+        // then the batch was handed over anyway and a list of the ones it could not take came
+        // back to be turned into an error -- a round trip whose result was always empty.
+        // `locate_chunks` raises on the first such item instead, naming its key.
+        if let Some(shard) = self.shard.as_ref() {
             // Confined to this block so no live `&mut` exists when the fallback below takes
             // its own view of the same array. The borrow checker will not catch that -- the
             // `&mut` comes from a raw pointer -- so the block is a deliberate lexical
             // guarantee rather than relying on the fallback staying unreachable.
             let element_size = self.element_size()?;
-            let declined = {
+            {
                 // An aliasing wrapper: no `&mut` is claimed over the whole buffer.
                 // `DisjointBytes` vends the pieces from it, one range each, so each piece
                 // becomes a `&mut [u8]` the compiler can check.
@@ -380,37 +378,20 @@ impl CodecPipelineImpl {
                         config,
                         &self.codec_options,
                     )
-                })?
-            };
-            if declined.is_empty() {
-                return Ok(());
+                })?;
             }
-            // Whatever that path could not take still has to be read, down the fused one.
-            let declined: Vec<chunk_item::ChunkItem> = declined.into_iter().cloned().collect();
-            // Unreachable: a read item always carries coordinates, because
-            // `chunk_info_for_read` only produces a `ChunkItems` handle and every route into
-            // that sets them. This was a hand-off to a second Rust path that no longer
-            // exists, so if it fires the invariant broke and silence is the wrong answer.
-            return Err(PyRuntimeError::new_err(format!(
-                "{} read items arrived without element offsets; there is no fallback path and \
-                 the caller should have declined to zarr-python instead",
-                declined.len()
-            )));
+            return Ok(());
         }
-        // No second path to fall through to. Reaching here means either the batch was
-        // empty, or an item arrived without element offsets, or the array does not present a
-        // sharding codec -- and in every one of those cases the output buffer is exactly as
-        // `np.empty` left it, so returning Ok would hand the caller uninitialised memory and
-        // call it data. Python declines all three before they get here; this is the assertion
-        // that says so, rather than a silence that looks like success.
+        // No second path to fall through to. Reaching here means the array presents no
+        // sharding codec, and the output buffer is exactly as `np.empty` left it -- so
+        // returning Ok would hand the caller uninitialised memory and call it data. Python
+        // declines this before it gets here (`_inner_chunk_shape` returns `None` for the same
+        // chains `ShardInfo::from_codec_chain` refuses); this is the assertion that says so,
+        // rather than a silence that looks like success.
         Err(PyRuntimeError::new_err(format!(
-            "a batch of {} items could not be served: {}",
+            "a batch of {} items could not be served: this array presents no sharding codec, \
+             so there is no decode unit to group by",
             chunk_descriptions.len(),
-            if self.shard.is_none() {
-                "this array presents no sharding codec, so there is no decode unit to group by"
-            } else {
-                "an item arrived without element offsets"
-            }
         )))
     }
 }

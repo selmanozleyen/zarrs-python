@@ -81,6 +81,27 @@ pub(crate) fn offset_runs(
     })
 }
 
+/// How many BYTES one index's run of elements occupies, refusing zero and overflow.
+///
+/// Both gathers need this and both encoded the same rule; a change to one that missed the
+/// other would be a wrong-length copy rather than a compile error. Called once per job, not
+/// per element.
+///
+/// Named for its unit. In this file `run` on its own means elements in `gather_runs` and bytes
+/// in the two callers here -- eleven lines apart, which is how a reader loses an afternoon.
+fn run_bytes(run_len: u64, size: usize) -> Result<usize, String> {
+    let Some(bytes) = usize::try_from(run_len)
+        .ok()
+        .and_then(|r| r.checked_mul(size))
+    else {
+        return Err(format!("run length {run_len} is too large to address"));
+    };
+    if bytes == 0 {
+        return Err("run length must be greater than zero".to_string());
+    }
+    Ok(bytes)
+}
+
 /// Writes a sequence of runs across output pieces that need not align with them.
 ///
 /// An item's output is ONE contiguous range only while every axis after the first is taken
@@ -170,20 +191,12 @@ pub(crate) fn gather(
     out: &mut [u8],
     size: usize,
 ) -> Result<(), String> {
-    let Some(run) = usize::try_from(run_len)
-        .ok()
-        .and_then(|r| r.checked_mul(size))
-    else {
-        return Err(format!("run length {run_len} is too large to address"));
-    };
-    if run == 0 {
-        return Err("run length must be greater than zero".to_string());
-    }
-    if element_offsets.len().checked_mul(run) != Some(out.len()) {
+    let run_bytes = run_bytes(run_len, size)?;
+    if element_offsets.len().checked_mul(run_bytes) != Some(out.len()) {
         return Err(format!(
-            "{} offsets of {run} bytes each fill {} bytes, but the output is {}",
+            "{} offsets of {run_bytes} bytes each fill {} bytes, but the output is {}",
             element_offsets.len(),
-            element_offsets.len().saturating_mul(run),
+            element_offsets.len().saturating_mul(run_bytes),
             out.len()
         ));
     }
@@ -195,15 +208,15 @@ pub(crate) fn gather(
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
-        // The END of the run is what has to be in bounds, not its start: a coordinate inside
-        // `scratch` whose run walks off the end would otherwise read past the decode.
-        let Some(element) = src.checked_add(run).and_then(|end| scratch.get(src..end)) else {
+        // The END of the run_bytes is what has to be in bounds, not its start: a coordinate inside
+        // `scratch` whose run_bytes walks off the end would otherwise read past the decode.
+        let Some(element) = src.checked_add(run_bytes).and_then(|end| scratch.get(src..end)) else {
             return Err(format!(
                 "coordinate {c} plus {run_len} elements is outside the {} decoded",
                 scratch.len() / size
             ));
         };
-        out[n * run..(n + 1) * run].copy_from_slice(element);
+        out[n * run_bytes..(n + 1) * run_bytes].copy_from_slice(element);
     }
     Ok(())
 }
@@ -220,21 +233,13 @@ pub(crate) fn gather_pieces(
     pieces: &mut [&mut [u8]],
     size: usize,
 ) -> Result<(), String> {
-    let Some(run) = usize::try_from(run_len)
-        .ok()
-        .and_then(|r| r.checked_mul(size))
-    else {
-        return Err(format!("run length {run_len} is too large to address"));
-    };
-    if run == 0 {
-        return Err("run length must be greater than zero".to_string());
-    }
+    let run_bytes = run_bytes(run_len, size)?;
     let total: usize = pieces.iter().map(|p| p.len()).sum();
-    if element_offsets.len().checked_mul(run) != Some(total) {
+    if element_offsets.len().checked_mul(run_bytes) != Some(total) {
         return Err(format!(
-            "{} offsets of {run} bytes each fill {} bytes, but the {} pieces hold {total}",
+            "{} offsets of {run_bytes} bytes each fill {} bytes, but the {} pieces hold {total}",
             element_offsets.len(),
-            element_offsets.len().saturating_mul(run),
+            element_offsets.len().saturating_mul(run_bytes),
             pieces.len()
         ));
     }
@@ -248,7 +253,7 @@ pub(crate) fn gather_pieces(
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
-        let Some(span) = r.len().checked_mul(run) else {
+        let Some(span) = r.len().checked_mul(run_bytes) else {
             return Err("the gathered span is too large to address".to_string());
         };
         let Some(region) = src.checked_add(span).and_then(|end| scratch.get(src..end)) else {

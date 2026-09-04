@@ -133,19 +133,19 @@ fn item_is_one_decode_unit(
 impl CodecPipelineImpl {
     /// Read and decode `items`, one job per innermost chunk, on workers scoped to this call.
     ///
-    /// `items` must be chunk-unit items: one whole innermost chunk each, carrying the
-    /// coordinates wanted from it. Returns the items this path could not take -- there is no
-    /// second path to hand them to, so the caller turns them into an error rather than leave
-    /// their output bytes unwritten.
-    pub(crate) fn retrieve_chunk_units<'a>(
+    /// `items` must be chunk-unit items: one whole innermost chunk each, carrying the element
+    /// offsets wanted from it. There is no second path to hand an item to, so anything this
+    /// cannot take is an ERROR rather than a value the caller has to remember to check --
+    /// which is what it used to be, and the check had already become vacuous.
+    pub(crate) fn retrieve_chunk_units(
         &self,
         shard: &Arc<ShardInfo>,
-        items: &'a [ChunkItem],
+        items: &[ChunkItem],
         output: UnsafeCellSlice<'_, u8>,
         output_len: usize,
         config: ReadConfig,
         codec_options: &CodecOptions,
-    ) -> PyResult<Vec<&'a ChunkItem>> {
+    ) -> PyResult<()> {
         let element_size = self.element_size()?;
         let ctx = JobContext {
             by_row: self.inner_chunk_is_plain_bytes,
@@ -164,9 +164,9 @@ impl CodecPipelineImpl {
             ),
         };
 
-        let (located, declined) = self.locate_chunks(shard, items, &ctx)?;
+        let located = self.locate_chunks(shard, items, &ctx)?;
         if located.is_empty() {
-            return Ok(declined);
+            return Ok(());
         }
 
         let output = DisjointBytes::new(output, output_len);
@@ -176,13 +176,6 @@ impl CodecPipelineImpl {
         // makes this the guard the whole path rests on: disjoint pieces summing to `len` must
         // tile `[0, len)` exactly, so the two together prove an exact partition.
         //
-        // `declined` is EMPTY here, always. It dates from when a declined item was handed to a
-        // second Rust path that filled its bytes afterwards; that path is gone, and
-        // `retrieve_items_and_apply_index` now refuses the whole batch unless every item
-        // carries element offsets -- which is the only thing `locate_chunks` declines for. The
-        // condition stayed and made this guard READ as optional, which is worse than useless:
-        // a future decline reason would silently switch off the check for the whole batch.
-        debug_assert!(declined.is_empty(), "nothing declines any more; see above");
         if output.covered() != output_len {
             return Err(PyRuntimeError::new_err(format!(
                 "the batch covers {} of {output_len} output bytes; the rest would be returned \
@@ -196,7 +189,7 @@ impl CodecPipelineImpl {
             fill(piece, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
         }
         if jobs.is_empty() {
-            return Ok(declined);
+            return Ok(());
         }
 
         // Two persistent work-stealing pools, and capacity is never divided between calls: a
@@ -231,7 +224,7 @@ impl CodecPipelineImpl {
         if let Some(e) = failure.lock().expect("failure slot poisoned").take() {
             return Err(PyRuntimeError::new_err(e));
         }
-        Ok(declined)
+        Ok(())
     }
 
     /// A decoder from `call_cache`, then `array_cache`, or built and inserted into both.
@@ -405,28 +398,28 @@ impl CodecPipelineImpl {
     ///
     /// The descent divides on every axis, so an item is not required to take the trailing axes
     /// whole -- but it IS required to lie within one inner chunk, which `locate` checks.
-    #[allow(clippy::type_complexity)]
     fn locate_chunks<'a>(
         &self,
         shard: &ShardInfo,
         items: &'a [ChunkItem],
         ctx: &JobContext,
-    ) -> PyResult<(Vec<(&'a ChunkItem, Option<ByteRange>)>, Vec<&'a ChunkItem>)> {
+    ) -> PyResult<Vec<(&'a ChunkItem, Option<ByteRange>)>> {
         let mut located = Vec::with_capacity(items.len());
-        let mut declined = Vec::new();
         let mut decoders = CallDecoders::default();
 
         for item in items {
-            if item.element_offsets.is_none() {
-                declined.push(item);
-                continue;
-            }
+            // An item with no element offsets was built by `ChunkItem::new`, which only the
+            // WRITE path uses. It used to be collected into a `declined` list and handed to a
+            // second Rust read path; that path is gone, so there is nothing to hand it to and
+            // this is an error rather than a quiet omission -- the output bytes it owns would
+            // otherwise be returned as `np.empty` left them.
+            element_offsets_of(item)?;
             // The whole position, not just axis 0: the descent divides on every axis now,
             // so a shard that splits a trailing one is addressed rather than refused.
             let start = item.chunk_subset.start().to_vec();
             located.push((item, self.locate(shard, item, &start, ctx, &mut decoders)?));
         }
-        Ok((located, declined))
+        Ok(located)
     }
 }
 
