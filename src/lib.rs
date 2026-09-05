@@ -28,6 +28,7 @@ use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
 use zarrs::storage::{ReadableStorage, ReadableWritableListableStorage, StorageHandle, StoreKey};
 
+mod pool;
 mod chunk_item;
 mod concurrency;
 mod runtime;
@@ -263,9 +264,8 @@ impl CodecPipelineImpl {
 
         let chunk_concurrent_minimum =
             chunk_concurrent_minimum.unwrap_or(global_config().chunk_concurrent_minimum());
-        let chunk_concurrent_maximum =
-            chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
-        let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
+        let chunk_concurrent_maximum = chunk_concurrent_maximum.unwrap_or_else(pool::parallelism);
+        let num_threads = num_threads.unwrap_or_else(pool::parallelism);
 
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
@@ -310,6 +310,9 @@ impl CodecPipelineImpl {
         // Get input array
         let output = Self::nparray_to_unsafe_cell_slice(value)?;
 
+        // With the GIL still held, and held across the `detach` below. See `pool::pool`.
+        let pool = pool::pool();
+
         // Adjust the concurrency based on the codec chain and the first chunk description
         let Some((chunk_concurrent_limit, codec_options)) =
             chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
@@ -326,7 +329,7 @@ impl CodecPipelineImpl {
         let mut partial_decoder_cache: HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>> =
             HashMap::new();
         if !partial_chunk_items.is_empty() {
-            let key_decoder_pairs =
+            let key_decoder_pairs = pool.install(|| {
                 iter_concurrent_limit!(chunk_concurrent_limit, partial_chunk_items, map, |item| {
                     let storage_handle = Arc::new(StorageHandle::new(self.readable_store.clone()));
                     let input_handle = StoragePartialDecoder::new(storage_handle, item.key.clone());
@@ -343,7 +346,8 @@ impl CodecPipelineImpl {
                         .map_codec_err()?;
                     Ok((item.key.clone(), partial_decoder))
                 })
-                .collect::<PyResult<Vec<_>>>()?;
+                .collect::<PyResult<Vec<_>>>()
+            })?;
             partial_decoder_cache.extend(key_decoder_pairs);
         }
 
@@ -401,12 +405,14 @@ impl CodecPipelineImpl {
                 .map_codec_err()
             };
 
-            iter_concurrent_limit!(
-                chunk_concurrent_limit,
-                chunk_descriptions,
-                try_for_each,
-                update_chunk_subset
-            )?;
+            pool.install(|| {
+                iter_concurrent_limit!(
+                    chunk_concurrent_limit,
+                    chunk_descriptions,
+                    try_for_each,
+                    update_chunk_subset
+                )
+            })?;
 
             Ok(())
         })
@@ -421,6 +427,9 @@ impl CodecPipelineImpl {
     ) -> PyResult<()> {
         // Fail before decoding anything; the write site checks again by construction.
         self.writable()?;
+
+        // With the GIL still held, and held across the `detach` below. See `pool::pool`.
+        let pool = pool::pool();
 
         enum InputValue<'a> {
             Array(ArrayBytes<'a>),
@@ -478,12 +487,14 @@ impl CodecPipelineImpl {
                 }
             };
 
-            iter_concurrent_limit!(
-                chunk_concurrent_limit,
-                chunk_descriptions,
-                try_for_each,
-                store_chunk
-            )?;
+            pool.install(|| {
+                iter_concurrent_limit!(
+                    chunk_concurrent_limit,
+                    chunk_descriptions,
+                    try_for_each,
+                    store_chunk
+                )
+            })?;
 
             Ok(())
         })
