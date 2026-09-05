@@ -475,6 +475,17 @@ impl CodecPipelineImpl {
         };
         codec_options.set_store_empty_chunks(write_empty_chunks);
 
+        // ON OUR OWN POOL, not rayon's global one, and taken here because `pools` must be
+        // called with the GIL held. This is the whole of the write path's fork story: rayon's
+        // global registry sits behind a `Once` with no reset, so a child that inherits it
+        // blocks in `in_worker_cold` for ever. With this, NOTHING in the crate reaches that
+        // registry, so it is never built and a fork has nothing to inherit.
+        //
+        // The decode pool, because encoding is the CPU half of a write. How many chunks run at
+        // once is still `chunk_concurrent_limit` below, so the pool's width does not widen the
+        // write; it only leaves slack for the ones parked on a store.
+        let (_, encode_pool) = read_decode::pools();
+
         py.detach(move || {
             // The two inputs differ in how the bytes are obtained, not in what is done with
             // them, so the store call is written once below rather than in each arm.
@@ -502,12 +513,14 @@ impl CodecPipelineImpl {
                 )
             };
 
-            iter_concurrent_limit!(
-                chunk_concurrent_limit,
-                chunk_descriptions,
-                try_for_each,
-                store_chunk
-            )?;
+            encode_pool.install(|| {
+                iter_concurrent_limit!(
+                    chunk_concurrent_limit,
+                    chunk_descriptions,
+                    try_for_each,
+                    store_chunk
+                )
+            })?;
 
             Ok(())
         })
