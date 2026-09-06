@@ -592,7 +592,7 @@ fn pool_max(multiplier: usize) -> usize {
 /// Takes the `Python` token for the reason [`PerProcess`] gives: this locks, and the GIL is
 /// what keeps that lock from being held when another thread forks.
 pub(crate) fn pools(_py: Python<'_>) -> PyResult<(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>)> {
-    let built = POOLS.get_or_try_init(|| {
+    let built = POOLS.get_or_try_init(|| -> PyResult<Pools> {
         Ok(Pools {
             read: Arc::new(build_pool(pool_max(READ_POOL_MAX), "read")?),
             decode: Arc::new(build_pool(pool_max(DECODE_POOL_MAX), "decode")?),
