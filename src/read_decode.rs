@@ -725,19 +725,27 @@ fn build_pool(size: usize, name: &'static str) -> PyResult<rayon::ThreadPool> {
 const READ_POOL_MAX: usize = 8;
 const DECODE_POOL_MAX: usize = 4;
 
-fn pool_max(multiplier: usize) -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) * multiplier
+/// A multiple of the BASE POOL's width, not of the machine's, so that one process-scoped
+/// setting sizes every pool in the process. `RAYON_NUM_THREADS` caps the base pool, and these
+/// two scale with it; without this the environment would cap writes and be ignored by reads.
+///
+/// This is numba's shape: `NUMBA_NUM_THREADS` fixes the threads a process launches, and
+/// `set_num_threads` may only lower what a call uses. Here the ceiling is set once per process
+/// and [`ReadConfig`] masks downward within it -- and, as there, asking above the ceiling is an
+/// error rather than a silent clamp.
+fn pool_max(py: Python<'_>, multiplier: usize) -> PyResult<usize> {
+    Ok(crate::pool::pool(py)?.current_num_threads() * multiplier)
 }
 
 /// Both pools, building them on first use and rebuilding them in a forked child.
 ///
 /// Takes the `Python` token for the reason [`PerProcess`] gives: this locks, and the GIL is
 /// what keeps that lock from being held when another thread forks.
-pub(crate) fn pools(_py: Python<'_>) -> PyResult<(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>)> {
+pub(crate) fn pools(py: Python<'_>) -> PyResult<(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>)> {
     let built = POOLS.get_or_try_init(|| -> PyResult<Pools> {
         Ok(Pools {
-            read: Arc::new(build_pool(pool_max(READ_POOL_MAX), "read")?),
-            decode: Arc::new(build_pool(pool_max(DECODE_POOL_MAX), "decode")?),
+            read: Arc::new(build_pool(pool_max(py, READ_POOL_MAX)?, "read")?),
+            decode: Arc::new(build_pool(pool_max(py, DECODE_POOL_MAX)?, "decode")?),
         })
     })?;
     Ok((built.read.clone(), built.decode.clone()))
@@ -759,9 +767,13 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
 /// compares against `pool_max` rather than against what any other call asked for.
 pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyResult<()> {
     for (limit, asked, knob) in [
-        (pool_max(READ_POOL_MAX), config.read_workers, "read_workers"),
         (
-            pool_max(DECODE_POOL_MAX),
+            pool_max(py, READ_POOL_MAX)?,
+            config.read_workers,
+            "read_workers",
+        ),
+        (
+            pool_max(py, DECODE_POOL_MAX)?,
             config.decode_workers,
             "decode_workers",
         ),
@@ -1100,13 +1112,19 @@ mod tests {
             // are built at `pool_max`, which is what lets two calls ask differently and both
             // be served.
             let (read, decode) = pools(py).expect("the pools must be buildable");
-            assert_eq!(read.current_num_threads(), pool_max(READ_POOL_MAX));
-            assert_eq!(decode.current_num_threads(), pool_max(DECODE_POOL_MAX));
+            assert_eq!(
+                read.current_num_threads(),
+                pool_max(py, READ_POOL_MAX).unwrap()
+            );
+            assert_eq!(
+                decode.current_num_threads(),
+                pool_max(py, DECODE_POOL_MAX).unwrap()
+            );
             assert_eq!(
                 pool_sizes(),
                 (
-                    Some(pool_max(READ_POOL_MAX)),
-                    Some(pool_max(DECODE_POOL_MAX))
+                    Some(pool_max(py, READ_POOL_MAX).unwrap()),
+                    Some(pool_max(py, DECODE_POOL_MAX).unwrap())
                 ),
                 "what was built is what is reported"
             );

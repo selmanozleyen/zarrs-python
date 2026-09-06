@@ -60,7 +60,8 @@ A read of a sharded array **remembers each shard's decoded index** for the durat
 
 - `codec_pipeline.read_workers` / `codec_pipeline.decode_workers`: how many workers one read may use -- one pool fetches byte ranges, the other decodes chunks.
   - Both default to the available parallelism, doubled for readers. Separate, because a reader waits on storage while a decoder occupies a core: a value above the core count is defensible for readers and not for decoders. On high-latency storage more readers is usually better, up to the number of chunks a read touches.
-  - **Per call.** Each read takes at most this many workers out of the pools, which are process-wide and work-stealing, so two reads asking for different widths both get what they asked for. The one width that cannot be served is one above what the pools were built with, since a rayon pool cannot grow.
+  - **Per call.** Each read takes at most this many workers out of the pools, which are process-wide and work-stealing, so two reads asking for different widths both get what they asked for.
+  - The one width that cannot be served is one above what the pools were BUILT with, since a rayon pool cannot grow; asking for more is an error rather than a silent clamp. That ceiling is a multiple of the pool size above, so `RAYON_NUM_THREADS` raises and lowers all of it together, and only before the first read. This is the arrangement `numba` uses: `NUMBA_NUM_THREADS` fixes what a process launches, and `set_num_threads` may only ask for less.
 
 - `codec_pipeline.raw_max_reads_per_chunk`: how many separate reads a chunk's wanted rows may become before the fast "read the row's bytes, not the chunk" path is declined for that chunk.
   - Defaults to `2`, and applies only where an inner chunk is a plain byte tiling (no compression), since that is what makes a row's bytes addressable inside it.
