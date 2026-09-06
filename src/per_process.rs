@@ -4,16 +4,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 /// A value built once per process, and built again in a forked child.
 ///
-/// `fork()` copies the parent's memory but only the calling thread, so anything that owns
-/// threads -- a rayon pool, a tokio runtime -- reaches a child as a description of workers that
-/// do not exist. Keying on the process id is what makes the child build its own instead. A
-/// `OnceLock` is the obvious shape and cannot express this: it has no reset reachable from a
-/// `static`.
-///
-/// CALL THIS WITH THE GIL HELD, and carry the returned `Arc` across `Python::detach`. It takes
-/// a lock, and the GIL is what stops that lock from being held at the instant another thread
-/// forks: a child inherits a held mutex as held, owned by a thread it does not have, and blocks
-/// on it -- trading one deadlock for another. Callers take a `Python` token to say so.
+/// `fork()` copies memory but only the calling thread, so anything owning threads reaches a child
+/// as a description of workers that do not exist. A `OnceLock` cannot express the rebuild: it has
+/// no reset reachable from a `static`. CALL WITH THE GIL HELD -- a lock held at the instant
+/// another thread forks is inherited locked, owned by a thread the child does not have.
 pub(crate) struct PerProcess<T> {
     slot: Mutex<Option<(u32, Arc<T>)>>,
 }
@@ -26,10 +20,6 @@ impl<T> PerProcess<T> {
     }
 
     /// The value for this process, calling `build` on first use and after a fork.
-    ///
-    /// A failed build leaves the previous value in place: `build` runs BEFORE the stale value is
-    /// taken, so a child that cannot spawn threads reports that rather than emptying the slot
-    /// and reporting something different on the next call.
     pub(crate) fn get_or_try_init<E>(
         &self,
         build: impl FnOnce() -> Result<T, E>,
@@ -37,8 +27,7 @@ impl<T> PerProcess<T> {
         self.get_or_try_init_for(std::process::id(), build)
     }
 
-    /// [`Self::get_or_try_init`] with the process id given rather than asked for, so the rebuild
-    /// branch -- the whole of the fix -- is reachable from a test without forking.
+    /// As [`Self::get_or_try_init`], with the pid given so a test reaches the rebuild without forking.
     fn get_or_try_init_for<E>(
         &self,
         pid: u32,
@@ -46,11 +35,10 @@ impl<T> PerProcess<T> {
     ) -> Result<Arc<T>, E> {
         let mut guard = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.as_ref().is_none_or(|(built, _)| *built != pid) {
+            // Built before the stale one is taken, so a failed build keeps what was already there.
             let fresh = Arc::new(build()?);
-            // FORGOTTEN, not dropped. Dropping is what the owner does, and in a child this
-            // process is not the owner: rayon's `ThreadPool::drop` terminates a registry whose
-            // per-worker mutexes may be inherited held, and tokio's `Runtime::drop` waits for
-            // tasks that never ran. What leaks is a copy of memory this process never owned.
+            // FORGOTTEN, not dropped: a child does not own this, and dropping joins or waits on
+            // threads that were never created.
             if let Some(stale) = guard.take() {
                 std::mem::forget(stale);
             }
@@ -65,8 +53,8 @@ impl<T> PerProcess<T> {
 mod tests {
     use super::*;
 
-    /// Caching AND the pid key, in ONE test on purpose: both drive the same slot, and cargo runs
-    /// tests in parallel threads, so two tests sharing one would race.
+    /// Caching and the pid key in one test: both drive the same slot, and cargo runs tests in
+    /// parallel threads, so two tests sharing one would race.
     #[test]
     fn a_value_is_kept_per_process_and_rebuilt_when_the_process_changes() {
         let slot: PerProcess<u32> = PerProcess::new();
@@ -78,12 +66,11 @@ mod tests {
         let first = take(1);
         assert!(
             Arc::ptr_eq(&first, &take(1)),
-            "the same process must be served the same value, not a new one per call"
+            "one value per process, not one per call"
         );
         assert!(
             !Arc::ptr_eq(&first, &take(2)),
-            "a pid change must rebuild -- without it a forked child keeps threads that do not \
-             exist, which is the deadlock this type exists to prevent"
+            "a pid change must rebuild, or a forked child keeps threads that do not exist"
         );
     }
 
@@ -103,7 +90,7 @@ mod tests {
                 &good,
                 &slot.get_or_try_init_for(1, || Ok::<u32, &str>(9)).unwrap()
             ),
-            "the slot still holds process 1's value, so it is returned rather than rebuilt"
+            "process 1's value is still there, so it is returned rather than rebuilt"
         );
     }
 }
