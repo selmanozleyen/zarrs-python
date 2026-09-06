@@ -56,9 +56,7 @@ fn pool_for(pid: u32) -> PyResult<Arc<rayon::ThreadPool>> {
         let built = rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("zarrs-{i}"))
             .build()
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("could not create a thread pool: {e}"))
-            })?;
+            .map_err(|e| PyRuntimeError::new_err(format!("could not create a thread pool: {e}")))?;
         // FORGOTTEN, not dropped. `ThreadPool::drop` terminates the registry, and terminating
         // takes a per-worker mutex that a child inherits locked by a worker that does not
         // exist. What leaks is a copy of memory this process never owned.
