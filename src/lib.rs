@@ -28,9 +28,9 @@ use zarrs::convert::array_metadata_v2_to_v3;
 use zarrs::plugin::ZarrVersion;
 use zarrs::storage::{ReadableStorage, ReadableWritableListableStorage, StorageHandle, StoreKey};
 
-mod pool;
 mod chunk_item;
 mod concurrency;
+mod pool;
 mod runtime;
 mod store;
 #[cfg(test)]
@@ -240,6 +240,7 @@ impl CodecPipelineImpl {
     ))]
     #[new]
     fn new(
+        py: Python<'_>,
         array_metadata: &str,
         mut store_config: StoreConfig,
         validate_checksums: bool,
@@ -262,10 +263,20 @@ impl CodecPipelineImpl {
             Arc::new(CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?);
         let codec_options = CodecOptions::default().with_validate_checksums(validate_checksums);
 
+        // `unwrap_or_ELSE`: `global_config()` forces a `LazyLock` whose `Default` reads
+        // `rayon::current_num_threads()`, so the eager form did that work even when the caller
+        // had already said what it wanted.
         let chunk_concurrent_minimum =
-            chunk_concurrent_minimum.unwrap_or(global_config().chunk_concurrent_minimum());
-        let chunk_concurrent_maximum = chunk_concurrent_maximum.unwrap_or_else(pool::parallelism);
-        let num_threads = num_threads.unwrap_or_else(pool::parallelism);
+            chunk_concurrent_minimum.unwrap_or_else(|| global_config().chunk_concurrent_minimum());
+        // BOTH DEFAULT TO THE POOL'S OWN WIDTH, which is what `main` did -- there the default
+        // was `rayon::current_num_threads()`, the width of the global pool the work ran on.
+        // These are budgets handed to `calc_concurrency_outer_inner`, so reading them off
+        // anything but the pool that will run the work lets a `RAYON_NUM_THREADS=4` process
+        // schedule a machine's worth of concurrent decodes onto four threads, each holding a
+        // decode buffer.
+        let width = pool::pool(py)?.current_num_threads();
+        let chunk_concurrent_maximum = chunk_concurrent_maximum.unwrap_or(width);
+        let num_threads = num_threads.unwrap_or(width);
 
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
@@ -311,7 +322,7 @@ impl CodecPipelineImpl {
         let output = Self::nparray_to_unsafe_cell_slice(value)?;
 
         // With the GIL still held, and held across the `detach` below. See `pool::pool`.
-        let pool = pool::pool();
+        let pool = pool::pool(py)?;
 
         // Adjust the concurrency based on the codec chain and the first chunk description
         let Some((chunk_concurrent_limit, codec_options)) =
@@ -429,7 +440,7 @@ impl CodecPipelineImpl {
         self.writable()?;
 
         // With the GIL still held, and held across the `detach` below. See `pool::pool`.
-        let pool = pool::pool();
+        let pool = pool::pool(py)?;
 
         enum InputValue<'a> {
             Array(ArrayBytes<'a>),
