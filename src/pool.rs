@@ -50,6 +50,13 @@ pub(crate) fn pool(_py: Python<'_>) -> PyResult<Arc<rayon::ThreadPool>> {
     })
 }
 
+/// What this process already built, or `None` if it has not built it yet.
+///
+/// Reporting only, so it must not build: the thing it reports on is whether building happened.
+pub(crate) fn peek() -> Option<Arc<rayon::ThreadPool>> {
+    POOL.peek()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
