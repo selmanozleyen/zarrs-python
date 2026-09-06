@@ -1,20 +1,33 @@
 """A forked child must not deadlock on a pool whose threads it did not inherit (#171).
 
-The parent decodes first on purpose: that is what builds the pool, and a pool that was never
-built cannot be inherited broken. Each case runs in a child with a deadline, because the bug
-under test is a hang -- an assertion would never be reached.
+The parent decodes before forking on purpose: that is what builds the pool, and a pool that
+was never built cannot be inherited broken. Each case runs in a child with a deadline, because
+the bug under test is a hang -- an assertion would never be reached.
 """
 
 from __future__ import annotations
 
 import os
 import time
+import traceback
 
 import numpy as np
 import pytest
 import zarr
 
 pytestmark = pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX only")
+
+
+@pytest.fixture(autouse=True)
+def _no_silent_fallback():
+    """Refuse the zarr-python fallback, so these cannot pass without running any Rust.
+
+    `conftest` selects the pipeline; nothing there stops `pipeline.py` handing a batch it
+    dislikes back to `BatchedCodecPipeline`, which would make every test here green while
+    testing the wrong library entirely.
+    """
+    with zarr.config.set({"codec_pipeline.strict": True}):
+        yield
 
 
 def _run_in_child(work, deadline: float = 30.0) -> None:
@@ -24,55 +37,77 @@ def _run_in_child(work, deadline: float = 30.0) -> None:
         try:
             work()
         except BaseException:  # noqa: BLE001
+            # To stderr, at fd level: a bare exit code is undebuggable from CI alone.
+            traceback.print_exc()
             code = 1
         os._exit(code)
 
     end = time.monotonic() + deadline
+    status = None
     while time.monotonic() < end:
         done, status = os.waitpid(pid, os.WNOHANG)
         if done:
-            assert os.waitstatus_to_exitcode(status) == 0, "the child raised"
-            return
+            break
         time.sleep(0.02)
-    os.kill(pid, 9)
-    os.waitpid(pid, 0)
-    pytest.fail(f"the child did not finish in {deadline}s -- it deadlocked")
+    else:
+        # One last look before declaring a hang: a child that finished inside the final sleep
+        # is not a deadlock, and killing it here would be a false failure on a loaded runner.
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if not done:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            pytest.fail(f"the child did not finish in {deadline}s -- it deadlocked")
+
+    code = os.waitstatus_to_exitcode(status)
+    assert code == 0, f"the child exited with {code} (negative means a signal)"
 
 
-def _seeded(path: str, *, shards: bool) -> zarr.Array:
+def _seeded(path: str, *, shards: bool) -> None:
     kwargs = {"shards": (128, 128)} if shards else {}
     array = zarr.create_array(
-        store=path, shape=(256, 256), chunks=(32, 32), dtype="int16",
-        zarr_format=3, **kwargs,
+        store=path,
+        shape=(256, 256),
+        chunks=(32, 32),
+        dtype="int16",
+        zarr_format=3,
+        **kwargs,
     )
     # The parent uses the codec, which is what builds the pool the child inherits.
     array[:] = np.arange(256 * 256, dtype="int16").reshape(256, 256)
-    return array
+
+
+# `[:]` is whole chunks; the ragged one is not, and only it reaches the partial-decoder path,
+# which is a separate `install` site and the one that runs with the GIL still held.
+SELECTIONS = {"whole-chunks": np.s_[:], "ragged": np.s_[3:130, 7:200]}
 
 
 @pytest.mark.parametrize("shards", [False, True], ids=["chunks", "sharded"])
-def test_a_forked_child_can_read(tmp_path, shards: bool) -> None:
+@pytest.mark.parametrize("selection", SELECTIONS.values(), ids=SELECTIONS.keys())
+def test_a_forked_child_can_read(tmp_path, shards: bool, selection) -> None:
     path = str(tmp_path / "a.zarr")
     _seeded(path, shards=shards)
-    expected = np.asarray(zarr.open_array(path, mode="r")[:])
+    expected = np.asarray(zarr.open_array(path, mode="r")[selection])
 
     def read() -> None:
-        got = np.asarray(zarr.open_array(path, mode="r")[:])
+        got = np.asarray(zarr.open_array(path, mode="r")[selection])
         np.testing.assert_array_equal(got, expected)
 
     _run_in_child(read)
 
 
 def test_a_forked_child_can_write(tmp_path) -> None:
-    """The write path took a different route to the same pool, and so has its own case."""
+    """The write path reaches the pool by its own route, so it gets its own case."""
     path = str(tmp_path / "a.zarr")
     _seeded(path, shards=False)
 
     def write() -> None:
-        zarr.open_array(path, mode="r+")[:64, :64] = np.zeros((64, 64), dtype="int16")
+        # NOT the fill value. Writing zeros into a fill-value-0 array takes the empty-chunk
+        # branch, which erases rather than encodes -- and "it reads back as zeros" would then
+        # be satisfied by written, erased, and never-written alike.
+        zarr.open_array(path, mode="r+")[:64, :64] = np.full((64, 64), 7, dtype="int16")
 
     _run_in_child(write)
     np.testing.assert_array_equal(
         np.asarray(zarr.open_array(path, mode="r")[:64, :64]),
-        np.zeros((64, 64), dtype="int16"),
+        np.full((64, 64), 7, dtype="int16"),
     )

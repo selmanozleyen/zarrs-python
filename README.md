@@ -36,8 +36,12 @@ A `NotImplementedError` will be raised if a store is not supported.
 `ZarrsCodecPipeline` options are exposed through `zarr.config`.
 
 Standard `zarr.config` options control some functionality (see the defaults in the [config.py](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py) of `zarr-python`):
-- `threading.max_workers`: the maximum number of threads used internally by the `ZarrsCodecPipeline` on the Rust side.
-  - Defaults to the number of threads in the global `rayon` thread pool if set to `None`, which is [typically the number of logical CPUs](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
+- `threading.max_workers`: how many chunks the `ZarrsCodecPipeline` decodes or encodes at once.
+  - This is a concurrency budget, not a thread count. The number of threads is the size of the
+    pipeline's `rayon` pool, which is set by the `RAYON_NUM_THREADS` environment variable and
+    defaults to [the number of logical CPUs](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
+  - Defaults to that pool's size if set to `None`, so that the budget cannot exceed the threads
+    available to spend it.
 - `array.write_empty_chunks`: whether or not to store empty chunks.
   - Defaults to false if `None`. Note that checking for emptiness has some overhead, see [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#store-empty-chunks) for more info.
 
@@ -97,22 +101,33 @@ Chunk concurrency is typically favored because:
 
 **Prefer the `spawn` or `forkserver` start method.** POSIX gives the child of a `fork()` in a
 threaded process almost nothing it may safely do -- only async-signal-safe functions, until
-`exec()`. Python 3.12 warns about this, and Python 3.14 changed the POSIX default start method
-to `forkserver` for the same reason.
+`exec()`. Python 3.12 warns about this, and Python 3.14 changed the default on Linux from
+`fork` to `forkserver` for the same reason. (macOS has defaulted to `spawn` since 3.8.)
 
 ```python
-import multiprocessing as mp
+if __name__ == "__main__":
+    import multiprocessing as mp
 
-mp.set_start_method("forkserver")  # or "spawn"
+    mp.set_start_method("forkserver")  # or "spawn"
 ```
 
-`torch.utils.data.DataLoader(num_workers=...)` goes through `multiprocessing`, so it follows
-whichever start method is set.
+The guard matters: under `spawn` and `forkserver` the child re-imports the main module, and
+setting the method a second time raises. `torch.utils.data.DataLoader(num_workers=...)` goes
+through `multiprocessing`, so it follows whichever method is set.
 
-Under `fork`, this library keeps its rayon pool keyed on the process that built it and rebuilds
-it in a child, so a forked child that reads or writes does not deadlock on threads it did not
-inherit. That is a mitigation rather than a guarantee: a child that forked while any thread held
-a lock, the allocator's included, can still deadlock, and no library can fix that from inside.
+Under `fork`, this library keeps its `rayon` pool keyed on the process that built it and
+rebuilds it in a child, so a child forked from a QUIESCENT parent can read and write a local
+array without deadlocking on threads it did not inherit. Three things that does not cover:
+
+- **Forking while a read is in flight.** The filesystem store takes a lock per key, and a child
+  that inherits it held by a worker that no longer exists will block on its first read.
+- **Remote stores.** An `ObjectStore`- or HTTP-backed array also goes through a `tokio` runtime
+  and an HTTP connection pool, neither of which is rebuilt here.
+- **Locks that are not ours**, the allocator's included, which no library can release from
+  inside a child.
+
+Which is the short way of saying the mitigation buys you the common case, and `spawn` or
+`forkserver` buys you the guarantee.
 
 ## Supported Indexing Methods
 
