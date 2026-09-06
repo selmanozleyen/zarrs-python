@@ -434,8 +434,9 @@ impl CodecPipelineImpl {
         strict: bool,
     ) -> PyResult<()> {
         // Every width is a per-call decision, so none of them is a constructor argument.
-        let config = read_decode::ReadConfig::from_call(read_workers, decode_workers, strict);
-        // The one width still not servable is one above `pool_max`, since the pools cannot grow.
+        let config = read_decode::ReadConfig::from_call(py, read_workers, decode_workers, strict)?;
+        // The one width still not servable is one above what the pools were built with, since a
+        // rayon pool cannot grow.
         read_decode::check_workers_arrived(py, config)?;
         self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, config)
     }
