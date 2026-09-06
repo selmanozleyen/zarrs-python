@@ -30,6 +30,7 @@ use zarrs::storage::{ReadableStorage, ReadableWritableListableStorage, StorageHa
 
 mod chunk_item;
 mod concurrency;
+mod per_process;
 mod pool;
 mod runtime;
 mod store;
