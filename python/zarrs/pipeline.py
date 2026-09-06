@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, TypedDict
 from warnings import warn
 
@@ -29,7 +30,8 @@ from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
     UnsupportedVIndexingError,
-    chunk_info,
+    chunk_info_for_read,
+    chunk_info_for_write,
 )
 
 
@@ -41,8 +43,8 @@ class UnsupportedMetadataError(Exception):
     pass
 
 
-#: What sends a batch to zarr-python instead. `read` and `write` must use the same set:
-#: a member in one and not the other falls back on read and raises on write.
+# : What sends a batch to zarr-python instead. `read` and `write` must use the same set:
+# : a member in one and not the other falls back on read and raises on write.
 FALLBACK_TO_ZARR_PYTHON = (
     UnsupportedMetadataError,
     DiscontiguousArrayError,
@@ -147,6 +149,20 @@ class ZarrsCodecPipeline(CodecPipeline):
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
 
+    @cached_property
+    def _inner_chunk_shape(self) -> tuple[int, ...] | None:
+        """The innermost unit the codec chain decodes, as Rust reports it.
+
+        A tuple is the inner chunk of a sharded array; `()` means the array is not sharded, so
+        its chunk is its own decode unit; `None` means refuse. Asked rather than derived: this
+        used to walk zarr's codec objects while Rust answered the same question from the bound
+        chain, and two derivations of one fact can disagree.
+        """
+        if self.impl is None:
+            return None
+        shape = self.impl.inner_chunk_shape()
+        return None if shape is None else tuple(shape)
+
     @property
     def supports_partial_decode(self) -> bool:
         return False
@@ -193,7 +209,9 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = chunk_info(batch_info, drop_axes, out.shape)
+            chunks_desc = chunk_info_for_read(
+                batch_info, drop_axes, out.shape, self._inner_chunk_shape
+            )
         except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
@@ -201,10 +219,24 @@ class ZarrsCodecPipeline(CodecPipeline):
             return None
         else:
             out: NDArrayLike = out.as_ndarray_like()
+            desc = chunks_desc.chunk_info_with_indices
+            # One entry point. `chunk_info_for_read` either produces a handle or raises, and the
+            # raise is caught above as a fall back to zarr-python: there is no second Rust read
+            # path to choose between any more.
+            retrieve = self.impl.retrieve_chunk_items_and_apply_index
+            # Per call because it IS a per-call decision: a threshold on how many byte-range
+            # reads one chunk is worth, not a size that something was built at. The two pool
+            # ceilings are not here -- they were read when the array was opened.
+            # PER CALL, all of it. The widths are a mask on pools built once, so nothing
+            # has to be fixed when the array is opened -- which means a `zarr.config.set`
+            # block around a read is honoured, rather than silently too late.
             await asyncio.to_thread(
-                self.impl.retrieve_chunks_and_apply_index,
-                chunks_desc.chunk_info_with_indices,
+                retrieve,
+                desc,
                 out,
+                config.get("codec_pipeline.read_workers", None),
+                config.get("codec_pipeline.decode_workers", None),
+                config.get("codec_pipeline.strict", False),
             )
             return None
 
@@ -220,7 +252,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = chunk_info(batch_info, drop_axes, value.shape)
+            chunks_desc = chunk_info_for_write(batch_info, drop_axes, value.shape)
         except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
