@@ -225,6 +225,7 @@ class ZarrsCodecPipeline(CodecPipeline):
                 out,
                 config.get("codec_pipeline.io_workers", None),
                 config.get("codec_pipeline.codec_workers", None),
+                config.get("codec_pipeline.raw_max_reads_per_chunk", None),
                 config.get("codec_pipeline.strict", False),
             )
             return None
