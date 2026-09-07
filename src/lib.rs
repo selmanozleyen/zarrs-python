@@ -59,10 +59,9 @@ pub(crate) struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
-    /// The process a REMOTE store was opened in -- `None` for a local one. A remote store
-    /// holds an HTTP connection pool, and the sockets in it belong to the process that
-    /// dialled them; a `fork()` child that reuses one waits for a reply that is delivered
-    /// to its parent. A filesystem store has no such state and is not tracked.
+    /// The process a remote store was opened in, `None` for a local one. A remote store holds
+    /// an HTTP connection pool whose sockets belong to the process that dialled them, so a
+    /// forked child reusing one waits for a reply delivered to its parent.
     pub(crate) remote_opened_in: Option<u32>,
 }
 

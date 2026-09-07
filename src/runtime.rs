@@ -9,19 +9,19 @@ use crate::per_process::PerProcess;
 
 /// The process-wide tokio runtime, rebuilt in a forked child.
 ///
-/// Only object-store and HTTP arrays reach tokio -- a filesystem store is synchronous -- so this
-/// is the remote half of surviving a `fork()`; the rayon half is [`crate::pool`]. A child
-/// inherits a runtime whose worker and driver threads do not exist, and a `block_on` on it waits
-/// for a readiness nothing will signal.
+/// Only object-store and HTTP arrays reach tokio, a filesystem store being synchronous, so this
+/// is the remote half of surviving a `fork()` and [`crate::pool`] is the rayon half. A child
+/// inherits a runtime whose threads do not exist, and a `block_on` on it waits for a readiness
+/// nothing will signal.
 ///
-/// THIS DOES NOT MAKE A FORKED REMOTE READ WORK. A store built before the fork carries an HTTP
-/// connection pool too, and a pooled socket belongs to the process that dialled it: the child
-/// writes a request and the reply is delivered to the parent. Measured: a child reading an array
-/// the parent had already read hangs for the full deadline with this in place. A store the child
-/// opens ITSELF is the case this buys; an inherited one is refused by name in `lib.rs`.
+/// This does not make a forked remote read work. A store built before the fork carries an HTTP
+/// connection pool, and a pooled socket belongs to the process that dialled it, so the child
+/// writes a request and the reply goes to the parent. Measured: a child reading an array the
+/// parent had already read hangs for the full deadline even with this. What it buys is a store
+/// the child opens itself; an inherited one is refused by name in `lib.rs`.
 static RUNTIME: PerProcess<Runtime> = PerProcess::new();
 
-/// Resolves the runtime PER CALL rather than capturing a handle.
+/// Resolves the runtime per call rather than capturing a handle.
 ///
 /// `AsyncToSyncStorageAdapter` stores this by value and a store is built once, so a captured
 /// handle would outlive a fork and the pid check would never run again. Holding nothing is what
