@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// A value built once per process, and built again in a forked child.
 ///
 /// `fork()` copies memory but only the calling thread, so anything owning threads reaches a child
-/// as a description of workers that do not exist. A `OnceLock` cannot express the rebuild: it has
-/// no reset reachable from a `static`. CALL WITH THE GIL HELD -- a lock held at the instant
-/// another thread forks is inherited locked, owned by a thread the child does not have.
+/// as workers that do not exist, and a `OnceLock` has no reset to express the rebuild. Call this
+/// with the GIL held: a lock held when another thread forks is inherited locked by a thread the
+/// child does not have.
 pub(crate) struct PerProcess<T> {
     slot: Mutex<Option<(u32, Arc<T>)>>,
 }
@@ -37,8 +37,8 @@ impl<T> PerProcess<T> {
         if guard.as_ref().is_none_or(|(built, _)| *built != pid) {
             // Built before the stale one is taken, so a failed build keeps what was already there.
             let fresh = Arc::new(build()?);
-            // FORGOTTEN, not dropped: a child does not own this, and dropping joins or waits on
-            // threads that were never created.
+            // Forgotten, not dropped: a child does not own this, and dropping joins or waits
+            // on threads that were never created.
             if let Some(stale) = guard.take() {
                 std::mem::forget(stale);
             }

@@ -264,17 +264,15 @@ impl CodecPipelineImpl {
             Arc::new(CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?);
         let codec_options = CodecOptions::default().with_validate_checksums(validate_checksums);
 
-        // `unwrap_or_ELSE`: `global_config()` forces a `LazyLock` whose `Default` reads
-        // `rayon::current_num_threads()`, so the eager form did that work even when the caller
-        // had already said what it wanted.
+        // Lazily: `global_config()` forces a `LazyLock` whose `Default` reads
+        // `rayon::current_num_threads()`, which the eager form did even when the caller had
+        // already said what it wanted.
         let chunk_concurrent_minimum =
             chunk_concurrent_minimum.unwrap_or_else(|| global_config().chunk_concurrent_minimum());
-        // BOTH DEFAULT TO THE POOL'S OWN WIDTH, which is what `main` did -- there the default
-        // was `rayon::current_num_threads()`, the width of the global pool the work ran on.
-        // These are budgets handed to `calc_concurrency_outer_inner`, so reading them off
-        // anything but the pool that will run the work lets a `RAYON_NUM_THREADS=4` process
-        // schedule a machine's worth of concurrent decodes onto four threads, each holding a
-        // decode buffer.
+        // Both default to the pool's own width, as they did on main against the global pool.
+        // They are budgets for `calc_concurrency_outer_inner`, so reading them off anything but
+        // the pool that runs the work would let a narrow process schedule a machine's worth of
+        // concurrent decodes onto few threads, each holding a buffer.
         let width = pool::pool(py)?.current_num_threads();
         let chunk_concurrent_maximum = chunk_concurrent_maximum.unwrap_or(width);
         let num_threads = num_threads.unwrap_or(width);
