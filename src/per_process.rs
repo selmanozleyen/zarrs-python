@@ -5,9 +5,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// A value built once per process, and built again in a forked child.
 ///
 /// `fork()` copies memory but only the calling thread, so anything owning threads reaches a child
-/// as workers that do not exist, and a `OnceLock` has no reset to express the rebuild. Call this
-/// with the GIL held: a lock held when another thread forks is inherited locked by a thread the
-/// child does not have.
+/// as workers that do not exist; a `OnceLock` has no reset to express the rebuild. CALL WITH THE
+/// GIL HELD -- a lock held when another thread forks is inherited locked by a vanished thread.
 pub(crate) struct PerProcess<T> {
     slot: Mutex<Option<(u32, Arc<T>)>>,
 }
@@ -37,8 +36,8 @@ impl<T> PerProcess<T> {
         if guard.as_ref().is_none_or(|(built, _)| *built != pid) {
             // Built before the stale one is taken, so a failed build keeps what was already there.
             let fresh = Arc::new(build()?);
-            // Forgotten, not dropped: a child does not own this, and dropping joins or waits
-            // on threads that were never created.
+            // FORGOTTEN, not dropped: a child does not own this, and dropping joins or waits on
+            // threads that were never created.
             if let Some(stale) = guard.take() {
                 std::mem::forget(stale);
             }
@@ -46,6 +45,20 @@ impl<T> PerProcess<T> {
         }
         let (_, value) = guard.as_ref().expect("just built");
         Ok(value.clone())
+    }
+
+    /// What this process already has, or `None` if it has not built it yet.
+    ///
+    /// Reporting only: it must not build, because the thing it reports on is whether building
+    /// has happened. A value belonging to another process reads as `None`, which is what it is
+    /// from here.
+    pub(crate) fn peek(&self) -> Option<Arc<T>> {
+        let guard = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let pid = std::process::id();
+        guard
+            .as_ref()
+            .filter(|(built, _)| *built == pid)
+            .map(|(_, value)| value.clone())
     }
 }
 
