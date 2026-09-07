@@ -93,6 +93,17 @@ Chunk concurrency is typically favored because:
 
 `zarrs-python` will often favor codec concurrency with sharded arrays, as they are well suited to codec concurrency.
 
+## Multiprocessing
+
+Prefer the `spawn` or `forkserver` start method. `fork()` in a threaded process is unsafe by
+POSIX, which is why Python 3.14 changed the default on Linux to `forkserver`.
+`torch.utils.data.DataLoader(num_workers=...)` follows whichever method is set.
+
+Under `fork`, this library keys its `rayon` pool on the process that built it and rebuilds it in
+a child, so a forked child can read and write a local array rather than deadlocking on threads it
+did not inherit. That is a mitigation, not a guarantee: it does not cover forking while a read is
+in flight, remote stores, or locks that are not ours.
+
 ## Supported Indexing Methods
 
 The following methods will trigger use with the old zarr-python pipeline:
