@@ -31,6 +31,7 @@ use zarrs::storage::{ReadableStorage, ReadableWritableListableStorage, StorageHa
 mod chunk_item;
 mod concurrency;
 mod fork;
+mod pool;
 mod runtime;
 mod store;
 #[cfg(test)]
@@ -38,7 +39,7 @@ mod tests;
 mod utils;
 
 use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
-use crate::store::StoreConfig;
+use crate::store::{StoreConfig, StoreKind};
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
@@ -58,6 +59,7 @@ pub(crate) struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
+    pub(crate) tokio_era: Option<u64>,
 }
 
 impl CodecPipelineImpl {
@@ -249,7 +251,6 @@ impl CodecPipelineImpl {
         direct_io: bool,
         file_handle_cache_size: usize,
     ) -> PyResult<Self> {
-        fork::check()?;
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
         let metadata = serde_json::from_str(array_metadata).map_py_err::<PyTypeError>()?;
@@ -269,8 +270,13 @@ impl CodecPipelineImpl {
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
+        let async_store = !matches!(store_config.kind, StoreKind::Filesystem(_));
+        if let Some(era) = async_store.then(runtime::era).flatten() {
+            fork::check_era(era)?;
+        }
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
+        let tokio_era = async_store.then(runtime::era).flatten();
         let writable_store = (!store_config.read_only).then(|| store.clone());
         let readable_store: ReadableStorage = store.readable();
 
@@ -300,6 +306,7 @@ impl CodecPipelineImpl {
             fill_value,
             data_type,
             writable_store,
+            tokio_era,
         })
     }
 
@@ -309,7 +316,10 @@ impl CodecPipelineImpl {
         chunk_descriptions: Vec<chunk_item::ChunkItem>, // FIXME: Ref / iterable?
         value: &Bound<'_, PyUntypedArray>,
     ) -> PyResult<()> {
-        fork::check()?;
+        if let Some(era) = self.tokio_era {
+            fork::check_era(era)?;
+        }
+        let pool = pool::pool(py)?;
 
         // Get input array
         let output = Self::nparray_to_unsafe_cell_slice(value)?;
@@ -330,7 +340,7 @@ impl CodecPipelineImpl {
         let mut partial_decoder_cache: HashMap<StoreKey, Arc<dyn ArrayPartialDecoderTraits>> =
             HashMap::new();
         if !partial_chunk_items.is_empty() {
-            let key_decoder_pairs =
+            let key_decoder_pairs = pool.install(|| {
                 iter_concurrent_limit!(chunk_concurrent_limit, partial_chunk_items, map, |item| {
                     let storage_handle = Arc::new(StorageHandle::new(self.readable_store.clone()));
                     let input_handle = StoragePartialDecoder::new(storage_handle, item.key.clone());
@@ -347,7 +357,8 @@ impl CodecPipelineImpl {
                         .map_codec_err()?;
                     Ok((item.key.clone(), partial_decoder))
                 })
-                .collect::<PyResult<Vec<_>>>()?;
+                .collect::<PyResult<Vec<_>>>()
+            })?;
             partial_decoder_cache.extend(key_decoder_pairs);
         }
 
@@ -405,12 +416,14 @@ impl CodecPipelineImpl {
                 .map_codec_err()
             };
 
-            iter_concurrent_limit!(
-                chunk_concurrent_limit,
-                chunk_descriptions,
-                try_for_each,
-                update_chunk_subset
-            )?;
+            pool.install(|| {
+                iter_concurrent_limit!(
+                    chunk_concurrent_limit,
+                    chunk_descriptions,
+                    try_for_each,
+                    update_chunk_subset
+                )
+            })?;
 
             Ok(())
         })
@@ -423,7 +436,10 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         write_empty_chunks: bool,
     ) -> PyResult<()> {
-        fork::check()?;
+        if let Some(era) = self.tokio_era {
+            fork::check_era(era)?;
+        }
+        let pool = pool::pool(py)?;
 
         // Fail before decoding anything; the write site checks again by construction.
         self.writable()?;
@@ -484,12 +500,14 @@ impl CodecPipelineImpl {
                 }
             };
 
-            iter_concurrent_limit!(
-                chunk_concurrent_limit,
-                chunk_descriptions,
-                try_for_each,
-                store_chunk
-            )?;
+            pool.install(|| {
+                iter_concurrent_limit!(
+                    chunk_concurrent_limit,
+                    chunk_descriptions,
+                    try_for_each,
+                    store_chunk
+                )
+            })?;
 
             Ok(())
         })

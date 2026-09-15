@@ -2,7 +2,9 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 use zarrs::storage::storage_adapter::async_to_sync::AsyncToSyncBlockOn;
 
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+use crate::fork;
+
+static RUNTIME: OnceLock<(u64, Runtime)> = OnceLock::new();
 
 pub struct TokioBlockOn(tokio::runtime::Handle);
 
@@ -12,7 +14,16 @@ impl AsyncToSyncBlockOn for TokioBlockOn {
     }
 }
 
+pub(crate) fn era() -> Option<u64> {
+    RUNTIME.get().map(|(era, _)| *era)
+}
+
 pub fn tokio_block_on() -> TokioBlockOn {
-    let runtime = RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime"));
+    let (_, runtime) = RUNTIME.get_or_init(|| {
+        (
+            fork::generation(),
+            Runtime::new().expect("Failed to create Tokio runtime"),
+        )
+    });
     TokioBlockOn(runtime.handle().clone())
 }

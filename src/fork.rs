@@ -5,7 +5,6 @@ use pyo3::PyResult;
 use pyo3::exceptions::PyRuntimeError;
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-static ARMED: AtomicU64 = AtomicU64::new(u64::MAX);
 
 #[cfg(unix)]
 extern "C" fn note_fork() {
@@ -23,15 +22,14 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
-pub(crate) fn check() -> PyResult<()> {
-    let now = generation();
-    match ARMED.compare_exchange(u64::MAX, now, Ordering::Relaxed, Ordering::Relaxed) {
-        Ok(_) => Ok(()),
-        Err(armed) if armed == now => Ok(()),
-        Err(_) => Err(PyRuntimeError::new_err(
-            "zarrs was used in this process before it was forked, and neither its rayon thread \
-             pool nor its tokio runtime survives a fork. Start worker processes with the \
-             'spawn' or 'forkserver' method instead.",
-        )),
+pub(crate) fn check_era(era: u64) -> PyResult<()> {
+    if era == generation() {
+        Ok(())
+    } else {
+        Err(PyRuntimeError::new_err(
+            "this store's tokio runtime was created before the process forked and does not \
+             survive a fork. Start worker processes with the 'spawn' or 'forkserver' method \
+             instead.",
+        ))
     }
 }
