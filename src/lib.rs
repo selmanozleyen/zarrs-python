@@ -30,6 +30,7 @@ use zarrs::storage::{ReadableStorage, ReadableWritableListableStorage, StorageHa
 
 mod chunk_item;
 mod concurrency;
+mod fork;
 mod runtime;
 mod store;
 #[cfg(test)]
@@ -248,6 +249,7 @@ impl CodecPipelineImpl {
         direct_io: bool,
         file_handle_cache_size: usize,
     ) -> PyResult<Self> {
+        fork::check()?;
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
         let metadata = serde_json::from_str(array_metadata).map_py_err::<PyTypeError>()?;
@@ -307,6 +309,8 @@ impl CodecPipelineImpl {
         chunk_descriptions: Vec<chunk_item::ChunkItem>, // FIXME: Ref / iterable?
         value: &Bound<'_, PyUntypedArray>,
     ) -> PyResult<()> {
+        fork::check()?;
+
         // Get input array
         let output = Self::nparray_to_unsafe_cell_slice(value)?;
 
@@ -419,6 +423,8 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         write_empty_chunks: bool,
     ) -> PyResult<()> {
+        fork::check()?;
+
         // Fail before decoding anything; the write site checks again by construction.
         self.writable()?;
 
