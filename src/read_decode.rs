@@ -469,31 +469,24 @@ fn carve<'a>(
 
 /// Jobs that took the RAW path, and jobs that read a whole chunk, since the run began.
 ///
-/// The project rule -- a knob that was set is not a knob that arrived -- applied to a code
-/// path. A gate that silently refuses everything is indistinguishable from a gate that is
-/// working: values stay correct either way and only the throughput differs, which reads as
-/// "the raw path did not pay" rather than "the raw path was never taken". Both failures have
-/// already happened here once.
+/// A gate that silently refuses everything looks like one that works: values are correct
+/// either way and only throughput differs. Both failures have happened here.
 pub(crate) static RAW_JOBS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CHUNK_JOBS: AtomicU64 = AtomicU64::new(0);
 
 /// How many READS this chunk's rows become once consecutive ones are merged.
 ///
-/// The count that matters is runs, not rows: 64 consecutive rows are ONE read, and 64
-/// scattered ones are 64. See [`coord_runs`] for what counts as consecutive; this is the gate, and
-/// `raw_row_jobs` emits exactly the runs it counts here -- from the same walk, so the gate
-/// cannot come to disagree with what it admits.
+/// Runs, not rows: 64 consecutive rows are one read, 64 scattered ones are 64. `raw_row_jobs`
+/// emits exactly the runs counted here, from the same walk, so the two cannot disagree.
 pub(crate) fn raw_runs(coords: &[u64], run_len: u64) -> usize {
     coord_runs(coords, run_len).count()
 }
 
 /// Default for `codec_pipeline.raw_max_reads_per_chunk`.
 ///
-/// The raw path reads a row's exact bytes instead of the chunk around it, which trades BYTES
-/// for REQUESTS -- and requests are the scarce resource, since a row costs nearly what the
-/// chunk holding it costs to fetch. Hence a PER-ITEM gate: take it only where a chunk's wanted
-/// rows collapse to a handful of reads. Two is measured; zero disables the path and costs ~75%
-/// on an uncompressed scattered draw. See README and `notes/deferred-wins.md`.
+/// Trades bytes for requests, and requests are the scarce resource, so the gate is per item:
+/// take it only where a chunk's wanted rows collapse to a handful of reads. Two is measured;
+/// zero disables the path and costs ~75% on an uncompressed scattered draw.
 const RAW_MAX_READS: usize = 2;
 
 /// One job per RUN of consecutive rows, each reading exactly its own bytes, for a chunk that
@@ -872,14 +865,9 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         return Err(format!("{} vanished between index and read", job.key));
     };
 
-    // A raw job's read WAS the answer: its range is the row, not the chunk. No decode, no
-    // scratch, no gather -- but not copy-free either, since `get_partial` hands back an owned
-    // buffer and these bytes still have to be moved into the output.
-    //
-    // `out` is a Vec since the band split, so a raw job's bytes are laid across its pieces in
-    // order. `raw_row_jobs` only ever builds ONE piece per job -- a raw job is one run of one
-    // row -- but walking the pieces costs nothing and means this cannot silently write only
-    // the first if that ever stops being true.
+    // A raw job's read was the answer: its range is the row, not the chunk. Not copy-free,
+    // since `get_partial` returns an owned buffer. `raw_row_jobs` builds one piece per job,
+    // but walking them costs nothing and cannot silently write only the first.
     if job.raw {
         let want: usize = job.out.iter().map(|p| p.len()).sum();
         if bytes.len() != want {
