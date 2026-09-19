@@ -26,13 +26,11 @@ pub(crate) struct ShardInfo {
     /// Outermost first. Exactly one entry for a singly sharded array, which is the case the
     /// hot path is tuned for: one iteration, one index, one cache lookup.
     levels: Vec<Level>,
-    /// The innermost chunk shape — the unit the codec chain decodes, and what a job sizes
-    /// its scratch buffer by. `None` when the array is not sharded: the decode unit is then
-    /// the chunk itself, which only an item knows, so a job carries it instead.
+    /// The innermost chunk shape, what a job sizes its scratch by. `None` when not sharded:
+    /// the decode unit is the chunk, which only an item knows.
     pub subchunk_shape: Option<ChunkShape>,
-    /// The codecs that decode an innermost chunk, bound to the array's data type and fill
-    /// value. This is the only chain that legitimately holds other codecs (blosc and so on);
-    /// every chain above it must be exclusively sharded.
+    /// The codecs that decode an innermost chunk, bound to the data type and fill value. The
+    /// only chain that may hold other codecs; every chain above it must be exclusively sharded.
     pub inner_chain: Arc<CodecChainBound>,
 }
 
@@ -40,8 +38,7 @@ impl ShardInfo {
     /// Read off the array's bound codec chain, or `None` if this array is sharded in a way this
     /// path refuses.
     ///
-    /// A non-sharded array is accepted, with no levels: its chunk is its own decode unit, the
-    /// store value is the whole chunk, and `locate` has nothing to descend.
+    /// A non-sharded array is accepted with no levels: its chunk is its own decode unit.
     pub fn from_codec_chain(chain: &Arc<CodecChainBound>) -> Option<Self> {
         let mut levels: Vec<Level> = Vec::new();
         let mut current = chain.clone();

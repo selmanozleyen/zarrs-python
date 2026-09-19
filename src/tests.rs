@@ -154,10 +154,8 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
 
 /// Two entries may not claim the same output bytes.
 ///
-/// `push_entry` is `#[pymethods]` with a caller-chosen `out_start`, and the read path writes
-/// items concurrently through views whose safety contract is that their subsets are disjoint.
-/// Overlap there is a data race, so it has to be refused where the entries are accumulated;
-/// nothing downstream sees both.
+/// `out_start` is caller-chosen and the read path writes items concurrently through views
+/// that must be disjoint, so overlap is refused where the entries are accumulated.
 #[test]
 fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
@@ -178,11 +176,8 @@ fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
             vec![],
         )?;
 
-        // `a` produced two items covering output 0..2, so an entry starting at 1 gives two items
-        // the same byte. `push_entry` does not refuse that: no check here can judge a banded entry,
-        // whose two bands share an axis-0 start and overlap nothing. The read refuses it instead,
-        // through `DisjointBytes`'s forward-only cursor; see
-        // `read_decode::tests::bytes_are_vended_once_and_forwards`.
+        // `push_entry` cannot judge this: a banded entry's two bands share an axis-0 start and
+        // overlap nothing. `DisjointBytes`'s forward-only cursor refuses it in the read.
         handle.push_entry(
             "c/1",
             vec![95],
@@ -265,9 +260,8 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
     })
 }
 
-/// A trailing selection that is strided within one index is refused, not silently trusted:
-/// `gather` copies one contiguous run per coordinate, so a strided box would be filled with
-/// whatever happened to sit consecutively after its start.
+/// A trailing selection strided within one index is refused: `gather` copies one contiguous
+/// run per coordinate, so a strided box would take whatever sat after its start.
 #[test]
 fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
@@ -378,10 +372,8 @@ fn test_gather_copies_a_run_per_coordinate() {
     assert!(crate::utils::gather(&scratch, &[0], 0, &mut out, 2).is_err());
 }
 
-/// `push_points` is `#[pymethods]`, so its arguments are whatever Python passed. Two things it must
-/// refuse rather than trust: a point whose offset leaves its own index's elements (`gather` only
-/// knows the whole decoded buffer, so that would return the next index's element under this point's
-/// name) and an offset array of the wrong length.
+/// Arguments are whatever Python passed. Two must be refused: a point whose offset leaves its
+/// own index's elements, and an offset array of the wrong length.
 #[test]
 fn test_push_points_refuses_offsets_that_leave_their_row() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
@@ -439,9 +431,8 @@ fn test_push_points_refuses_offsets_that_leave_their_row() -> PyResult<()> {
     })
 }
 
-/// `push_grid` is `#[pymethods]` too. A column past the row it belongs to would have
-/// `gather_runs` read the next row's element under this column's name, so it is refused
-/// here rather than trusted from the gate.
+/// A column past its own row would have `gather_runs` read the next row's element under this
+/// column's name, so it is refused here rather than trusted from the gate.
 #[test]
 fn test_push_grid_refuses_runs_outside_the_row() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};

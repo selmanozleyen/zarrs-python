@@ -41,14 +41,11 @@ pub(crate) struct ChunkItem {
     /// Indices within `chunk_subset`, when this item is a whole inner chunk plus the
     /// elements wanted from it. The chunk is decoded once and these are gathered out.
     pub coords: Option<Arc<[u64]>>,
-    /// How many consecutive elements each coordinate stands for: 1 on the 1-D path, and the
-    /// row's length where a rank-N selection takes its trailing axes whole, so `gather` moves a
-    /// row per coordinate instead of an element.
+    /// How many consecutive elements each coordinate stands for: 1 on the 1-D path, the row's
+    /// length where a rank-N selection takes its trailing axes whole.
     pub run_len: u64,
-    /// Where each run starts inside a coordinate's own elements, and how long a run is, when
-    /// the wanted elements are not one consecutive span: `oindex[rows, cols]` takes the same
-    /// sub-box out of every selected row, so one shared description serves the whole item.
-    /// `None` means a single contiguous run, which is every other case.
+    /// Where each run starts inside a coordinate's own elements and how long it is, when the
+    /// wanted elements are not one span. `None` means a single contiguous run.
     pub grid: Option<(Arc<[u64]>, u64)>,
 }
 
@@ -135,9 +132,8 @@ pub(crate) enum Offsets<'a> {
     /// Per-axis starts of a sub-box shared by every index: `X[rows, 8:24]`. The offset is
     /// derived from these by `trailing_layout`, which is also what checks the box is one run.
     Uniform(&'a [u64]),
-    /// One per index: a point selection, `X[rows, cols]`, where each point names its own element.
-    /// The run is then a single element and the output is flat, so the grouping by inner chunk is
-    /// the whole win: the ordinary route costs a partial-decode call per point.
+    /// One per index: a point selection, `X[rows, cols]`. The run is a single element and the
+    /// output flat, so grouping by inner chunk is the whole win.
     PerIndex(&'a [u64]),
     /// The same sub-box taken out of every index: `oindex[rows, cols]`, and any rank-N grid.
     Grid { starts: &'a [u64], run: u64 },
@@ -155,10 +151,8 @@ impl Offsets<'_> {
 
 /// `(row_stride, run_len, elem_offset)` for a selection whose trailing axes may be partial.
 ///
-/// Derived from the per-axis starts rather than accepted as one fused number, because a fused
-/// offset cannot be checked: given only `offset + run_len <= row_stride`, a rank-3 box of
-/// 2-of-4 rows by 5-of-10 columns passes and `gather` copies 10 consecutive elements read back
-/// as a 2x5 tile. With the starts, both the shape and the wrap are checkable.
+/// From the per-axis starts, not one fused number: a fused offset passes
+/// `offset + run_len <= row_stride` for a box whose rows wrap, and gathers a wrong tile.
 fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u64, u64, u64)> {
     if inner.is_empty() || inner.len() != shape.len() {
         return Err(PyErr::new::<PyValueError, _>(format!(
@@ -186,10 +180,8 @@ fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u6
             )));
         }
     }
-    // Row-major, a sub-box is one run exactly when every axis before the last partial one takes a
-    // single element. `ContiguousIndices` walks the axes in reverse absorbing whole ones, so
-    // `len() == 1` is that condition and `contiguous_elements()` is the run it absorbed. Asked
-    // rather than restated, so the rule has one definition.
+    // Asked rather than restated: `ContiguousIndices` absorbs whole axes in reverse, so
+    // `len() == 1` is "one run" and `contiguous_elements()` is what it absorbed.
     let box_ = ArraySubset::new_with_start_shape(starts.to_vec(), widths.to_vec())
         .map_py_err::<PyValueError>()?;
     let runs = box_
@@ -214,9 +206,8 @@ fn trailing_layout(inner: &[u64], shape: &[u64], starts: &[u64]) -> PyResult<(u6
             "a start of {starts:?} is outside the {extents:?} one index holds"
         ))
     })?;
-    // The per-axis checks above already imply this. Kept because `gather` only knows the
-    // whole decoded buffer's length, so a run walking into the next index's elements would
-    // return them under this index's name rather than fail a bounds check.
+    // Implied above, kept because `gather` sees only the buffer length: a run walking into the
+    // next index's elements returns them under this index's name.
     if elem_offset
         .checked_add(run_len)
         .is_none_or(|end| end > row_stride)
@@ -240,9 +231,8 @@ fn trailing_zeros(out_start: u64, rank: usize) -> Vec<u64> {
 
 /// Build one item per inner chunk for a whole entry.
 ///
-/// `indices` selects along axis 0 and must be non-negative and non-decreasing. Both are
-/// rechecked here: a negative index becomes a wild chunk id, and `inner == 0` divides by
-/// zero.
+/// `indices` selects along axis 0, non-negative and non-decreasing, rechecked here: a negative
+/// index becomes a wild chunk id.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn build_chunk_unit_items(
@@ -250,24 +240,19 @@ pub(crate) fn build_chunk_unit_items(
     chunk_shape: Vec<u64>,
     shape: Vec<u64>,
     indices: PyReadonlyArray1<'_, i64>,
-    // Where this entry's output begins on every axis. Axis 0 is the split; the rest place the
-    // entry's band within the output. They were implicitly zero, which is only right when an entry
-    // spans the whole trailing extent, false as soon as the shard grid divides it.
+    // Where this entry's output begins on every axis. Zero is right only while an entry spans
+    // the whole trailing extent.
     out_starts: &[u64],
-    // The item's own extent on the trailing axes. Separate from `shape`, which stays the full
-    // output shape and gives the row stride an output offset is computed against: the two agree
-    // only while an entry spans the whole trailing extent.
+    // The item's own trailing extent, separate from `shape`, which stays the full output shape
+    // and gives the row stride.
     out_widths: &[u64],
-    // The inner chunk: the unit of compression, therefore of decoding, therefore the buffer every
-    // coordinate below addresses. One extent per axis, not just the split: a shard may hold several
-    // inner chunks on a trailing axis, and then the shard's extent is not the row stride of
-    // anything that ever gets decoded.
+    // The inner chunk: the unit of decoding, so the buffer every coordinate addresses. One
+    // extent per axis, since a shard may hold several inner chunks on a trailing axis.
     inner: &[u64],
     offsets: Offsets<'_>,
 ) -> PyResult<Vec<ChunkItem>> {
-    // Arity first, and rank at least one, because everything below indexes: `inner_nz[0]` for
-    // the split extent and `out_widths[1..]` for the bands. `push_entry` is a pymethod taking
-    // arbitrary vectors, so a short one has to be an error rather than a panic across the FFI.
+    // Arity first: everything below indexes, and `push_entry` takes arbitrary vectors, so a
+    // short one must be an error rather than a panic across the FFI.
     if chunk_shape.is_empty() || inner.len() != chunk_shape.len() {
         return Err(PyErr::new::<PyValueError, _>(format!(
             "one inner extent per axis is needed, on a chunk of rank at least one: {} \
@@ -290,10 +275,8 @@ pub(crate) fn build_chunk_unit_items(
             "an inner chunk {inner:?} cannot be larger than the shard {chunk_shape:?} it divides"
         )));
     }
-    // Rejects a zero extent on any axis. Checked in place rather than through
-    // `to_nonzero_u64_vec`: that allocates a Vec, and
-    // `inner.to_vec()` allocates another, both per entry. A scattered batch pushes thousands
-    // of entries per call, and the only thing wanted out of them is `inner[0]`.
+    // Rejects a zero extent on any axis, in place rather than through `to_nonzero_u64_vec`:
+    // that allocates per entry, and a scattered batch pushes thousands.
     if let Some(axis) = inner.iter().position(|e| *e == 0) {
         return Err(PyErr::new::<PyValueError, _>(format!(
             "the inner chunk has extent zero on axis {axis}: {inner:?}"
@@ -309,9 +292,8 @@ pub(crate) fn build_chunk_unit_items(
         return Ok(Vec::new());
     }
     let (row_stride, run_len, uniform_offset) = match offsets {
-        // The band's position inside its own inner chunk. `trailing_layout` then refuses any band
-        // that leaves it, the same check that already refuses a run walking off its sub-row, reused
-        // rather than re-invented.
+        // The band's position inside its own inner chunk; `trailing_layout` refuses one that
+        // leaves it.
         Offsets::Uniform(starts) => {
             let within: Vec<u64> = starts
                 .iter()
@@ -320,13 +302,11 @@ pub(crate) fn build_chunk_unit_items(
                 .collect();
             trailing_layout(inner, out_widths, &within)?
         }
-        // A point names one element, so the run is one element and the output is flat. The trailing
-        // extents are not a shared sub-box here (each point carries its own offset) so only the
-        // stride comes from the chunk.
+        // A point names one element, so the run is one and the output flat. Each point carries
+        // its own offset, so only the stride comes from the chunk.
         Offsets::PerIndex(_) => (inner[1..].iter().product::<u64>(), 1, 0),
-        // A grid takes the same `cols` from every row, so the run is the list's length and
-        // the coordinate itself is the start of the row: the offsets are applied per element
-        // by the gather, not folded into the coordinate.
+        // A grid takes the same `cols` from every row, so the run is the list's length and the
+        // offsets are applied by the gather, not folded into the coordinate.
         Offsets::Grid { starts, run } => {
             let stride: u64 = inner[1..].iter().product();
             for &c in starts {
@@ -357,9 +337,8 @@ pub(crate) fn build_chunk_unit_items(
             .zip(&out_widths[1..])
             .map(|(start, width)| (*start, *width))
             .collect(),
-        // Points and grids take the trailing axes whole, and their Python gates require one
-        // inner chunk there. If that ever stops being true `locate` refuses the item rather
-        // than returning wrong data.
+        // Points and grids take the trailing axes whole; if that stops holding, `locate`
+        // refuses the item rather than returning wrong data.
         _ => chunk_shape[1..].iter().map(|d| (0, *d)).collect(),
     };
     // Constant for every index in the two shared cases; unused in the varying one.
@@ -387,11 +366,8 @@ pub(crate) fn build_chunk_unit_items(
             .map_err(|_| PyErr::new::<PyValueError, _>(format!("index {} is negative", indices[i])))
     };
 
-    // Non-decreasing is assumed below: the grouping walks a run of equal chunk ids, so out of order
-    // the same chunk is grouped twice, and the extent check trusts the last of a group to be its
-    // largest. `push_entry` is `#[pymethods]` taking an arbitrary array, so it is enforced here as
-    // well as by Python's `_is_sorted_integer_axis`. Inside the walk rather than in a pass of
-    // its own, which would walk the indices a second time.
+    // Non-decreasing is assumed below: out of order, the same chunk is grouped twice and the
+    // extent check trusts the last of a group. Enforced here because `push_entry` is a pymethod.
     let mut items = Vec::new();
     let mut a = 0usize;
     let mut previous = 0u64;
@@ -469,14 +445,8 @@ pub(crate) fn build_chunk_unit_items(
             shape: chunk_shape.clone(),
             num_elements,
             array_shape: shape.clone(),
-            // Relative to the chunk subset, because that is the buffer gathered from, scaled by
-            // `row_stride` (one index's worth of that buffer) and stepped by the offset to where
-            // this selection starts inside the row. With the trailing axes whole the offset is 0
-            // and the stride is the run.
-            //
-            // The shared cases step by a constant, so the offset lookup and its bounds check
-            // are hoisted out: this closure runs once per selected index, and inside it that
-            // work is loop-invariant.
+            // Relative to the chunk subset, the buffer gathered from. The constant-step cases
+            // hoist the offset lookup out: this closure runs once per selected index.
             coords: Some(match offsets {
                 Offsets::PerIndex(per) => (a..b)
                     .map(|i| {
@@ -518,11 +488,8 @@ pub(crate) fn build_chunk_unit_items(
 #[pyclass]
 pub(crate) struct ChunkItems {
     items: Vec<ChunkItem>,
-    /// Where the last entry's output ended, so a later one cannot overlap it. Python drives
-    /// `push_entry` directly, and two entries sharing an `out_start` would give two items
-    /// overlapping output ranges, which the read path writes concurrently through views whose
-    /// safety contract is that they are disjoint. A wrong answer would be recoverable; this would
-    /// be a data race.
+    /// Where the last entry's output ended, so a later one cannot overlap it. Two entries
+    /// sharing an `out_start` would race: the read path writes those views concurrently.
     out_end: u64,
 }
 
@@ -551,16 +518,12 @@ impl ChunkItems {
 
     /// Build one batch entry's items and append them.
     ///
-    /// `indices` select along axis 0 and are checked here: non-negative, non-decreasing, and inside
-    /// the chunk extent. So is `out_start`: entries must be pushed in increasing order, and one
-    /// that would reuse output another entry already owns is refused.
+    /// `indices` select along axis 0: non-negative, non-decreasing, inside the chunk extent. So
+    /// is `out_start`, which must increase and may not reuse output another entry owns. Axes
+    /// after the first are taken whole, which is what makes one index one contiguous run.
     ///
-    /// Axes after the first are taken whole and must be the same extent in `chunk_shape` and in
-    /// `shape`, which is what makes one index one contiguous run.
-    ///
-    /// One obligation this cannot check: `shape` must be the real extent of the output buffer,
-    /// since the output subset is bounded against it. A larger one describes bytes the buffer does
-    /// not have, and that produces wrong data rather than an error.
+    /// Unchecked: `shape` must be the output buffer's real extent, since the output subset is
+    /// bounded against it. A larger one gives wrong data rather than an error.
     #[pyo3(signature = (key, chunk_shape, shape, indices, out_starts, out_widths, inner, elem_starts=Vec::new()))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub(crate) fn push_entry(
@@ -779,12 +742,9 @@ impl ChunkItems {
         let out_starts = trailing_zeros(out_start, shape.len());
         // These take the trailing axes whole, so the item's extent is the output shape.
         let out_widths = shape.clone();
-        // These paths take the trailing axes whole, and their Python gates require the shard to
-        // hold one inner chunk on each, so the shard extent is the inner extent there. Widened here
-        // so that is written down once rather than assumed at every use.
-        //
-        // `skip(1)`, not `[1..]`: pymethods take arbitrary vectors, and a rank-0 chunk must reach
-        // `build_chunk_unit_items` to be refused by name rather than panic across the FFI.
+        // These paths take the trailing axes whole and their gates hold the shard to one inner
+        // chunk on each, so the shard extent is the inner extent. `skip(1)` not `[1..]`: a rank-0
+        // chunk must reach `build_chunk_unit_items` to be refused rather than panic.
         let inner: Vec<u64> = std::iter::once(inner)
             .chain(chunk_shape.iter().skip(1).copied())
             .collect();
