@@ -249,16 +249,18 @@ class ZarrsCodecPipeline(CodecPipeline):
             # the array's life and a `with zarr.config.set(...)` around a read would silently
             # do nothing.
             #
-            # The two ceilings SIZE PROCESS-WIDE POOLS and only the first read in the process
-            # builds them, so a later value is read here and then ignored downstream. That is
-            # worth saying at the call site rather than only in the Rust: passing a value that
-            # has no effect looks like a bug from up here. `pool_sizes()` reports what was built.
+            # Only `raw_max_reads_per_chunk` is actually honoured per call, though. The two
+            # ceilings SIZE PROCESS-WIDE POOLS and only the first read in the process builds
+            # them, so a later value is read here and then ignored downstream. That is worth
+            # saying at the call site rather than only in the Rust: passing a value that has
+            # no effect looks like a bug from up here. `pool_sizes()` reports what was built.
             await asyncio.to_thread(
                 retrieve,
                 desc,
                 out,
                 config.get("codec_pipeline.read_worker_ceiling", None),
                 config.get("codec_pipeline.decode_worker_ceiling", None),
+                config.get("codec_pipeline.raw_max_reads_per_chunk", None),
             )
             return None
 

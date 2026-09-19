@@ -42,6 +42,45 @@ use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
 // TODO: Use a OnceLock for store with get_or_try_init when stabilised?
+/// Is an innermost chunk a plain byte tiling of its elements?
+///
+/// True only when the sharding codec's inner chain is exactly `bytes`: no filter, no
+/// compressor, nothing between an element and its bytes. Then a chunk's bytes are its
+/// elements in C order, the offset of any row inside it is arithmetic, and a row can be read
+/// WITHOUT reading the chunk around it.
+///
+/// Read off the metadata JSON the pipeline is constructed from, rather than taken as another
+/// constructor flag -- that argument list already carries three bools and nine parameters.
+///
+/// Conservative by construction: anything unrecognised, unparsable or nested returns false
+/// and the read takes the ordinary chunk path, which is always correct.
+fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(array_metadata_json) else {
+        return false;
+    };
+    let Some(codecs) = meta.get("codecs").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    for codec in codecs {
+        if codec.get("name").and_then(|n| n.as_str()) != Some("sharding_indexed") {
+            continue;
+        }
+        let inner = codec
+            .get("configuration")
+            .and_then(|c| c.get("codecs"))
+            .and_then(|c| c.as_array());
+        let Some(inner) = inner else { return false };
+        let names: Vec<&str> = inner
+            .iter()
+            .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+            .collect();
+        // Exactly the byte reinterpretation. A `crc32c` or a `blosc` here means the chunk
+        // cannot be entered part-way, which is the whole reason the chunk is the read unit.
+        return names == ["bytes"];
+    }
+    false
+}
+
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct CodecPipelineImpl {
@@ -83,6 +122,7 @@ pub struct CodecPipelineImpl {
     /// reading the chunk around them. Measured at scale: 8,192 rows as exact ranges take
     /// 628 ms against 1121 for the chunks holding them, because the request COUNT is the
     /// same either way and only the bytes differ.
+    pub(crate) inner_chunk_is_raw: bool,
 }
 
 impl CodecPipelineImpl {
@@ -443,6 +483,7 @@ impl CodecPipelineImpl {
             // bool plumbed from `pipeline.py`; the information now comes from the same place
             // the write guard reads it.
             cache_shard_indexes: read_only,
+            inner_chunk_is_raw: inner_chunk_is_raw(array_metadata),
         })
     }
 
@@ -456,7 +497,7 @@ impl CodecPipelineImpl {
     /// rayon, for selections this path declined. An audit of the public indexing surface found
     /// nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
     /// than a slower second Rust path.
-    #[pyo3(signature = (chunk_items, value, read_worker_ceiling=None, decode_worker_ceiling=None))]
+    #[pyo3(signature = (chunk_items, value, read_worker_ceiling=None, decode_worker_ceiling=None, raw_max_reads_per_chunk=None))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,
@@ -464,8 +505,13 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         read_worker_ceiling: Option<usize>,
         decode_worker_ceiling: Option<usize>,
+        raw_max_reads_per_chunk: Option<usize>,
     ) -> PyResult<()> {
-        let config = read_decode::ReadConfig::new(read_worker_ceiling, decode_worker_ceiling);
+        let config = read_decode::ReadConfig::new(
+            read_worker_ceiling,
+            decode_worker_ceiling,
+            raw_max_reads_per_chunk,
+        );
         self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, config)
     }
 
@@ -557,6 +603,21 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
+/// `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
+/// inner chunks read and decoded.
+///
+/// Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
+/// the same values, so a gate that refuses everything passes every values test.
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn raw_path_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        read_decode::RAW_JOBS.load(Ordering::Relaxed),
+        read_decode::CHUNK_JOBS.load(Ordering::Relaxed),
+    )
+}
+
 
 /// The sizes the two worker pools were BUILT with, or `None` where one has not been built.
 ///
@@ -584,6 +645,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(shard_index_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(reset_shard_index_cache_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(raw_path_stats, m)?)?;
     m.add_function(wrap_pyfunction!(pool_sizes, m)?)?;
     m.add_class::<CodecPipelineImpl>()?;
     m.add_class::<chunk_item::ChunkItem>()?;
