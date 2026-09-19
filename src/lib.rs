@@ -30,6 +30,7 @@ use zarrs::plugin::ZarrVersion;
 use zarrs::storage::{ReadableStorage, ReadableWritableListableStorage, StorageHandle, StoreKey};
 
 mod chunk_item;
+mod shard_index;
 mod concurrency;
 mod runtime;
 mod store;
@@ -52,6 +53,9 @@ pub(crate) struct CodecPipelineImpl {
     /// as `readable_store`; the read-only case simply never keeps a writable view of it.
     pub(crate) writable_store: Option<ReadableWritableListableStorage>,
     pub(crate) codec_chain: Arc<CodecChainBound>,
+    /// Where an innermost chunk lives inside its shard, at whatever nesting depth. `None` for
+    /// an unsharded array. Derived once at construction, from the BOUND chain.
+    pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
     pub(crate) codec_options: CodecOptions,
     pub(crate) chunk_concurrent_minimum: usize,
     pub(crate) chunk_concurrent_maximum: usize,
@@ -285,6 +289,7 @@ impl CodecPipelineImpl {
 
         Ok(Self {
             readable_store,
+            shard: shard_index::ShardInfo::from_codec_chain(&codec_chain).map(Arc::new),
             codec_chain,
             codec_options,
             chunk_concurrent_minimum,
