@@ -823,7 +823,7 @@ impl ReadConfig {
     /// What a caller with nothing to say gets: the defaults, so a path with no `ReadConfig`
     /// of its own -- a write's encode -- can still ask for the pools.
     pub(crate) fn defaults() -> Self {
-        Self::from_call(None, None, false)
+        Self::from_call(None, None, None, false)
     }
 }
 
@@ -1129,7 +1129,7 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             // The FIRST call's config is what builds them, so it has to exist before they do.
-            let config = ReadConfig::from_call(None, None, true);
+            let config = ReadConfig::from_call(None, None, None, true);
             let (io, cpu) = pools(py, config).expect("the pools must be buildable");
             assert_eq!(
                 io.current_num_threads(),
@@ -1154,7 +1154,7 @@ mod tests {
             assert!(config.decode_workers <= cpu.current_num_threads());
 
             // A later call naming a different width is answered by the pool that exists.
-            let narrower = ReadConfig::from_call(Some(1), Some(1), false);
+            let narrower = ReadConfig::from_call(Some(1), Some(1), None, false);
             let (io2, cpu2) = pools(py, narrower).expect("already built");
             assert_eq!(io2.current_num_threads(), io.current_num_threads());
             assert_eq!(cpu2.current_num_threads(), cpu.current_num_threads());
