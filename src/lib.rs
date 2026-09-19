@@ -253,13 +253,8 @@ impl CodecPipelineImpl {
             CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?;
         let codec_options = CodecOptions::default().with_validate_checksums(validate_checksums);
 
-        // `unwrap_or_ELSE`: `global_config()` forces a `LazyLock` whose `Default` reads
-        // `rayon::current_num_threads()`, so the eager form did that work even when the caller
-        // had already said what it wanted.
         let chunk_concurrent_minimum =
             chunk_concurrent_minimum.unwrap_or_else(|| global_config().chunk_concurrent_minimum());
-        // BOTH DEFAULT TO THE POOL'S OWN WIDTH, which is what `main` did -- there the default
-        // was `rayon::current_num_threads()`, the width of the global pool the work ran on.
         let chunk_concurrent_maximum =
             chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
         let num_threads = num_threads.unwrap_or(rayon::current_num_threads());

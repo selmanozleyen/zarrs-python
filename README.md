@@ -115,19 +115,8 @@ The guard matters: under `spawn` and `forkserver` the child re-imports the main 
 setting the method a second time raises. `torch.utils.data.DataLoader(num_workers=...)` goes
 through `multiprocessing`, so it follows whichever method is set.
 
-Under `fork`, this library keeps its `rayon` pool keyed on the process that built it and
-rebuilds it in a child, so a child forked from a QUIESCENT parent can read and write a local
-array without deadlocking on threads it did not inherit. Three things that does not cover:
-
-- **Forking while a read is in flight.** The filesystem store takes a lock per key, and a child
-  that inherits it held by a worker that no longer exists will block on its first read.
-- **Remote stores.** An `ObjectStore`- or HTTP-backed array also goes through a `tokio` runtime
-  and an HTTP connection pool, neither of which is rebuilt here.
-- **Locks that are not ours**, the allocator's included, which no library can release from
-  inside a child.
-
-Which is the short way of saying the mitigation buys you the common case, and `spawn` or
-`forkserver` buys you the guarantee.
+Under `fork` a child inherits the pools' bookkeeping without their threads, so its first
+read blocks on a latch nothing will set. Use `spawn` or `forkserver`.
 
 ## Supported Indexing Methods
 
