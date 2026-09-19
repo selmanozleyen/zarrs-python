@@ -131,3 +131,30 @@ def test_the_gate_is_a_config_knob(tmp_path: Path):
 
     np.testing.assert_array_equal(off, values[rows, :])
     np.testing.assert_array_equal(on, values[rows, :])
+
+
+def test_a_foreign_endian_chunk_is_never_read_raw(tmp_path: Path) -> None:
+    """The raw path copies stored bytes verbatim; the chunk path swaps a foreign-order
+    element. Taking it on a big-endian array would give the same array two answers, so the
+    eligibility check requires the platform's own order.
+    """
+    from zarr.codecs import BytesCodec
+
+    values = np.arange(SHAPE[0] * SHAPE[1], dtype=">f4").reshape(SHAPE)
+    path = tmp_path / "big.zarr"
+    zarr.create_array(
+        path,
+        dtype=values.dtype,
+        shape=values.shape,
+        chunks=CHUNKS,
+        shards=SHARDS,
+        serializer=BytesCodec(endian="big"),
+        compressors=None,
+    )[:] = values
+
+    rows = np.arange(0, SHAPE[0], 8)  # scattered, so the gate would otherwise admit it
+    got, raw, chunk = _read(path, (rows, slice(None)))
+
+    np.testing.assert_array_equal(got, values[rows, :])
+    assert raw == 0, f"a big-endian array took the raw path: {raw} raw jobs"
+    assert chunk > 0
