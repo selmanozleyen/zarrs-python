@@ -88,12 +88,11 @@ fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
         if only.get("name").and_then(|n| n.as_str()) != Some("bytes") {
             return false;
         }
-        // AND in this machine's own byte order. The `bytes` codec REVERSES a multi-byte
-        // element when the array's order is not the platform's, so on a foreign-order array
-        // the chunk path swaps and the raw path -- which copies the stored bytes verbatim --
-        // does not. Same array, two answers, no error, and big-endian is legal Zarr V3.
+        // And in this machine's byte order: the chunk path swaps a foreign-order element and
+        // the raw path, copying verbatim, does not. Same array, two answers, no error.
         //
-        // Absent is only legal for a single-byte element, which has no order to get wrong.
+        // An absent `endian` is admitted on any host, which is wrong on a big-endian one: the
+        // v3 default is little, not "no order". Unreachable on any machine this runs on.
         let endian = only
             .get("configuration")
             .and_then(|c| c.get("endian"))
