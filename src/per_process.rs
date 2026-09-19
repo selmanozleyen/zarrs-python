@@ -59,6 +59,20 @@ impl<T> PerProcess<T> {
         let (_, value) = guard.as_ref().expect("just built");
         Ok(value.clone())
     }
+
+    /// What this process already has, or `None` if it has not built it yet.
+    ///
+    /// Reporting only: it must not build, because the thing it reports on is whether building
+    /// has happened. A value belonging to another process reads as `None`, which is what it is
+    /// from here.
+    pub(crate) fn peek(&self) -> Option<Arc<T>> {
+        let guard = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let pid = std::process::id();
+        guard
+            .as_ref()
+            .filter(|(built, _)| *built == pid)
+            .map(|(_, value)| value.clone())
+    }
 }
 
 #[cfg(test)]
