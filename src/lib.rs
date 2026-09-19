@@ -254,11 +254,8 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         config: read_decode::ReadConfig,
     ) -> PyResult<()> {
-        // Every item must be a chunk-unit item and the array must present a sharding codec.
-        // Both are guaranteed by `chunk_info_for_read`, which is the only route to a
-        // `ChunkItems` handle; anything it cannot describe raises and falls back to
-        // zarr-python in Python. The check stays because this is a `#[pymethods]` boundary,
-        // and what it guards is an exclusive output slice.
+        // Guaranteed by `chunk_info_for_read`, the only route to a `ChunkItems` handle. Checked
+        // anyway: this is a pymethods boundary guarding an exclusive output slice.
         if let Some(shard) = self.shard.as_ref() {
             let element_size = self.element_size()?;
             // An aliasing wrapper: no `&mut` is claimed over the whole buffer. `DisjointBytes`
@@ -300,9 +297,8 @@ impl CodecPipelineImpl {
 impl CodecPipelineImpl {
     /// The innermost unit this array's codec chain decodes, or `None` to refuse the array.
     ///
-    /// Three answers: a shape is the inner chunk of a sharded array; an empty shape means the
-    /// array is not sharded, so its chunk is its own decode unit; `None` means this chain
-    /// cannot be served at all.
+    /// A shape is a sharded array's inner chunk; an empty shape means unsharded, so the chunk
+    /// is its own decode unit; `None` refuses the chain.
     fn inner_chunk_shape(&self) -> Option<Vec<u64>> {
         let shard = self.shard.as_ref()?;
         Some(
@@ -383,10 +379,8 @@ impl CodecPipelineImpl {
             })
             .map_py_err::<PyTypeError>()?;
 
-        // A codec chain is unbound until it is given the data type and fill value it will
-        // work on; `decode`, `encode`, `partial_decoder` and `recommended_concurrency` all
-        // live on the bound form. Bound once here, because it is the same for every chunk
-        // this pipeline touches.
+        // A codec chain is unbound until given a data type and fill value. Bound once here,
+        // since it is the same for every chunk this pipeline touches.
         let codec_chain = codec_chain
             .with_context(data_type.clone(), fill_value.clone())
             .map_py_err::<PyTypeError>()?;

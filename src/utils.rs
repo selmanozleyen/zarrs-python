@@ -143,10 +143,8 @@ pub(crate) fn gather(
         return Err("output region does not match the coordinate count".to_string());
     }
     for (n, &c) in coords.iter().enumerate() {
-        // Checked, and not because a coordinate can be that large today: they are all below the
-        // inner chunk extent. Unchecked, a large one wraps in release and can land back inside
-        // scratch, so `get` succeeds and the wrong element is copied: exactly the silent-wrong-data
-        // mode this function's bounds check exists to refuse.
+        // Not because a coordinate can be that large today: unchecked, a large one wraps in
+        // release and lands back inside scratch, so `get` succeeds on the wrong element.
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
@@ -177,10 +175,8 @@ pub(crate) fn gather_pieces(
         return Err("output pieces do not match the coordinate count".to_string());
     }
     let mut writer = PieceWriter::new(pieces);
-    // Consecutive coordinates name one contiguous span of the decode and are copied as one.
-    // The pieces are written in order, so a merged span still lands correctly when it
-    // straddles two of them. (`gather`, the single-piece path, does not merge: it writes into
-    // one slice at a fixed stride, where a copy per coordinate costs nothing extra.)
+    // Consecutive coordinates name one contiguous span and are copied as one. Pieces are
+    // written in order, so a merged span straddling two of them still lands correctly.
     for r in coord_runs(coords, run_len) {
         let c = coords[r.start];
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
@@ -228,9 +224,8 @@ pub(crate) fn gather_runs(
     }
     for (n, &c) in coords.iter().enumerate() {
         for (j, &start) in starts.iter().enumerate() {
-            // Checked for the reason the contiguous gather checks: unchecked, a large value
-            // wraps in release and can land back inside scratch, so the read succeeds and
-            // returns the wrong elements rather than failing.
+            // As in the contiguous gather: unchecked, a large value wraps in release and
+            // lands back inside scratch, returning wrong elements rather than failing.
             let Some(src) = c
                 .checked_add(start)
                 .and_then(|e| usize::try_from(e).ok())

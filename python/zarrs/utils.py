@@ -52,10 +52,8 @@ def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
                 return np.flatnonzero(sel).astype(np.int64, copy=False)
             if sel.dtype.kind not in "iuf":
                 raise DiscontiguousArrayError(sel.dtype)
-            # The one cast: everything downstream assumes int64 positions. Float is accepted
-            # only because uint64 arrives as float64 (zarr subtracts an `intp` offset, NEP 50
-            # promotes). Checked before casting, since `astype` truncates 3.7 in silence and
-            # comparing afterwards casts `2.0**63` to `i64::MAX`, which compares equal.
+            # Everything downstream assumes int64. Float is accepted only because uint64
+            # arrives as float64; checked before casting, since `astype` truncates in silence.
             if sel.dtype.kind == "f" and not (
                 np.isfinite(sel).all()
                 and (sel == np.rint(sel)).all()
@@ -73,10 +71,8 @@ def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
     )
 
 
-# Modelled on `zarr.core.indexing.make_slice_selection` but not replaceable by it: upstream
-# raises `ArrayIndexError` for any index array of more than one element, where this turns a
-# consecutive run into the slice it is, which every multi-row read and write here depends on.
-# It also avoids upstream's `DeprecationWarning` on converting an ndim > 0 array to a scalar.
+# Not replaceable by `zarr.core.indexing.make_slice_selection`: upstream raises for any index
+# array of more than one element, where this turns a consecutive run into the slice it is.
 def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
     ls: list[slice] = []
     for dim_selection in selection:
@@ -322,12 +318,8 @@ def _chunk_unit_args(
     if any(int(v) <= 0 for v in inner_shape):
         return None
     chunk_sel_raw, out_sel_raw = _as_selector_tuples(chunk_selection, out_selection)
-    # zarr drops a scalar axis from the output without saying so in `drop_axes`, on any axis:
-    # `X[5]`, `X[5, 5]` (a 0-d output), `X[:, 3]`. Rebuilding each as an extent of one is exact,
-    # since an axis of extent one contributes no stride, so the axis is synthesised back rather
-    # than given a path of its own. A constant trailing index array is the same thing spelled as
-    # a point selection: `X[rows, 7]` arrives as a `CoordinateIndexer` whose axis 1 is [7, 7, 7],
-    # which is the box `rows x 7:8`.
+    # zarr drops a scalar axis from the output without saying so in `drop_axes`. Rebuilding it
+    # as an extent of one is exact, since such an axis contributes no stride.
     scalars: dict[int, int] = {}
     for axis, sel in enumerate(chunk_sel_raw):
         if isinstance(sel, (int, np.integer)):
@@ -341,10 +333,8 @@ def _chunk_unit_args(
             and bool((sel == sel[0]).all())
         ):
             scalars[axis] = int(sel[0])
-    # The three-way length equality must stay an equality: it is what refuses a constant array
-    # whose axis the output kept (`oindex[rows, [7]]`, output rank 2), where an extent of one
-    # would claim a single output column against an output that has more. Right bytes, right
-    # number of slots, wrong stride, no error.
+    # Must stay an equality: it refuses a constant array whose axis the output kept, where an
+    # extent of one claims a single column against an output that has more.
     if (
         scalars
         and len(chunk_sel_raw) == len(chunk_spec.shape)
@@ -395,16 +385,11 @@ def _chunk_unit_args(
         span = _step1_span(indices, chunk_spec.shape[0])
         if span is None:
             return None
-        # Keep the run rather than `np.arange`-ing it: with the trailing axes whole,
-        # `first..first + count` on axis 0 is one contiguous block per inner chunk, so Rust needs
-        # a coordinate and a length instead of one u64 per element. On a long sequential read
-        # those per-element indices are most of the description, and zarr already had the run.
-        #
-        # The span form has nowhere to put a trailing start, a width or a band: it says "the
-        # whole trailing extent" on both sides and derives its row stride from the shard. So the
-        # width is what has to be whole (a start of 0 follows from it but does not imply it), and
-        # the shard must hold one inner chunk per trailing axis, or `push_span` builds an item
-        # spanning two of them that `locate` refuses outside `pipeline.py`'s try.
+        # Keep the run rather than `np.arange`-ing it: Rust needs a coordinate and a length
+        # instead of one u64 per element, and on a long read those indices are most of the
+        # description. The span form says "the whole trailing extent" on both sides and derives
+        # its row stride from the shard, so the width must be whole and the shard must hold one
+        # inner chunk per trailing axis.
         if all(
             int(inner_shape[axis]) == int(chunk_spec.shape[axis])
             and int(widths[axis - 1]) == int(shape[axis]) == int(chunk_spec.shape[axis])
@@ -448,10 +433,8 @@ def _chunk_unit_args(
         band_starts = [b[0] for b in combo]
         band_widths = [b[1] for b in combo]
         band_out = [b[2] for b in combo]
-        # Both one-run tests, per band. The output one against the output extents, since
-        # `output_pieces` models an item as one run per axis-0 index. The chunk one against the
-        # inner extents, with the band reduced into its own inner chunk, because the buffer
-        # being addressed is the inner chunk and not the shard.
+        # Both one-run tests, per band: the output against the output extents, the chunk
+        # against the inner extents, since the buffer addressed is the inner chunk.
         if _contiguous_offset(band_out, band_widths, tuple(shape[1:])) is None:
             return None
         # Gate only. Rust re-derives the offset from these same starts and rechecks the shape,
@@ -469,10 +452,8 @@ def _chunk_unit_args(
                 indices,
                 (int(start), *band_out),
                 (int(shape[0]), *band_widths),
-                # The whole inner chunk, not just the split extent. Every trailing stride Rust
-                # computes is a product of these, and the decoded buffer is the inner chunk --
-                # so handing it the shard's extents would be right only for a shard holding
-                # one inner chunk on each trailing axis.
+                # The whole inner chunk: every trailing stride Rust computes is a product of
+                # these, and the decoded buffer is the inner chunk, not the shard.
                 tuple(int(v) for v in inner_shape),
                 # Shard-relative: this is what steers `locate` to the right inner chunk.
                 # Rust reduces it into the inner chunk for the coordinate.
@@ -651,11 +632,8 @@ def _grid_unit_args(
         if len_a != extents[axis]:
             break
 
-    # Whatever is left varies per run, enumerated row-major so the runs land in output order:
-    # each varying axis takes its own indices, each absorbed one is pinned at its run start, and
-    # the C-order ravel of that open mesh is the run starts. `np.ix_` builds the mesh and
-    # `np.ravel_multi_index` applies the strides and bounds-checks, where multiplying in uint64
-    # wrapped an out-of-range index silently.
+    # Whatever is left varies per run, enumerated row-major so the runs land in output order.
+    # `np.ravel_multi_index` bounds-checks, where multiplying in uint64 wrapped silently.
     cols = [
         sels[axis - 1] if axis < first_absorbed else np.array([absorbed_start[axis]])
         for axis in range(1, rank)
