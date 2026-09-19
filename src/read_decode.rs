@@ -636,12 +636,11 @@ pub(crate) static INDEX_CALL_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_ARRAY_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 
-/// What one call uses when the knob is unset, out of a pool `width` threads wide.
+/// Readers one call takes when the knob is unset, out of a CPU pool `width` threads wide.
 ///
-/// A decoder occupies a core, so the core count is its limit. A reader blocks on storage, so
-/// one-per-core would leave the device idle.
-fn default_workers(width: usize, readers: bool) -> usize {
-    if readers { width * 2 } else { width }
+/// A reader blocks on storage, so one-per-core would leave the device idle.
+fn default_readers(width: usize) -> usize {
+    width * 2
 }
 
 /// How much wider the I/O pool is than the CPU pool.
@@ -709,19 +708,8 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
 /// A call using fewer workers than the pool holds is the ordinary case, not a problem, so this
 /// compares against the pools' own widths rather than against what any other call asked for.
 pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyResult<()> {
-    let (io, cpu) = pools(py)?;
-    for (limit, asked, knob) in [
-        (
-            io.current_num_threads(),
-            config.read_workers,
-            "read_workers",
-        ),
-        (
-            cpu.current_num_threads(),
-            config.decode_workers,
-            "decode_workers",
-        ),
-    ] {
+    let (io, _) = pools(py)?;
+    for (limit, asked, knob) in [(io.current_num_threads(), config.read_workers, "read_workers")] {
         if asked <= limit {
             continue;
         }
@@ -740,10 +728,9 @@ pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyRes
 /// What one call reads from `zarr.config` when it starts.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadConfig {
-    /// Workers this call takes, out of the pool that will run it.
+    /// Workers this call takes, out of the I/O pool. Decodes have no equivalent: they are
+    /// spawned as reads finish, so the CPU pool's width is their only bound.
     pub(crate) read_workers: usize,
-    /// The same, for decodes.
-    pub(crate) decode_workers: usize,
     /// Reads a chunk may become before the raw path is declined for it; see [`RAW_MAX_READS`].
     pub(crate) raw_max_reads: usize,
     /// Whether a width above what the pools were built with is an error rather than a warning.
@@ -756,20 +743,15 @@ impl ReadConfig {
     pub(crate) fn from_call(
         py: Python<'_>,
         read_workers: Option<usize>,
-        decode_workers: Option<usize>,
         raw_max_reads: Option<usize>,
         strict: bool,
     ) -> PyResult<Self> {
         let (_, cpu) = pools(py)?;
         let width = cpu.current_num_threads();
-        let resolve = |asked: Option<usize>, readers: bool| {
-            asked
-                .filter(|n| *n > 0)
-                .unwrap_or_else(|| default_workers(width, readers))
-        };
         Ok(Self {
-            read_workers: resolve(read_workers, true),
-            decode_workers: resolve(decode_workers, false),
+            read_workers: read_workers
+                .filter(|n| *n > 0)
+                .unwrap_or_else(|| default_readers(width)),
             raw_max_reads: raw_max_reads.unwrap_or(RAW_MAX_READS),
             strict,
         })
@@ -1059,7 +1041,6 @@ mod tests {
             // the ceiling check.
             let config = ReadConfig::from_call(py, None, None, None, true).expect("resolvable");
             assert!(config.read_workers <= io.current_num_threads());
-            assert!(config.decode_workers <= cpu.current_num_threads());
         });
     }
 }

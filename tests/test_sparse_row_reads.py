@@ -20,11 +20,9 @@ CONFIGS = {
     "default": {},
     "one worker": {
         "codec_pipeline.read_workers": 1,
-        "codec_pipeline.decode_workers": 1,
     },
     "wider than the machine": {
         "codec_pipeline.read_workers": 64,
-        "codec_pipeline.decode_workers": 4,
     },
 }
 

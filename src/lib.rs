@@ -474,14 +474,13 @@ impl CodecPipelineImpl {
 
     /// The one read entry point. A selection this declines falls back to zarr-python; there is
     /// no second Rust path.
-    #[pyo3(signature = (chunk_items, value, read_workers=None, decode_workers=None, raw_max_reads_per_chunk=None, strict=false))]
+    #[pyo3(signature = (chunk_items, value, read_workers=None, raw_max_reads_per_chunk=None, strict=false))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,
         chunk_items: PyRef<'_, chunk_item::ChunkItems>,
         value: &Bound<'_, PyUntypedArray>,
         read_workers: Option<usize>,
-        decode_workers: Option<usize>,
         raw_max_reads_per_chunk: Option<usize>,
         strict: bool,
     ) -> PyResult<()> {
@@ -489,7 +488,6 @@ impl CodecPipelineImpl {
         let config = read_decode::ReadConfig::from_call(
             py,
             read_workers,
-            decode_workers,
             raw_max_reads_per_chunk,
             strict,
         )?;
