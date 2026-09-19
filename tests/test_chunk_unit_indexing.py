@@ -906,3 +906,43 @@ def test_a_kept_constant_column_axis_is_not_rebuilt(tmp_path: Path, cols) -> Non
         got = zarr.open_array(path, mode="r").oindex[rows, cols]
 
     np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
+
+
+def test_a_bare_ndarray_selector_is_declined_not_mis_described(tmp_path: Path) -> None:
+    """A rank-1 array indexed by an out-of-order array reaches `chunk_info` as a bare
+    ndarray rather than a tuple, and `make_slice_selection` would read each element as its
+    own dimension. It is declined instead, which strict makes visible.
+    """
+    from zarrs.utils import DiscontiguousArrayError
+
+    values = np.arange(8, dtype=np.float32)
+    path = tmp_path / "bare.zarr"
+    zarr.create_array(path, dtype=values.dtype, shape=values.shape, chunks=(4,))[:] = (
+        values
+    )
+    idx = np.array([0, 4, 5, 1])
+
+    with zarr.config.set(CHUNK_UNIT):
+        np.testing.assert_array_equal(zarr.open_array(path, mode="r")[idx], values[idx])
+
+    with (
+        zarr.config.set({**CHUNK_UNIT, "codec_pipeline.strict": True}),
+        pytest.raises(DiscontiguousArrayError),
+    ):
+        zarr.open_array(path, mode="r")[idx]
+
+
+def test_a_row_of_an_array_wider_than_one_shard(tmp_path: Path) -> None:
+    """`drop_axes` is a parameter the per-entry loop appends to. An array spanning two shards
+    on the row gives that loop two entries, so a leak would fail the second under strict.
+    """
+    values = np.arange(32 * 40, dtype=np.float64).reshape(32, 40)
+    path = tmp_path / "wide.zarr"
+    zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape, chunks=(8, 10), shards=(16, 20)
+    )[:] = values
+
+    with zarr.config.set({**CHUNK_UNIT, "codec_pipeline.strict": True}):
+        got = zarr.open_array(path, mode="r")[5, :]
+
+    np.testing.assert_array_equal(got, values[5, :])
