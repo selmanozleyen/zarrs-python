@@ -126,7 +126,6 @@ class CodecPipelineImpl:
         chunk_items: ChunkItems,
         value: numpy.typing.NDArray[typing.Any],
         read_workers: typing.Optional[builtins.int] = None,
-        decode_workers: typing.Optional[builtins.int] = None,
         raw_max_reads_per_chunk: typing.Optional[builtins.int] = None,
         strict: builtins.bool = False,
     ) -> None:

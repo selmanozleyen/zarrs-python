@@ -1039,7 +1039,7 @@ mod tests {
 
             // And the default a call gets must fit inside them, or every default read trips
             // the ceiling check.
-            let config = ReadConfig::from_call(py, None, None, None, true).expect("resolvable");
+            let config = ReadConfig::from_call(py, None, None, true).expect("resolvable");
             assert!(config.read_workers <= io.current_num_threads());
         });
     }
