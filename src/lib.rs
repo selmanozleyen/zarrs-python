@@ -463,16 +463,8 @@ impl CodecPipelineImpl {
         };
         codec_options.set_store_empty_chunks(write_empty_chunks);
 
-        // ON OUR OWN POOL, not rayon's global one, and taken here because `pools` must be
-        // called with the GIL held. This is the whole of the write path's fork story: rayon's
-        // global registry sits behind a `Once` with no reset, so a child that inherits it
-        // blocks in `in_worker_cold` for ever. With this, NOTHING in the crate reaches that
-        // registry, so it is never built and a fork has nothing to inherit.
-        //
-        // The pool this crate already owns, not one of the read path's two: a write encodes and
-        // stores, which is the shape the base pool is for, and a third pool would be another
-        // set of threads in every process.
-        // Encodes run on the same CPU pool decodes do; see `read_decode::pools`.
+        // Taken here because `pools` must be called with the GIL held. Encodes run on the
+        // same CPU pool decodes do.
         let (_, encode_pool) = read_decode::pools(py)?;
 
         py.detach(move || {
@@ -558,7 +550,6 @@ pub mod _internal {
     use super::chunk_item::ChunkItems;
     #[pymodule_export]
     use super::pool_sizes;
-    #[pymodule_export]
     #[pymodule_export]
     use super::reset_shard_index_cache_stats;
     #[pymodule_export]
