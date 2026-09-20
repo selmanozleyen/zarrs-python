@@ -36,7 +36,8 @@ A `NotImplementedError` will be raised if a store is not supported.
 `ZarrsCodecPipeline` options are exposed through `zarr.config`.
 
 Standard `zarr.config` options control some functionality (see the defaults in the [config.py](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py) of `zarr-python`):
-- `threading.max_workers`: how many chunks the `ZarrsCodecPipeline` decodes or encodes at once.
+- `threading.max_workers`: how many chunks the `ZarrsCodecPipeline` encodes at once. **Writes
+  only.** A read is bounded by `codec_pipeline.read_workers` and by the pools' own widths.
   - This is a concurrency budget, not a thread count. The number of threads is the size of the
     pipeline's `rayon` pool, which is set by the `RAYON_NUM_THREADS` environment variable and
     defaults to [the number of logical CPUs](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
@@ -46,9 +47,11 @@ Standard `zarr.config` options control some functionality (see the defaults in t
   - Defaults to false if `None`. Note that checking for emptiness has some overhead, see [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#store-empty-chunks) for more info.
 
 The `ZarrsCodecPipeline` specific options are:
-- `codec_pipeline.chunk_concurrent_maximum`: the maximum number of chunks stored/retrieved concurrently.
+- `codec_pipeline.chunk_concurrent_maximum`: the maximum number of chunks stored concurrently.
+  **Writes only**, for the same reason.
   - Defaults to the number of logical CPUs if `None`. It is constrained by `threading.max_workers` as well.
-- `codec_pipeline.chunk_concurrent_minimum`: the minimum number of chunks retrieved/stored concurrently when balancing chunk/codec concurrency.
+- `codec_pipeline.chunk_concurrent_minimum`: the minimum number of chunks stored concurrently
+  when balancing chunk against codec concurrency. **Writes only**, for the same reason.
   - Defaults to 4 if `None`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#chunk-concurrent-minimum) for more info.
 - `codec_pipeline.validate_checksums`: enable checksum validation (e.g. with the CRC32C codec).
   - Defaults to `True`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#validate-checksums) for more info.

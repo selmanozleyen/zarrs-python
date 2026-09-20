@@ -64,6 +64,9 @@ pub(crate) struct CodecPipelineImpl {
     pub(crate) subshard_indexes: Mutex<HashMap<(StoreKey, Vec<u64>), Arc<ShardingPartialDecoder>>>,
     /// True exactly when the store is read-only: one we can write through must not cache.
     pub(crate) cache_shard_indexes: bool,
+    /// Whether the caller named any of upstream's chunk-concurrency knobs. Kept because the
+    /// resolved values cannot say it: they default, so every read would look like a request.
+    pub(crate) chunk_concurrency_asked: bool,
 }
 
 impl CodecPipelineImpl {
@@ -238,6 +241,27 @@ impl CodecPipelineImpl {
         Ok(UnsafeCellSlice::new(output))
     }
 
+    /// Say once that a read does not spend the chunk-concurrency budget.
+    ///
+    /// Once per process, not per call: the condition is a property of how this pipeline was
+    /// built, so repeating it per read would be noise around a fact that cannot change.
+    fn warn_read_ignores_chunk_concurrency(&self, py: Python<'_>) -> PyResult<()> {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !self.chunk_concurrency_asked
+            || SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        py.import("warnings")?.call_method1(
+            "warn",
+            ("codec_pipeline.chunk_concurrent_minimum, chunk_concurrent_maximum and \
+              threading.max_workers bound a WRITE through this pipeline, not a read. A read is \
+              bounded by codec_pipeline.read_workers and by the pools' own widths, which are \
+              fixed at the first read of the process.",),
+        )?;
+        Ok(())
+    }
+
     fn retrieve_items_and_apply_index(
         &self,
         py: Python,
@@ -256,6 +280,12 @@ impl CodecPipelineImpl {
             // BEFORE `detach`, deliberately: `pools` locks, and the GIL is what keeps that
             // lock from being held when another thread forks.
             let pools = read_decode::pools(py)?;
+            // These are upstream's knobs and this path no longer spends them: the outer limit
+            // below is dropped and the codec target is overridden to 1, so a read is bounded by
+            // `read_workers` and the pools alone. Said out loud rather than accepted silently,
+            // because upstream honours them and a write through this same pipeline still does.
+            // Before `detach`: warning is Python work and the GIL is held here.
+            self.warn_read_ignores_chunk_concurrency(py)?;
             py.detach(|| {
                 // `None` here means the item slice is empty. It must NOT short-circuit: the
                 // coverage check inside is the only thing stopping an `np.empty` buffer being
@@ -385,6 +415,9 @@ impl CodecPipelineImpl {
             readable_store,
             codec_chain,
             codec_options,
+            chunk_concurrency_asked: chunk_concurrent_minimum.is_some()
+                || chunk_concurrent_maximum.is_some()
+                || num_threads.is_some(),
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
