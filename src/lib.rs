@@ -124,8 +124,7 @@ pub(crate) struct CodecPipelineImpl {
     pub(crate) subshard_indexes: Mutex<HashMap<(StoreKey, Vec<u64>), Arc<ShardingPartialDecoder>>>,
     /// True exactly when the store is read-only: one we can write through must not cache.
     pub(crate) cache_shard_indexes: bool,
-    /// Whether an innermost chunk is a plain byte tiling -- no filter, no compressor -- so a
-    /// row's bytes are addressable arithmetically and readable without the chunk around them.
+    /// A plain byte tiling -- no filter, no compressor -- so a row's bytes are arithmetic.
     pub(crate) inner_chunk_is_raw: bool,
 }
 
