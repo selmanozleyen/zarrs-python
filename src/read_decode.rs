@@ -636,18 +636,18 @@ pub(crate) static INDEX_CALL_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_ARRAY_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 
-/// What one call uses when the knob is unset, out of a pool `width` threads wide.
+/// The default size of either pool: the machine's parallelism.
 ///
-/// A decoder occupies a core, so the core count is its limit. A reader blocks on storage, so
-/// one-per-core would leave the device idle.
-fn default_workers(width: usize, readers: bool) -> usize {
-    if readers { width * 2 } else { width }
+/// Read off the machine and not off a pool, because this is what SIZES the pools and they do
+/// not exist yet when it is called.
+fn default_pool_size() -> usize {
+    std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
 }
 
-/// How much wider the I/O pool is than the CPU pool.
+/// How much wider the I/O pool defaults to than the CPU pool.
 ///
-/// A parked reader is a stack and no CPU, so a low bound buys nothing. It multiplies the CPU
-/// pool, so `RAYON_NUM_THREADS` sizes both.
+/// A parked reader is a stack and no CPU, so a low bound buys nothing. Only a default: either
+/// pool can be sized on its own through its knob.
 const READ_POOL_MULTIPLIER: usize = 8;
 
 /// The pool a read's STORE traffic runs on.
@@ -656,8 +656,11 @@ const READ_POOL_MULTIPLIER: usize = 8;
 /// decode needs. Decoding has no third pool: it is CPU work and runs on the CPU pool.
 static READ_POOL: OnceLock<Arc<rayon::ThreadPool>> = OnceLock::new();
 
-/// The CPU pool: decodes here, and a write's encode on the same threads. Sized from rayon's
-/// own view, so `RAYON_NUM_THREADS` still sizes it.
+/// The CPU pool: decodes here, and a write's encode on the same threads.
+///
+/// Sized by `codec_pipeline.decode_workers` on the FIRST call of the process. A rayon pool
+/// cannot grow, so a later `zarr.config.set` around a read resizes nothing; `pool_sizes`
+/// reports what was built so a caller can assert rather than assume.
 static CPU_POOL: OnceLock<Arc<rayon::ThreadPool>> = OnceLock::new();
 
 fn build_pool(size: usize, name: &'static str) -> PyResult<rayon::ThreadPool> {
@@ -672,21 +675,21 @@ fn build_pool(size: usize, name: &'static str) -> PyResult<rayon::ThreadPool> {
 ///
 /// The `Python` token is taken so the caller states it holds the GIL here rather than inside
 /// `detach`; the pools are built once and shared for the life of the process.
-pub(crate) fn pools(_py: Python<'_>) -> PyResult<(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>)> {
+pub(crate) fn pools(
+    _py: Python<'_>,
+    config: ReadConfig,
+) -> PyResult<(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>)> {
     let cpu = match CPU_POOL.get() {
         Some(p) => p.clone(),
         None => {
-            let built = Arc::new(build_pool(rayon::current_num_threads(), "cpu")?);
+            let built = Arc::new(build_pool(config.decode_workers, "cpu")?);
             CPU_POOL.get_or_init(|| built).clone()
         }
     };
     let io = match READ_POOL.get() {
         Some(p) => p.clone(),
         None => {
-            let built = Arc::new(build_pool(
-                cpu.current_num_threads() * READ_POOL_MULTIPLIER,
-                "read",
-            )?);
+            let built = Arc::new(build_pool(config.read_workers, "read")?);
             READ_POOL.get_or_init(|| built).clone()
         }
     };
@@ -709,7 +712,7 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
 /// A call using fewer workers than the pool holds is the ordinary case, not a problem, so this
 /// compares against the pools' own widths rather than against what any other call asked for.
 pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyResult<()> {
-    let (io, cpu) = pools(py)?;
+    let (io, cpu) = pools(py, config)?;
     for (limit, asked, knob) in [
         (
             io.current_num_threads(),
@@ -740,9 +743,11 @@ pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyRes
 /// What one call reads from `zarr.config` when it starts.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadConfig {
-    /// Workers this call takes, out of the pool that will run it.
+    /// Sizes the I/O pool, and caps what one call takes of it. Only the FIRST call's value
+    /// builds the pool; see [`READ_POOL`].
     pub(crate) read_workers: usize,
-    /// The same, for decodes.
+    /// Sizes the CPU pool. Only the FIRST call's value builds it; see [`CPU_POOL`]. Decodes
+    /// are spawned as reads finish, so this width is their only bound.
     pub(crate) decode_workers: usize,
     /// Reads a chunk may become before the raw path is declined for it; see [`RAW_MAX_READS`].
     pub(crate) raw_max_reads: usize,
@@ -754,25 +759,20 @@ impl ReadConfig {
     /// Everything this call reads from `zarr.config`, resolved against the pools that will run
     /// it. Zero or absent means "the default", not "none".
     pub(crate) fn from_call(
-        py: Python<'_>,
         read_workers: Option<usize>,
         decode_workers: Option<usize>,
         raw_max_reads: Option<usize>,
         strict: bool,
-    ) -> PyResult<Self> {
-        let (_, cpu) = pools(py)?;
-        let width = cpu.current_num_threads();
-        let resolve = |asked: Option<usize>, readers: bool| {
-            asked
+    ) -> Self {
+        let machine = default_pool_size();
+        Self {
+            read_workers: read_workers
                 .filter(|n| *n > 0)
-                .unwrap_or_else(|| default_workers(width, readers))
-        };
-        Ok(Self {
-            read_workers: resolve(read_workers, true),
-            decode_workers: resolve(decode_workers, false),
+                .unwrap_or(machine * READ_POOL_MULTIPLIER),
+            decode_workers: decode_workers.filter(|n| *n > 0).unwrap_or(machine),
             raw_max_reads: raw_max_reads.unwrap_or(RAW_MAX_READS),
             strict,
-        })
+        }
     }
 }
 
@@ -1037,11 +1037,11 @@ mod tests {
             // A call cannot size the pools -- it masks them. Whatever any caller wants, the
             // widths are fixed per process, which is what lets two calls ask differently and
             // both be served.
-            let (io, cpu) = pools(py).expect("the pools must be buildable");
+            let (io, cpu) = pools(py, config).expect("the pools must be buildable");
             assert_eq!(
                 io.current_num_threads(),
                 cpu.current_num_threads() * READ_POOL_MULTIPLIER,
-                "the I/O pool is a multiple of the CPU pool, so one setting sizes both"
+                "unset, the two default to the machine and 8x the machine"
             );
             assert_eq!(
                 pool_sizes(),
@@ -1057,7 +1057,7 @@ mod tests {
 
             // And the default a call gets must fit inside them, or every default read trips
             // the ceiling check.
-            let config = ReadConfig::from_call(py, None, None, None, true).expect("resolvable");
+            let config = ReadConfig::from_call(None, None, None, true);
             assert!(config.read_workers <= io.current_num_threads());
             assert!(config.decode_workers <= cpu.current_num_threads());
         });

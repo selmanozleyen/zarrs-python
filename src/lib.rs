@@ -317,7 +317,7 @@ impl CodecPipelineImpl {
             let output_len = output.len();
             // BEFORE `detach`, deliberately: building a pool is Python-visible work and the
             // GIL is held here.
-            let pools = read_decode::pools(py)?;
+            let pools = read_decode::pools(py, config)?;
             py.detach(|| {
                 let Some((_, codec_options)) =
                     chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
@@ -477,12 +477,11 @@ impl CodecPipelineImpl {
     ) -> PyResult<()> {
         // Every width is a per-call decision, so none of them is a constructor argument.
         let config = read_decode::ReadConfig::from_call(
-            py,
             read_workers,
             decode_workers,
             raw_max_reads_per_chunk,
             strict,
-        )?;
+        );
         // The one width still not servable is one above what the pools were built with, since a
         // rayon pool cannot grow.
         read_decode::check_workers_arrived(py, config)?;
