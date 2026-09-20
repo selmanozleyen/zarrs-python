@@ -257,11 +257,13 @@ impl CodecPipelineImpl {
             // lock from being held when another thread forks.
             let pools = read_decode::pools(py)?;
             py.detach(|| {
-                let Some((_, codec_options)) =
-                    chunk_descriptions.get_chunk_concurrent_limit_and_codec_options(self)?
-                else {
-                    return Ok(());
-                };
+                // `None` here means the item slice is empty. It must NOT short-circuit: the
+                // coverage check inside is the only thing stopping an `np.empty` buffer being
+                // returned as data, and an empty batch against a non-empty output is exactly
+                // the case it exists to refuse.
+                let codec_options = chunk_descriptions
+                    .get_chunk_concurrent_limit_and_codec_options(self)?
+                    .map_or_else(|| self.codec_options.clone(), |(_, o)| o);
                 self.retrieve_chunk_units(
                     shard,
                     chunk_descriptions,

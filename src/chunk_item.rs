@@ -47,6 +47,12 @@ pub(crate) struct ChunkItem {
     /// Where each run starts inside a coordinate's own elements and how long it is, when the
     /// wanted elements are not one span. `None` means a single contiguous run.
     pub grid: Option<(Arc<[u64]>, u64)>,
+    /// The inner-chunk geometry the CALLER used to build `coords`: its split extent and its
+    /// row stride. `coords` address the buffer the codec chain decodes, so these have to equal
+    /// that buffer's shape; `carve` refuses an item where they do not. Two integers rather
+    /// than the shape itself, so verifying costs no allocation. `(0, 0)` where `coords` is
+    /// `None` and there is nothing to verify.
+    pub claimed_inner: (u64, u64),
 }
 
 #[gen_stub_pymethods]
@@ -87,6 +93,7 @@ impl ChunkItem {
             coords: None,
             run_len: 1,
             grid: None,
+            claimed_inner: (0, 0),
         })
     }
 }
@@ -473,6 +480,7 @@ pub(crate) fn build_chunk_unit_items(
                     .into(),
             }),
             run_len,
+            claimed_inner: (inner[0], row_stride),
             grid: match offsets {
                 Offsets::Grid { starts, run } => Some((Arc::from(starts), run)),
                 _ => None,
@@ -645,6 +653,7 @@ impl ChunkItems {
                 // block in a single copy.
                 coords: Some(vec![(span_lo - lo) * row_stride].into()),
                 run_len: rows * row_stride,
+                claimed_inner: (inner, row_stride),
                 grid: None,
             });
             self.out_end = out_hi;

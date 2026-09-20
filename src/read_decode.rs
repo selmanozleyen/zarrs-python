@@ -356,8 +356,28 @@ fn carve<'a>(
 ) -> PyResult<(Vec<Job<'a>>, Vec<&'a mut [u8]>)> {
     // Pass 1: what each item needs, and the element-count agreement. Nothing is vended yet.
     let mut plan: Vec<(usize, Vec<(usize, usize)>)> = Vec::with_capacity(located.len());
+    // The decode unit the caller SAID it was addressing, against the one the codec chain
+    // really decodes. `locate` checks only that an item fits inside the real chunk, which a
+    // too-SMALL claim satisfies while shifting every coordinate's stride and origin: in
+    // bounds, wrong elements, no error. Verified here because this is where `ctx` and the
+    // item meet, and it is two integer compares in a loop that already runs per item.
+    let real_inner = (
+        ctx.decode_shape[0].get(),
+        ctx.decode_shape[1..].iter().map(|d| d.get()).product::<u64>(),
+    );
     for (i, (item, _)) in located.iter().enumerate() {
         let coords = coords_of(item)?;
+        if item.claimed_inner != real_inner {
+            return Err(PyRuntimeError::new_err(format!(
+                "{} was described against an inner chunk of split {} and row stride {}, but \
+                 this array decodes {} by {}; its coordinates would address the wrong elements",
+                item.key,
+                item.claimed_inner.0,
+                item.claimed_inner.1,
+                real_inner.0,
+                real_inner.1,
+            )));
+        }
         // A piece's start comes from `subset` and its length from `coords`, with nothing tying
         // them together: disagreeing, they carve the right number of wrong elements.
         if (coords.len() as u64).checked_mul(item.run_len) != Some(item.subset.num_elements()) {
