@@ -53,7 +53,7 @@ def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
             if sel.dtype.kind not in "iuf":
                 raise DiscontiguousArrayError(sel.dtype)
             # THE ONE CAST: everything downstream assumes int64 positions. Float is accepted
-            # only because uint64 arrives as float64 -- zarr subtracts an `intp` offset and
+            # only because uint64 arrives as float64: zarr subtracts an `intp` offset and
             # NEP 50 promotes. Checked BEFORE casting: `astype` truncates 3.7 in silence, and
             # comparing after casts `2.0**63` to `i64::MAX`, which compares equal.
             if sel.dtype.kind == "f" and not (
@@ -85,7 +85,7 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
             dim_selection = dim_selection.ravel()
             if len(dim_selection) == 0:
                 # `dim_selection[0]` is an `IndexError` here, and `IndexError` is not in
-                # `FALLBACK_TO_ZARR_PYTHON` -- it would escape `read` rather than decline.
+                # `FALLBACK_TO_ZARR_PYTHON`, so it would escape `read` rather than decline.
                 raise DiscontiguousArrayError(dim_selection)
             if len(dim_selection) == 1:
                 ls.append(
