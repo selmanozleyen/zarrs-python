@@ -55,20 +55,14 @@ pub(crate) struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
-    /// Present only for a singly-sharded array: the concurrent path locates chunks itself,
-    /// so it needs the shard's index codecs and the codecs inside a shard. `None` means this
-    /// array cannot take that path at all.
+    /// `None` means this array cannot take the chunk-unit path at all.
     pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
-    /// Shard indexes read so far, for the life of the array. Reading one is a full-latency
-    /// round trip on the calling thread, so keeping the decoder costs a shard once per array
-    /// rather than once per call; a shard that does not exist is remembered too.
+    /// Kept for the life of the array: reading one is a full-latency round trip on the
+    /// calling thread. A shard that does not exist is remembered too.
     pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Arc<ShardingPartialDecoder>>>,
-    /// The same, for levels below the outermost, keyed by the path of subchunk indices that
-    /// reaches them. Empty and untouched unless the array is nested-sharded, which keeps the
-    /// single-level path free of the key allocation this needs.
+    /// The same below the outermost level, empty unless the array is nested-sharded.
     pub(crate) subshard_indexes: Mutex<HashMap<(StoreKey, Vec<u64>), Arc<ShardingPartialDecoder>>>,
-    /// Whether to remember shard indexes at all: true exactly when `writable_store`
-    /// is `None`, so a store this pipeline can write through never caches.
+    /// True exactly when the store is read-only: one we can write through must not cache.
     pub(crate) cache_shard_indexes: bool,
 }
 
