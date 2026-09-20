@@ -26,7 +26,8 @@ use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 
 use crate::utils::{
-    PyCodecErrExt as _, PyErrExt as _, gather, gather_pieces, gather_runs, key_partial_decoder,
+    PyCodecErrExt as _, PyErrExt as _, coord_runs, gather, gather_pieces, gather_runs,
+    key_partial_decoder,
 };
 
 /// The per-array state a decode needs, shared by every job of a call.
@@ -521,6 +522,13 @@ pub(crate) static INDEX_CALL_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_ARRAY_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 
+/// Jobs that decoded straight into the output, and jobs that went through scratch.
+///
+/// Both produce the same bytes, so values cannot tell them apart and a predicate that silently
+/// never fires would read as "the copy was not the cost" rather than "the path never ran".
+pub(crate) static DIRECT_JOBS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CHUNK_COPY_JOBS: AtomicU64 = AtomicU64::new(0);
+
 /// The default size of either pool: the machine's parallelism.
 ///
 /// Read off the machine and not off a pool, because this is what SIZES the pools and they do
@@ -528,9 +536,8 @@ pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 fn default_pool_size() -> usize {
     std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
 }
-}
 
-/// How much wider the I/O pool is than the CPU pool.
+/// How much wider the I/O pool DEFAULTS to than the CPU pool.
 ///
 /// A parked reader is a stack and no CPU, so a low bound buys nothing. It multiplies the CPU
 /// pool, so `RAYON_NUM_THREADS` sizes both.
@@ -556,23 +563,24 @@ fn build_pool(size: usize, name: &'static str) -> PyResult<rayon::ThreadPool> {
 
 /// `(io, cpu)`: the pool that fetches, and the pool that decodes.
 ///
+/// Sized by the FIRST call of the process and never resized, because a rayon pool cannot grow.
 /// The `Python` token is taken so the caller states it holds the GIL here rather than inside
-/// `detach`; the pools are built once and shared for the life of the process.
-pub(crate) fn pools(_py: Python<'_>) -> PyResult<(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>)> {
+/// `detach`.
+pub(crate) fn pools(
+    _py: Python<'_>,
+    config: ReadConfig,
+) -> PyResult<(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>)> {
     let cpu = match CPU_POOL.get() {
         Some(p) => p.clone(),
         None => {
-            let built = Arc::new(build_pool(rayon::current_num_threads(), "cpu")?);
+            let built = Arc::new(build_pool(config.decode_workers, "cpu")?);
             CPU_POOL.get_or_init(|| built).clone()
         }
     };
     let io = match READ_POOL.get() {
         Some(p) => p.clone(),
         None => {
-            let built = Arc::new(build_pool(
-                cpu.current_num_threads() * READ_POOL_MULTIPLIER,
-                "read",
-            )?);
+            let built = Arc::new(build_pool(config.read_workers, "read")?);
             READ_POOL.get_or_init(|| built).clone()
         }
     };
@@ -755,6 +763,48 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let shape = ctx.decode_shape.as_slice();
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
+
+    // The item wants the WHOLE decode unit, so scratch would be filled and then copied out
+    // byte for byte. Decode straight into the output instead and skip the copy.
+    //
+    // The conditions are what make the two paths identical rather than merely similar: one
+    // output piece (so the destination is contiguous), that piece exactly `needed` bytes, no
+    // grid, and the coordinates a single run starting at 0 covering every element. Under them
+    // `gather` degenerates to `out[..needed] = scratch[..needed]`, which is the copy being
+    // removed. Anything else keeps the scratch path untouched.
+    let whole_unit = job.out.len() == 1
+        && job.out[0].len() == needed
+        && job.grid.is_none()
+        && job.coords.first() == Some(&0)
+        && job.coords.len() as u64 * job.run_len == elements
+        && coord_runs(job.coords, job.run_len).nth(1).is_none();
+    if whole_unit {
+        DIRECT_JOBS.fetch_add(1, Ordering::Relaxed);
+        let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
+        let slice = UnsafeCellSlice::new(&mut job.out[0][..]);
+        let mut view = unsafe {
+            // SAFETY: this view is the only writer to that piece, which `DisjointBytes` vended
+            // to this job alone and no other job can hold.
+            ArrayBytesFixedDisjointView::new(
+                slice,
+                size,
+                &shape_u64,
+                ArraySubset::new_with_shape(shape_u64.clone()),
+            )
+            .map_err(|e| e.to_string())?
+        };
+        return ctx
+            .shard
+            .inner_chain
+            .decode_into(
+                Cow::Borrowed(&bytes),
+                shape,
+                ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+                &ctx.codec_options,
+            )
+            .map_err(|e| e.to_string());
+    }
+    CHUNK_COPY_JOBS.fetch_add(1, Ordering::Relaxed);
     // Grow only: zero-filling would memset a whole chunk that `decode_into` overwrites. A codec
     // leaving a gap is already broken, but here it would show the previous chunk's elements.
     if scratch.len() < needed {
@@ -823,6 +873,7 @@ mod tests {
             array_shape: to_nonzero(array),
             coords: None,
             run_len: 1,
+            claimed_inner: (0, 0),
             grid: None,
         };
         // Strided: axis 1 takes 5 of 10 and axis 2 takes 5 of 10, so a row is not one run.

@@ -371,6 +371,11 @@ impl CodecPipelineImpl {
             CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?;
         let codec_options = CodecOptions::default().with_validate_checksums(validate_checksums);
 
+        // Before the shadowing below turns these into resolved widths, which cannot say whether
+        // the caller named one: they all default.
+        let chunk_concurrency_asked = chunk_concurrent_minimum.is_some()
+            || chunk_concurrent_maximum.is_some()
+            || num_threads.is_some();
         let chunk_concurrent_minimum =
             chunk_concurrent_minimum.unwrap_or_else(|| global_config().chunk_concurrent_minimum());
         // A budget wider than the pool schedules decodes with no thread to run them.
@@ -415,9 +420,7 @@ impl CodecPipelineImpl {
             readable_store,
             codec_chain,
             codec_options,
-            chunk_concurrency_asked: chunk_concurrent_minimum.is_some()
-                || chunk_concurrent_maximum.is_some()
-                || num_threads.is_some(),
+            chunk_concurrency_asked,
             chunk_concurrent_minimum,
             chunk_concurrent_maximum,
             num_threads,
@@ -545,6 +548,20 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
+/// `(direct, via_scratch)` decode jobs since the run began.
+///
+/// Both produce the same bytes, so a predicate that never fires is invisible in values and
+/// would read as "the copy was not the cost" rather than "the path never ran".
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn decode_path_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        read_decode::DIRECT_JOBS.load(Ordering::Relaxed),
+        read_decode::CHUNK_COPY_JOBS.load(Ordering::Relaxed),
+    )
+}
+
 /// The sizes the two worker pools were built with, or `None` where one has not been built.
 #[gen_stub_pyfunction]
 #[pyfunction]
@@ -573,6 +590,8 @@ pub mod _internal {
     use super::chunk_item::ChunkItem;
     #[pymodule_export]
     use super::chunk_item::ChunkItems;
+    #[pymodule_export]
+    use super::decode_path_stats;
     #[pymodule_export]
     use super::pool_sizes;
     #[pymodule_export]
