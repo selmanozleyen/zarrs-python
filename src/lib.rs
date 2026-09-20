@@ -279,7 +279,7 @@ impl CodecPipelineImpl {
             let output_len = output.len();
             // BEFORE `detach`, deliberately: `pools` locks, and the GIL is what keeps that
             // lock from being held when another thread forks.
-            let pools = read_decode::pools(py)?;
+            let pools = read_decode::pools(py, config)?;
             // These are upstream's knobs and this path no longer spends them: the outer limit
             // below is dropped and the codec target is overridden to 1, so a read is bounded by
             // `read_workers` and the pools alone. Said out loud rather than accepted silently,
@@ -447,7 +447,7 @@ impl CodecPipelineImpl {
         strict: bool,
     ) -> PyResult<()> {
         // Every width is a per-call decision, so none of them is a constructor argument.
-        let config = read_decode::ReadConfig::from_call(py, read_workers, decode_workers, strict)?;
+        let config = read_decode::ReadConfig::from_call(read_workers, decode_workers, strict);
         // The one width still not servable is one above what the pools were built with, since a
         // rayon pool cannot grow.
         read_decode::check_workers_arrived(py, config)?;
@@ -488,7 +488,9 @@ impl CodecPipelineImpl {
 
         // Taken here because `pools` must be called with the GIL held. Encodes run on the
         // same CPU pool decodes do.
-        let (_, encode_pool) = read_decode::pools(py)?;
+        // A write has no `ReadConfig`; it takes the pools at their defaults, which is what it
+        // did before either knob sized them.
+        let (_, encode_pool) = read_decode::pools(py, read_decode::ReadConfig::defaults())?;
 
         py.detach(move || {
             // The two inputs differ in how the bytes are obtained, not in what is done with

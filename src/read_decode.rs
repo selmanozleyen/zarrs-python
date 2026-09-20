@@ -521,12 +521,13 @@ pub(crate) static INDEX_CALL_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_ARRAY_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 
-/// What one call uses when the knob is unset, out of a pool `width` threads wide.
+/// The default size of either pool: the machine's parallelism.
 ///
-/// A decoder occupies a core, so the core count is its limit. A reader blocks on storage, so
-/// one-per-core would leave the device idle.
-fn default_workers(width: usize, readers: bool) -> usize {
-    if readers { width * 2 } else { width }
+/// Read off the machine and not off a pool, because this is what SIZES the pools and they do
+/// not exist yet when it is called.
+fn default_pool_size() -> usize {
+    std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
+}
 }
 
 /// How much wider the I/O pool is than the CPU pool.
@@ -594,25 +595,33 @@ pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
 /// A call using fewer workers than the pool holds is the ordinary case, not a problem, so this
 /// compares against the pools' own widths rather than against what any other call asked for.
 pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyResult<()> {
-    let (io, cpu) = pools(py)?;
-    for (limit, asked, knob) in [
+    let (io, cpu) = pools(py, config)?;
+    // `caps_per_call` is the difference between the two knobs, and it decides which way a
+    // mismatch is worth saying anything about. A read takes at most `read_workers` of the I/O
+    // pool, so asking for FEWER than the pool holds is served exactly; only more is unservable.
+    // A decode has no such limiter -- it is spawned as each read returns -- so the pool is the
+    // only bound and asking for fewer is silently ignored, which is the failure this knob was
+    // found in.
+    for (limit, asked, knob, caps_per_call) in [
         (
             io.current_num_threads(),
             config.read_workers,
             "read_workers",
+            true,
         ),
         (
             cpu.current_num_threads(),
             config.decode_workers,
             "decode_workers",
+            false,
         ),
     ] {
-        if asked <= limit {
+        if asked == limit || (caps_per_call && asked < limit) {
             continue;
         }
         let message = format!(
-            "codec_pipeline.{knob} = {asked} is above the {limit} workers this process builds, \
-             so {limit} will be used. The pools are built once and cannot grow."
+            "codec_pipeline.{knob} = {asked} but this process built {limit} workers, \
+             so {limit} will be used. The pools are sized by the first call and cannot change."
         );
         if config.strict {
             return Err(PyValueError::new_err(message));
@@ -634,26 +643,29 @@ pub(crate) struct ReadConfig {
 }
 
 impl ReadConfig {
-    /// Everything this call reads from `zarr.config`, resolved against the pools that will run
-    /// it. Zero or absent means "the default", not "none".
+    /// Everything this call reads from `zarr.config`. Zero or absent means "the default".
+    ///
+    /// Resolved off the MACHINE, not off the pools: this is what sizes them on the first call
+    /// of the process, so they do not exist yet when it runs.
     pub(crate) fn from_call(
-        py: Python<'_>,
         read_workers: Option<usize>,
         decode_workers: Option<usize>,
         strict: bool,
-    ) -> PyResult<Self> {
-        let (_, cpu) = pools(py)?;
-        let width = cpu.current_num_threads();
-        let resolve = |asked: Option<usize>, readers: bool| {
-            asked
+    ) -> Self {
+        let machine = default_pool_size();
+        Self {
+            read_workers: read_workers
                 .filter(|n| *n > 0)
-                .unwrap_or_else(|| default_workers(width, readers))
-        };
-        Ok(Self {
-            read_workers: resolve(read_workers, true),
-            decode_workers: resolve(decode_workers, false),
+                .unwrap_or(machine * READ_POOL_MULTIPLIER),
+            decode_workers: decode_workers.filter(|n| *n > 0).unwrap_or(machine),
             strict,
-        })
+        }
+    }
+
+    /// What a caller with nothing to say gets: the defaults, so a path with no `ReadConfig`
+    /// of its own -- a write's encode -- can still ask for the pools.
+    pub(crate) fn defaults() -> Self {
+        Self::from_call(None, None, false)
     }
 }
 
@@ -889,10 +901,9 @@ mod tests {
     fn the_io_pool_is_wider_than_the_cpu_pool_and_both_report_what_they_built() {
         Python::initialize();
         Python::attach(|py| {
-            // A call cannot size the pools -- it masks them. Whatever any caller wants, the
-            // widths are fixed per process, which is what lets two calls ask differently and
-            // both be served.
-            let (io, cpu) = pools(py).expect("the pools must be buildable");
+            // The FIRST call's config is what builds them, so it has to exist before they do.
+            let config = ReadConfig::from_call(None, None, true);
+            let (io, cpu) = pools(py, config).expect("the pools must be buildable");
             assert_eq!(
                 io.current_num_threads(),
                 cpu.current_num_threads() * READ_POOL_MULTIPLIER,
@@ -910,11 +921,16 @@ mod tests {
             // decode needs, so there are more of the former than there are cores.
             assert!(io.current_num_threads() > cpu.current_num_threads());
 
-            // And the default a call gets must fit inside them, or every default read trips
+            // The config that built them must fit inside them, or every default read trips
             // the ceiling check.
-            let config = ReadConfig::from_call(py, None, None, true).expect("resolvable");
             assert!(config.read_workers <= io.current_num_threads());
             assert!(config.decode_workers <= cpu.current_num_threads());
+
+            // A later call naming a different width is answered by the pool that exists.
+            let narrower = ReadConfig::from_call(Some(1), Some(1), false);
+            let (io2, cpu2) = pools(py, narrower).expect("already built");
+            assert_eq!(io2.current_num_threads(), io.current_num_threads());
+            assert_eq!(cpu2.current_num_threads(), cpu.current_num_threads());
         });
     }
 }
