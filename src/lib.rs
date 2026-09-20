@@ -45,11 +45,8 @@ use crate::utils::{PyCodecErrExt, PyErrExt as _};
 #[gen_stub_pyclass]
 #[pyclass]
 pub(crate) struct CodecPipelineImpl {
-    /// Read handle, deliberately the READ-ONLY type: `set`/`erase` are not in its interface,
-    /// so the only way to reach a write is `writable()`.
     pub(crate) readable_store: ReadableStorage,
-    /// The writable handle -- `None` when zarr-python opened the store read-only. Same object
-    /// as `readable_store`; the read-only case simply never keeps a writable view of it.
+    /// The same store, `None` when opened read-only, so a write has to go through `writable()`.
     pub(crate) writable_store: Option<ReadableWritableListableStorage>,
     pub(crate) codec_chain: Arc<CodecChainBound>,
     pub(crate) codec_options: CodecOptions,
