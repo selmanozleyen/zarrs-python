@@ -23,10 +23,13 @@ use crate::chunk_item::ChunkItem;
 use crate::shard_index::ShardInfo;
 use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
+use zarrs::array::codec::bytes_to_bytes::blosc::{
+    blosc_decompress_bytes_partial, blosc_typesize, blosc_validate,
+};
 
 use crate::utils::{
-    PyCodecErrExt as _, PyErrExt as _, coord_runs, gather, gather_pieces, gather_runs,
-    key_partial_decoder,
+    PieceWriter, PyCodecErrExt as _, PyErrExt as _, coord_runs, gather, gather_pieces,
+    gather_runs, key_partial_decoder,
 };
 
 /// The per-array state a decode needs, shared by every job of a call.
@@ -34,6 +37,9 @@ struct JobContext {
     /// See `CodecPipelineImpl::inner_chunk_is_raw`. When true a row's bytes are addressable
     /// inside its chunk, so a job reads the ROW rather than the chunk holding it.
     raw: bool,
+    /// See `CodecPipelineImpl::inner_chunk_is_blosc`. When true a chunk's blocks can be
+    /// inflated on their own, so a job decompresses the rows it wants and not the chunk.
+    blosc: bool,
     shard: Arc<ShardInfo>,
     store: ReadableStorage,
     codec_options: CodecOptions,
@@ -75,6 +81,7 @@ impl CodecPipelineImpl {
         let element_size = self.element_size()?;
         let ctx = JobContext {
             raw: self.inner_chunk_is_raw,
+            blosc: self.inner_chunk_is_blosc,
             raw_max_reads: config.raw_max_reads,
             shard: shard.clone(),
             store: self.readable_store.clone(),
@@ -505,6 +512,8 @@ fn carve<'a>(
 /// either way and only throughput differs. Both failures have happened here.
 pub(crate) static RAW_JOBS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CHUNK_JOBS: AtomicU64 = AtomicU64::new(0);
+/// Jobs that inflated only the blocks their rows land in.
+pub(crate) static BLOCK_JOBS: AtomicU64 = AtomicU64::new(0);
 
 /// How many READS this chunk's rows become once consecutive ones are merged.
 ///
@@ -980,6 +989,62 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             )
             .map_err(|e| e.to_string());
     }
+    // Inflate only the blocks the wanted rows land in, rather than the whole chunk.
+    //
+    // At cs=1 a chunk holds 91,549 elements and a row uses about 1,450 of them, so a full
+    // decode throws away ~98% of its own output -- and the disks are idle at a quarter of
+    // capacity while it happens, so the codec is the constraint, not the store.
+    //
+    // `blosc_decompress_bytes_partial` is blosc's own `getitem`: it walks the block index in
+    // the compressed buffer and inflates only the blocks covering `[offset, offset+len)`.
+    // Called directly rather than through `CodecChainBound::partial_decoder`, which cannot
+    // reach it -- zarrs reports `partial_decode: false` for blosc with the note "technically
+    // supports partial decoding, but it needs coalescing to be efficient". `coord_runs` is
+    // that coalescing: consecutive rows are already one run here.
+    //
+    // Falls through to the full decode on ANY doubt -- a buffer blosc will not validate, a
+    // typesize that does not divide the element, or a run whose bytes it declines. Both paths
+    // return the same bytes, so a fall-through costs time and never correctness.
+    if ctx.blosc && job.grid.is_none() && blosc_validate(&bytes).is_some() {
+        if let Some(ts) = blosc_typesize(&bytes).filter(|ts| *ts == size) {
+            let runs: Vec<_> = coord_runs(job.coords, job.run_len).collect();
+            // One `getitem` per run, and the runs must fill the output exactly: the pieces are
+            // vended in coordinate order, so anything else would write the right number of
+            // wrong elements.
+            let want: usize = job.out.iter().map(|p| p.len()).sum();
+            let have: usize = runs
+                .iter()
+                .map(|r| (r.end - r.start) * job.run_len as usize * size)
+                .sum();
+            if have == want {
+                let mut parts = Vec::with_capacity(runs.len());
+                let mut ok = true;
+                for r in &runs {
+                    let at = job.coords[r.start] as usize * size;
+                    let len = (r.end - r.start) * job.run_len as usize * size;
+                    match blosc_decompress_bytes_partial(&bytes, at, len, ts) {
+                        Ok(part) if part.len() == len => parts.push(part),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    BLOCK_JOBS.fetch_add(1, Ordering::Relaxed);
+                    let mut writer = PieceWriter::new(&mut job.out);
+                    for part in &parts {
+                        writer.write(part)?;
+                    }
+                    if !writer.finished() {
+                        return Err("the inflated blocks did not fill the output".to_string());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     CHUNK_COPY_JOBS.fetch_add(1, Ordering::Relaxed);
     // Grow only: zero-filling would memset a whole chunk that `decode_into` overwrites. A codec
     // leaving a gap is already broken, but here it would show the previous chunk's elements.

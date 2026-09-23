@@ -62,6 +62,49 @@ const NATIVE_ENDIAN: &str = if cfg!(target_endian = "little") {
 ///
 /// Conservative by construction: anything unrecognised, unparsable or nested returns false
 /// and the read takes the ordinary chunk path, which is always correct.
+/// Whether an innermost chunk is `bytes` then `blosc`, so blosc's own block index can give
+/// back part of it without inflating the rest.
+///
+/// A sibling of [`inner_chunk_is_raw`] one layer up: that one needs no codec at all and reads a
+/// row's bytes off the store; this one accepts exactly one bytes-to-bytes codec, blosc, and
+/// decompresses only the blocks a row lands in. Same endianness rule, and for the same reason
+/// -- blosc hands back the stored bytes and does not swap them.
+fn inner_chunk_is_blosc(array_metadata_json: &str) -> bool {
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(array_metadata_json) else {
+        return false;
+    };
+    let Some(codecs) = meta.get("codecs").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    for codec in codecs {
+        if codec.get("name").and_then(|n| n.as_str()) != Some("sharding_indexed") {
+            continue;
+        }
+        let inner = codec
+            .get("configuration")
+            .and_then(|c| c.get("codecs"))
+            .and_then(|c| c.as_array());
+        let Some(inner) = inner else { return false };
+        // Exactly two, in this order. A `crc32c` beside them, a filter before them, or a
+        // second bytes-to-bytes codec after blosc all mean the decompressed bytes are not
+        // the chunk's bytes, and the offset arithmetic below would address the wrong ones.
+        let [bytes, blosc] = inner.as_slice() else {
+            return false;
+        };
+        if bytes.get("name").and_then(|n| n.as_str()) != Some("bytes")
+            || blosc.get("name").and_then(|n| n.as_str()) != Some("blosc")
+        {
+            return false;
+        }
+        let endian = bytes
+            .get("configuration")
+            .and_then(|c| c.get("endian"))
+            .and_then(serde_json::Value::as_str);
+        return endian.is_none_or(|e| e == NATIVE_ENDIAN);
+    }
+    false
+}
+
 fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
     let Ok(meta) = serde_json::from_str::<serde_json::Value>(array_metadata_json) else {
         return false;
@@ -127,6 +170,8 @@ pub(crate) struct CodecPipelineImpl {
     pub(crate) chunk_concurrency_asked: bool,
     /// A plain byte tiling -- no filter, no compressor -- so a row's bytes are arithmetic.
     pub(crate) inner_chunk_is_raw: bool,
+    /// A plain byte tiling behind blosc, so part of a chunk can be inflated on its own.
+    pub(crate) inner_chunk_is_blosc: bool,
 }
 
 impl CodecPipelineImpl {
@@ -495,6 +540,7 @@ impl CodecPipelineImpl {
             cache_shard_indexes: writable_store.is_none(),
             writable_store,
             inner_chunk_is_raw: inner_chunk_is_raw(array_metadata),
+            inner_chunk_is_blosc: inner_chunk_is_blosc(array_metadata),
         })
     }
 
@@ -636,6 +682,16 @@ fn raw_path_stats() -> (u64, u64) {
     )
 }
 
+/// Jobs that inflated only the blocks their rows land in, since the run began.
+///
+/// Values cannot see this -- a partial inflate and a full one return the same bytes -- so a
+/// gate that silently never fires would read as "the codec was not the cost".
+#[gen_stub_pyfunction]
+#[pyfunction]
+fn block_path_stats() -> u64 {
+    read_decode::BLOCK_JOBS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The sizes the two worker pools were built with, or `None` where one has not been built.
 #[gen_stub_pyfunction]
 #[pyfunction]
@@ -668,6 +724,8 @@ pub mod _internal {
     use super::decode_path_stats;
     #[pymodule_export]
     use super::pool_sizes;
+    #[pymodule_export]
+    use super::block_path_stats;
     #[pymodule_export]
     use super::raw_path_stats;
     #[pymodule_export]
