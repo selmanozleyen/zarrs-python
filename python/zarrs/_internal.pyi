@@ -2,10 +2,9 @@
 # ruff: noqa: E501, F401
 
 import builtins
-import typing
-
 import numpy
 import numpy.typing
+import typing
 import zarr.abc.store
 
 @typing.final
@@ -19,20 +18,20 @@ class ChunkItem:
         shape: typing.Sequence[builtins.int],
     ) -> ChunkItem:
         r"""
-        `coords` is always `None` here -- it is not a parameter, so this constructor cannot
-        build a chunk-unit item. `ChunkItems::push_entry` builds those.
+        `coords` is always `None` here: it is not a parameter, so this constructor cannot build a
+        chunk-unit item. `ChunkItems::push_entry` builds those.
         """
 
 @typing.final
 class ChunkItems:
     r"""
     A batch of chunk items, built and held in Rust.
-
-    Push one entry at a time, then pass the handle to
-    `retrieve_chunk_items_and_apply_index`.
     """
+    def refuse_backwards(self, out_start: builtins.int) -> None:
+        r"""
+        Output must not step backwards: the pieces are vended forward-only.
+        """
     def __new__(cls) -> ChunkItems: ...
-    def __len__(self) -> builtins.int: ...
     def push_entry(
         self,
         key: builtins.str,
@@ -47,17 +46,16 @@ class ChunkItems:
         r"""
         Build one batch entry's items and append them.
 
-        `indices` select along AXIS 0 and are checked here: non-negative, non-decreasing, and
-        inside the chunk extent. So is `out_start` -- entries must be pushed in increasing
-        order, and one that would reuse output another entry already owns is refused.
+        `indices` select along axis 0 and are checked here: non-negative, non-decreasing, and inside
+        the chunk extent. So is `out_start`: entries must be pushed in increasing order, and one
+        that would reuse output another entry already owns is refused.
 
-        Axes after the first are taken WHOLE and must be the same extent in `chunk_shape` and
-        in `shape`; that is checked too. It is what makes one index one contiguous run, and
-        the rank-N case the 1-D case with a run length.
+        Axes after the first are taken whole and must be the same extent in `chunk_shape` and in
+        `shape`, which is what makes one index one contiguous run.
 
-        One obligation this CANNOT check: `shape` must be the real extent of the output buffer,
-        since the output subset is bounded against it. A larger one describes bytes the buffer
-        does not have, and that produces wrong data rather than an error.
+        One obligation this cannot check: `shape` must be the real extent of the output buffer,
+        since the output subset is bounded against it. A larger one describes bytes the buffer does
+        not have, and that produces wrong data rather than an error.
         """
     def push_span(
         self,
@@ -70,7 +68,7 @@ class ChunkItems:
         inner: builtins.int,
     ) -> None:
         r"""
-        Push a contiguous SPAN of the split axis, without naming its elements.
+        Push a contiguous span of the split axis, without naming its elements.
         """
     def push_grid(
         self,
@@ -84,7 +82,7 @@ class ChunkItems:
         inner: builtins.int,
     ) -> None:
         r"""
-        Push a GRID selection: the same columns taken from every selected index.
+        Push a grid selection: the same columns taken from every selected index.
         """
     def push_points(
         self,
@@ -97,47 +95,44 @@ class ChunkItems:
         inner: builtins.int,
     ) -> None:
         r"""
-        Push a POINT selection: one element per index, each naming its own offset inside that
+        Push a point selection: one element per index, each naming its own offset inside that
         index's elements.
         """
 
 @typing.final
 class CodecPipelineImpl:
+    def inner_chunk_shape(self) -> typing.Optional[builtins.list[builtins.int]]:
+        r"""
+        The innermost unit this array's codec chain decodes, or `None` to refuse the array.
+
+        Three answers: a shape is the inner chunk of a sharded array; an empty shape means the
+        array is not sharded, so its chunk is its own decode unit; `None` means this chain
+        cannot be served at all.
+        """
     def __new__(
         cls,
         array_metadata: builtins.str,
         store_config: zarr.abc.store.Store,
         *,
         validate_checksums: builtins.bool = False,
-        chunk_concurrent_minimum: builtins.int | None = None,
-        chunk_concurrent_maximum: builtins.int | None = None,
-        num_threads: builtins.int | None = None,
+        chunk_concurrent_minimum: typing.Optional[builtins.int] = None,
+        chunk_concurrent_maximum: typing.Optional[builtins.int] = None,
+        num_threads: typing.Optional[builtins.int] = None,
         direct_io: builtins.bool = False,
         file_handle_cache_size: builtins.int = 0,
     ) -> CodecPipelineImpl: ...
-    def inner_chunk_shape(self) -> builtins.list[builtins.int] | None:
-        r"""
-        The innermost unit this array's codec chain decodes, or `None` to refuse the array.
-
-        THREE ANSWERS: a shape is the inner chunk of a sharded array; an EMPTY shape means the
-        array is not sharded, so its chunk is its own decode unit; `None` means this chain
-        cannot be served at all.
-        """
     def retrieve_chunk_items_and_apply_index(
         self,
         chunk_items: ChunkItems,
         value: numpy.typing.NDArray[typing.Any],
-        read_workers: builtins.int | None = None,
-        decode_workers: builtins.int | None = None,
+        read_workers: typing.Optional[builtins.int] = None,
+        decode_workers: typing.Optional[builtins.int] = None,
+        raw_max_reads_per_chunk: typing.Optional[builtins.int] = None,
         strict: builtins.bool = False,
     ) -> None:
         r"""
-        The one read entry point.
-
-        There was a second entry point until 2026-08-30 -- a partial decoder per chunk over
-        rayon, for selections this path declined. An audit of the public indexing surface found
-        nothing reaching it, so it went, and a decline is now a fall back to zarr-python rather
-        than a slower second Rust path.
+        The one read entry point. A selection this declines falls back to zarr-python; there is
+        no second Rust path.
         """
     def store_chunks_with_indices(
         self,
@@ -146,9 +141,18 @@ class CodecPipelineImpl:
         write_empty_chunks: builtins.bool,
     ) -> None: ...
 
-def pool_sizes() -> tuple[builtins.int | None, builtins.int | None]:
+def pool_sizes() -> tuple[typing.Optional[builtins.int], typing.Optional[builtins.int]]:
     r"""
-    The sizes the two worker pools were BUILT with, or `None` where one has not been built.
+    The sizes the two worker pools were built with, or `None` where one has not been built.
+    """
+
+def raw_path_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
+    inner chunks read and decoded.
+
+    Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
+    the same values, so a gate that refuses everything passes every values test.
     """
 
 def reset_shard_index_cache_stats() -> None:
