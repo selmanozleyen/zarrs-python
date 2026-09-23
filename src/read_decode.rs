@@ -10,7 +10,6 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::types::PyAnyMethods;
 use pyo3::{PyResult, Python};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use rayon_iter_concurrent_limit::iter_concurrent_limit;
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
     ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
@@ -108,16 +107,24 @@ impl CodecPipelineImpl {
 
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
-        // A call takes at most `read_workers` of the pool, so two calls asking for different
-        // widths both get what they asked for.
-        let readers = config.read_workers.max(1);
+        // Every job queued at once, and the POOL is the bound -- `read_workers` sized it, so a
+        // second limiter on top would only starve the threads it just built. That is what the
+        // old `iter_concurrent_limit!` did: capping a call at 8 left the other 712 workers of
+        // an oversized pool with nothing, and a rayon worker with nothing does not block, it
+        // spins and tries to steal. 720 threads then delivered FEWER IOPS than 64 for six
+        // times the CPU. With the queue full, every worker pops the next job instead.
+        //
+        // The scopes nest so a reader hands its chunk straight to the decode pool, and
+        // `in_place_scope` runs the calling thread as a worker rather than leaving it idle.
+        // Both block until their tasks finish, which is what keeps the `&mut [u8]` into the
+        // caller's numpy buffer valid without a raw pointer or a completion latch.
         let (read_pool, decode_pool) = pools;
         decode_pool.in_place_scope(|dec| {
-            read_pool.install(|| {
-                let (failure, ctx) = (&failure, &ctx);
-                iter_concurrent_limit!(readers, jobs, for_each, |job| {
-                    read_one(job, dec, failure, ctx);
-                });
+            read_pool.in_place_scope(|rd| {
+                for job in jobs {
+                    let (failure, ctx) = (&failure, &ctx);
+                    rd.spawn(move |_| read_one(job, dec, failure, ctx));
+                }
             });
         });
 
