@@ -369,6 +369,11 @@ fn carve<'a>(
     // too-SMALL claim satisfies while shifting every coordinate's stride and origin: in
     // bounds, wrong elements, no error. Verified here because this is where `ctx` and the
     // item meet, and it is two integer compares in a loop that already runs per item.
+    // An empty batch carves nothing, and `decode_shape` is empty for an unsharded array, so
+    // indexing it below would panic where the caller's coverage check means to return an error.
+    if located.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let real_inner = (
         ctx.decode_shape[0].get(),
         ctx.decode_shape[1..].iter().map(|d| d.get()).product::<u64>(),
