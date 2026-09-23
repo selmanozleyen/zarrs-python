@@ -531,9 +531,12 @@ fn test_raw_is_refused_for_a_foreign_byte_order() {
         crate::inner_chunk_is_raw(&bytes_with("big")),
         cfg!(target_endian = "big")
     );
-    // No `endian` at all is only legal for a single-byte element, which has no order to get
-    // wrong -- so it stays eligible.
-    assert!(crate::inner_chunk_is_raw(&meta(r#"{"name":"bytes"}"#)));
+    // No `endian` at all means little, the V3 default. Reading it as "no order" and admitting
+    // it everywhere would hand back byte-reversed elements on a big-endian host.
+    assert_eq!(
+        crate::inner_chunk_is_raw(&meta(r#"{"name":"bytes"}"#)),
+        cfg!(target_endian = "little")
+    );
     // A codec beside the byte reinterpretation still declines, and one carrying no name
     // cannot be skipped past to reach that conclusion.
     assert!(!crate::inner_chunk_is_raw(&meta(

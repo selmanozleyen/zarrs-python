@@ -89,15 +89,13 @@ fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
             return false;
         }
         // And in this machine's byte order: the chunk path swaps a foreign-order element and
-        // the raw path, copying verbatim, does not. Same array, two answers, no error.
-        //
-        // An absent `endian` is admitted on any host, which is wrong on a big-endian one: the
-        // v3 default is little, not "no order". Unreachable on any machine this runs on.
+        // the raw path, copying verbatim, does not. Same array, two answers, no error. Absent
+        // means little, which is the v3 default, not "no order".
         let endian = only
             .get("configuration")
             .and_then(|c| c.get("endian"))
             .and_then(serde_json::Value::as_str);
-        return endian.is_none_or(|e| e == NATIVE_ENDIAN);
+        return endian.unwrap_or("little") == NATIVE_ENDIAN;
     }
     false
 }
