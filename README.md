@@ -37,7 +37,7 @@ A `NotImplementedError` will be raised if a store is not supported.
 
 Standard `zarr.config` options control some functionality (see the defaults in the [config.py](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py) of `zarr-python`):
 - `threading.max_workers`: how many chunks the `ZarrsCodecPipeline` encodes at once. **Writes
-  only.** A read is bounded by `codec_pipeline.read_workers` and by the pools' own widths.
+  only.** A read runs on the two pools sized by `codec_pipeline.read_workers` and `decode_workers` below.
   - This is a concurrency budget, not a thread count. The number of threads is the size of the
     pipeline's `rayon` pool, which is set by the `RAYON_NUM_THREADS` environment variable and
     defaults to [the number of logical CPUs](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
@@ -61,17 +61,17 @@ The `ZarrsCodecPipeline` specific options are:
   - The cache is per `Array` object, not per process, so compare `file_handle_cache_size` times the number of open arrays against `ulimit -n`. See [here](https://docs.rs/zarrs_filesystem/latest/zarrs_filesystem/struct.FilesystemStoreOptions.html#method.file_handle_cache_size) for more info.
 A read of a sharded array **remembers each shard's decoded index** for the duration of that read, so a shard whose index was already read is not read again per item. This is automatic and has no option. An array opened `mode="r"` keeps them for the life of the array instead, which assumes nothing else is rewriting it while it is open -- the same caveat as `file_handle_cache_size` above, for the same reason.
 
-- `codec_pipeline.read_workers` / `codec_pipeline.decode_workers`: how many workers one read may use for fetching byte ranges and for decoding chunks.
-  - Decoding runs on the same pool as encoding, being CPU work; fetching runs on a second, wider one. They are separate because a reader waits on storage while a decoder occupies a core: a value above the core count is defensible for readers and not for decoders. On high-latency storage more readers is usually better, up to the number of chunks a read touches.
-  - **Per call.** Each read takes at most this many workers out of those pools, which are process-wide and work-stealing, so two reads asking for different widths both get what they asked for.
-  - Both default to a share of the pool that will run them, and every width in the process comes from one number: the size of the CPU pool, which `RAYON_NUM_THREADS` sets before anything starts. Raising or lowering it moves all of them together.
-  - The one width that cannot be served is one above what a pool was BUILT with, since a rayon pool cannot grow; asking for more is an error rather than a silent clamp. This is the arrangement `numba` uses -- `NUMBA_NUM_THREADS` fixes what a process launches, and `set_num_threads` may only ask for less.
+- `codec_pipeline.read_workers` / `codec_pipeline.decode_workers`: the sizes of the two thread pools a read runs on, one fetching byte ranges from the store and one decoding chunks.
+  - Each pool's threads wait on a queue and cost nothing while it is empty, so a wide pool is safe: an idle worker is a parked thread, not a spinning one. A read queues all of its chunks at once, each reader hands its chunk to the decode pool as it arrives, and the pool widths are the only bound.
+  - They are separate because a reader mostly waits on storage while a decoder occupies a core, so more readers than cores is reasonable and more decoders than cores is not. On high-latency storage more readers is usually better, up to the number of chunks a read touches.
+  - `decode_workers` defaults to the number of CPUs this process may run on, and `read_workers` to 8 times that.
+  - Both pools are **built by the first read of the process and never resized**. A later read that asks for a different width is served by the pools that exist, with a warning, or an error if `strict` is set. Set them before the first read.
 
 - `codec_pipeline.raw_max_reads_per_chunk`: how many separate reads a chunk's wanted rows may become before the fast "read the row's bytes, not the chunk" path is declined for that chunk.
   - Defaults to `2`, and applies only where an inner chunk is a plain byte tiling (no compression), since that is what makes a row's bytes addressable inside it.
   - It trades bytes for requests. A row costs nearly as much to fetch as the whole chunk containing it, so a scattered selection that would become many small reads is served better by one large one — hence a per-chunk gate rather than an array-wide switch.
   - `0` disables the path entirely. On an uncompressed store with a scattered row draw that costs about 75% of throughput, so raise it rather than disable it unless you are measuring.
-  - Unlike the two ceilings above, this is honoured on every read, so `zarr.config.set` scopes it as expected.
+  - Unlike the two pool sizes above, this is honoured on every read, so `zarr.config.set` scopes it as expected.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.

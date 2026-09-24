@@ -676,16 +676,12 @@ fn default_pool_size() -> usize {
     std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
 }
 
-/// How much wider the I/O pool DEFAULTS to than the CPU pool.
-///
-/// A parked reader is a stack and no CPU, so a low bound buys nothing. It multiplies the CPU
-/// pool, so `RAYON_NUM_THREADS` sizes both.
+/// How much wider the read pool defaults to than the decode pool: a parked reader is a stack
+/// and no CPU, so a low bound buys nothing.
 const READ_POOL_MULTIPLIER: usize = 8;
 
-/// The pool a read's STORE traffic runs on.
-///
-/// Separate from the CPU pool because a reader parked on storage must never hold a worker a
-/// decode needs. Decoding has no third pool: it is CPU work and runs on the CPU pool.
+/// The pool a read's store traffic runs on, separate so a reader parked on storage never holds
+/// a worker a decode needs.
 static READ_POOL: OnceLock<Arc<QueuePool>> = OnceLock::new();
 
 type QueueTask = Box<dyn FnOnce() + Send + 'static>;
@@ -769,9 +765,9 @@ pub(crate) fn batch<R>(submit: impl FnOnce(Batch) -> R) -> R {
 }
 
 /// The pool decodes run on.
-static CPU_POOL: OnceLock<Arc<QueuePool>> = OnceLock::new();
+static DECODE_POOL: OnceLock<Arc<QueuePool>> = OnceLock::new();
 
-/// `(io, cpu)`: the pool that fetches, and the pool that decodes.
+/// `(read, decode)`: the pool that fetches, and the pool that decodes.
 ///
 /// Sized by the FIRST call of the process and never resized.
 /// The `Python` token is taken so the caller states it holds the GIL here rather than inside
@@ -780,11 +776,11 @@ pub(crate) fn pools(
     _py: Python<'_>,
     config: ReadConfig,
 ) -> PyResult<(Arc<QueuePool>, Arc<QueuePool>)> {
-    let cpu = match CPU_POOL.get() {
+    let cpu = match DECODE_POOL.get() {
         Some(p) => p.clone(),
         None => {
             let built = Arc::new(QueuePool::new(config.decode_workers, "decode")?);
-            CPU_POOL.get_or_init(|| built).clone()
+            DECODE_POOL.get_or_init(|| built).clone()
         }
     };
     let io = match READ_POOL.get() {
@@ -804,37 +800,21 @@ pub(crate) fn pools(
 pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
     (
         READ_POOL.get().map(|p| p.width()),
-        CPU_POOL.get().map(|p| p.width()),
+        DECODE_POOL.get().map(|p| p.width()),
     )
 }
 
-/// Refuse a width above what the pools were BUILT with, the one width they cannot give.
+/// Say so when a call asks for a width other than what the pools were built with.
 ///
-/// A call using fewer workers than the pool holds is the ordinary case, not a problem, so this
-/// compares against the pools' own widths rather than against what any other call asked for.
+/// Neither knob caps a call: every job is queued at once and the pool is the only bound, so a
+/// smaller width than the pool's would be ignored as silently as a larger one.
 pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyResult<()> {
-    let (io, cpu) = pools(py, config)?;
-    // `caps_per_call` is the difference between the two knobs, and it decides which way a
-    // mismatch is worth saying anything about. A read takes at most `read_workers` of the I/O
-    // pool, so asking for FEWER than the pool holds is served exactly; only more is unservable.
-    // A decode has no such limiter -- it is spawned as each read returns -- so the pool is the
-    // only bound and asking for fewer is silently ignored, which is the failure this knob was
-    // found in.
-    for (limit, asked, knob, caps_per_call) in [
-        (
-            io.width(),
-            config.read_workers,
-            "read_workers",
-            true,
-        ),
-        (
-            cpu.width(),
-            config.decode_workers,
-            "decode_workers",
-            false,
-        ),
+    let (io, dec) = pools(py, config)?;
+    for (limit, asked, knob) in [
+        (io.width(), config.read_workers, "read_workers"),
+        (dec.width(), config.decode_workers, "decode_workers"),
     ] {
-        if asked == limit || (caps_per_call && asked < limit) {
+        if asked == limit {
             continue;
         }
         let message = format!(
@@ -1237,7 +1217,7 @@ mod tests {
             assert_eq!(
                 io.width(),
                 cpu.width() * READ_POOL_MULTIPLIER,
-                "the I/O pool is a multiple of the CPU pool, so one setting sizes both"
+                "the read pool is a multiple of the decode pool, so one setting sizes both"
             );
             assert_eq!(
                 pool_sizes(),

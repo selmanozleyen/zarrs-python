@@ -315,9 +315,9 @@ impl CodecPipelineImpl {
         py.import("warnings")?.call_method1(
             "warn",
             ("codec_pipeline.chunk_concurrent_minimum, chunk_concurrent_maximum and \
-              threading.max_workers bound a WRITE through this pipeline, not a read. A read is \
-              bounded by codec_pipeline.read_workers and by the pools' own widths, which are \
-              fixed at the first read of the process.",),
+              threading.max_workers bound a WRITE through this pipeline, not a read. A read runs \
+              on the two pools that codec_pipeline.read_workers and decode_workers size at the \
+              first read of the process.",),
         )?;
         Ok(())
     }
@@ -342,7 +342,7 @@ impl CodecPipelineImpl {
             let pools = read_decode::pools(py, config)?;
             // These are upstream's knobs and this path no longer spends them: the outer limit
             // below is dropped and the codec target is overridden to 1, so a read is bounded by
-            // `read_workers` and the pools alone. Said out loud rather than accepted silently,
+            // the two pools alone. Said out loud rather than accepted silently,
             // because upstream honours them and a write through this same pipeline still does.
             // Before `detach`: warning is Python work and the GIL is held here.
             self.warn_read_ignores_chunk_concurrency(py)?;
@@ -511,15 +511,14 @@ impl CodecPipelineImpl {
         raw_max_reads_per_chunk: Option<usize>,
         strict: bool,
     ) -> PyResult<()> {
-        // Every width is a per-call decision, so none of them is a constructor argument.
+        // Read per call so a first call can size the pools; later calls are checked against them.
         let config = read_decode::ReadConfig::from_call(
             read_workers,
             decode_workers,
             raw_max_reads_per_chunk,
             strict,
         );
-        // The one width still not servable is one above what the pools were built with, since a
-        // rayon pool cannot grow.
+        // The pools are fixed once built, so a width that differs from theirs is said out loud.
         read_decode::check_workers_arrived(py, config)?;
         self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, config)
     }
