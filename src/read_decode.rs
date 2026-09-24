@@ -69,7 +69,7 @@ impl CodecPipelineImpl {
         output: UnsafeCellSlice<'_, u8>,
         output_len: usize,
         config: ReadConfig,
-        pools: &(Arc<IoPool>, Arc<rayon::ThreadPool>),
+        pools: &(Arc<QueuePool>, Arc<QueuePool>),
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
         let element_size = self.element_size()?;
@@ -114,17 +114,18 @@ impl CodecPipelineImpl {
 
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
-        // Every job queued at once; the pool is the bound, since `read_workers` sized it. Readers
-        // block on the queue when it empties, so an idle one costs nothing -- rayon's would spend
-        // 33 rounds stealing first, which at a few hundred workers is most of the machine. Each
-        // reader hands its chunk to the decode scope, and both block until their tasks finish,
-        // which keeps the `&mut [u8]` into the caller's numpy buffer valid.
+        // Every job queued at once; the pools are the bound, since the two knobs sized them.
+        // Workers block on their queue when it empties, so an idle one costs nothing -- rayon's
+        // would spend 33 rounds stealing first, which at a few hundred workers is most of the
+        // machine. A reader queues its chunk's decode on the other pool, and `batch` returns only
+        // once both have run, which keeps the `&mut [u8]` into the numpy buffer valid.
         let (read_pool, decode_pool) = pools;
-        decode_pool.in_place_scope(|dec| {
-            read_pool.scope(jobs.into_iter().map(|job| {
-                let (failure, ctx) = (&failure, &ctx);
-                move || read_one(job, dec, failure, ctx)
-            }));
+        batch(|b| {
+            for job in jobs {
+                let (failure, ctx, task_b) = (&failure, &ctx, b.clone());
+                // SAFETY: `jobs`, `failure`, `ctx` and the pools all outlive this `batch` call.
+                unsafe { b.spawn(read_pool, move || read_one(job, decode_pool, &task_b, failure, ctx)) };
+            }
         });
 
         if let Some(e) = failure.lock().expect("failure slot poisoned").take() {
@@ -685,26 +686,26 @@ const READ_POOL_MULTIPLIER: usize = 8;
 ///
 /// Separate from the CPU pool because a reader parked on storage must never hold a worker a
 /// decode needs. Decoding has no third pool: it is CPU work and runs on the CPU pool.
-static READ_POOL: OnceLock<Arc<IoPool>> = OnceLock::new();
+static READ_POOL: OnceLock<Arc<QueuePool>> = OnceLock::new();
 
-type IoTask = Box<dyn FnOnce() + Send + 'static>;
+type QueueTask = Box<dyn FnOnce() + Send + 'static>;
 type Panic = Box<dyn std::any::Any + Send>;
 
-/// Reader threads blocked on one queue, built once and never resized.
-pub(crate) struct IoPool {
-    tx: crossbeam_channel::Sender<IoTask>,
+/// Worker threads blocked on one queue, built once and never resized.
+pub(crate) struct QueuePool {
+    tx: crossbeam_channel::Sender<QueueTask>,
     width: usize,
 }
 
-impl IoPool {
-    fn new(width: usize) -> PyResult<Self> {
-        let (tx, rx) = crossbeam_channel::unbounded::<IoTask>();
+impl QueuePool {
+    fn new(width: usize, name: &'static str) -> PyResult<Self> {
+        let (tx, rx) = crossbeam_channel::unbounded::<QueueTask>();
         for i in 0..width {
             let rx = rx.clone();
             std::thread::Builder::new()
-                .name(format!("zarrs-read-{i}"))
+                .name(format!("zarrs-{name}-{i}"))
                 .spawn(move || rx.iter().for_each(|task| task()))
-                .map_err(|e| PyRuntimeError::new_err(format!("could not create the read pool: {e}")))?;
+                .map_err(|e| PyRuntimeError::new_err(format!("could not create the {name} pool: {e}")))?;
         }
         Ok(Self { tx, width })
     }
@@ -712,93 +713,81 @@ impl IoPool {
     pub(crate) fn width(&self) -> usize {
         self.width
     }
-
-    /// Run every task on the pool and return once all have finished, re-raising the first panic.
-    fn scope<'a, F: FnOnce() + Send + 'a>(&self, tasks: impl IntoIterator<Item = F>) {
-        let (done_tx, done_rx) = crossbeam_channel::unbounded::<Option<Panic>>();
-        // Waits on drop as well, so an unwind out of this function still cannot outlive a task.
-        let mut pending = Pending { rx: done_rx, n: 0, panic: None };
-        for task in tasks {
-            let done = done_tx.clone();
-            let task: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
-                let _ = done.send(r.err());
-            });
-            // SAFETY: the task borrows for 'a, and `pending` does not let this function return,
-            // or unwind past it, until every task sent has reported back through `done`.
-            let task: IoTask = unsafe { std::mem::transmute(task) };
-            self.tx.send(task).expect("the read pool's queue is never closed");
-            pending.n += 1;
-        }
-        drop(done_tx);
-        pending.wait();
-        if let Some(p) = pending.panic.take() {
-            std::panic::resume_unwind(p);
-        }
-    }
 }
 
-struct Pending {
-    rx: crossbeam_channel::Receiver<Option<Panic>>,
-    n: usize,
-    panic: Option<Panic>,
+/// The handle every task of one `batch` carries; the batch returns once all are dropped.
+#[derive(Clone)]
+pub(crate) struct Batch {
+    wg: crossbeam_utils::sync::WaitGroup,
+    panic: Arc<Mutex<Option<Panic>>>,
 }
 
-impl Pending {
-    fn wait(&mut self) {
-        while self.n > 0 {
-            match self.rx.recv() {
-                Ok(p) => {
-                    self.n -= 1;
-                    if self.panic.is_none() {
-                        self.panic = p;
-                    }
+impl Batch {
+    /// Queue `task` on `pool`.
+    ///
+    /// # Safety
+    /// Whatever `task` borrows must outlive the `batch` call this handle came from.
+    unsafe fn spawn<'a>(&self, pool: &QueuePool, task: impl FnOnce() + Send + 'a) {
+        let b = self.clone();
+        let task: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
+                let mut slot = b.panic.lock().expect("panic slot poisoned");
+                if slot.is_none() {
+                    *slot = Some(p);
                 }
-                // Every sender gone means no task still holds one, so none is running.
-                Err(_) => self.n = 0,
             }
+        });
+        // SAFETY: `b` goes when the task finishes, and `batch` waits for every clone of it.
+        let task: QueueTask = unsafe { std::mem::transmute(task) };
+        pool.tx.send(task).expect("a pool's queue is never closed");
+    }
+}
+
+/// Run `submit`, which queues tasks through the handle it is given, and return once every one
+/// has finished, including tasks queued by other tasks. Re-raises the first task panic.
+pub(crate) fn batch<R>(submit: impl FnOnce(Batch) -> R) -> R {
+    struct WaitOnDrop(crossbeam_utils::sync::WaitGroup);
+    impl Drop for WaitOnDrop {
+        fn drop(&mut self) {
+            std::mem::take(&mut self.0).wait();
         }
     }
-}
-
-impl Drop for Pending {
-    fn drop(&mut self) {
-        self.wait();
+    let root = crossbeam_utils::sync::WaitGroup::new();
+    let panic = Arc::new(Mutex::new(None));
+    let b = Batch { wg: root.clone(), panic: panic.clone() };
+    // Waits on drop as well, so an unwind out of `submit` still cannot outlive a task.
+    let wait = WaitOnDrop(root);
+    let r = submit(b);
+    drop(wait);
+    if let Some(p) = panic.lock().expect("panic slot poisoned").take() {
+        std::panic::resume_unwind(p);
     }
+    r
 }
 
-/// The CPU pool: decodes here, and a write's encode on the same threads. Sized from rayon's
-/// own view, so `RAYON_NUM_THREADS` still sizes it.
-static CPU_POOL: OnceLock<Arc<rayon::ThreadPool>> = OnceLock::new();
-
-fn build_pool(size: usize, name: &'static str) -> PyResult<rayon::ThreadPool> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(size)
-        .thread_name(move |i| format!("zarrs-{name}-{i}"))
-        .build()
-        .map_err(|e| PyRuntimeError::new_err(format!("could not create the {name} pool: {e}")))
-}
+/// The pool decodes run on.
+static CPU_POOL: OnceLock<Arc<QueuePool>> = OnceLock::new();
 
 /// `(io, cpu)`: the pool that fetches, and the pool that decodes.
 ///
-/// Sized by the FIRST call of the process and never resized, because a rayon pool cannot grow.
+/// Sized by the FIRST call of the process and never resized.
 /// The `Python` token is taken so the caller states it holds the GIL here rather than inside
 /// `detach`.
 pub(crate) fn pools(
     _py: Python<'_>,
     config: ReadConfig,
-) -> PyResult<(Arc<IoPool>, Arc<rayon::ThreadPool>)> {
+) -> PyResult<(Arc<QueuePool>, Arc<QueuePool>)> {
     let cpu = match CPU_POOL.get() {
         Some(p) => p.clone(),
         None => {
-            let built = Arc::new(build_pool(config.decode_workers, "cpu")?);
+            let built = Arc::new(QueuePool::new(config.decode_workers, "decode")?);
             CPU_POOL.get_or_init(|| built).clone()
         }
     };
     let io = match READ_POOL.get() {
         Some(p) => p.clone(),
         None => {
-            let built = Arc::new(IoPool::new(config.read_workers)?);
+            let built = Arc::new(QueuePool::new(config.read_workers, "read")?);
             READ_POOL.get_or_init(|| built).clone()
         }
     };
@@ -812,7 +801,7 @@ pub(crate) fn pools(
 pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
     (
         READ_POOL.get().map(|p| p.width()),
-        CPU_POOL.get().map(|p| p.current_num_threads()),
+        CPU_POOL.get().map(|p| p.width()),
     )
 }
 
@@ -836,7 +825,7 @@ pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyRes
             true,
         ),
         (
-            cpu.current_num_threads(),
+            cpu.width(),
             config.decode_workers,
             "decode_workers",
             false,
@@ -938,40 +927,41 @@ thread_local! {
 }
 
 /// One chunk: one store read, then its decode handed to the decode pool.
-fn read_one<'scope, 'env>(
+fn read_one<'env>(
     job: Job<'env>,
-    dec: &rayon::Scope<'scope>,
+    dec: &'env QueuePool,
+    b: &Batch,
     failure: &'env Mutex<Option<String>>,
     ctx: &'env JobContext,
-) where
-    'env: 'scope,
-{
+) {
     match ctx.store.get_partial(&job.key, job.range) {
         // `None` is an absent key, not an empty range; `decode_one` owns what absence means.
-        Ok(bytes) => spawn_decode(dec, job, bytes, failure),
+        Ok(bytes) => spawn_decode(dec, b, job, bytes, failure),
         Err(e) => record(failure, format!("read {} failed: {e}", job.key)),
     }
 }
 
 /// One chunk's decode, on the decode pool.
-fn spawn_decode<'scope, 'env>(
-    dec: &rayon::Scope<'scope>,
+fn spawn_decode<'env>(
+    dec: &QueuePool,
+    b: &Batch,
     mut job: Job<'env>,
     bytes: MaybeBytes,
     failure: &'env Mutex<Option<String>>,
-) where
-    'env: 'scope,
-{
+) {
     // every job goes to the pool, including a raw one whose "decode" is only a
     // `copy_from_slice`: a reader that copies inline stops issuing reads while it does.
-    dec.spawn(move |_| {
-        SCRATCH.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
-                record(failure, e);
-            }
+    // SAFETY: the job and `failure` borrow from the caller of `batch`, which outlives it.
+    unsafe {
+        b.spawn(dec, move || {
+            SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
+                    record(failure, e);
+                }
+            });
         });
-    });
+    }
 }
 
 /// Decode one innermost chunk into scratch, then gather the wanted elements into `out`.
@@ -1195,24 +1185,38 @@ mod tests {
         assert_eq!(buffer[4], 2);
     }
 
-    /// Borrowed tasks have all run by the time `scope` returns, and a panic comes back to the
-    /// caller without costing the pool a thread.
+    /// A batch returns only after every task, including ones queued by other tasks on the
+    /// other pool, and a panic comes back to the caller without costing a pool a thread.
     #[test]
-    fn io_pool_scope_waits_for_borrowed_tasks_and_survives_a_panic() {
-        let pool = IoPool::new(4).expect("buildable");
+    fn batch_waits_for_nested_tasks_and_survives_a_panic() {
+        let (reads, decodes) = (QueuePool::new(4, "t-read").unwrap(), QueuePool::new(2, "t-dec").unwrap());
         let mut out = vec![0u64; 1000];
-        pool.scope(out.chunks_mut(10).enumerate().map(|(i, c)| {
-            move || c.iter_mut().for_each(|x| *x = i as u64 + 1)
-        }));
+        batch(|b| {
+            for (i, c) in out.chunks_mut(10).enumerate() {
+                let (inner, decodes) = (b.clone(), &decodes);
+                // SAFETY: `out` and `decodes` outlive the batch.
+                unsafe {
+                    b.spawn(&reads, move || {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                        inner.spawn(decodes, move || c.iter_mut().for_each(|x| *x = i as u64 + 1));
+                    });
+                }
+            }
+        });
         assert!(out.chunks(10).enumerate().all(|(i, c)| c.iter().all(|&x| x == i as u64 + 1)));
 
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pool.scope([|| panic!("reader failed")]);
+            batch(|b| unsafe { b.spawn(&decodes, || panic!("decode failed")) });
         }));
         assert!(caught.is_err(), "the task's panic reaches the caller");
         let mut ran = [false; 8];
-        pool.scope(ran.iter_mut().map(|r| move || *r = true));
-        assert!(ran.iter().all(|&r| r), "all four workers are still there");
+        batch(|b| {
+            for r in ran.iter_mut() {
+                // SAFETY: `ran` outlives the batch.
+                unsafe { b.spawn(&decodes, move || *r = true) };
+            }
+        });
+        assert!(ran.iter().all(|&r| r), "both decode workers are still there");
     }
 
     /// The pools are built at the size asked for, and the size is one-shot.
@@ -1225,31 +1229,31 @@ mod tests {
             let (io, cpu) = pools(py, config).expect("the pools must be buildable");
             assert_eq!(
                 io.width(),
-                cpu.current_num_threads() * READ_POOL_MULTIPLIER,
+                cpu.width() * READ_POOL_MULTIPLIER,
                 "the I/O pool is a multiple of the CPU pool, so one setting sizes both"
             );
             assert_eq!(
                 pool_sizes(),
                 (
                     Some(io.width()),
-                    Some(cpu.current_num_threads())
+                    Some(cpu.width())
                 ),
                 "what is reported is read off the pools, not computed a second time"
             );
             // The reason there are two: a reader parked on storage must not hold a worker a
             // decode needs, so there are more of the former than there are cores.
-            assert!(io.width() > cpu.current_num_threads());
+            assert!(io.width() > cpu.width());
 
             // The config that built them must fit inside them, or every default read trips
             // the ceiling check.
             assert!(config.read_workers <= io.width());
-            assert!(config.decode_workers <= cpu.current_num_threads());
+            assert!(config.decode_workers <= cpu.width());
 
             // A later call naming a different width is answered by the pool that exists.
             let narrower = ReadConfig::from_call(Some(1), Some(1), None, false);
             let (io2, cpu2) = pools(py, narrower).expect("already built");
             assert_eq!(io2.width(), io.width());
-            assert_eq!(cpu2.current_num_threads(), cpu.current_num_threads());
+            assert_eq!(cpu2.width(), cpu.width());
         });
     }
 }
