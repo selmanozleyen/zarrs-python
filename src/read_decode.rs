@@ -69,7 +69,7 @@ impl CodecPipelineImpl {
         output: UnsafeCellSlice<'_, u8>,
         output_len: usize,
         config: ReadConfig,
-        pools: &(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>),
+        pools: &(Arc<IoPool>, Arc<rayon::ThreadPool>),
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
         let element_size = self.element_size()?;
