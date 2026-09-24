@@ -730,6 +730,9 @@ impl Batch {
     unsafe fn spawn<'a>(&self, pool: &QueuePool, task: impl FnOnce() + Send + 'a) {
         let b = self.clone();
         let task: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
+            // The whole handle: a 2021 closure naming only `b.panic` captures just that field,
+            // and the `WaitGroup` would be dropped before the task had run.
+            let b = b;
             if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
                 let mut slot = b.panic.lock().expect("panic slot poisoned");
                 if slot.is_none() {
@@ -1198,7 +1201,11 @@ mod tests {
                 unsafe {
                     b.spawn(&reads, move || {
                         std::thread::sleep(std::time::Duration::from_micros(50));
-                        inner.spawn(decodes, move || c.iter_mut().for_each(|x| *x = i as u64 + 1));
+                        inner.spawn(decodes, move || {
+                            // Slow enough that a batch returning early is always caught.
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            c.iter_mut().for_each(|x| *x = i as u64 + 1);
+                        });
                     });
                 }
             }
