@@ -70,6 +70,10 @@ class ChunkItems:
         r"""
         Push a contiguous span of the split axis, without naming its elements.
         """
+    def __len__(self) -> builtins.int:
+        r"""
+        The number of read items pushed so far.
+        """
     def push_ranges(
         self,
         keys: typing.Sequence[builtins.str],

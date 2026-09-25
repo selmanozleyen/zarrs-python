@@ -524,6 +524,11 @@ impl ChunkItems {
         }
     }
 
+    /// The number of read items pushed so far.
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+
     /// Build one batch entry's items and append them.
     ///
     /// `indices` select along axis 0: non-negative, non-decreasing, inside the chunk extent. So
@@ -699,8 +704,18 @@ impl ChunkItems {
                 PyErr::new::<PyValueError, _>("the ranges are too long to address")
             })?;
         }
+        // A range that continues where the last ended is the same read: otherwise a chunk of
+        // consecutive rows becomes one item, and one decode, per row.
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(starts.len());
         for (s, n) in starts.iter().zip(lengths.iter()) {
-            let (mut s, mut n) = (u(*s)?, u(*n)?);
+            let (s, n) = (u(*s)?, u(*n)?);
+            match merged.last_mut() {
+                Some((ms, mn)) if *ms + *mn == s => *mn += n,
+                _ if n > 0 => merged.push((s, n)),
+                _ => {}
+            }
+        }
+        for (mut s, mut n) in merged {
             while n > 0 {
                 let shard = s / shard_len;
                 let (local, piece) = (s % shard_len, n.min(shard_len - s % shard_len));

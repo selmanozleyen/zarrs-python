@@ -112,3 +112,18 @@ def test_refusals_come_before_the_read(arr, tmp_path):
     )
     with pytest.raises(zarrs.UnsupportedRangeReadError):
         zarrs.aread_ranges(two_d, np.array([0]), np.array([1]))
+
+
+def test_consecutive_ranges_are_one_read(arr):
+    """Rows that follow each other read as one span, so a chunk is not decoded once per row."""
+    a, values = arr
+    starts = np.arange(100, 100 + 64 * 5, 5)  # 64 touching ranges of 5, across a seam
+    lengths = np.full(starts.size, 5)
+    handle = zarrs._internal.ChunkItems()
+    shard_ids = np.array([0, 1], dtype=np.int64)
+    handle.push_ranges(["k0", "k1"], shard_ids, starts, lengths, SHARD, INNER)
+    # 100..420 as one span is an item per inner chunk it crosses (1..6); per range it was 64+.
+    assert len(handle) == 6, len(handle)
+    np.testing.assert_array_equal(
+        read(a, starts, lengths), expected(values, starts, lengths)
+    )
