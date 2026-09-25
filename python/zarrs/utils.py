@@ -301,13 +301,12 @@ def _bands(lo: int, hi: int, inner: int, out_lo: int) -> list[tuple[int, int, in
 _MIN_MEAN_SPAN = 64
 
 
-def _index_runs(indices: np.ndarray) -> list[tuple[int, int]] | None:
-    """(first, stop) positions of each step-1 run in `indices`, or None if the runs are short."""
+def _index_runs(indices: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """Start and stop positions of each step-1 run in `indices`, or None if the runs are short."""
     breaks = np.flatnonzero(np.diff(indices) != 1) + 1
     if (breaks.size + 1) * _MIN_MEAN_SPAN > indices.size:
         return None
-    edges = [0, *breaks.tolist(), indices.size]
-    return list(zip(edges[:-1], edges[1:]))
+    return np.concatenate(([0], breaks)), np.concatenate((breaks, [indices.size]))
 
 
 def _chunk_unit_args(
@@ -442,18 +441,18 @@ def _chunk_unit_args(
     # A coordinate read of whole CSR rows is a few long runs per shard; as spans, Rust takes
     # O(1) per run instead of walking every element.
     if whole and (runs := _index_runs(indices)) is not None:
+        a, b = runs
         return [
             (
-                "span",
+                "spans",
                 byte_getter.path,
                 chunk_spec.shape,
                 shape,
-                int(indices[a]),
-                int(b - a),
-                int(start + a),
+                indices[a],
+                (b - a).astype(np.int64),
+                (start + a).astype(np.int64),
                 int(inner_shape[0]),
             )
-            for a, b in runs
         ]
 
     pushes = []
@@ -728,6 +727,8 @@ def chunk_info_for_read(
             # to be said to describe the read.
             if kind == "span":
                 handle.push_span(*args)
+            elif kind == "spans":
+                handle.push_spans(*args)
             else:
                 handle.push_entry(*args)
         return RustChunkInfo(handle, write_empty_chunks=True)

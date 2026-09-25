@@ -661,6 +661,44 @@ impl ChunkItems {
         Ok(())
     }
 
+    /// Push several spans of one chunk in one call: `push_span` per (first, count, out_start).
+    #[pyo3(signature = (key, chunk_shape, shape, firsts, counts, out_starts, inner))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    pub(crate) fn push_spans(
+        &mut self,
+        key: &str,
+        chunk_shape: Vec<u64>,
+        shape: Vec<u64>,
+        firsts: PyReadonlyArray1<'_, i64>,
+        counts: PyReadonlyArray1<'_, i64>,
+        out_starts: PyReadonlyArray1<'_, i64>,
+        inner: u64,
+    ) -> PyResult<()> {
+        let (firsts, counts, out_starts) =
+            (firsts.as_array(), counts.as_array(), out_starts.as_array());
+        if counts.len() != firsts.len() || out_starts.len() != firsts.len() {
+            return Err(PyErr::new::<PyValueError, _>(
+                "firsts, counts and out_starts must be the same length",
+            ));
+        }
+        let u = |v: i64| {
+            u64::try_from(v)
+                .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative span field {v}")))
+        };
+        for i in 0..firsts.len() {
+            self.push_span(
+                key,
+                chunk_shape.clone(),
+                shape.clone(),
+                u(firsts[i])?,
+                u(counts[i])?,
+                u(out_starts[i])?,
+                inner,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Push a grid selection: the same columns taken from every selected index.
     #[pyo3(signature = (key, chunk_shape, shape, indices, starts, run, out_start, inner))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]

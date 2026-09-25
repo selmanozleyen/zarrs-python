@@ -99,7 +99,7 @@ def test_coordinate_runs_read_as_spans(tmp_path):
     )
     scattered = np.arange(0, 4096, 3)
     original = utils._chunk_unit_args
-    for coords, kind in [(long_runs, "span"), (scattered, "entry")]:
+    for coords, kind in [(long_runs, "spans"), (scattered, "entry")]:
         seen = []
 
         def watched(*args, **kwargs):

@@ -751,6 +751,15 @@ def _wanted(entry, out_shape) -> list[tuple[int, int]]:
 
 def _described(args) -> list[tuple[int, int]]:
     """The same pairs, expanded the way Rust reads the description back."""
+    if args[0] == "spans":
+        _, key, chunk_shape, shape, firsts, counts, out_starts, inner = args
+        return [
+            pair
+            for f, c, o in zip(firsts, counts, out_starts, strict=True)
+            for pair in _described(
+                ("span", key, chunk_shape, shape, int(f), int(c), int(o), inner)
+            )
+        ]
     if args[0] == "span":
         _, _key, chunk_shape, shape, first, count, out_start, _inner = args
         row, out_row = prod(chunk_shape[1:]), prod(shape[1:])
