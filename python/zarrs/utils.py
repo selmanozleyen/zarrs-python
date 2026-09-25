@@ -310,6 +310,70 @@ def _index_runs(indices: np.ndarray) -> list[tuple[int, int]] | None:
     return list(zip(edges[:-1], edges[1:]))
 
 
+def _coordinate_batch_args(
+    entries: list, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> tuple | None:
+    """A whole 1-D coordinate batch as the args of one `push_spans`, or None.
+
+    What a CSR row read hands over: one sorted int array per shard, each to a contiguous output
+    slice, a few rows per shard. Described entry by entry, the Python per shard costs more than
+    its rows, so the runs are found across the batch at once.
+    """
+    if drop_axes or len(shape) != 1 or inner_shape is None or not entries:
+        return None
+    chunk_shape = entries[0][1].shape
+    if len(chunk_shape) != 1:
+        return None
+    inner = int(inner_shape[0]) if inner_shape else int(chunk_shape[0])
+    if inner <= 0:
+        return None
+    keys, sels, out_lo = [], [], []
+    for byte_getter, chunk_spec, chunk_sel, out_sel, _ in entries:
+        if isinstance(chunk_sel, tuple):
+            if len(chunk_sel) != 1:
+                return None
+            chunk_sel = chunk_sel[0]
+        if isinstance(out_sel, tuple):
+            if len(out_sel) != 1:
+                return None
+            out_sel = out_sel[0]
+        if not (
+            isinstance(chunk_sel, np.ndarray)
+            and chunk_sel.ndim == 1
+            and chunk_sel.size > 0
+            and isinstance(out_sel, slice)
+            and out_sel.step in (None, 1)
+            and out_sel.stop is not None
+            and out_sel.stop - (out_sel.start or 0) == chunk_sel.size
+            and chunk_spec.shape == chunk_shape
+        ):
+            return None
+        keys.append(byte_getter.path)
+        sels.append(chunk_sel)
+        out_lo.append(out_sel.start or 0)
+    idx = np.concatenate(sels)
+    sizes = np.fromiter(map(len, sels), np.int64, len(sels))
+    entry_first = np.cumsum(sizes) - sizes
+    seams = entry_first[1:] - 1
+    step = np.diff(idx)
+    # Order and continuity are judged within an entry, never across two.
+    step[seams] = 1
+    if idx.min() < 0 or (step < 0).any():
+        return None
+    breaks = step != 1
+    breaks[seams] = True
+    firsts = np.concatenate(([0], np.flatnonzero(breaks) + 1))
+    if firsts.size * _MIN_MEAN_SPAN > idx.size:
+        return None
+    counts = np.diff(np.append(firsts, idx.size))
+    entry = np.searchsorted(entry_first, firsts, side="right") - 1
+    out_starts = np.asarray(out_lo, dtype=np.int64)[entry] + (firsts - entry_first[entry])
+    # Rust refuses an output that steps back; decline instead, and let the ordinary route serve it.
+    if (out_starts[1:] < out_starts[:-1] + counts[:-1]).any():
+        return None
+    return keys, chunk_shape, shape, entry, idx[firsts], counts, out_starts, inner
+
+
 def _chunk_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
 ) -> list[tuple] | None:
@@ -712,6 +776,10 @@ def chunk_info_for_read(
     # A generator would be consumed by the eligibility test, and the ordinary route needs
     # to read the same entries again if that test fails.
     entries = list(_as_int64_batch_info(batch_info))
+    if (batch := _coordinate_batch_args(entries, shape, drop_axes, inner_chunk_shape)) is not None:
+        handle = ChunkItems()
+        handle.push_spans(*batch)
+        return RustChunkInfo(handle, write_empty_chunks=True)
 
     # All or nothing: one ineligible entry sends the whole batch down the ordinary route.
     unit_args = [

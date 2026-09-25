@@ -661,6 +661,56 @@ impl ChunkItems {
         Ok(())
     }
 
+    /// Push the runs of a whole batch in one call: `push_span` per run, keyed by `keys[entries[i]]`.
+    #[pyo3(signature = (keys, chunk_shape, shape, entries, firsts, counts, out_starts, inner))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    pub(crate) fn push_spans(
+        &mut self,
+        keys: Vec<String>,
+        chunk_shape: Vec<u64>,
+        shape: Vec<u64>,
+        entries: PyReadonlyArray1<'_, i64>,
+        firsts: PyReadonlyArray1<'_, i64>,
+        counts: PyReadonlyArray1<'_, i64>,
+        out_starts: PyReadonlyArray1<'_, i64>,
+        inner: u64,
+    ) -> PyResult<()> {
+        let (entries, firsts) = (entries.as_array(), firsts.as_array());
+        let (counts, out_starts) = (counts.as_array(), out_starts.as_array());
+        let n = firsts.len();
+        if entries.len() != n || counts.len() != n || out_starts.len() != n {
+            return Err(PyErr::new::<PyValueError, _>(
+                "entries, firsts, counts and out_starts must be the same length",
+            ));
+        }
+        let u = |v: i64| {
+            u64::try_from(v)
+                .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative span field {v}")))
+        };
+        for i in 0..n {
+            let key = usize::try_from(entries[i])
+                .ok()
+                .and_then(|e| keys.get(e))
+                .ok_or_else(|| {
+                    PyErr::new::<PyIndexError, _>(format!(
+                        "entry {} is not one of the {} keys",
+                        entries[i],
+                        keys.len()
+                    ))
+                })?;
+            self.push_span(
+                key,
+                chunk_shape.clone(),
+                shape.clone(),
+                u(firsts[i])?,
+                u(counts[i])?,
+                u(out_starts[i])?,
+                inner,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Push a grid selection: the same columns taken from every selected index.
     #[pyo3(signature = (key, chunk_shape, shape, indices, starts, run, out_start, inner))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]

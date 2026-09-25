@@ -70,6 +70,20 @@ class ChunkItems:
         r"""
         Push a contiguous span of the split axis, without naming its elements.
         """
+    def push_spans(
+        self,
+        keys: typing.Sequence[builtins.str],
+        chunk_shape: typing.Sequence[builtins.int],
+        shape: typing.Sequence[builtins.int],
+        entries: numpy.typing.NDArray[numpy.int64],
+        firsts: numpy.typing.NDArray[numpy.int64],
+        counts: numpy.typing.NDArray[numpy.int64],
+        out_starts: numpy.typing.NDArray[numpy.int64],
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push the runs of a whole batch in one call: `push_span` per run, keyed by `keys[entries[i]]`.
+        """
     def push_grid(
         self,
         key: builtins.str,

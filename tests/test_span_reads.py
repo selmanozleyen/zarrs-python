@@ -82,35 +82,55 @@ def test_the_span_path_is_actually_taken(sharded_1d):
     assert "span" in seen, f"no entry took the span path; kinds seen: {set(seen)}"
 
 
-def test_coordinate_runs_read_as_spans(tmp_path):
-    """Whole CSR rows by coordinate: long runs become spans, short ones stay elements."""
-    import zarrs.utils as utils
-
+@pytest.fixture
+def runs_array(tmp_path):
     values = np.arange(4096, dtype=np.float32)
     array = zarr.create_array(
         store=tmp_path / "runs.zarr", shape=values.shape, chunks=(256,), shards=(1024,),
         dtype=values.dtype,
     )
     array[:] = values
-    array = zarr.open_array(tmp_path / "runs.zarr", mode="r")
-    # Rows crossing inner-chunk and shard boundaries.
-    long_runs = np.concatenate(
-        [np.arange(a, a + n) for a, n in [(10, 300), (900, 200), (2100, 90)]]
-    )
-    scattered = np.arange(0, 4096, 3)
-    original = utils._chunk_unit_args
-    for coords, kind in [(long_runs, "span"), (scattered, "entry")]:
-        seen = []
+    return zarr.open_array(tmp_path / "runs.zarr", mode="r"), values
 
-        def watched(*args, **kwargs):
-            out = original(*args, **kwargs)
-            seen.extend(push[0] for push in out or ())
-            return out
 
-        utils._chunk_unit_args = watched
-        try:
-            got = array.get_coordinate_selection(coords)
-        finally:
-            utils._chunk_unit_args = original
-        np.testing.assert_array_equal(got, values[coords])
-        assert set(seen) == {kind}, seen
+# Rows crossing inner-chunk and shard boundaries, a row either side of one seam.
+LONG_RUNS = np.concatenate(
+    [np.arange(a, a + n) for a, n in [(10, 300), (900, 124), (1024, 76), (2100, 90)]]
+)
+SCATTERED = np.arange(0, 4096, 3)
+
+
+def _watch(monkeypatch, name):
+    import zarrs.utils as utils
+
+    seen = []
+    original = getattr(utils, name)
+
+    def watched(*args, **kwargs):
+        out = original(*args, **kwargs)
+        seen.append(out)
+        return out
+
+    monkeypatch.setattr(utils, name, watched)
+    return seen
+
+
+@pytest.mark.parametrize(("coords", "batched"), [(LONG_RUNS, True), (SCATTERED, False)])
+def test_coordinate_batch_reads_runs_as_spans(runs_array, monkeypatch, coords, batched):
+    """Long runs go as one batch of spans; short ones decline to the per-entry route."""
+    array, values = runs_array
+    seen = _watch(monkeypatch, "_coordinate_batch_args")
+    np.testing.assert_array_equal(array.get_coordinate_selection(coords), values[coords])
+    assert seen and all((args is not None) == batched for args in seen), seen
+
+
+@pytest.mark.parametrize(("coords", "kind"), [(LONG_RUNS, "span"), (SCATTERED, "entry")])
+def test_coordinate_runs_per_entry(runs_array, monkeypatch, coords, kind):
+    """The per-entry route, reached when the batch declines: long runs still become spans."""
+    import zarrs.utils as utils
+
+    array, values = runs_array
+    monkeypatch.setattr(utils, "_coordinate_batch_args", lambda *a: None)
+    seen = _watch(monkeypatch, "_chunk_unit_args")
+    np.testing.assert_array_equal(array.get_coordinate_selection(coords), values[coords])
+    assert {push[0] for out in seen for push in out or ()} == {kind}
