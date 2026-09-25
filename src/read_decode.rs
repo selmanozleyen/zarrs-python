@@ -676,9 +676,15 @@ fn default_pool_size() -> usize {
     std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
 }
 
-/// How much wider the read pool defaults to than the decode pool: a parked reader is a stack
-/// and no CPU, so a low bound buys nothing.
-const READ_POOL_MULTIPLIER: usize = 8;
+/// Reads kept in flight however few the cores: 8 readers starved an 8-cpu machine 3.6x on a
+/// scattered draw, where 64 matched the full node. An idle reader is a parked thread.
+const READ_FLOOR: usize = 64;
+
+/// Default `(read, decode)` widths for a machine of `cores`. Decoders get every core up to 16 and
+/// half of them past that, where a wider decode pool started costing more than it gave.
+fn default_widths(cores: usize) -> (usize, usize) {
+    (cores.max(READ_FLOOR), if cores <= 16 { cores } else { cores / 2 })
+}
 
 /// The pool a read's store traffic runs on, separate so a reader parked on storage never holds
 /// a worker a decode needs.
@@ -856,12 +862,10 @@ impl ReadConfig {
         raw_max_reads: Option<usize>,
         strict: bool,
     ) -> Self {
-        let machine = default_pool_size();
+        let (read, decode) = default_widths(default_pool_size());
         Self {
-            read_workers: read_workers
-                .filter(|n| *n > 0)
-                .unwrap_or(machine * READ_POOL_MULTIPLIER),
-            decode_workers: decode_workers.filter(|n| *n > 0).unwrap_or(machine),
+            read_workers: read_workers.filter(|n| *n > 0).unwrap_or(read),
+            decode_workers: decode_workers.filter(|n| *n > 0).unwrap_or(decode),
             raw_max_reads: raw_max_reads.unwrap_or(RAW_MAX_READS),
             strict,
         }
@@ -1209,6 +1213,22 @@ mod tests {
         assert!(ran.iter().all(|&r| r), "both decode workers are still there");
     }
 
+    /// The defaults at the sizes they were measured on.
+    #[test]
+    fn default_widths_follow_the_measured_rule() {
+        for (cores, want) in [
+            (1, (64, 1)),
+            (4, (64, 4)),
+            (8, (64, 8)),
+            (16, (64, 16)),
+            (32, (64, 16)),
+            (90, (90, 45)),
+            (200, (200, 100)),
+        ] {
+            assert_eq!(default_widths(cores), want, "{cores} cpus");
+        }
+    }
+
     /// The pools are built at the size asked for, and the size is one-shot.
     #[test]
     fn the_io_pool_is_wider_than_the_cpu_pool_and_both_report_what_they_built() {
@@ -1218,9 +1238,9 @@ mod tests {
             let config = ReadConfig::from_call(None, None, None, true);
             let (io, cpu) = pools(py, config).expect("the pools must be buildable");
             assert_eq!(
-                io.width(),
-                cpu.width() * READ_POOL_MULTIPLIER,
-                "the read pool is a multiple of the decode pool, so one setting sizes both"
+                (io.width(), cpu.width()),
+                default_widths(default_pool_size()),
+                "with nothing asked, the pools are the defaults for this machine"
             );
             assert_eq!(
                 pool_sizes(),
