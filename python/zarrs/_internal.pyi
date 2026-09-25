@@ -70,6 +70,19 @@ class ChunkItems:
         r"""
         Push a contiguous span of the split axis, without naming its elements.
         """
+    def push_ranges(
+        self,
+        keys: typing.Sequence[builtins.str],
+        shard_ids: numpy.typing.NDArray[numpy.int64],
+        starts: numpy.typing.NDArray[numpy.int64],
+        lengths: numpy.typing.NDArray[numpy.int64],
+        shard_len: builtins.int,
+        inner: builtins.int,
+    ) -> None:
+        r"""
+        Push whole ranges of a 1-D array, back to back in the output, split at shard boundaries
+        here: per range, not per element. `shard_ids` ascends and names the shard of each key.
+        """
     def push_grid(
         self,
         key: builtins.str,

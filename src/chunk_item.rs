@@ -661,6 +661,63 @@ impl ChunkItems {
         Ok(())
     }
 
+    /// Push whole ranges of a 1-D array, back to back in the output, split at shard boundaries
+    /// here: per range, not per element. `shard_ids` ascends and names the shard of each key.
+    #[pyo3(signature = (keys, shard_ids, starts, lengths, shard_len, inner))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn push_ranges(
+        &mut self,
+        keys: Vec<String>,
+        shard_ids: PyReadonlyArray1<'_, i64>,
+        starts: PyReadonlyArray1<'_, i64>,
+        lengths: PyReadonlyArray1<'_, i64>,
+        shard_len: u64,
+        inner: u64,
+    ) -> PyResult<()> {
+        let ids = shard_ids
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("the shard id array must be contiguous"))?;
+        let (starts, lengths) = (starts.as_array(), lengths.as_array());
+        if keys.len() != ids.len() || starts.len() != lengths.len() {
+            return Err(PyErr::new::<PyValueError, _>(
+                "one key per shard id, and one length per start",
+            ));
+        }
+        if shard_len == 0 {
+            return Err(PyErr::new::<PyValueError, _>(
+                "the shard length must be non-zero",
+            ));
+        }
+        let u = |v: i64| {
+            u64::try_from(v)
+                .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative range field {v}")))
+        };
+        let mut out = self.out_end;
+        let mut total = out;
+        for n in lengths.iter() {
+            total = total.checked_add(u(*n)?).ok_or_else(|| {
+                PyErr::new::<PyValueError, _>("the ranges are too long to address")
+            })?;
+        }
+        for (s, n) in starts.iter().zip(lengths.iter()) {
+            let (mut s, mut n) = (u(*s)?, u(*n)?);
+            while n > 0 {
+                let shard = s / shard_len;
+                let (local, piece) = (s % shard_len, n.min(shard_len - s % shard_len));
+                let key = i64::try_from(shard)
+                    .ok()
+                    .and_then(|sh| ids.binary_search(&sh).ok())
+                    .map(|i| keys[i].as_str())
+                    .ok_or_else(|| {
+                        PyErr::new::<PyIndexError, _>(format!("no key given for shard {shard}"))
+                    })?;
+                self.push_span(key, vec![shard_len], vec![total], local, piece, out, inner)?;
+                (out, s, n) = (out + piece, s + piece, n - piece);
+            }
+        }
+        Ok(())
+    }
+
     /// Push a grid selection: the same columns taken from every selected index.
     #[pyo3(signature = (key, chunk_shape, shape, indices, starts, run, out_start, inner))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]

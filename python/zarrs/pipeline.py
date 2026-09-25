@@ -15,7 +15,7 @@ from zarr.core.config import config
 from zarr.core.metadata import ArrayMetadata, ArrayV2Metadata, ArrayV3Metadata
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from typing import Self
 
     from zarr.abc.store import ByteGetter, ByteSetter, Store
@@ -24,8 +24,9 @@ if TYPE_CHECKING:
     from zarr.core.chunk_grids import ChunkGrid
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
+    from zarr.storage import StorePath
 
-from ._internal import CodecPipelineImpl
+from ._internal import ChunkItems, CodecPipelineImpl
 from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
@@ -41,6 +42,10 @@ class UnsupportedDataTypeError(Exception):
 
 class UnsupportedMetadataError(Exception):
     pass
+
+
+class UnsupportedRangeReadError(Exception):
+    """`read_ranges` does not serve this array; read it another way."""
 
 
 # : What sends a batch to zarr-python instead. `read` and `write` must use the same set:
@@ -240,6 +245,103 @@ class ZarrsCodecPipeline(CodecPipeline):
                 config.get("codec_pipeline.strict", False),
             )
             return None
+
+    async def read_ranges(
+        self,
+        store_path: StorePath,
+        metadata: ArrayMetadata,
+        starts: np.ndarray,
+        lengths: np.ndarray,
+        out: np.ndarray,
+    ) -> None:
+        """Read `lengths[i]` elements from `starts[i]` of a 1-D array into `out`, back to back.
+
+        Described per range in Rust: no index array, no zarr indexer, no entry per chunk. The
+        arguments are what a zarr `Array` holds, so a multi-range selection in zarr itself
+        (zarr-python#3175) could call this as it is.
+        """
+        await asyncio.to_thread(
+            self.plan_ranges(store_path, metadata, starts, lengths, out)
+        )
+
+    def plan_ranges(
+        self,
+        store_path: StorePath,
+        metadata: ArrayMetadata,
+        starts: np.ndarray,
+        lengths: np.ndarray,
+        out: np.ndarray,
+    ) -> Callable[[], None]:
+        """`read_ranges`, checked now and returned as a call that does the read.
+
+        Raises `UnsupportedRangeReadError` for an array this does not serve, before anything
+        is read, so a caller can fall back without a read in flight.
+        """
+        inner = self._inner_chunk_shape
+        grid = getattr(metadata, "chunk_grid", None)
+        if (
+            self.impl is None
+            or inner is None
+            or len(metadata.shape) != 1
+            or not hasattr(grid, "chunk_shape")
+        ):
+            raise UnsupportedRangeReadError("a 1-D array with a regular grid is needed")
+        dtype = metadata.dtype.to_native_dtype()
+        if dtype.kind in {"V", "S", "U", "M", "m", "O", "T"} or not dtype.isnative:
+            raise UnsupportedRangeReadError(f"dtype {dtype} is not served")
+        starts = np.asarray(starts, dtype=np.int64)
+        lengths = np.asarray(lengths, dtype=np.int64)
+        if starts.ndim != 1 or starts.shape != lengths.shape:
+            raise ValueError("starts and lengths must be 1-D and the same length")
+        total = int(lengths.sum())
+        if out.shape != (total,) or out.dtype != dtype or not out.flags.c_contiguous:
+            raise ValueError(
+                f"out must be a contiguous {dtype} array of {total} elements, "
+                f"not {out.dtype} {out.shape}"
+            )
+        if (
+            (lengths < 0).any()
+            or (starts < 0).any()
+            or (starts + lengths > metadata.shape[0]).any()
+        ):
+            raise IndexError(
+                f"a range falls outside the array's {metadata.shape[0]} elements"
+            )
+        keep = lengths > 0
+        starts, lengths = starts[keep], lengths[keep]
+        shard_len = int(grid.chunk_shape[0])
+        first, last = starts // shard_len, (starts + lengths - 1) // shard_len
+        ids = np.union1d(first, last)
+        if (wide := last - first > 1).any():
+            between = [
+                np.arange(f + 1, l)
+                for f, l in zip(first[wide], last[wide], strict=True)
+            ]
+            ids = np.union1d(ids, np.concatenate(between))
+        keys = [(store_path / metadata.encode_chunk_key((int(i),))).path for i in ids]
+        knobs = (
+            config.get("codec_pipeline.read_workers", None),
+            config.get("codec_pipeline.decode_workers", None),
+            config.get("codec_pipeline.raw_max_reads_per_chunk", None),
+            config.get("codec_pipeline.strict", False),
+        )
+        impl = self.impl
+
+        def read() -> None:
+            if not starts.size:
+                return
+            handle = ChunkItems()
+            handle.push_ranges(
+                keys,
+                ids.astype(np.int64),
+                starts,
+                lengths,
+                shard_len,
+                int(inner[0]) if inner else shard_len,
+            )
+            impl.retrieve_chunk_items_and_apply_index(handle, out, *knobs)
+
+        return read
 
     async def write(
         self,
