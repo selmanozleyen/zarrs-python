@@ -67,6 +67,8 @@ A read of a sharded array **remembers each shard's decoded index** for the durat
   - `decode_workers` defaults to the number of CPUs this process may run on, and `read_workers` to 8 times that.
   - Both pools are **built by the first read of the process and never resized**. A later read that asks for a different width is served by the pools that exist, with a warning, or an error if `strict` is set. Set them before the first read.
 
+- **Forking.** These pools, rayon's pool for writes and the tokio runtime for remote stores are process-wide threads, and `fork()` copies none of them. A process that has already used zarrs therefore refuses to read or write in a forked child, with a `RuntimeError`, instead of hanging on queues nobody serves. Start worker processes with the `spawn` or `forkserver` method; a child forked before any use is unaffected.
+
 - `codec_pipeline.raw_max_reads_per_chunk`: how many separate reads a chunk's wanted rows may become before the fast "read the row's bytes, not the chunk" path is declined for that chunk.
   - Defaults to `2`, and applies only where an inner chunk is a plain byte tiling (no compression), since that is what makes a row's bytes addressable inside it.
   - It trades bytes for requests. A row costs nearly as much to fetch as the whole chunk containing it, so a scattered selection that would become many small reads is served better by one large one — hence a per-chunk gate rather than an array-wide switch.

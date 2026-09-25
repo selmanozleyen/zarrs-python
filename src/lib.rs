@@ -29,6 +29,7 @@ use zarrs::storage::{ReadableStorage, ReadableWritableListableStorage, StoreKey}
 
 mod chunk_item;
 mod concurrency;
+mod fork;
 mod read_decode;
 mod runtime;
 mod shard_index;
@@ -416,6 +417,7 @@ impl CodecPipelineImpl {
         direct_io: bool,
         file_handle_cache_size: usize,
     ) -> PyResult<Self> {
+        fork::check()?;
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
         let metadata = serde_json::from_str(array_metadata).map_py_err::<PyTypeError>()?;
@@ -530,6 +532,7 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         write_empty_chunks: bool,
     ) -> PyResult<()> {
+        fork::check()?;
         // Fail before decoding anything; the write site checks again by construction.
         self.writable()?;
 

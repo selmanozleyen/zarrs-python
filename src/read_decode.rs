@@ -776,6 +776,9 @@ pub(crate) fn pools(
     _py: Python<'_>,
     config: ReadConfig,
 ) -> PyResult<(Arc<QueuePool>, Arc<QueuePool>)> {
+    // Every read comes through here, and inherited pools have queues but no threads: a read in
+    // a forked child would wait forever rather than fail.
+    crate::fork::check()?;
     let cpu = match DECODE_POOL.get() {
         Some(p) => p.clone(),
         None => {
