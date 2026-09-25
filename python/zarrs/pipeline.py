@@ -257,8 +257,8 @@ class ZarrsCodecPipeline(CodecPipeline):
         """Read `lengths[i]` elements from `starts[i]` of a 1-D array into `out`, back to back.
 
         Described per range in Rust: no index array, no zarr indexer, no entry per chunk. The
-        arguments are what a zarr `Array` holds, so a multi-range selection in zarr itself
-        (zarr-python#3175) could call this as it is.
+        arguments are what a zarr `Array` holds, so zarr could call it from a multi-range
+        selection of its own; zarr-python#3175 discusses one, and none exists yet.
         """
         await asyncio.to_thread(
             self.plan_ranges(store_path, metadata, starts, lengths, out)
