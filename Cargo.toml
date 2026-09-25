@@ -14,7 +14,7 @@ pyo3 = { version = "0.27.1", features = ["abi3-py311"] }
 # delete the [patch.crates-io] block below, in the SAME commit -- see the note there for why
 # doing only one of the two builds silently against the wrong `zarrs_storage`. src/ already
 # compiles against the 0.24 API.
-zarrs = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7", features = ["async", "zlib", "pcodec", "bz2"] }
+zarrs = { git = "https://github.com/selmanozleyen/zarrs", rev = "e62034e6c87e535acacf4e0581da628ca6c839cd", features = ["async", "zlib", "pcodec", "bz2"] }
 rayon_iter_concurrent_limit = "0.2.0"
 rayon = "1.10.0"
 crossbeam-channel = "0.5"
@@ -48,4 +48,4 @@ lto = true
 # `zarrs 0.24` compiled against an unpublished `zarrs_storage`. Nothing warns, because the
 # git copy carries the same version number as the published one with different contents.
 [patch.crates-io]
-zarrs_storage = { git = "https://github.com/zarrs/zarrs", rev = "c17fe374b1fa7df8373b6c6f6eb3f1d33c3a3bd7" }
+zarrs_storage = { git = "https://github.com/selmanozleyen/zarrs", rev = "e62034e6c87e535acacf4e0581da628ca6c839cd" }
