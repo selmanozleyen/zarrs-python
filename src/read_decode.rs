@@ -687,27 +687,123 @@ static READ_POOL: OnceLock<Arc<QueuePool>> = OnceLock::new();
 type QueueTask = Box<dyn FnOnce() + Send + 'static>;
 type Panic = Box<dyn std::any::Any + Send>;
 
-/// Worker threads blocked on one queue, built once and never resized.
+/// Worker threads on one queue, built once and never resized.
+///
+/// A push wakes a parked worker only when no worker is already searching for work, the rule
+/// tokio's and Go's schedulers use: otherwise a wide pool wakes a cold thread per task while a
+/// warm one would have taken it a few microseconds later.
 pub(crate) struct QueuePool {
-    tx: crossbeam_channel::Sender<QueueTask>,
+    shared: Arc<Shared>,
     width: usize,
+}
+
+struct Shared {
+    queue: crossbeam_deque::Injector<QueueTask>,
+    searching: std::sync::atomic::AtomicUsize,
+    sleepers: Mutex<usize>,
+    wake: std::sync::Condvar,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl Shared {
+    fn steal(&self) -> Option<QueueTask> {
+        loop {
+            match self.queue.steal() {
+                crossbeam_deque::Steal::Success(t) => return Some(t),
+                crossbeam_deque::Steal::Empty => return None,
+                crossbeam_deque::Steal::Retry => {}
+            }
+        }
+    }
+
+    fn wake_one(&self) {
+        if *self.sleepers.lock().expect("sleepers poisoned") > 0 {
+            self.wake.notify_one();
+        }
+    }
+
+    fn work(&self) {
+        use std::sync::atomic::{Ordering::SeqCst, fence};
+        loop {
+            self.searching.fetch_add(1, SeqCst);
+            let backoff = crossbeam_utils::Backoff::new();
+            let task = loop {
+                if let Some(t) = self.steal() {
+                    break Some(t);
+                }
+                if backoff.is_completed() {
+                    break None;
+                }
+                backoff.snooze();
+            };
+            let last = self.searching.fetch_sub(1, SeqCst) == 1;
+            fence(SeqCst);
+            if let Some(task) = task {
+                // The last searcher leaving with work still queued passes the search on, or the
+                // rest of a burst would wait behind this task.
+                if last && !self.queue.is_empty() {
+                    self.wake_one();
+                }
+                task();
+                continue;
+            }
+            let mut sleepers = self.sleepers.lock().expect("sleepers poisoned");
+            // Re-checked under the lock a pusher takes to wake us, so a push landing between
+            // leaving the search and parking is seen here or wakes us there.
+            if !self.queue.is_empty() {
+                continue;
+            }
+            if self.closed.load(SeqCst) {
+                return;
+            }
+            *sleepers += 1;
+            sleepers = self.wake.wait(sleepers).expect("sleepers poisoned");
+            *sleepers -= 1;
+        }
+    }
 }
 
 impl QueuePool {
     fn new(width: usize, name: &'static str) -> PyResult<Self> {
-        let (tx, rx) = crossbeam_channel::unbounded::<QueueTask>();
+        let shared = Arc::new(Shared {
+            queue: crossbeam_deque::Injector::new(),
+            searching: std::sync::atomic::AtomicUsize::new(0),
+            sleepers: Mutex::new(0),
+            wake: std::sync::Condvar::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
         for i in 0..width {
-            let rx = rx.clone();
+            let shared = shared.clone();
             std::thread::Builder::new()
                 .name(format!("zarrs-{name}-{i}"))
-                .spawn(move || rx.iter().for_each(|task| task()))
+                .spawn(move || shared.work())
                 .map_err(|e| PyRuntimeError::new_err(format!("could not create the {name} pool: {e}")))?;
         }
-        Ok(Self { tx, width })
+        Ok(Self { shared, width })
     }
 
     pub(crate) fn width(&self) -> usize {
         self.width
+    }
+
+    fn push(&self, task: QueueTask) {
+        use std::sync::atomic::{Ordering::SeqCst, fence};
+        self.shared.queue.push(task);
+        // Pairs with the fence after a worker leaves the search: either it sees this task, or
+        // this sees it gone and wakes a sleeper.
+        fence(SeqCst);
+        if self.shared.searching.load(SeqCst) == 0 {
+            self.shared.wake_one();
+        }
+    }
+}
+
+// The pools in the statics live for the process; this is for the ones tests build.
+impl Drop for QueuePool {
+    fn drop(&mut self) {
+        self.shared.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _guard = self.shared.sleepers.lock().expect("sleepers poisoned");
+        self.shared.wake.notify_all();
     }
 }
 
@@ -738,7 +834,7 @@ impl Batch {
         });
         // SAFETY: `b` goes when the task finishes, and `batch` waits for every clone of it.
         let task: QueueTask = unsafe { std::mem::transmute(task) };
-        pool.tx.send(task).expect("a pool's queue is never closed");
+        pool.push(task);
     }
 }
 
@@ -1207,6 +1303,43 @@ mod tests {
             }
         });
         assert!(ran.iter().all(|&r| r), "both decode workers are still there");
+    }
+
+    /// No task is lost to a push racing a worker that is leaving the search to park. A lost
+    /// wakeup would hang rather than fail, so the churn runs under a deadline.
+    #[test]
+    fn queue_pool_loses_no_wakeup_under_churn() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let reads = QueuePool::new(8, "t-r2").unwrap();
+            let decodes = QueuePool::new(3, "t-d2").unwrap();
+            for round in 0..3000usize {
+                let (want, hits) = (round % 17 + 1, AtomicUsize::new(0));
+                batch(|b| {
+                    for _ in 0..want {
+                        let (inner, decodes, hits) = (b.clone(), &decodes, &hits);
+                        // SAFETY: `decodes` and `hits` outlive the batch.
+                        unsafe {
+                            b.spawn(&reads, move || {
+                                inner.spawn(decodes, move || {
+                                    hits.fetch_add(1, Relaxed);
+                                });
+                            });
+                        }
+                    }
+                });
+                assert_eq!(hits.load(Relaxed), want);
+                // Now and then long enough for every worker to give up searching and park.
+                if round % 50 == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a batch never finished: a wakeup was lost");
     }
 
     /// The pools are built at the size asked for, and the size is one-shot.
