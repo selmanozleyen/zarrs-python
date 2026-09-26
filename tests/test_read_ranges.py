@@ -127,3 +127,57 @@ def test_consecutive_ranges_are_one_read(arr):
     np.testing.assert_array_equal(
         read(a, starts, lengths), expected(values, starts, lengths)
     )
+
+
+def test_the_zarr_hook_serves_1d_and_declines_the_rest(arr, tmp_path):
+    """`read_ranges` as zarr's pipeline hook: True when it read, False to let zarr read."""
+    from zarr.core.buffer import default_buffer_prototype
+
+    a, values = arr
+    pipeline = a._async_array.codec_pipeline
+    out = default_buffer_prototype().nd_buffer.empty(
+        shape=(7,), dtype=np.dtype("float32")
+    )
+    starts, lengths = np.array([300, 10]), np.array([4, 3])
+    assert (
+        sync(pipeline.read_ranges(a.store_path, a.metadata, starts, lengths, out))
+        is True
+    )
+    np.testing.assert_array_equal(
+        out.as_ndarray_like(), expected(values, starts, lengths)
+    )
+    two_d = zarr.create_array(
+        store=tmp_path / "2d.zarr", shape=(4, 4), chunks=(2, 2), dtype="f4"
+    )
+    p2 = two_d._async_array.codec_pipeline
+    out2 = default_buffer_prototype().nd_buffer.empty(
+        shape=(1, 4), dtype=np.dtype("float32")
+    )
+    served = sync(
+        p2.read_ranges(
+            two_d.store_path, two_d.metadata, np.array([0]), np.array([1]), out2
+        )
+    )
+    assert served is False
+
+
+def test_zarr_range_selection_takes_the_hook(arr, monkeypatch):
+    """Through zarr's own API, when the installed zarr has it: the hook serves the read."""
+    if not hasattr(zarr.Array, "get_range_selection"):
+        pytest.skip("this zarr has no get_range_selection")
+    import zarrs.pipeline as pipeline_mod
+
+    a, values = arr
+    served = []
+    original = pipeline_mod.ZarrsCodecPipeline.read_ranges
+
+    async def watched(self, *args, **kwargs):
+        served.append(await original(self, *args, **kwargs))
+        return served[-1]
+
+    monkeypatch.setattr(pipeline_mod.ZarrsCodecPipeline, "read_ranges", watched)
+    starts, lengths = [900, 10, 900], [30, 20, 30]
+    np.testing.assert_array_equal(
+        a.get_range_selection(starts, lengths), expected(values, starts, lengths)
+    )
+    assert served == [True]

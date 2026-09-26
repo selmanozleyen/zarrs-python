@@ -252,17 +252,21 @@ class ZarrsCodecPipeline(CodecPipeline):
         metadata: ArrayMetadata,
         starts: np.ndarray,
         lengths: np.ndarray,
-        out: np.ndarray,
-    ) -> None:
-        """Read `lengths[i]` elements from `starts[i]` of a 1-D array into `out`, back to back.
+        out: NDBuffer | np.ndarray,
+    ) -> bool:
+        """zarr's `CodecPipeline.read_ranges` hook: ranges of axis 0, back to back, into `out`.
 
-        Described per range in Rust: no index array, no zarr indexer, no entry per chunk. The
-        arguments are what a zarr `Array` holds, so zarr could call it from a multi-range
-        selection of its own; zarr-python#3175 discusses one, and none exists yet.
+        Described per range in Rust: no index array and no entry per chunk. Returns False for
+        an array this does not serve, before reading anything, and zarr then reads the ranges
+        through its own indexer and `read`.
         """
-        await asyncio.to_thread(
-            self.plan_ranges(store_path, metadata, starts, lengths, out)
-        )
+        buffer = out.as_ndarray_like() if hasattr(out, "as_ndarray_like") else out
+        try:
+            read = self.plan_ranges(store_path, metadata, starts, lengths, buffer)
+        except UnsupportedRangeReadError:
+            return False
+        await asyncio.to_thread(read)
+        return True
 
     def plan_ranges(
         self,
