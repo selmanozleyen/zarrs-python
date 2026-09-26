@@ -127,3 +127,19 @@ def test_consecutive_ranges_are_one_read(arr):
     np.testing.assert_array_equal(
         read(a, starts, lengths), expected(values, starts, lengths)
     )
+
+
+def test_ranges_sharing_a_chunk_read_it_once(arr):
+    """Ranges that do not touch but share an inner chunk: one read and decode of it, not one each."""
+    from zarrs._internal import raw_path_stats
+
+    a, values = arr
+    starts = np.arange(
+        0, 4 * INNER, 8
+    )  # 32 ranges of 3, eight in each of 4 inner chunks
+    lengths = np.full(starts.size, 3)
+    before = raw_path_stats()[1]
+    np.testing.assert_array_equal(
+        read(a, starts, lengths), expected(values, starts, lengths)
+    )
+    assert raw_path_stats()[1] - before == 4
