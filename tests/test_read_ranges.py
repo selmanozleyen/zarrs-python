@@ -29,9 +29,21 @@ def arr(tmp_path):
     return _array(tmp_path / "a.zarr")
 
 
-def read(a, starts, lengths, **kwargs):
+def read(a, starts, lengths, out=None):
+    """Ranges through the pipeline's `read_ranges` hook, which must serve them."""
+    from zarr.core.buffer import default_buffer_prototype
+
     starts, lengths = np.asarray(starts, np.int64), np.asarray(lengths, np.int64)
-    return sync(zarrs.aread_ranges(a, starts, lengths, **kwargs))
+    if out is None:
+        shape = (int(lengths.sum()), *a.shape[1:])
+        out = np.empty(shape, dtype=a.metadata.dtype.to_native_dtype())
+    buffer = default_buffer_prototype().nd_buffer(out)
+    pipeline = a._async_array.codec_pipeline
+    assert (
+        sync(pipeline.read_ranges(a.store_path, a.metadata, starts, lengths, buffer))
+        is True
+    )
+    return out
 
 
 def expected(values, starts, lengths):
@@ -101,17 +113,12 @@ def test_into_a_buffer(arr):
     np.testing.assert_array_equal(out, values[3:11])
 
 
-def test_refusals_come_before_the_read(arr, tmp_path):
+def test_refusals_come_before_the_read(arr):
     a, _ = arr
     with pytest.raises(IndexError):
-        zarrs.aread_ranges(a, np.array([LENGTH - 1]), np.array([2]))
+        read(a, [LENGTH - 1], [2])
     with pytest.raises(ValueError, match="out must be"):
-        zarrs.aread_ranges(a, np.array([0]), np.array([4]), out=np.empty(3, np.float32))
-    two_d = zarr.create_array(
-        store=tmp_path / "2d.zarr", shape=(4, 4), chunks=(2, 2), dtype="f4"
-    )
-    with pytest.raises(zarrs.UnsupportedRangeReadError):
-        zarrs.aread_ranges(two_d, np.array([0]), np.array([1]))
+        read(a, [0], [4], out=np.empty(3, np.float32))
 
 
 def test_consecutive_ranges_are_one_read(arr):

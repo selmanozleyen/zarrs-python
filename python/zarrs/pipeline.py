@@ -279,7 +279,7 @@ class ZarrsCodecPipeline(CodecPipeline):
         """`read_ranges`, checked now and returned as a call that does the read.
 
         Raises `UnsupportedRangeReadError` for an array this does not serve, before anything
-        is read, so a caller can fall back without a read in flight.
+        is read, which `read_ranges` answers as False.
         """
         inner = self._inner_chunk_shape
         grid = getattr(metadata, "chunk_grid", None)
