@@ -666,9 +666,9 @@ impl ChunkItems {
         Ok(())
     }
 
-    /// Push whole ranges of a 1-D array, back to back in the output, split at shard boundaries
+    /// Push whole rows of axis 0, back to back in the output, split at shard boundaries
     /// here: per range, not per element. `shard_ids` ascends and names the shard of each key.
-    #[pyo3(signature = (keys, shard_ids, starts, lengths, shard_len, inner))]
+    #[pyo3(signature = (keys, shard_ids, starts, lengths, shard_len, inner, trailing))]
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn push_ranges(
         &mut self,
@@ -678,6 +678,7 @@ impl ChunkItems {
         lengths: PyReadonlyArray1<'_, i64>,
         shard_len: u64,
         inner: u64,
+        trailing: Vec<u64>,
     ) -> PyResult<()> {
         let ids = shard_ids
             .as_slice()
@@ -715,6 +716,12 @@ impl ChunkItems {
                 _ => {}
             }
         }
+        // Rows along axis 0, every other axis whole: the shapes `push_span` takes.
+        let dims = |first: u64| {
+            std::iter::once(first)
+                .chain(trailing.iter().copied())
+                .collect()
+        };
         for (mut s, mut n) in merged {
             while n > 0 {
                 let shard = s / shard_len;
@@ -726,7 +733,7 @@ impl ChunkItems {
                     .ok_or_else(|| {
                         PyErr::new::<PyIndexError, _>(format!("no key given for shard {shard}"))
                     })?;
-                self.push_span(key, vec![shard_len], vec![total], local, piece, out, inner)?;
+                self.push_span(key, dims(shard_len), dims(total), local, piece, out, inner)?;
                 (out, s, n) = (out + piece, s + piece, n - piece);
             }
         }

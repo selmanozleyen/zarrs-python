@@ -82,9 +82,10 @@ class ChunkItems:
         lengths: numpy.typing.NDArray[numpy.int64],
         shard_len: builtins.int,
         inner: builtins.int,
+        trailing: typing.Sequence[builtins.int],
     ) -> None:
         r"""
-        Push whole ranges of a 1-D array, back to back in the output, split at shard boundaries
+        Push whole rows of axis 0, back to back in the output, split at shard boundaries
         here: per range, not per element. `shard_ids` ascends and names the shard of each key.
         """
     def push_grid(

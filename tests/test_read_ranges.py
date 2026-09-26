@@ -121,7 +121,7 @@ def test_consecutive_ranges_are_one_read(arr):
     lengths = np.full(starts.size, 5)
     handle = zarrs._internal.ChunkItems()
     shard_ids = np.array([0, 1], dtype=np.int64)
-    handle.push_ranges(["k0", "k1"], shard_ids, starts, lengths, SHARD, INNER)
+    handle.push_ranges(["k0", "k1"], shard_ids, starts, lengths, SHARD, INNER, [])
     # 100..420 as one span is an item per inner chunk it crosses (1..6); per range it was 64+.
     assert len(handle) == 6, len(handle)
     np.testing.assert_array_equal(
@@ -197,3 +197,30 @@ def test_ranges_sharing_a_chunk_read_it_once(arr):
         read(a, starts, lengths), expected(values, starts, lengths)
     )
     assert raw_path_stats()[1] - before == 4
+
+
+@pytest.mark.parametrize("shards", [(SHARD, 7), None])
+def test_rows_of_a_2d_array(tmp_path, shards):
+    """Ranges of rows with the other axis whole, through zarr's hook, sharded or not."""
+    from zarr.core.buffer import default_buffer_prototype
+
+    values = np.arange(LENGTH * 7, dtype=np.float32).reshape(LENGTH, 7)
+    a = zarr.create_array(
+        store=tmp_path / "rows.zarr",
+        shape=values.shape,
+        chunks=(INNER, 7),
+        shards=shards,
+        dtype=values.dtype,
+    )
+    a[:] = values
+    a = zarr.open_array(tmp_path / "rows.zarr", mode="r")
+    starts, lengths = np.array([SHARD - 2, 10, 3000, 11]), np.array([5, 3, 1, 70])
+    want = np.concatenate([values[s : s + n] for s, n in zip(starts, lengths)])
+    np.testing.assert_array_equal(read(a, starts, lengths), want)
+    out = default_buffer_prototype().nd_buffer.empty(shape=want.shape, dtype=want.dtype)
+    pipeline = a._async_array.codec_pipeline
+    assert (
+        sync(pipeline.read_ranges(a.store_path, a.metadata, starts, lengths, out))
+        is True
+    )
+    np.testing.assert_array_equal(out.as_ndarray_like(), want)

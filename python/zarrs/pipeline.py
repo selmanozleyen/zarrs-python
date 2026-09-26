@@ -283,13 +283,25 @@ class ZarrsCodecPipeline(CodecPipeline):
         """
         inner = self._inner_chunk_shape
         grid = getattr(metadata, "chunk_grid", None)
+        shape = tuple(int(v) for v in metadata.shape)
         if (
             self.impl is None
             or inner is None
-            or len(metadata.shape) != 1
+            or not shape
             or not hasattr(grid, "chunk_shape")
         ):
-            raise UnsupportedRangeReadError("a 1-D array with a regular grid is needed")
+            raise UnsupportedRangeReadError(
+                "a chunked array with a regular grid is needed"
+            )
+        # Ranges run along axis 0 with every other axis whole, so a row is one run only if
+        # each shard, and each inner chunk in it, spans the other axes whole too.
+        trailing = shape[1:]
+        if tuple(int(v) for v in grid.chunk_shape[1:]) != trailing or (
+            inner and tuple(int(v) for v in inner[1:]) != trailing
+        ):
+            raise UnsupportedRangeReadError(
+                "every axis after the first must be whole in a chunk"
+            )
         dtype = metadata.dtype.to_native_dtype()
         if dtype.kind in {"V", "S", "U", "M", "m", "O", "T"} or not dtype.isnative:
             raise UnsupportedRangeReadError(f"dtype {dtype} is not served")
@@ -298,9 +310,13 @@ class ZarrsCodecPipeline(CodecPipeline):
         if starts.ndim != 1 or starts.shape != lengths.shape:
             raise ValueError("starts and lengths must be 1-D and the same length")
         total = int(lengths.sum())
-        if out.shape != (total,) or out.dtype != dtype or not out.flags.c_contiguous:
+        if (
+            out.shape != (total, *trailing)
+            or out.dtype != dtype
+            or not out.flags.c_contiguous
+        ):
             raise ValueError(
-                f"out must be a contiguous {dtype} array of {total} elements, "
+                f"out must be a contiguous {dtype} array of shape {(total, *trailing)}, "
                 f"not {out.dtype} {out.shape}"
             )
         if (
@@ -322,7 +338,10 @@ class ZarrsCodecPipeline(CodecPipeline):
                 for f, l in zip(first[wide], last[wide], strict=True)
             ]
             ids = np.union1d(ids, np.concatenate(between))
-        keys = [(store_path / metadata.encode_chunk_key((int(i),))).path for i in ids]
+        rest = (0,) * len(trailing)
+        keys = [
+            (store_path / metadata.encode_chunk_key((int(i), *rest))).path for i in ids
+        ]
         knobs = (
             config.get("codec_pipeline.read_workers", None),
             config.get("codec_pipeline.decode_workers", None),
@@ -342,6 +361,7 @@ class ZarrsCodecPipeline(CodecPipeline):
                 lengths,
                 shard_len,
                 int(inner[0]) if inner else shard_len,
+                list(trailing),
             )
             impl.retrieve_chunk_items_and_apply_index(handle, out, *knobs)
 
