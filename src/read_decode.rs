@@ -430,82 +430,83 @@ fn carve<'a>(
     // storage that keeps the order they arrive in close to the order they are wanted.
     let mut order: Vec<usize> = (0..located.len()).collect();
     order.sort_by_key(|&i| output_offset(located[i].0));
-    for i in order {
-        let (item, range) = &located[i];
-        let pieces = std::mem::take(&mut taken[i]);
+    // Items reading one chunk sit next to each other in output order. Each such group is one
+    // chunk, and whether it is read as its rows' own bytes or whole is decided for the chunk,
+    // counting every item's runs: an item smaller than the chunk (one per row range) would
+    // otherwise pass the gate one row at a time and read a strided chunk once per row.
+    let mut g = 0;
+    while g < order.len() {
+        let (first, range) = &located[order[g]];
+        let mut end = g + 1;
+        while range.is_some() && end < order.len() {
+            let (next, next_range) = &located[order[end]];
+            if next_range != range || next.key != first.key {
+                break;
+            }
+            end += 1;
+        }
+        let group = &order[g..end];
+        g = end;
         // A range is the chunk's place in its shard; its absence means the chunk was never
         // written, and the output it owns is filled rather than read.
-        match range {
-            // One job per ROW, each reading exactly its own bytes.
-            //
-            // Only when the chunk is a plain byte tiling, so a row's offset inside it is
-            // arithmetic: `coord` is already the row's element offset within the chunk, and
-            // `run_len` its length. The request COUNT is the same either way, so all that
-            // changes is how many bytes each one moves.
-            //
-            // The pieces are taken in coordinate order, which is ascending, so
-            // `DisjointBytes` still vends each byte once and coverage is still checked.
-            // One output piece and no grid: the item is a plain run of rows, which is every
-            // rank-1 read and every read whose trailing axes are whole. A banded item has one
-            // piece per row and a grid item carries its own per-element offsets; neither is a
-            // single contiguous claim, so both take the ordinary path rather than get a second
-            // implementation here.
-            Some(range)
-                if ctx.raw
-                    // Zero DISABLES, which the threshold alone does not say: an item with no
-                    // coordinates is 0 reads, and `0 <= 0` would take the path the knob was
-                    // set to refuse. Nothing builds such an item today -- `push_span` returns
-                    // early on an empty count -- so this makes the documented behaviour true
-                    // by construction rather than by the absence of a caller.
-                    && ctx.raw_max_reads > 0
-                    && pieces.len() == 1
-                    && item.grid.is_none()
-                    && raw_runs(coords_of(item)?, item.run_len) <= ctx.raw_max_reads =>
-            {
-                let piece = pieces.into_iter().next().expect("length checked");
-                raw_row_jobs(
-                    item,
-                    *range,
-                    piece,
-                    coords_of(item)?,
-                    element_size,
-                    ctx,
-                    &mut jobs,
-                )?;
+        let Some(range) = range else {
+            for &i in group {
+                absent.extend(std::mem::take(&mut taken[i]));
             }
-            Some(range) => {
-                let coords = coords_of(item)?;
-                let grid = item.grid.as_ref().map(|(starts, run)| (&starts[..], *run));
-                // Items in output order that read the same chunk sit next to each other (rows
-                // of one inner chunk that do not touch, as a strided draw gives): one read and
-                // one decode, gathered into each, instead of one of each per item.
-                if let Some(last) = jobs
-                    .last_mut()
-                    .filter(|j| !j.raw && j.key == item.key && j.range == *range)
-                {
-                    last.shared.push(Part {
-                        out: pieces,
-                        coords,
-                        run_len: item.run_len,
-                        grid,
-                    });
-                    continue;
-                }
-                CHUNK_JOBS.fetch_add(1, Ordering::Relaxed);
-                jobs.push(Job {
-                    key: item.key.clone(),
-                    range: *range,
-                    raw: false,
-                    out: pieces,
-                    coords,
-                    run_len: item.run_len,
-                    grid,
-                    shared: Vec::new(),
-                    ctx,
-                });
+            continue;
+        };
+        // One job per ROW RUN, each reading exactly its own bytes, when the chunk is a plain
+        // byte tiling, so a row's offset inside it is arithmetic, and its wanted rows collapse
+        // to few enough reads. One output piece and no grid per item: a banded item has one
+        // piece per row and a grid item carries its own per-element offsets, and neither is a
+        // single contiguous claim. Zero disables: `0 <= 0` would otherwise take the path the
+        // knob was set to refuse.
+        let mut raw = ctx.raw && ctx.raw_max_reads > 0;
+        let mut runs = 0;
+        for &i in group {
+            let item = located[i].0;
+            if !raw || taken[i].len() != 1 || item.grid.is_some() {
+                raw = false;
+                break;
             }
-            None => absent.extend(pieces),
+            runs += raw_runs(coords_of(item)?, item.run_len);
         }
+        if raw && runs <= ctx.raw_max_reads {
+            for &i in group {
+                let item = located[i].0;
+                let piece = std::mem::take(&mut taken[i])
+                    .into_iter()
+                    .next()
+                    .expect("length checked");
+                let coords = coords_of(item)?;
+                raw_row_jobs(item, *range, piece, coords, element_size, ctx, &mut jobs)?;
+            }
+            continue;
+        }
+        // Otherwise one read and one decode of the chunk, gathered into every item.
+        CHUNK_JOBS.fetch_add(1, Ordering::Relaxed);
+        let mut parts = Vec::with_capacity(group.len());
+        for &i in group {
+            let item = located[i].0;
+            parts.push(Part {
+                out: std::mem::take(&mut taken[i]),
+                coords: coords_of(item)?,
+                run_len: item.run_len,
+                grid: item.grid.as_ref().map(|(starts, run)| (&starts[..], *run)),
+            });
+        }
+        let lead = parts.remove(0);
+        jobs.push(Job {
+            key: first.key.clone(),
+            range: *range,
+            raw: false,
+            out: lead.out,
+            coords: lead.coords,
+            run_len: lead.run_len,
+            grid: lead.grid,
+            shared: parts,
+            ctx,
+        });
     }
     Ok((jobs, absent))
 }

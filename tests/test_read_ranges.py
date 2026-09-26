@@ -231,3 +231,27 @@ def test_rows_of_a_2d_array(tmp_path, shards):
         is True
     )
     np.testing.assert_array_equal(out.as_ndarray_like(), want)
+
+
+@pytest.mark.parametrize(("stride", "raw"), [(8, False), (INNER, True)])
+def test_the_raw_gate_counts_a_chunk_not_an_item(tmp_path, stride, raw):
+    """Rows of one inner chunk count together against raw_max_reads_per_chunk: eight strided
+    rows are one read of their chunk, not eight row reads; one row per chunk stays raw."""
+    from zarrs._internal import raw_path_stats
+
+    values = np.arange(LENGTH * 4, dtype=np.float32).reshape(LENGTH, 4)
+    a = zarr.create_array(
+        store=tmp_path / "raw.zarr",
+        shape=values.shape,
+        chunks=(INNER, 4),
+        shards=(SHARD, 4),
+        dtype=values.dtype,
+        compressors=None,
+    )
+    a[:] = values
+    a = zarr.open_array(tmp_path / "raw.zarr", mode="r")
+    starts = np.arange(0, 4 * INNER, stride)  # rows of the first four inner chunks
+    before = raw_path_stats()
+    np.testing.assert_array_equal(read(a, starts, np.ones_like(starts)), values[starts])
+    raw_jobs, chunk_jobs = (now - then for now, then in zip(raw_path_stats(), before))
+    assert (raw_jobs, chunk_jobs) == ((starts.size, 0) if raw else (0, 4))
