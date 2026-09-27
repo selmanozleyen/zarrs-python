@@ -524,6 +524,11 @@ impl ChunkItems {
         }
     }
 
+    /// The number of read items pushed so far.
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+
     /// Build one batch entry's items and append them.
     ///
     /// `indices` select along axis 0: non-negative, non-decreasing, inside the chunk extent. So
@@ -657,6 +662,80 @@ impl ChunkItems {
                 grid: None,
             });
             self.out_end = out_hi;
+        }
+        Ok(())
+    }
+
+    /// Push whole rows of axis 0, back to back in the output, split at shard boundaries
+    /// here: per range, not per element. `shard_ids` ascends and names the shard of each key.
+    #[pyo3(signature = (keys, shard_ids, starts, lengths, shard_len, inner, trailing))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn push_ranges(
+        &mut self,
+        keys: Vec<String>,
+        shard_ids: PyReadonlyArray1<'_, i64>,
+        starts: PyReadonlyArray1<'_, i64>,
+        lengths: PyReadonlyArray1<'_, i64>,
+        shard_len: u64,
+        inner: u64,
+        trailing: Vec<u64>,
+    ) -> PyResult<()> {
+        let ids = shard_ids
+            .as_slice()
+            .map_err(|_| PyErr::new::<PyValueError, _>("the shard id array must be contiguous"))?;
+        let (starts, lengths) = (starts.as_array(), lengths.as_array());
+        if keys.len() != ids.len() || starts.len() != lengths.len() {
+            return Err(PyErr::new::<PyValueError, _>(
+                "one key per shard id, and one length per start",
+            ));
+        }
+        if shard_len == 0 {
+            return Err(PyErr::new::<PyValueError, _>(
+                "the shard length must be non-zero",
+            ));
+        }
+        let u = |v: i64| {
+            u64::try_from(v)
+                .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative range field {v}")))
+        };
+        let mut out = self.out_end;
+        let mut total = out;
+        for n in lengths.iter() {
+            total = total.checked_add(u(*n)?).ok_or_else(|| {
+                PyErr::new::<PyValueError, _>("the ranges are too long to address")
+            })?;
+        }
+        // A range that continues where the last ended is the same read: otherwise a chunk of
+        // consecutive rows becomes one item, and one decode, per row.
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(starts.len());
+        for (s, n) in starts.iter().zip(lengths.iter()) {
+            let (s, n) = (u(*s)?, u(*n)?);
+            match merged.last_mut() {
+                Some((ms, mn)) if *ms + *mn == s => *mn += n,
+                _ if n > 0 => merged.push((s, n)),
+                _ => {}
+            }
+        }
+        // Rows along axis 0, every other axis whole: the shapes `push_span` takes.
+        let dims = |first: u64| {
+            std::iter::once(first)
+                .chain(trailing.iter().copied())
+                .collect()
+        };
+        for (mut s, mut n) in merged {
+            while n > 0 {
+                let shard = s / shard_len;
+                let (local, piece) = (s % shard_len, n.min(shard_len - s % shard_len));
+                let key = i64::try_from(shard)
+                    .ok()
+                    .and_then(|sh| ids.binary_search(&sh).ok())
+                    .map(|i| keys[i].as_str())
+                    .ok_or_else(|| {
+                        PyErr::new::<PyIndexError, _>(format!("no key given for shard {shard}"))
+                    })?;
+                self.push_span(key, dims(shard_len), dims(total), local, piece, out, inner)?;
+                (out, s, n) = (out + piece, s + piece, n - piece);
+            }
         }
         Ok(())
     }

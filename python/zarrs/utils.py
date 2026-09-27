@@ -297,6 +297,19 @@ def _bands(lo: int, hi: int, inner: int, out_lo: int) -> list[tuple[int, int, in
     return out
 
 
+# Below this mean run length a span per run costs more FFI calls than one element walk.
+_MIN_MEAN_SPAN = 64
+
+
+def _index_runs(indices: np.ndarray) -> list[tuple[int, int]] | None:
+    """(first, stop) positions of each step-1 run in `indices`, or None if the runs are short."""
+    breaks = np.flatnonzero(np.diff(indices) != 1) + 1
+    if (breaks.size + 1) * _MIN_MEAN_SPAN > indices.size:
+        return None
+    edges = [0, *breaks.tolist(), indices.size]
+    return list(zip(edges[:-1], edges[1:]))
+
+
 def _chunk_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
 ) -> list[tuple] | None:
@@ -381,6 +394,11 @@ def _chunk_unit_args(
         lanes.append(_bands(int(lo), int(hi), int(inner_shape[axis]), int(out_span[0])))
     indices = chunk_sel[0]
     out_axis_sel = out_sel[0]
+    whole = all(
+        int(inner_shape[axis]) == int(chunk_spec.shape[axis])
+        and int(widths[axis - 1]) == int(shape[axis]) == int(chunk_spec.shape[axis])
+        for axis in range(1, rank)
+    )
     if isinstance(indices, slice):
         span = _step1_span(indices, chunk_spec.shape[0])
         if span is None:
@@ -390,11 +408,7 @@ def _chunk_unit_args(
         # description. The span form says "the whole trailing extent" on both sides and derives
         # its row stride from the shard, so the width must be whole and the shard must hold one
         # inner chunk per trailing axis.
-        if all(
-            int(inner_shape[axis]) == int(chunk_spec.shape[axis])
-            and int(widths[axis - 1]) == int(shape[axis]) == int(chunk_spec.shape[axis])
-            for axis in range(1, rank)
-        ):
+        if whole:
             out_span = _step1_span(out_axis_sel, shape[0])
             count = span[1] - span[0]
             if (
@@ -425,6 +439,22 @@ def _chunk_unit_args(
     start = out_axis_sel.start or 0
     if not _output_run_matches(indices, out_axis_sel):
         return None
+    # A coordinate read of whole CSR rows is a few long runs per shard; as spans, Rust takes
+    # O(1) per run instead of walking every element.
+    if whole and (runs := _index_runs(indices)) is not None:
+        return [
+            (
+                "span",
+                byte_getter.path,
+                chunk_spec.shape,
+                shape,
+                int(indices[a]),
+                int(b - a),
+                int(start + a),
+                int(inner_shape[0]),
+            )
+            for a, b in runs
+        ]
 
     pushes = []
     # One item per combination of bands across the trailing axes. Rank 1 has no lanes, so the

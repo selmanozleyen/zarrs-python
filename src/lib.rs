@@ -29,6 +29,8 @@ use zarrs::storage::{ReadableStorage, ReadableWritableListableStorage, StoreKey}
 
 mod chunk_item;
 mod concurrency;
+mod fork;
+mod lustre;
 mod read_decode;
 mod runtime;
 mod shard_index;
@@ -104,6 +106,8 @@ fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
 #[pyclass]
 pub(crate) struct CodecPipelineImpl {
     pub(crate) readable_store: ReadableStorage,
+    /// Where a filesystem store lives, so the first read can ask what its storage takes in flight.
+    pub(crate) filesystem_root: Option<String>,
     /// The same store, `None` when opened read-only, so a write has to go through `writable()`.
     pub(crate) writable_store: Option<ReadableWritableListableStorage>,
     pub(crate) codec_chain: Arc<CodecChainBound>,
@@ -315,9 +319,9 @@ impl CodecPipelineImpl {
         py.import("warnings")?.call_method1(
             "warn",
             ("codec_pipeline.chunk_concurrent_minimum, chunk_concurrent_maximum and \
-              threading.max_workers bound a WRITE through this pipeline, not a read. A read is \
-              bounded by codec_pipeline.read_workers and by the pools' own widths, which are \
-              fixed at the first read of the process.",),
+              threading.max_workers bound a WRITE through this pipeline, not a read. A read runs \
+              on the two pools that codec_pipeline.read_workers and decode_workers size at the \
+              first read of the process.",),
         )?;
         Ok(())
     }
@@ -342,7 +346,7 @@ impl CodecPipelineImpl {
             let pools = read_decode::pools(py, config)?;
             // These are upstream's knobs and this path no longer spends them: the outer limit
             // below is dropped and the codec target is overridden to 1, so a read is bounded by
-            // `read_workers` and the pools alone. Said out loud rather than accepted silently,
+            // the two pools alone. Said out loud rather than accepted silently,
             // because upstream honours them and a write through this same pipeline still does.
             // Before `detach`: warning is Python work and the GIL is held here.
             self.warn_read_ignores_chunk_concurrency(py)?;
@@ -416,6 +420,7 @@ impl CodecPipelineImpl {
         direct_io: bool,
         file_handle_cache_size: usize,
     ) -> PyResult<Self> {
+        fork::check()?;
         store_config.direct_io(direct_io);
         store_config.file_handle_cache_size(file_handle_cache_size);
         let metadata = serde_json::from_str(array_metadata).map_py_err::<PyTypeError>()?;
@@ -449,6 +454,10 @@ impl CodecPipelineImpl {
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
         let writable_store = (!store_config.read_only).then(|| store.clone());
+        let filesystem_root = match &store_config.kind {
+            store::StoreKind::Filesystem(config) => Some(config.root.clone()),
+            _ => None,
+        };
         let readable_store: ReadableStorage = store.readable();
 
         let data_type =
@@ -478,6 +487,7 @@ impl CodecPipelineImpl {
 
         Ok(Self {
             readable_store,
+            filesystem_root,
             codec_chain,
             codec_options,
             chunk_concurrency_asked,
@@ -511,15 +521,23 @@ impl CodecPipelineImpl {
         raw_max_reads_per_chunk: Option<usize>,
         strict: bool,
     ) -> PyResult<()> {
-        // Every width is a per-call decision, so none of them is a constructor argument.
+        // Only the first read of the process sizes the pools, so only it looks at the storage: a
+        // later one without an explicit width takes the pool that exists rather than re-deriving
+        // a default that would then disagree with it.
+        let read_workers = read_workers.filter(|n| *n > 0).or_else(|| {
+            read_decode::pool_sizes().0.or_else(|| {
+                let (root, item) = (self.filesystem_root.as_ref()?, chunk_items.as_slice().first()?);
+                lustre::read_capacity(&std::path::Path::new(root).join(item.key.as_str()))
+            })
+        });
+        // Read per call so a first call can size the pools; later calls are checked against them.
         let config = read_decode::ReadConfig::from_call(
             read_workers,
             decode_workers,
             raw_max_reads_per_chunk,
             strict,
         );
-        // The one width still not servable is one above what the pools were built with, since a
-        // rayon pool cannot grow.
+        // The pools are fixed once built, so a width that differs from theirs is said out loud.
         read_decode::check_workers_arrived(py, config)?;
         self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, config)
     }
@@ -531,6 +549,7 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         write_empty_chunks: bool,
     ) -> PyResult<()> {
+        fork::check()?;
         // Fail before decoding anything; the write site checks again by construction.
         self.writable()?;
 

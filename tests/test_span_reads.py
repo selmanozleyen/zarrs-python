@@ -80,3 +80,37 @@ def test_the_span_path_is_actually_taken(sharded_1d):
     finally:
         utils._chunk_unit_args = original
     assert "span" in seen, f"no entry took the span path; kinds seen: {set(seen)}"
+
+
+def test_coordinate_runs_read_as_spans(tmp_path):
+    """Whole CSR rows by coordinate: long runs become spans, short ones stay elements."""
+    import zarrs.utils as utils
+
+    values = np.arange(4096, dtype=np.float32)
+    array = zarr.create_array(
+        store=tmp_path / "runs.zarr", shape=values.shape, chunks=(256,), shards=(1024,),
+        dtype=values.dtype,
+    )
+    array[:] = values
+    array = zarr.open_array(tmp_path / "runs.zarr", mode="r")
+    # Rows crossing inner-chunk and shard boundaries.
+    long_runs = np.concatenate(
+        [np.arange(a, a + n) for a, n in [(10, 300), (900, 200), (2100, 90)]]
+    )
+    scattered = np.arange(0, 4096, 3)
+    original = utils._chunk_unit_args
+    for coords, kind in [(long_runs, "span"), (scattered, "entry")]:
+        seen = []
+
+        def watched(*args, **kwargs):
+            out = original(*args, **kwargs)
+            seen.extend(push[0] for push in out or ())
+            return out
+
+        utils._chunk_unit_args = watched
+        try:
+            got = array.get_coordinate_selection(coords)
+        finally:
+            utils._chunk_unit_args = original
+        np.testing.assert_array_equal(got, values[coords])
+        assert set(seen) == {kind}, seen

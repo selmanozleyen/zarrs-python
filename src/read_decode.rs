@@ -69,7 +69,7 @@ impl CodecPipelineImpl {
         output: UnsafeCellSlice<'_, u8>,
         output_len: usize,
         config: ReadConfig,
-        pools: &(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>),
+        pools: &(Arc<QueuePool>, Arc<QueuePool>),
         codec_options: &CodecOptions,
     ) -> PyResult<()> {
         let element_size = self.element_size()?;
@@ -114,25 +114,18 @@ impl CodecPipelineImpl {
 
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
-        // Every job queued at once, and the POOL is the bound -- `read_workers` sized it, so a
-        // second limiter on top would only starve the threads it just built. That is what the
-        // old `iter_concurrent_limit!` did: capping a call at 8 left the other 712 workers of
-        // an oversized pool with nothing, and a rayon worker with nothing does not block, it
-        // spins and tries to steal. 720 threads then delivered FEWER IOPS than 64 for six
-        // times the CPU. With the queue full, every worker pops the next job instead.
-        //
-        // The scopes nest so a reader hands its chunk straight to the decode pool, and
-        // `in_place_scope` runs the calling thread as a worker rather than leaving it idle.
-        // Both block until their tasks finish, which is what keeps the `&mut [u8]` into the
-        // caller's numpy buffer valid without a raw pointer or a completion latch.
+        // Every job queued at once; the pools are the bound, since the two knobs sized them.
+        // Workers block on their queue when it empties, so an idle one costs nothing -- rayon's
+        // would spend 33 rounds stealing first, which at a few hundred workers is most of the
+        // machine. A reader queues its chunk's decode on the other pool, and `batch` returns only
+        // once both have run, which keeps the `&mut [u8]` into the numpy buffer valid.
         let (read_pool, decode_pool) = pools;
-        decode_pool.in_place_scope(|dec| {
-            read_pool.in_place_scope(|rd| {
-                for job in jobs {
-                    let (failure, ctx) = (&failure, &ctx);
-                    rd.spawn(move |_| read_one(job, dec, failure, ctx));
-                }
-            });
+        batch(|b| {
+            for job in jobs {
+                let (failure, ctx, task_b) = (&failure, &ctx, b.clone());
+                // SAFETY: `jobs`, `failure`, `ctx` and the pools all outlive this `batch` call.
+                unsafe { b.spawn(read_pool, move || read_one(job, decode_pool, &task_b, failure, ctx)) };
+            }
         });
 
         if let Some(e) = failure.lock().expect("failure slot poisoned").take() {
@@ -481,15 +474,33 @@ fn carve<'a>(
                 )?;
             }
             Some(range) => {
+                let coords = coords_of(item)?;
+                let grid = item.grid.as_ref().map(|(starts, run)| (&starts[..], *run));
+                // Items in output order that read the same chunk sit next to each other (rows
+                // of one inner chunk that do not touch, as a strided draw gives): one read and
+                // one decode, gathered into each, instead of one of each per item.
+                if let Some(last) = jobs
+                    .last_mut()
+                    .filter(|j| !j.raw && j.key == item.key && j.range == *range)
+                {
+                    last.shared.push(Part {
+                        out: pieces,
+                        coords,
+                        run_len: item.run_len,
+                        grid,
+                    });
+                    continue;
+                }
                 CHUNK_JOBS.fetch_add(1, Ordering::Relaxed);
                 jobs.push(Job {
                     key: item.key.clone(),
                     range: *range,
                     raw: false,
                     out: pieces,
-                    coords: coords_of(item)?,
+                    coords,
                     run_len: item.run_len,
-                    grid: item.grid.as_ref().map(|(starts, run)| (&starts[..], *run)),
+                    grid,
+                    shared: Vec::new(),
                     ctx,
                 });
             }
@@ -570,6 +581,7 @@ fn raw_row_jobs<'a>(
             coords: &[],
             run_len: item.run_len,
             grid: None,
+            shared: Vec::new(),
             ctx,
         });
         RAW_JOBS.fetch_add(1, Ordering::Relaxed);
@@ -683,50 +695,126 @@ fn default_pool_size() -> usize {
     std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
 }
 
-/// How much wider the I/O pool DEFAULTS to than the CPU pool.
-///
-/// A parked reader is a stack and no CPU, so a low bound buys nothing. It multiplies the CPU
-/// pool, so `RAYON_NUM_THREADS` sizes both.
-const READ_POOL_MULTIPLIER: usize = 8;
+/// Reads kept in flight however few the cores: 8 readers starved an 8-cpu machine 3.6x on a
+/// scattered draw, where 64 matched the full node. An idle reader is a parked thread.
+const READ_FLOOR: usize = 64;
 
-/// The pool a read's STORE traffic runs on.
-///
-/// Separate from the CPU pool because a reader parked on storage must never hold a worker a
-/// decode needs. Decoding has no third pool: it is CPU work and runs on the CPU pool.
-static READ_POOL: OnceLock<Arc<rayon::ThreadPool>> = OnceLock::new();
-
-/// The CPU pool: decodes here, and a write's encode on the same threads. Sized from rayon's
-/// own view, so `RAYON_NUM_THREADS` still sizes it.
-static CPU_POOL: OnceLock<Arc<rayon::ThreadPool>> = OnceLock::new();
-
-fn build_pool(size: usize, name: &'static str) -> PyResult<rayon::ThreadPool> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(size)
-        .thread_name(move |i| format!("zarrs-{name}-{i}"))
-        .build()
-        .map_err(|e| PyRuntimeError::new_err(format!("could not create the {name} pool: {e}")))
+/// Default `(read, decode)` widths for a machine of `cores`. Decoders get every core up to 16 and
+/// half of them past that, where a wider decode pool started costing more than it gave.
+fn default_widths(cores: usize) -> (usize, usize) {
+    (cores.max(READ_FLOOR), if cores <= 16 { cores } else { cores / 2 })
 }
 
-/// `(io, cpu)`: the pool that fetches, and the pool that decodes.
+/// The pool a read's store traffic runs on, separate so a reader parked on storage never holds
+/// a worker a decode needs.
+static READ_POOL: OnceLock<Arc<QueuePool>> = OnceLock::new();
+
+type QueueTask = Box<dyn FnOnce() + Send + 'static>;
+type Panic = Box<dyn std::any::Any + Send>;
+
+/// Worker threads blocked on one queue, built once and never resized.
+pub(crate) struct QueuePool {
+    tx: crossbeam_channel::Sender<QueueTask>,
+    width: usize,
+}
+
+impl QueuePool {
+    fn new(width: usize, name: &'static str) -> PyResult<Self> {
+        let (tx, rx) = crossbeam_channel::unbounded::<QueueTask>();
+        for i in 0..width {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("zarrs-{name}-{i}"))
+                .spawn(move || rx.iter().for_each(|task| task()))
+                .map_err(|e| PyRuntimeError::new_err(format!("could not create the {name} pool: {e}")))?;
+        }
+        Ok(Self { tx, width })
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.width
+    }
+}
+
+/// The handle every task of one `batch` carries; the batch returns once all are dropped.
+#[derive(Clone)]
+pub(crate) struct Batch {
+    wg: crossbeam_utils::sync::WaitGroup,
+    panic: Arc<Mutex<Option<Panic>>>,
+}
+
+impl Batch {
+    /// Queue `task` on `pool`.
+    ///
+    /// # Safety
+    /// Whatever `task` borrows must outlive the `batch` call this handle came from.
+    unsafe fn spawn<'a>(&self, pool: &QueuePool, task: impl FnOnce() + Send + 'a) {
+        let b = self.clone();
+        let task: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
+            // The whole handle: a 2021 closure naming only `b.panic` captures just that field,
+            // and the `WaitGroup` would be dropped before the task had run.
+            let b = b;
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
+                let mut slot = b.panic.lock().expect("panic slot poisoned");
+                if slot.is_none() {
+                    *slot = Some(p);
+                }
+            }
+        });
+        // SAFETY: `b` goes when the task finishes, and `batch` waits for every clone of it.
+        let task: QueueTask = unsafe { std::mem::transmute(task) };
+        pool.tx.send(task).expect("a pool's queue is never closed");
+    }
+}
+
+/// Run `submit`, which queues tasks through the handle it is given, and return once every one
+/// has finished, including tasks queued by other tasks. Re-raises the first task panic.
+pub(crate) fn batch<R>(submit: impl FnOnce(Batch) -> R) -> R {
+    struct WaitOnDrop(crossbeam_utils::sync::WaitGroup);
+    impl Drop for WaitOnDrop {
+        fn drop(&mut self) {
+            std::mem::take(&mut self.0).wait();
+        }
+    }
+    let root = crossbeam_utils::sync::WaitGroup::new();
+    let panic = Arc::new(Mutex::new(None));
+    let b = Batch { wg: root.clone(), panic: panic.clone() };
+    // Waits on drop as well, so an unwind out of `submit` still cannot outlive a task.
+    let wait = WaitOnDrop(root);
+    let r = submit(b);
+    drop(wait);
+    if let Some(p) = panic.lock().expect("panic slot poisoned").take() {
+        std::panic::resume_unwind(p);
+    }
+    r
+}
+
+/// The pool decodes run on.
+static DECODE_POOL: OnceLock<Arc<QueuePool>> = OnceLock::new();
+
+/// `(read, decode)`: the pool that fetches, and the pool that decodes.
 ///
-/// Sized by the FIRST call of the process and never resized, because a rayon pool cannot grow.
+/// Sized by the FIRST call of the process and never resized.
 /// The `Python` token is taken so the caller states it holds the GIL here rather than inside
 /// `detach`.
 pub(crate) fn pools(
     _py: Python<'_>,
     config: ReadConfig,
-) -> PyResult<(Arc<rayon::ThreadPool>, Arc<rayon::ThreadPool>)> {
-    let cpu = match CPU_POOL.get() {
+) -> PyResult<(Arc<QueuePool>, Arc<QueuePool>)> {
+    // Every read comes through here, and inherited pools have queues but no threads: a read in
+    // a forked child would wait forever rather than fail.
+    crate::fork::check()?;
+    let cpu = match DECODE_POOL.get() {
         Some(p) => p.clone(),
         None => {
-            let built = Arc::new(build_pool(config.decode_workers, "cpu")?);
-            CPU_POOL.get_or_init(|| built).clone()
+            let built = Arc::new(QueuePool::new(config.decode_workers, "decode")?);
+            DECODE_POOL.get_or_init(|| built).clone()
         }
     };
     let io = match READ_POOL.get() {
         Some(p) => p.clone(),
         None => {
-            let built = Arc::new(build_pool(config.read_workers, "read")?);
+            let built = Arc::new(QueuePool::new(config.read_workers, "read")?);
             READ_POOL.get_or_init(|| built).clone()
         }
     };
@@ -739,38 +827,22 @@ pub(crate) fn pools(
 /// it describes.
 pub(crate) fn pool_sizes() -> (Option<usize>, Option<usize>) {
     (
-        READ_POOL.get().map(|p| p.current_num_threads()),
-        CPU_POOL.get().map(|p| p.current_num_threads()),
+        READ_POOL.get().map(|p| p.width()),
+        DECODE_POOL.get().map(|p| p.width()),
     )
 }
 
-/// Refuse a width above what the pools were BUILT with, the one width they cannot give.
+/// Say so when a call asks for a width other than what the pools were built with.
 ///
-/// A call using fewer workers than the pool holds is the ordinary case, not a problem, so this
-/// compares against the pools' own widths rather than against what any other call asked for.
+/// Neither knob caps a call: every job is queued at once and the pool is the only bound, so a
+/// smaller width than the pool's would be ignored as silently as a larger one.
 pub(crate) fn check_workers_arrived(py: Python<'_>, config: ReadConfig) -> PyResult<()> {
-    let (io, cpu) = pools(py, config)?;
-    // `caps_per_call` is the difference between the two knobs, and it decides which way a
-    // mismatch is worth saying anything about. A read takes at most `read_workers` of the I/O
-    // pool, so asking for FEWER than the pool holds is served exactly; only more is unservable.
-    // A decode has no such limiter -- it is spawned as each read returns -- so the pool is the
-    // only bound and asking for fewer is silently ignored, which is the failure this knob was
-    // found in.
-    for (limit, asked, knob, caps_per_call) in [
-        (
-            io.current_num_threads(),
-            config.read_workers,
-            "read_workers",
-            true,
-        ),
-        (
-            cpu.current_num_threads(),
-            config.decode_workers,
-            "decode_workers",
-            false,
-        ),
+    let (io, dec) = pools(py, config)?;
+    for (limit, asked, knob) in [
+        (io.width(), config.read_workers, "read_workers"),
+        (dec.width(), config.decode_workers, "decode_workers"),
     ] {
-        if asked == limit || (caps_per_call && asked < limit) {
+        if asked == limit {
             continue;
         }
         let message = format!(
@@ -809,12 +881,10 @@ impl ReadConfig {
         raw_max_reads: Option<usize>,
         strict: bool,
     ) -> Self {
-        let machine = default_pool_size();
+        let (read, decode) = default_widths(default_pool_size());
         Self {
-            read_workers: read_workers
-                .filter(|n| *n > 0)
-                .unwrap_or(machine * READ_POOL_MULTIPLIER),
-            decode_workers: decode_workers.filter(|n| *n > 0).unwrap_or(machine),
+            read_workers: read_workers.filter(|n| *n > 0).unwrap_or(read),
+            decode_workers: decode_workers.filter(|n| *n > 0).unwrap_or(decode),
             raw_max_reads: raw_max_reads.unwrap_or(RAW_MAX_READS),
             strict,
         }
@@ -846,7 +916,17 @@ struct Job<'a> {
     /// Where each run starts inside a coordinate's elements and how long it is, when the wanted
     /// elements are not one span. `None` is a single contiguous run.
     grid: Option<(&'a [u64], u64)>,
+    /// Further items served by the same chunk: read and decoded once, gathered into each.
+    shared: Vec<Part<'a>>,
     ctx: &'a JobContext,
+}
+
+/// One more item's gather out of a job's decoded chunk: its output, and what it wants from it.
+struct Part<'a> {
+    out: Vec<&'a mut [u8]>,
+    coords: &'a [u64],
+    run_len: u64,
+    grid: Option<(&'a [u64], u64)>,
 }
 
 /// Keep the first failure; later ones are usually consequences of it.
@@ -866,40 +946,41 @@ thread_local! {
 }
 
 /// One chunk: one store read, then its decode handed to the decode pool.
-fn read_one<'scope, 'env>(
+fn read_one<'env>(
     job: Job<'env>,
-    dec: &rayon::Scope<'scope>,
+    dec: &'env QueuePool,
+    b: &Batch,
     failure: &'env Mutex<Option<String>>,
     ctx: &'env JobContext,
-) where
-    'env: 'scope,
-{
+) {
     match ctx.store.get_partial(&job.key, job.range) {
         // `None` is an absent key, not an empty range; `decode_one` owns what absence means.
-        Ok(bytes) => spawn_decode(dec, job, bytes, failure),
+        Ok(bytes) => spawn_decode(dec, b, job, bytes, failure),
         Err(e) => record(failure, format!("read {} failed: {e}", job.key)),
     }
 }
 
 /// One chunk's decode, on the decode pool.
-fn spawn_decode<'scope, 'env>(
-    dec: &rayon::Scope<'scope>,
+fn spawn_decode<'env>(
+    dec: &QueuePool,
+    b: &Batch,
     mut job: Job<'env>,
     bytes: MaybeBytes,
     failure: &'env Mutex<Option<String>>,
-) where
-    'env: 'scope,
-{
+) {
     // every job goes to the pool, including a raw one whose "decode" is only a
     // `copy_from_slice`: a reader that copies inline stops issuing reads while it does.
-    dec.spawn(move |_| {
-        SCRATCH.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
-                record(failure, e);
-            }
+    // SAFETY: the job and `failure` borrow from the caller of `batch`, which outlives it.
+    unsafe {
+        b.spawn(dec, move || {
+            SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
+                    record(failure, e);
+                }
+            });
         });
-    });
+    }
 }
 
 /// Decode one innermost chunk into scratch, then gather the wanted elements into `out`.
@@ -908,7 +989,8 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let size = ctx.element_size;
     let Some(bytes) = bytes else {
         if ctx.may_be_absent {
-            for piece in &mut job.out {
+            let parts = job.shared.iter_mut().flat_map(|p| p.out.iter_mut());
+            for piece in job.out.iter_mut().chain(parts) {
                 fill(piece, &ctx.fill_value, size)?;
             }
             return Ok(());
@@ -948,7 +1030,8 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     // grid, and the coordinates a single run starting at 0 covering every element. Under them
     // `gather` degenerates to `out[..needed] = scratch[..needed]`, which is the copy being
     // removed. Anything else keeps the scratch path untouched.
-    let whole_unit = job.out.len() == 1
+    let whole_unit = job.shared.is_empty()
+        && job.out.len() == 1
         && job.out[0].len() == needed
         && job.grid.is_none()
         && job.coords.first() == Some(&0)
@@ -1013,23 +1096,42 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             )
             .map_err(|e| e.to_string())?;
     }
+    let (coords, run_len, grid) = (job.coords, job.run_len, job.grid);
+    gather_part(scratch, &mut job.out, coords, run_len, grid, size)
+        .map_err(|e| format!("{}: {e}", job.key))?;
+    for part in &mut job.shared {
+        let (coords, run_len, grid) = (part.coords, part.run_len, part.grid);
+        gather_part(scratch, &mut part.out, coords, run_len, grid, size)
+            .map_err(|e| format!("{}: {e}", job.key))?;
+    }
+    Ok(())
+}
+
+/// Gather what one item wants out of a decoded chunk into its output pieces.
+fn gather_part(
+    scratch: &[u8],
+    out: &mut [&mut [u8]],
+    coords: &[u64],
+    run_len: u64,
+    grid: Option<(&[u64], u64)>,
+    size: usize,
+) -> Result<(), String> {
     // One piece is the overwhelming case: `gather` writes into a single slice, one copy per
     // coordinate, with its own bounds checks. Several pieces only happen when a shard divides
     // a trailing axis, and `gather_pieces` merges consecutive coordinates because there a run
     // can straddle two pieces.
-    let result = if let [piece] = &mut job.out[..] {
-        match job.grid {
-            Some((starts, run)) => gather_runs(&scratch[..], job.coords, starts, run, piece, size),
-            None => gather(&scratch[..], job.coords, job.run_len, piece, size),
+    if let [piece] = out {
+        match grid {
+            Some((starts, run)) => gather_runs(scratch, coords, starts, run, piece, size),
+            None => gather(scratch, coords, run_len, piece, size),
         }
-    } else if job.grid.is_some() {
+    } else if grid.is_some() {
         // A grid takes the same sub-box out of every index, so its output is one range by
         // construction. Reaching here means an item was built with both, which nothing does.
         Err("a grid selection cannot also span several output pieces".to_string())
     } else {
-        gather_pieces(&scratch[..], job.coords, job.run_len, &mut job.out, size)
-    };
-    result.map_err(|e| format!("{}: {e}", job.key))
+        gather_pieces(scratch, coords, run_len, out, size)
+    }
 }
 
 #[cfg(test)]
@@ -1123,6 +1225,60 @@ mod tests {
         assert_eq!(buffer[4], 2);
     }
 
+    /// A batch returns only after every task, including ones queued by other tasks on the
+    /// other pool, and a panic comes back to the caller without costing a pool a thread.
+    #[test]
+    fn batch_waits_for_nested_tasks_and_survives_a_panic() {
+        let (reads, decodes) = (QueuePool::new(4, "t-read").unwrap(), QueuePool::new(2, "t-dec").unwrap());
+        let mut out = vec![0u64; 1000];
+        batch(|b| {
+            for (i, c) in out.chunks_mut(10).enumerate() {
+                let (inner, decodes) = (b.clone(), &decodes);
+                // SAFETY: `out` and `decodes` outlive the batch.
+                unsafe {
+                    b.spawn(&reads, move || {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                        inner.spawn(decodes, move || {
+                            // Slow enough that a batch returning early is always caught.
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            c.iter_mut().for_each(|x| *x = i as u64 + 1);
+                        });
+                    });
+                }
+            }
+        });
+        assert!(out.chunks(10).enumerate().all(|(i, c)| c.iter().all(|&x| x == i as u64 + 1)));
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            batch(|b| unsafe { b.spawn(&decodes, || panic!("decode failed")) });
+        }));
+        assert!(caught.is_err(), "the task's panic reaches the caller");
+        let mut ran = [false; 8];
+        batch(|b| {
+            for r in ran.iter_mut() {
+                // SAFETY: `ran` outlives the batch.
+                unsafe { b.spawn(&decodes, move || *r = true) };
+            }
+        });
+        assert!(ran.iter().all(|&r| r), "both decode workers are still there");
+    }
+
+    /// The defaults at the sizes they were measured on.
+    #[test]
+    fn default_widths_follow_the_measured_rule() {
+        for (cores, want) in [
+            (1, (64, 1)),
+            (4, (64, 4)),
+            (8, (64, 8)),
+            (16, (64, 16)),
+            (32, (64, 16)),
+            (90, (90, 45)),
+            (200, (200, 100)),
+        ] {
+            assert_eq!(default_widths(cores), want, "{cores} cpus");
+        }
+    }
+
     /// The pools are built at the size asked for, and the size is one-shot.
     #[test]
     fn the_io_pool_is_wider_than_the_cpu_pool_and_both_report_what_they_built() {
@@ -1132,32 +1288,32 @@ mod tests {
             let config = ReadConfig::from_call(None, None, None, true);
             let (io, cpu) = pools(py, config).expect("the pools must be buildable");
             assert_eq!(
-                io.current_num_threads(),
-                cpu.current_num_threads() * READ_POOL_MULTIPLIER,
-                "the I/O pool is a multiple of the CPU pool, so one setting sizes both"
+                (io.width(), cpu.width()),
+                default_widths(default_pool_size()),
+                "with nothing asked, the pools are the defaults for this machine"
             );
             assert_eq!(
                 pool_sizes(),
                 (
-                    Some(io.current_num_threads()),
-                    Some(cpu.current_num_threads())
+                    Some(io.width()),
+                    Some(cpu.width())
                 ),
                 "what is reported is read off the pools, not computed a second time"
             );
             // The reason there are two: a reader parked on storage must not hold a worker a
             // decode needs, so there are more of the former than there are cores.
-            assert!(io.current_num_threads() > cpu.current_num_threads());
+            assert!(io.width() > cpu.width());
 
             // The config that built them must fit inside them, or every default read trips
             // the ceiling check.
-            assert!(config.read_workers <= io.current_num_threads());
-            assert!(config.decode_workers <= cpu.current_num_threads());
+            assert!(config.read_workers <= io.width());
+            assert!(config.decode_workers <= cpu.width());
 
             // A later call naming a different width is answered by the pool that exists.
             let narrower = ReadConfig::from_call(Some(1), Some(1), None, false);
             let (io2, cpu2) = pools(py, narrower).expect("already built");
-            assert_eq!(io2.current_num_threads(), io.current_num_threads());
-            assert_eq!(cpu2.current_num_threads(), cpu.current_num_threads());
+            assert_eq!(io2.width(), io.width());
+            assert_eq!(cpu2.width(), cpu.width());
         });
     }
 }
