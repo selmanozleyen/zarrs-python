@@ -13,7 +13,9 @@ pub trait ChunkConcurrentLimitAndCodecOptions {
     ) -> PyResult<Option<(usize, CodecOptions)>>;
 }
 
-impl ChunkConcurrentLimitAndCodecOptions for Vec<ChunkItem> {
+// For the slice, not the Vec: `Vec<ChunkItem>` still reaches it by deref, and the
+// ChunkItems handle hands out a slice.
+impl ChunkConcurrentLimitAndCodecOptions for [ChunkItem] {
     fn get_chunk_concurrent_limit_and_codec_options(
         &self,
         codec_pipeline_impl: &CodecPipelineImpl,
@@ -25,7 +27,7 @@ impl ChunkConcurrentLimitAndCodecOptions for Vec<ChunkItem> {
 
         let codec_concurrency = codec_pipeline_impl
             .codec_chain
-            .recommended_concurrency(&item.shape, &codec_pipeline_impl.data_type)
+            .recommended_concurrency(&item.shape)
             .map_codec_err()?;
 
         let min_concurrent_chunks =
