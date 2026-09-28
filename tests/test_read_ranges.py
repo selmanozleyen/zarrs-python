@@ -29,6 +29,34 @@ def arr(tmp_path):
     return _array(tmp_path / "a.zarr")
 
 
+def _hook(pipeline, a, starts, lengths, out):
+    """Call the hook the way zarr does; fails if it hands the read back to zarr's default."""
+    from zarr.abc.codec import CodecPipeline
+    from zarr.core.buffer import default_buffer_prototype
+
+    base = CodecPipeline.read_ranges
+
+    async def refuse(*args, **kwargs):
+        raise AssertionError("zarrs handed the read back to zarr")
+
+    CodecPipeline.read_ranges = refuse
+    try:
+        sync(
+            pipeline.read_ranges(
+                a.store_path,
+                a.metadata,
+                starts,
+                lengths,
+                out,
+                config=a._async_array.config,
+                chunk_grid=a._async_array._chunk_grid,
+                prototype=default_buffer_prototype(),
+            )
+        )
+    finally:
+        CodecPipeline.read_ranges = base
+
+
 def read(a, starts, lengths, out=None):
     """Ranges through the pipeline's `read_ranges` hook, which must serve them."""
     from zarr.core.buffer import default_buffer_prototype
@@ -38,11 +66,7 @@ def read(a, starts, lengths, out=None):
         shape = (int(lengths.sum()), *a.shape[1:])
         out = np.empty(shape, dtype=a.metadata.dtype.to_native_dtype())
     buffer = default_buffer_prototype().nd_buffer(out)
-    pipeline = a._async_array.codec_pipeline
-    assert (
-        sync(pipeline.read_ranges(a.store_path, a.metadata, starts, lengths, buffer))
-        is True
-    )
+    _hook(a._async_array.codec_pipeline, a, starts, lengths, buffer)
     return out
 
 
@@ -136,36 +160,38 @@ def test_consecutive_ranges_are_one_read(arr):
     )
 
 
-def test_the_zarr_hook_serves_1d_and_declines_the_rest(arr, tmp_path):
-    """`read_ranges` as zarr's pipeline hook: True when it read, False to let zarr read."""
+def test_the_zarr_hook_serves_1d_and_hands_back_the_rest(arr, tmp_path):
+    """`read_ranges` as zarr's pipeline hook: reads what it serves, hands the rest to zarr."""
     from zarr.core.buffer import default_buffer_prototype
 
     a, values = arr
-    pipeline = a._async_array.codec_pipeline
     out = default_buffer_prototype().nd_buffer.empty(
         shape=(7,), dtype=np.dtype("float32")
     )
     starts, lengths = np.array([300, 10]), np.array([4, 3])
-    assert (
-        sync(pipeline.read_ranges(a.store_path, a.metadata, starts, lengths, out))
-        is True
-    )
+    _hook(a._async_array.codec_pipeline, a, starts, lengths, out)
     np.testing.assert_array_equal(
         out.as_ndarray_like(), expected(values, starts, lengths)
     )
+    # Chunked on the second axis: not served, so zarr's default reads it.
+    values2 = np.arange(16, dtype=np.float32).reshape(4, 4)
     two_d = zarr.create_array(
         store=tmp_path / "2d.zarr", shape=(4, 4), chunks=(2, 2), dtype="f4"
     )
-    p2 = two_d._async_array.codec_pipeline
-    out2 = default_buffer_prototype().nd_buffer.empty(
-        shape=(1, 4), dtype=np.dtype("float32")
-    )
-    served = sync(
-        p2.read_ranges(
-            two_d.store_path, two_d.metadata, np.array([0]), np.array([1]), out2
+    two_d[:] = values2
+    with pytest.raises(AssertionError, match="handed the read back"):
+        _hook(
+            two_d._async_array.codec_pipeline,
+            two_d,
+            np.array([0]),
+            np.array([1]),
+            default_buffer_prototype().nd_buffer.empty(
+                shape=(1, 4), dtype=np.dtype("float32")
+            ),
         )
+    np.testing.assert_array_equal(
+        two_d.get_range_selection([1, 3], [1, 1]), values2[[1, 3]]
     )
-    assert served is False
 
 
 def test_zarr_range_selection_takes_the_hook(arr, monkeypatch):
@@ -179,15 +205,15 @@ def test_zarr_range_selection_takes_the_hook(arr, monkeypatch):
     original = pipeline_mod.ZarrsCodecPipeline.read_ranges
 
     async def watched(self, *args, **kwargs):
-        served.append(await original(self, *args, **kwargs))
-        return served[-1]
+        served.append(1)
+        await original(self, *args, **kwargs)
 
     monkeypatch.setattr(pipeline_mod.ZarrsCodecPipeline, "read_ranges", watched)
     starts, lengths = [900, 10, 900], [30, 20, 30]
     np.testing.assert_array_equal(
         a.get_range_selection(starts, lengths), expected(values, starts, lengths)
     )
-    assert served == [True]
+    assert served == [1]
 
 
 def test_ranges_sharing_a_chunk_read_it_once(arr):
@@ -225,9 +251,5 @@ def test_rows_of_a_2d_array(tmp_path, shards):
     want = np.concatenate([values[s : s + n] for s, n in zip(starts, lengths)])
     np.testing.assert_array_equal(read(a, starts, lengths), want)
     out = default_buffer_prototype().nd_buffer.empty(shape=want.shape, dtype=want.dtype)
-    pipeline = a._async_array.codec_pipeline
-    assert (
-        sync(pipeline.read_ranges(a.store_path, a.metadata, starts, lengths, out))
-        is True
-    )
+    _hook(a._async_array.codec_pipeline, a, starts, lengths, out)
     np.testing.assert_array_equal(out.as_ndarray_like(), want)

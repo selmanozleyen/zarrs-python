@@ -4,7 +4,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 from warnings import warn
 
 import numpy as np
@@ -253,20 +253,20 @@ class ZarrsCodecPipeline(CodecPipeline):
         starts: np.ndarray,
         lengths: np.ndarray,
         out: NDBuffer | np.ndarray,
-    ) -> bool:
+        **kwargs: Any,
+    ) -> None:
         """zarr's `CodecPipeline.read_ranges` hook: ranges of axis 0, back to back, into `out`.
 
-        Described per range in Rust: no index array and no entry per chunk. Returns False for
-        an array this does not serve, before reading anything, and zarr then reads the ranges
-        through its own indexer and `read`.
+        Described per range in Rust: no index array and no entry per chunk. An array this does
+        not serve is handed back to zarr's default, before anything is read.
         """
         buffer = out.as_ndarray_like() if hasattr(out, "as_ndarray_like") else out
         try:
             read = self.plan_ranges(store_path, metadata, starts, lengths, buffer)
         except UnsupportedRangeReadError:
-            return False
+            await super().read_ranges(store_path, metadata, starts, lengths, out, **kwargs)
+            return
         await asyncio.to_thread(read)
-        return True
 
     def plan_ranges(
         self,
@@ -279,7 +279,7 @@ class ZarrsCodecPipeline(CodecPipeline):
         """`read_ranges`, checked now and returned as a call that does the read.
 
         Raises `UnsupportedRangeReadError` for an array this does not serve, before anything
-        is read, which `read_ranges` answers as False.
+        is read, which `read_ranges` answers with zarr's default.
         """
         inner = self._inner_chunk_shape
         grid = getattr(metadata, "chunk_grid", None)
