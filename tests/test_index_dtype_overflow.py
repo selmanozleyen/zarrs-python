@@ -121,6 +121,7 @@ def test_an_all_false_mask_declines_rather_than_raising_IndexError() -> None:
         make_slice_selection(chunk_selection)
 
 
+@pytest.mark.usefixtures("no_dispatch")
 @pytest.mark.parametrize("dtype", UNSIGNED)
 def test_unsigned_descending_rows_are_refused(dtype: str, sharded) -> None:
     """Rows 27 and 3 land in different shards, so each arrives alone and looks orderable."""

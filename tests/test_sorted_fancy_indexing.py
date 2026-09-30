@@ -83,6 +83,7 @@ def test_sorted_vindex_1d(sharded_1d: tuple[Path, np.ndarray]) -> None:
         pytest.param((slice(6, 9), np.array([5, 6, 13])), id="slice-cols"),
     ],
 )
+@pytest.mark.usefixtures("no_dispatch")
 def test_unsupported_raises_strictly_but_falls_back_correctly(
     sharded: tuple[Path, np.ndarray], index: object
 ) -> None:
@@ -92,6 +93,22 @@ def test_unsupported_raises_strictly_but_falls_back_correctly(
     with zarr.config.set(ZARRS):
         z = zarr.open_array(path, mode="r")
         np.testing.assert_array_equal(z[index], expected[index])
+
+
+# Refused by `read` above, but orthogonal, so zarr hands them to `read_runs`.
+@pytest.mark.parametrize(
+    "index",
+    [
+        pytest.param(np.array([9, 2]), id="unsorted-rows"),
+        pytest.param((slice(None), np.array([0, 1, 7, 23])), id="cols"),
+        pytest.param((slice(6, 9), np.array([5, 6, 13])), id="slice-cols"),
+    ],
+)
+def test_run_selections_are_served_strictly(
+    sharded: tuple[Path, np.ndarray], index: object
+) -> None:
+    path, expected = sharded
+    np.testing.assert_array_equal(open_strict(path)[index], expected[index])
 
 
 def test_a_write_of_rows_sharing_a_chunk(sharded: tuple[Path, np.ndarray]) -> None:

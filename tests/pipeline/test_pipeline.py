@@ -88,11 +88,12 @@ def test_pipeline_used(
         compressors=[codec],
     )
     spy_read = mocker.spy(z._async_array.codec_pipeline, "read")
+    spy_read_runs = mocker.spy(z._async_array.codec_pipeline, "read_runs")
     spy_write = mocker.spy(z._async_array.codec_pipeline, "write")
     assert isinstance(z._async_array.codec_pipeline, zarrs.ZarrsCodecPipeline)
     z[...] = np.random.random(z.shape)
     z[...]
-    assert spy_read.call_count == 1
+    assert spy_read.call_count + spy_read_runs.call_count == 1
     assert spy_write.call_count == 1
 
 

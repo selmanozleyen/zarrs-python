@@ -43,6 +43,16 @@ def entries(monkeypatch) -> dict[str, int]:
     return counts
 
 
+@pytest.fixture
+def no_dispatch(monkeypatch) -> None:
+    """Hide the pipeline's `read_runs` from zarr, so selections go through `read` again."""
+    from zarr.abc.codec import CodecPipeline
+
+    from zarrs import ZarrsCodecPipeline
+
+    monkeypatch.setattr(ZarrsCodecPipeline, "read_runs", CodecPipeline.read_runs)
+
+
 @pytest.fixture(autouse=True)
 def _setup_codec_pipeline():
     config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"})

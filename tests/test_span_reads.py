@@ -56,6 +56,7 @@ def test_span_matches_an_explicit_index_array(sharded_1d):
         np.testing.assert_array_equal(as_span, values[start:stop])
 
 
+@pytest.mark.usefixtures("no_dispatch")
 def test_the_span_path_is_actually_taken(sharded_1d):
     from zarrs.utils import _chunk_unit_args
 

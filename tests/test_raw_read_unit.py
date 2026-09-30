@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pytest
 import zarr
 
 from zarrs._internal import raw_path_stats
@@ -71,6 +72,7 @@ def test_a_dense_run_of_rows_is_one_read(tmp_path: Path) -> None:
     assert raw == 1, f"8 consecutive rows should be one read, got {raw}"
 
 
+@pytest.mark.usefixtures("no_dispatch")
 def test_a_scattered_chunk_declines_the_raw_path(tmp_path: Path) -> None:
     """Every other row of a chunk is 4 runs, above the limit of 2, so the chunk is read whole."""
     values = _write(tmp_path / "scat.zarr", compressed=False)
