@@ -57,19 +57,19 @@ class ChunkItems:
         r"""
         The number of read items pushed so far.
         """
-    def push_ranges(
+    def push_runs(
         self,
         keys: typing.Sequence[builtins.str],
-        shard_ids: numpy.typing.NDArray[numpy.int64],
-        starts: numpy.typing.NDArray[numpy.int64],
-        lengths: numpy.typing.NDArray[numpy.int64],
-        shard_len: builtins.int,
-        inner: builtins.int,
-        trailing: typing.Sequence[builtins.int],
+        shard_ids: typing.Sequence[numpy.typing.NDArray[numpy.int64]],
+        starts: typing.Sequence[numpy.typing.NDArray[numpy.int64]],
+        lengths: typing.Sequence[numpy.typing.NDArray[numpy.int64]],
+        shard_shape: typing.Sequence[builtins.int],
+        inner: typing.Sequence[builtins.int],
     ) -> None:
         r"""
-        Push ranges of whole rows on axis 0, back to back in the output. `shard_ids` ascends and
-        names the shard of each key.
+        Push the product of runs on every axis, each axis's runs back to back in the output.
+        `shard_ids[k]` ascends and names the shards touched on axis `k`; `keys` are their
+        product in C order.
         """
 
 @typing.final

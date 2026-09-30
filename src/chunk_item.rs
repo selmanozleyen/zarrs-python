@@ -480,76 +480,135 @@ impl ChunkItems {
         Ok(())
     }
 
-    /// Push ranges of whole rows on axis 0, back to back in the output. `shard_ids` ascends and
-    /// names the shard of each key.
-    #[pyo3(signature = (keys, shard_ids, starts, lengths, shard_len, inner, trailing))]
+    /// Push the product of runs on every axis, each axis's runs back to back in the output.
+    /// `shard_ids[k]` ascends and names the shards touched on axis `k`; `keys` are their
+    /// product in C order.
+    #[pyo3(signature = (keys, shard_ids, starts, lengths, shard_shape, inner))]
     #[allow(clippy::needless_pass_by_value)]
-    pub(crate) fn push_ranges(
+    pub(crate) fn push_runs(
         &mut self,
         keys: Vec<String>,
-        shard_ids: PyReadonlyArray1<'_, i64>,
-        starts: PyReadonlyArray1<'_, i64>,
-        lengths: PyReadonlyArray1<'_, i64>,
-        shard_len: u64,
-        inner: u64,
-        trailing: Vec<u64>,
+        shard_ids: Vec<PyReadonlyArray1<'_, i64>>,
+        starts: Vec<PyReadonlyArray1<'_, i64>>,
+        lengths: Vec<PyReadonlyArray1<'_, i64>>,
+        shard_shape: Vec<u64>,
+        inner: Vec<u64>,
     ) -> PyResult<()> {
-        let ids = shard_ids
-            .as_slice()
-            .map_err(|_| PyErr::new::<PyValueError, _>("the shard id array must be contiguous"))?;
-        let (starts, lengths) = (starts.as_array(), lengths.as_array());
-        if keys.len() != ids.len() || starts.len() != lengths.len() {
+        let rank = shard_shape.len();
+        if rank == 0
+            || [shard_ids.len(), starts.len(), lengths.len(), inner.len()] != [rank; 4]
+        {
             return Err(PyErr::new::<PyValueError, _>(
-                "one key per shard id, and one length per start",
+                "one shard id array, run pair and inner extent per axis",
             ));
         }
-        if shard_len == 0 {
+        if shard_shape.iter().chain(&inner).any(|d| *d == 0) {
             return Err(PyErr::new::<PyValueError, _>(
-                "the shard length must be non-zero",
+                "shard and inner extents must be non-zero",
             ));
         }
         let u = |v: i64| {
             u64::try_from(v)
-                .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative range field {v}")))
+                .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative run field {v}")))
         };
-        let mut out = self.out_end;
-        let mut total = out;
-        for n in lengths.iter() {
-            total = total.checked_add(u(*n)?).ok_or_else(|| {
-                PyErr::new::<PyValueError, _>("the ranges are too long to address")
+        // Per axis, `(shard position, shard-local lo..hi, output start)` of each piece that
+        // stays within one inner chunk.
+        let mut axes: Vec<Vec<(usize, u64, u64, u64)>> = Vec::with_capacity(rank);
+        let mut out_shape = Vec::with_capacity(rank);
+        let mut id_counts = Vec::with_capacity(rank);
+        for k in 0..rank {
+            let ids = shard_ids[k].as_slice().map_err(|_| {
+                PyErr::new::<PyValueError, _>("the shard id arrays must be contiguous")
             })?;
+            let (s_arr, n_arr) = (starts[k].as_array(), lengths[k].as_array());
+            if s_arr.len() != n_arr.len() {
+                return Err(PyErr::new::<PyValueError, _>("one length per start"));
+            }
+            let (shard, split) = (shard_shape[k], inner[k]);
+            let mut pieces = Vec::new();
+            let mut out = 0u64;
+            for (s, n) in s_arr.iter().zip(n_arr.iter()) {
+                let mut s = u(*s)?;
+                let end = s.checked_add(u(*n)?).ok_or_else(|| {
+                    PyErr::new::<PyValueError, _>("a run is too long to address")
+                })?;
+                while s < end {
+                    let (id, lo) = (s / shard, s % shard);
+                    let hi = ((lo / split + 1) * split).min(shard).min(lo + (end - s));
+                    let pos = i64::try_from(id)
+                        .ok()
+                        .and_then(|id| ids.binary_search(&id).ok())
+                        .ok_or_else(|| {
+                            PyErr::new::<PyIndexError, _>(format!(
+                                "no key given for shard {id} of axis {k}"
+                            ))
+                        })?;
+                    pieces.push((pos, lo, hi, out));
+                    (out, s) = (out + hi - lo, s + hi - lo);
+                }
+            }
+            axes.push(pieces);
+            out_shape.push(out);
+            id_counts.push(ids.len());
         }
-        // Touching ranges are one span.
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(starts.len());
-        for (s, n) in starts.iter().zip(lengths.iter()) {
-            let (s, n) = (u(*s)?, u(*n)?);
-            match merged.last_mut() {
-                Some((ms, mn)) if *ms + *mn == s => *mn += n,
-                _ if n > 0 => merged.push((s, n)),
-                _ => {}
+        if keys.len() != id_counts.iter().product::<usize>() {
+            return Err(PyErr::new::<PyValueError, _>(
+                "one key per shard in the product of the shard ids",
+            ));
+        }
+        if axes.iter().any(Vec::is_empty) {
+            return Ok(());
+        }
+        let keys = keys
+            .into_iter()
+            .map(|k| StoreKey::new(k).map_py_err::<PyValueError>())
+            .collect::<PyResult<Vec<_>>>()?;
+        let num_elements = shard_shape.iter().product();
+        let claimed_inner = (inner[0], inner[1..].iter().product());
+        let array_shape = to_nonzero_u64_vec(out_shape)?;
+        let shape = to_nonzero_u64_vec(shard_shape)?;
+        // An odometer over the product, last axis fastest, so items come in output order.
+        let mut at = vec![0usize; rank];
+        loop {
+            let pieces: Vec<_> = at.iter().zip(&axes).map(|(i, a)| a[*i]).collect();
+            let key = pieces
+                .iter()
+                .zip(&id_counts)
+                .fold(0, |acc, (p, count)| acc * count + p.0);
+            let within = ArraySubset::new_with_start_shape(
+                pieces.iter().zip(&inner).map(|p| p.0.1 % p.1).collect(),
+                pieces.iter().map(|p| p.2 - p.1).collect(),
+            )
+            .map_py_err::<PyValueError>()?;
+            let runs = within
+                .contiguous_linearised_indices(&inner)
+                .map_py_err::<PyValueError>()?;
+            let chunk_ranges: Vec<_> = pieces.iter().map(|p| p.1..p.2).collect();
+            let out_ranges: Vec<_> = pieces.iter().map(|p| p.3..p.3 + p.2 - p.1).collect();
+            self.items.push(ChunkItem {
+                key: keys[key].clone(),
+                chunk_subset: ArraySubset::new_with_ranges(&chunk_ranges),
+                subset: ArraySubset::new_with_ranges(&out_ranges),
+                shape: shape.clone(),
+                num_elements,
+                array_shape: array_shape.clone(),
+                coords: Some(runs.iter().map(|(i, _)| i).collect()),
+                run_len: runs.contiguous_elements(),
+                claimed_inner,
+            });
+            let mut k = rank;
+            loop {
+                if k == 0 {
+                    return Ok(());
+                }
+                k -= 1;
+                at[k] += 1;
+                if at[k] < axes[k].len() {
+                    break;
+                }
+                at[k] = 0;
             }
         }
-        let dims = |first: u64| {
-            std::iter::once(first)
-                .chain(trailing.iter().copied())
-                .collect()
-        };
-        for (mut s, mut n) in merged {
-            while n > 0 {
-                let shard = s / shard_len;
-                let (local, piece) = (s % shard_len, n.min(shard_len - s % shard_len));
-                let key = i64::try_from(shard)
-                    .ok()
-                    .and_then(|sh| ids.binary_search(&sh).ok())
-                    .map(|i| keys[i].as_str())
-                    .ok_or_else(|| {
-                        PyErr::new::<PyIndexError, _>(format!("no key given for shard {shard}"))
-                    })?;
-                self.push_span(key, dims(shard_len), dims(total), local, piece, out, inner)?;
-                (out, s, n) = (out + piece, s + piece, n - piece);
-            }
-        }
-        Ok(())
     }
 }
 

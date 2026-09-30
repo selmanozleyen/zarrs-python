@@ -412,3 +412,65 @@ fn test_coord_runs_do_not_wrap_at_the_top_of_the_range() {
     assert_eq!(crate::utils::coord_runs(&[0, 4, 8], run_len).count(), 1);
     assert_eq!(crate::utils::coord_runs(&[], run_len).count(), 0);
 }
+
+/// Runs on two axes: one item per inner chunk a piece meets, its coords walking the box.
+#[test]
+fn test_push_runs_splits_every_axis_at_inner_chunks() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let a = |v: &[i64]| PyArray1::from_slice(py, v).readonly();
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        // Shards of 8 x 8 in inner chunks of 4 x 4: rows 2..6 cross a seam, columns 9..11 are
+        // in shard 1.
+        handle.push_runs(
+            vec!["c/0/1".to_string()],
+            vec![a(&[0]), a(&[1])],
+            vec![a(&[2]), a(&[9])],
+            vec![a(&[4]), a(&[2])],
+            vec![8, 8],
+            vec![4, 4],
+        )?;
+        let got: Vec<_> = handle
+            .as_slice()
+            .iter()
+            .map(|i| {
+                (
+                    i.key.as_str(),
+                    i.chunk_subset.start().to_vec(),
+                    i.subset.start().to_vec(),
+                    i.coords.as_ref().unwrap().to_vec(),
+                    i.run_len,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("c/0/1", vec![2, 1], vec![0, 0], vec![9, 13], 2),
+                ("c/0/1", vec![4, 1], vec![2, 0], vec![1, 5], 2),
+            ]
+        );
+        Ok(())
+    })
+}
+
+/// A box of a decoded chunk lands in a strided box of the output, one run at a time.
+#[test]
+fn test_gather_pieces_copies_a_box() {
+    // A 3 x 4 chunk of 1-byte elements: rows 1..3 by columns 1..3 are runs of 2 at 5 and 9.
+    let scratch: Vec<u8> = (0..12u8).collect();
+    let mut out = vec![0u8; 10];
+    // A 2 x 5 output taking the box at columns 2..4.
+    let (top, bottom) = out.split_at_mut(5);
+    crate::utils::gather_pieces(&scratch, &[5, 9], 2, &mut [&mut top[2..4], &mut bottom[2..4]], 1)
+        .expect("in bounds");
+    assert_eq!(out, vec![0, 0, 5, 6, 0, 0, 0, 9, 10, 0]);
+
+    // Whole rows 1..3 are one run of 8, spilling across two output rows.
+    let mut out = vec![0u8; 8];
+    let (a, b) = out.split_at_mut(4);
+    crate::utils::gather_pieces(&scratch, &[4], 8, &mut [a, b], 1).expect("in bounds");
+    assert_eq!(out, (4..12u8).collect::<Vec<_>>());
+}

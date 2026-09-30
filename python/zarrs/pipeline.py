@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from dataclasses import dataclass
 from functools import cached_property
@@ -124,6 +125,22 @@ def array_metadata_to_codecs(metadata: ArrayMetadata) -> list[Codec]:
         return [v2_codec]
 
 
+def _shards_touched(
+    starts: np.ndarray, lengths: np.ndarray, size: int
+) -> np.ndarray:
+    """The ascending ids of the shards of extent `size` that the runs touch."""
+    keep = lengths > 0
+    starts, lengths = starts[keep], lengths[keep]
+    first, last = starts // size, (starts + lengths - 1) // size
+    ids = np.union1d(first, last)
+    if (wide := last - first > 1).any():
+        between = [
+            np.arange(f + 1, l) for f, l in zip(first[wide], last[wide], strict=True)
+        ]
+        ids = np.union1d(ids, np.concatenate(between))
+    return ids.astype(np.int64)
+
+
 @dataclass
 class ZarrsCodecPipeline(CodecPipeline):
     metadata: ArrayMetadata
@@ -232,30 +249,28 @@ class ZarrsCodecPipeline(CodecPipeline):
             )
             return None
 
-    async def read_ranges(
+    async def read_runs(
         self,
         store_path: StorePath,
         metadata: ArrayMetadata,
-        starts: np.ndarray,
-        lengths: np.ndarray,
+        runs: tuple[tuple[np.ndarray, np.ndarray], ...],
         out: NDBuffer | np.ndarray,
         **kwargs: Any,
     ) -> None:
-        """Read ranges of axis 0 back to back into `out`, or defer to zarr's default."""
+        """Read the product of runs on every axis into `out`, or defer to zarr's default."""
         buffer = out.as_ndarray_like() if hasattr(out, "as_ndarray_like") else out
         try:
-            read = self.plan_ranges(store_path, metadata, starts, lengths, buffer)
+            read = self.plan_runs(store_path, metadata, runs, buffer)
         except UnsupportedRangeReadError:
-            await super().read_ranges(store_path, metadata, starts, lengths, out, **kwargs)
+            await super().read_runs(store_path, metadata, runs, out, **kwargs)
             return
         await asyncio.to_thread(read)
 
-    def plan_ranges(
+    def plan_runs(
         self,
         store_path: StorePath,
         metadata: ArrayMetadata,
-        starts: np.ndarray,
-        lengths: np.ndarray,
+        runs: tuple[tuple[np.ndarray, np.ndarray], ...],
         out: np.ndarray,
     ) -> Callable[[], None]:
         """Check the read now and return a call that does it.
@@ -274,69 +289,54 @@ class ZarrsCodecPipeline(CodecPipeline):
             raise UnsupportedRangeReadError(
                 "a chunked array with a regular grid is needed"
             )
-        # A row is one run only if shards and inner chunks span every other axis whole.
-        trailing = shape[1:]
-        if tuple(int(v) for v in grid.chunk_shape[1:]) != trailing or (
-            inner and tuple(int(v) for v in inner[1:]) != trailing
-        ):
-            raise UnsupportedRangeReadError(
-                "every axis after the first must be whole in a chunk"
-            )
         dtype = metadata.dtype.to_native_dtype()
         if dtype.kind in {"V", "S", "U", "M", "m", "O", "T"} or not dtype.isnative:
             raise UnsupportedRangeReadError(f"dtype {dtype} is not served")
-        starts = np.asarray(starts, dtype=np.int64)
-        lengths = np.asarray(lengths, dtype=np.int64)
-        if starts.ndim != 1 or starts.shape != lengths.shape:
-            raise ValueError("starts and lengths must be 1-D and the same length")
-        total = int(lengths.sum())
-        if (
-            out.shape != (total, *trailing)
-            or out.dtype != dtype
-            or not out.flags.c_contiguous
-        ):
+        if not out.flags.c_contiguous:
+            raise UnsupportedRangeReadError("out must be C contiguous")
+        if len(runs) != len(shape):
             raise ValueError(
-                f"out must be a contiguous {dtype} array of shape {(total, *trailing)}, "
-                f"not {out.dtype} {out.shape}"
+                f"one (starts, lengths) pair per axis is needed: {len(runs)} for {len(shape)}"
             )
-        if (
-            (lengths < 0).any()
-            or (starts < 0).any()
-            or (starts + lengths > metadata.shape[0]).any()
-        ):
-            raise IndexError(
-                f"a range falls outside the array's {metadata.shape[0]} elements"
+        runs = [
+            (np.asarray(s, dtype=np.int64), np.asarray(n, dtype=np.int64))
+            for s, n in runs
+        ]
+        for axis, ((starts, lengths), size) in enumerate(zip(runs, shape, strict=True)):
+            if starts.ndim != 1 or starts.shape != lengths.shape:
+                raise ValueError("starts and lengths must be 1-D and the same length")
+            if (lengths < 0).any() or (starts < 0).any() or (starts + lengths > size).any():
+                raise IndexError(
+                    f"a run falls outside axis {axis}, which has {size} elements"
+                )
+        want = tuple(int(lengths.sum()) for _, lengths in runs)
+        if out.shape != want or out.dtype != dtype:
+            raise ValueError(
+                f"out must be a {dtype} array of shape {want}, not {out.dtype} {out.shape}"
             )
-        keep = lengths > 0
-        starts, lengths = starts[keep], lengths[keep]
-        shard_len = int(grid.chunk_shape[0])
-        first, last = starts // shard_len, (starts + lengths - 1) // shard_len
-        ids = np.union1d(first, last)
-        if (wide := last - first > 1).any():
-            between = [
-                np.arange(f + 1, l)
-                for f, l in zip(first[wide], last[wide], strict=True)
-            ]
-            ids = np.union1d(ids, np.concatenate(between))
-        rest = (0,) * len(trailing)
+        shard_shape = [int(v) for v in grid.chunk_shape]
+        ids = [
+            _shards_touched(starts, lengths, size)
+            for (starts, lengths), size in zip(runs, shard_shape, strict=True)
+        ]
         keys = [
-            (store_path / metadata.encode_chunk_key((int(i), *rest))).path for i in ids
+            (store_path / metadata.encode_chunk_key(c)).path
+            for c in itertools.product(*(i.tolist() for i in ids))
         ]
         knobs = _read_config()
         impl = self.impl
 
         def read() -> None:
-            if not starts.size:
+            if not out.size:
                 return
             handle = ChunkItems()
-            handle.push_ranges(
+            handle.push_runs(
                 keys,
-                ids.astype(np.int64),
-                starts,
-                lengths,
-                shard_len,
-                int(inner[0]) if inner else shard_len,
-                list(trailing),
+                ids,
+                [starts for starts, _ in runs],
+                [lengths for _, lengths in runs],
+                shard_shape,
+                list(inner or shard_shape),
             )
             impl.retrieve_chunk_items_and_apply_index(handle, out, *knobs)
 

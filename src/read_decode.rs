@@ -285,16 +285,6 @@ fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, 
         .subset
         .contiguous_linearised_indices(&full)
         .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", item.key)))?;
-    let one_per_row = u64::try_from(runs.len()).is_ok_and(|n| n == item.subset.shape()[0]);
-    if runs.len() != 1 && !one_per_row {
-        return Err(PyRuntimeError::new_err(format!(
-            "{}: output {:?} of {:?} is strided within one index, and an item's output is \
-             vended as one run per index",
-            item.key,
-            &item.subset.shape()[1..],
-            &full[1..]
-        )));
-    }
     let width = usize::try_from(runs.contiguous_elements())
         .ok()
         .and_then(|r| r.checked_mul(element_size))
@@ -380,6 +370,7 @@ fn carve<'a>(
 
     let mut jobs: Vec<Job<'a>> = Vec::with_capacity(located.len());
     let mut absent: Vec<&'a mut [u8]> = Vec::new();
+    let mut by_chunk: HashMap<(StoreKey, u64, u64), usize> = HashMap::new();
     // Queued in output order, so on high-latency storage chunks arrive roughly as wanted.
     let mut order: Vec<usize> = (0..located.len()).collect();
     order.sort_by_key(|&i| output_offset(located[i].0));
@@ -407,18 +398,17 @@ fn carve<'a>(
             }
             Some(range) => {
                 let coords = coords_of(item)?;
-                // Adjacent items on the same chunk share one read and decode.
-                if let Some(last) = jobs
-                    .last_mut()
-                    .filter(|j| !j.raw && j.key == item.key && j.range == *range)
-                {
-                    last.shared.push(Part {
+                // Items on the same chunk share one read and decode.
+                let chunk = (item.key.clone(), range.start(0), range.length(0));
+                if let Some(&j) = by_chunk.get(&chunk) {
+                    jobs[j].shared.push(Part {
                         out: pieces,
                         coords,
                         run_len: item.run_len,
                     });
                     continue;
                 }
+                by_chunk.insert(chunk, jobs.len());
                 CHUNK_JOBS.fetch_add(1, Ordering::Relaxed);
                 jobs.push(Job {
                     key: item.key.clone(),
@@ -938,7 +928,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn output_pieces_refuses_a_strided_sub_box() {
+    fn output_pieces_vend_a_box_one_run_at_a_time() {
         let item = |subset: &[std::ops::Range<u64>], array: &[u64]| ChunkItem {
             key: StoreKey::new("c/0".to_string()).expect("a key"),
             chunk_subset: ArraySubset::new_with_ranges(subset),
@@ -950,31 +940,12 @@ mod tests {
             run_len: 1,
             claimed_inner: (0, 0),
         };
-        // Strided: axis 1 takes 5 of 10 and axis 2 takes 5 of 10, so a row is not one run.
         let strided = item(&[0..2, 0..5, 0..5], &[6, 10, 10]);
-        assert!(
-            output_pieces(&strided, 8).is_err(),
-            "a strided output sub-box must be refused, not modelled as one run"
-        );
-        // Taking all of axis 1 and part of axis 2 is ten runs of five, not one run.
-        let wide_then_partial = item(&[0..2, 0..10, 0..5], &[6, 10, 10]);
-        assert!(
-            output_pieces(&wide_then_partial, 8).is_err(),
-            "a full axis above a partial one is still strided"
-        );
-        // One element on axis 1 and part of axis 2 is one run per index, and is served.
-        let one_run = item(&[0..2, 3..4, 0..5], &[6, 10, 10]);
-        assert!(
-            output_pieces(&one_run, 8).is_ok(),
-            "a single element above a partial axis is one contiguous run"
-        );
-        // Whole trailing axes, the ordinary case, stay on the single-range path.
+        let pieces = output_pieces(&strided, 8).expect("a strided box");
+        assert_eq!(pieces.len(), 10, "one piece per run of the last axis");
+        assert_eq!(pieces[1], (10 * 8, 5 * 8));
         let whole = item(&[0..2, 0..10, 0..10], &[6, 10, 10]);
-        assert_eq!(
-            output_pieces(&whole, 8).expect("whole").len(),
-            1,
-            "whole trailing axes are one contiguous range, not one per row"
-        );
+        assert_eq!(output_pieces(&whole, 8).expect("whole"), vec![(0, 200 * 8)]);
     }
 
     fn to_nonzero(dims: &[u64]) -> Vec<NonZeroU64> {
