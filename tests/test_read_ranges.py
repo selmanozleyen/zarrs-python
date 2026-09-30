@@ -97,7 +97,6 @@ def test_ranges_match_numpy(arr, starts, lengths):
 
 
 def test_rows_match_a_coordinate_selection(arr):
-    """The read anndata does today, and the one this replaces, side by side."""
     a, _ = arr
     rng = np.random.default_rng()
     starts = np.sort(rng.choice(LENGTH // 50, 60, replace=False)) * 50
@@ -153,7 +152,7 @@ def test_consecutive_ranges_are_one_read(arr):
     handle = zarrs._internal.ChunkItems()
     shard_ids = np.array([0, 1], dtype=np.int64)
     handle.push_ranges(["k0", "k1"], shard_ids, starts, lengths, SHARD, INNER, [])
-    # 100..420 as one span is an item per inner chunk it crosses (1..6); per range it was 64+.
+    # 100..420 as one span: one item per inner chunk it crosses.
     assert len(handle) == 6, len(handle)
     np.testing.assert_array_equal(
         read(a, starts, lengths), expected(values, starts, lengths)

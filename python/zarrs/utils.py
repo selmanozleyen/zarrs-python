@@ -226,8 +226,10 @@ def _step1_span(sel: Any, extent: int) -> tuple[int, int] | None:
 
 
 def _is_one_run(widths: list[int], extents: tuple[int, ...]) -> bool:
-    """Is a sub-box one run in row-major order: every axis before the last partial one takes one element?"""
-    partial = [axis for axis, (w, e) in enumerate(zip(widths, extents, strict=True)) if w != e]
+    """Is a sub-box one run: every axis before the last partial one takes one element?"""
+    partial = [
+        axis for axis, (w, e) in enumerate(zip(widths, extents, strict=True)) if w != e
+    ]
     return not partial or all(w == 1 for w in widths[: partial[-1]])
 
 
@@ -410,7 +412,7 @@ def chunk_info_for_read(
     shape: tuple[int, ...],
     inner_chunk_shape: tuple[int, ...] | None,
 ) -> RustChunkInfo:
-    """A `ChunkItems` handle for a read batch, or `DiscontiguousArrayError` if one entry is not served."""
+    """A `ChunkItems` handle for a read batch; raises if any entry is not served."""
     entries = list(_as_int64_batch_info(batch_info))
     unit_args = [
         _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)

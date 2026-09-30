@@ -37,7 +37,7 @@ def sharded_1d(tmp_path: Path) -> tuple[Path, np.ndarray]:
 
 
 def open_strict(path: Path) -> zarr.Array:
-    """Open with no fallback, so an unsupported selection raises rather than being rerouted."""
+    """Open with no fallback, so an unsupported selection raises."""
     with zarr.config.set({**ZARRS, "codec_pipeline.strict": True}):
         return zarr.open_array(path, mode="r+")
 
@@ -71,18 +71,14 @@ def test_sorted_vindex_1d(sharded_1d: tuple[Path, np.ndarray]) -> None:
     np.testing.assert_array_equal(z[index], expected[index])
 
 
-# Indices within one shard, so one chunk item really gets several of them: spread across shards
-# each item gets one, which is a box and was always supported.
+# Indices within one shard, so one entry gets several of them.
 @pytest.mark.parametrize(
     "index",
     [
-        # Unsorted: zarr-python reorders the output, so a run's position in the selection is
-        # not its position in the output.
         pytest.param(np.array([9, 2]), id="unsorted-rows"),
         pytest.param((np.array([1, 3]), np.array([0, 2])), id="two-array-axes"),
         pytest.param((slice(None), slice(None, None, 2)), id="strided"),
-        # A column index array over a 24-wide array on 12-wide shards: each entry covers part
-        # of the output width, which `_is_whole_axis` refuses on the output side.
+        # A column index array is not a step-1 slice on the trailing axis.
         pytest.param((slice(None), np.array([0, 1, 7, 23])), id="cols"),
         pytest.param((slice(6, 9), np.array([5, 6, 13])), id="slice-cols"),
     ],

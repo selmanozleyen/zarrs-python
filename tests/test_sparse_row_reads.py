@@ -14,8 +14,7 @@ N_VAR = 5000
 CHUNK = 4096
 SHARD = 16384
 
-# Values must not depend on the pool sizes. Only the first read builds them, so this asserts
-# width-independence, not that each config was applied.
+# Only the first read of the process builds the pools, so later widths only warn.
 CONFIGS = {
     "default": {},
     "one worker": {

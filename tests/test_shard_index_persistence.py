@@ -90,8 +90,7 @@ def test_a_write_that_falls_back_to_zarr_python(array: tuple[Path, np.ndarray]) 
         z = zarr.open_array(path, mode="r+")
         np.testing.assert_array_equal(z[selection], expected[selection])
 
-        # Non-contiguous integer-array write: refused by make_slice_selection, so it falls
-        # back to zarr-python's pipeline.
+        # A non-contiguous integer-array write falls back to zarr-python.
         rows = np.array([5, 900, 3_000])
         z[rows] = -1.0
         expected[rows] = -1.0

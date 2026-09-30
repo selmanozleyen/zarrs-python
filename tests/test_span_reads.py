@@ -4,8 +4,7 @@ import numpy as np
 import pytest
 import zarr
 
-# One shard holds several inner chunks, so a span crosses boundaries within a shard as well
-# as between them.
+# Several inner chunks per shard, so a span crosses boundaries within and between shards.
 INNER = 8
 SHARD = 32
 LENGTH = 200
@@ -58,7 +57,6 @@ def test_span_matches_an_explicit_index_array(sharded_1d):
 
 
 def test_the_span_path_is_actually_taken(sharded_1d):
-    """Otherwise the tests above pass by never reaching the code they are about."""
     from zarrs.utils import _chunk_unit_args
 
     path, _ = sharded_1d
@@ -70,7 +68,6 @@ def test_the_span_path_is_actually_taken(sharded_1d):
 
     def watched(*args, **kwargs):
         out = original(*args, **kwargs)
-        # A list of pushes, one per band, so the kind is the first field of each.
         seen.extend(push[0] for push in out or ())
         return out
 

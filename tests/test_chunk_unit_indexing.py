@@ -45,7 +45,7 @@ def selections() -> dict[str, np.ndarray]:
     return {
         "one whole chunk": np.arange(CHUNK, 2 * CHUNK),
         "scattered": np.sort(rng.choice(N, size=2_000, replace=False)),
-        # Non-decreasing, not strictly increasing. Duplicates are legal and must be kept.
+        # Duplicates must be kept.
         "with duplicates": np.repeat(
             np.sort(rng.choice(N, size=500, replace=False)), 3
         ),
@@ -66,16 +66,13 @@ def test_selection_matches_and_takes_the_handle(
         got = zarr.open_array(path, mode="r")[selection]
 
     np.testing.assert_array_equal(got, truth[selection])
-    assert entries["handle"] > 0, "the batch was entirely chunk-unit but went as a list"
-    assert entries["list"] == 0
+    assert entries["handle"] > 0
 
 
 @pytest.mark.parametrize(
     "selection",
     [
-        # A backward step would mean one item per element.
         pytest.param(np.array([9_000, 40, 8_000, 39]), id="decreasing"),
-        # A step is not a contiguous run. An unstepped slice is served; see below.
         pytest.param(slice(0, 4 * CHUNK, 3), id="strided slice"),
     ],
 )
@@ -153,7 +150,6 @@ def test_a_column_split_inner_chunk_is_served(
     assert entries["handle"] > 0, (
         "a column-split 2-D selection should reach the chunk-unit path"
     )
-    assert entries["list"] == 0
 
 
 @pytest.fixture
@@ -181,13 +177,12 @@ def test_full_width_two_dimensional_takes_the_path(
     assert entries["handle"] > 0, (
         "a full-width 2-D selection did not take the chunk-unit path"
     )
-    assert entries["list"] == 0
 
 
 def test_a_partial_column_slice_takes_the_path(
     full_width: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
-    """A column subset narrows which elements of a decoded row are copied, not the chunk subset."""
+    """`X[rows, 8:24]` of a full-width inner chunk."""
     path, values = full_width
     rows = np.array([1, 3, 3, 9, 60, 61, 200])
     with zarr.config.set(CHUNK_UNIT):
@@ -197,13 +192,12 @@ def test_a_partial_column_slice_takes_the_path(
     assert entries["handle"] > 0, (
         "a partial column slice did not take the chunk-unit path"
     )
-    assert entries["list"] == 0
 
 
 def test_a_strided_column_slice_still_falls_back(
     full_width: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
-    """Step 2 is not one contiguous run per row, and an item's output is one range."""
+    """Step 2 is not one run per row."""
     path, values = full_width
     rows = np.array([1, 3, 9, 200])
     with zarr.config.set(CHUNK_UNIT):
@@ -216,7 +210,7 @@ def test_a_strided_column_slice_still_falls_back(
 def test_a_column_slice_matches_zarr_python(
     full_width: tuple[Path, np.ndarray],
 ) -> None:
-    """The widened case, byte for byte against the reference pipeline on the same store."""
+    """Byte for byte against the reference pipeline, on the same store."""
     path, _ = full_width
     rows = np.sort(np.random.default_rng(0).choice(256, size=64, replace=False))
     with zarr.config.set(CHUNK_UNIT):
@@ -269,8 +263,7 @@ def test_a_codec_after_sharding_is_refused(
         shape=values.shape,
         chunks=(SHARD,),
         dtype="float32",
-        # An explicit sharding serializer leaves the default compressor outside it, which is
-        # the layout this refuses. `shards=` would nest the compressor inside instead.
+        # An explicit sharding serializer leaves the default compressor outside it.
         serializer=ShardingCodec(chunk_shape=(CHUNK,), codecs=[BytesCodec()]),
     )
     z[:] = values
@@ -285,7 +278,7 @@ def test_a_codec_after_sharding_is_refused(
 def test_a_shard_holding_one_inner_chunk(
     tmp_path: Path, entries: dict[str, int]
 ) -> None:
-    """`shards == chunks`, so a coords item's chunk subset is the whole chunk."""
+    """`shards == chunks`."""
     values = np.arange(4096, dtype=np.float32)
     path = tmp_path / "one_per_shard"
     zarr.create_array(
@@ -316,7 +309,6 @@ def test_an_array_narrower_than_its_chunk_takes_the_path(
 
     np.testing.assert_array_equal(got, values[rows, :])
     assert entries["handle"] > 0, "a narrow array did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 @pytest.mark.parametrize(
@@ -330,7 +322,6 @@ def test_an_array_narrower_than_its_chunk_takes_the_path(
 def test_a_contiguous_slice_takes_the_path(
     array: tuple[Path, np.ndarray], entries: dict[str, int], selection
 ) -> None:
-    """A sequential read is grouped like a scattered one, whatever axis 0 is spelled as."""
     path, truth = array
 
     with zarr.config.set(CHUNK_UNIT):
@@ -338,13 +329,12 @@ def test_a_contiguous_slice_takes_the_path(
 
     np.testing.assert_array_equal(got, truth[selection])
     assert entries["handle"] > 0, "a contiguous slice did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 def test_a_single_column_takes_the_path(
     full_width: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
-    """`X[rows, 5]`, which is a point selection with a constant column, not a dropped axis."""
+    """`X[rows, 5]` arrives as a point selection with a constant column."""
     path, values = full_width
     rows = np.array([1, 3, 3, 9, 60, 61, 200])
     with zarr.config.set(CHUNK_UNIT):
@@ -372,7 +362,6 @@ def unsharded(tmp_path: Path, request) -> tuple[Path, np.ndarray]:
 def test_an_unsharded_array_takes_the_path(
     unsharded: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
-    """No sharding codec: the chunk is its own decode unit and the store value is the chunk."""
     path, values = unsharded
     rows = np.array([1, 3, 3, 40, 41, 300, 999])
     with zarr.config.set(CHUNK_UNIT):
@@ -380,7 +369,6 @@ def test_an_unsharded_array_takes_the_path(
 
     np.testing.assert_array_equal(got, values[rows])
     assert entries["handle"] > 0, "an unsharded array did not take the chunk-unit path"
-    assert entries["list"] == 0
 
 
 def test_an_unsharded_array_matches_zarr_python(
@@ -402,7 +390,6 @@ def test_an_unsharded_array_matches_zarr_python(
 def test_an_unsharded_array_reads_unwritten_chunks_as_fill(
     tmp_path: Path, entries: dict[str, int]
 ) -> None:
-    """A key that was never written is absent, not an error: same as a never-written shard."""
     path = tmp_path / "sparse_plain"
     z = zarr.create_array(
         path, dtype=np.float32, shape=(4_000,), chunks=(256,), fill_value=np.float32(-7)
@@ -450,7 +437,6 @@ def nested(tmp_path: Path) -> tuple[Path, np.ndarray]:
 def test_every_shape_works_through_two_shard_levels(
     nested: tuple[Path, np.ndarray], entries: dict[str, int], name: str, read
 ) -> None:
-    """`locate` walks one index per level, so depth does not interact with shape."""
     path, _ = nested
     rows = np.array([1, 3, 3, 40, 300, 900])
     with zarr.config.set(CHUNK_UNIT):
@@ -464,7 +450,6 @@ def test_every_shape_works_through_two_shard_levels(
     assert entries["handle"] > 0, (
         f"{name} did not take the chunk-unit path through two levels"
     )
-    assert entries["list"] == 0
 
 
 # --- The description, checked against the bytes it claims, with no store and no Rust ----
@@ -571,13 +556,11 @@ def _described(args) -> list[tuple[int, int]]:
     [
         ((4, 5), (4, 5)),
         ((2, 3, 4), (2, 3, 4)),
-        # divided: two inner chunks across the shard, so a column range crossing the boundary
-        # is described as several items. Without `inner != shard` there is no band to see.
+        # Two inner chunks across the shard, so a column range can cross into both.
         ((4, 12), (4, 6)),
         ((16, 12), (8, 6)),
         ((4, 12, 4), (4, 6, 4)),
-        # An inner chunk that does not divide the shard, so the last band is short. The only
-        # geometry here where the band width and the inner chunk give different row strides.
+        # An inner chunk that does not divide the shard, so the last band is short.
         ((4, 12), (4, 5)),
     ],
     ids=[
@@ -610,7 +593,6 @@ def test_a_description_names_exactly_its_own_bytes(shard, inner, rows) -> None:
             pushes = _chunk_unit_args(entry, out_shape, (), tuple(inner))
             if pushes is None:
                 break
-            # One item per band, so the entry's claim is the union of what its pushes say.
             said = [pair for args in pushes for pair in _described(args)]
             assert sorted(said) == sorted(_wanted(entry, out_shape)), (
                 f"{[a[0] for a in pushes]} for {entry[0].path} names bytes the selection did "
@@ -651,8 +633,7 @@ def test_a_strided_output_box_is_declined() -> None:
         pytest.param((slice(None), 3), id="scalar-on-a-trailing-axis"),
         pytest.param((5, slice(None)), id="scalar-row"),
         pytest.param((5, slice(6, 18)), id="scalar-row-and-a-column-band"),
-        # A CoordinateIndexer with a constant column: `chunk_sel` arrives as (array([1,5,20]),
-        # array([7,7,7])), the box `rows x 7:8` spelled as points.
+        # A CoordinateIndexer with a constant column.
         pytest.param(
             (np.array([1, 5, 20]), 7), id="a-constant-column-is-a-scalar-axis"
         ),
@@ -675,7 +656,6 @@ def test_a_scalar_axis_is_served(
     assert entries["handle"] > 0, (
         "a scalar axis should not send the batch to zarr-python"
     )
-    assert entries["list"] == 0
 
 
 @pytest.mark.parametrize(
@@ -701,10 +681,7 @@ def test_a_kept_constant_column_axis_is_not_rebuilt(tmp_path: Path, cols) -> Non
 
 
 def test_a_bare_ndarray_selector_is_declined_not_mis_described(tmp_path: Path) -> None:
-    """A rank-1 array indexed by an out-of-order array reaches `chunk_info` as a bare
-    ndarray rather than a tuple, and `make_slice_selection` would read each element as its
-    own dimension. It is declined instead, which strict makes visible.
-    """
+    """An out-of-order index on a rank-1 array arrives as a bare ndarray, not a tuple."""
     from zarrs.utils import DiscontiguousArrayError
 
     values = np.arange(8, dtype=np.float32)
@@ -725,9 +702,7 @@ def test_a_bare_ndarray_selector_is_declined_not_mis_described(tmp_path: Path) -
 
 
 def test_a_row_of_an_array_wider_than_one_shard(tmp_path: Path) -> None:
-    """`drop_axes` is a parameter the per-entry loop appends to. An array spanning two shards
-    on the row gives that loop two entries, so a leak would fail the second under strict.
-    """
+    """Two entries in one batch: `drop_axes` must not leak from the first into the second."""
     values = np.arange(32 * 40, dtype=np.float64).reshape(32, 40)
     path = tmp_path / "wide.zarr"
     zarr.create_array(

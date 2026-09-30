@@ -15,8 +15,7 @@ from zarrs.utils import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-# No fallback to hide behind: an unservable selection must raise rather than be served
-# correctly by zarr-python and look like a passing test.
+# No fallback, so an unserved selection raises.
 STRICT = {
     "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
     "codec_pipeline.strict": True,

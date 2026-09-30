@@ -23,8 +23,6 @@ fn test_nparray_to_unsafe_cell_slice_empty() -> PyResult<()> {
         .call0()?
         .extract()?;
 
-        // The size the array actually holds, so the new mismatch check passes rather than
-        // being the thing under test here.
         let element_size = arr.dtype().itemsize();
         let slice = CodecPipelineImpl::nparray_to_unsafe_cell_slice(&arr, element_size)?;
         assert!(slice.is_empty());
@@ -40,8 +38,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
     Python::initialize();
     Python::attach(|py| {
         let inner = 10u64;
-        // Chunk 0: 3, 3, 9 (a duplicate, which the path accepts). Chunk 2: 20, 27.
-        // Chunk 9: 94, the last index the extent allows.
+        // Chunk 0: 3, 3, 9. Chunk 2: 20, 27. Chunk 9: 94, the last index the extent allows.
         let indices = PyArray1::from_slice(py, &[3i64, 3, 9, 20, 27, 94]);
         let items = crate::chunk_item::build_chunk_unit_items(
             "c/0",
@@ -71,12 +68,11 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
             vec![
                 (0, 10, 7, 10, vec![3, 3, 9]),
                 (20, 30, 10, 12, vec![0, 7]),
-                // hi is min(lo + inner, extent): the last chunk is short.
+                // The last chunk is short.
                 (90, 95, 12, 13, vec![4]),
             ]
         );
 
-        // A negative index would cast to a wild chunk id, so it must be refused.
         let bad = PyArray1::from_slice(py, &[-1i64]);
         assert!(
             crate::chunk_item::build_chunk_unit_items(
@@ -91,7 +87,6 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
             )
             .is_err()
         );
-        // An output subset past the output extent must be refused.
         let over = PyArray1::from_slice(py, &[0i64, 1]);
         assert!(
             crate::chunk_item::build_chunk_unit_items(
@@ -110,8 +105,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
     })
 }
 
-/// `push_entry` must accumulate, not replace: a selection spanning two shards is two entries,
-/// and the second entry's output starts where the first left off.
+/// A selection spanning two shards is two entries, the second starting where the first ended.
 #[test]
 fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
@@ -152,12 +146,9 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
     })
 }
 
-/// Two entries may not claim the same output bytes.
-///
-/// `out_start` is caller-chosen and the read path writes items concurrently through views
-/// that must be disjoint, so overlap is refused where the entries are accumulated.
+/// `push_entry` accepts overlapping output; `DisjointBytes` refuses it when the read carves.
 #[test]
-fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
+fn test_push_entry_leaves_overlap_to_the_read() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
 
     Python::initialize();
@@ -176,8 +167,6 @@ fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
             vec![],
         )?;
 
-        // `push_entry` cannot judge this: a banded entry's two bands share an axis-0 start and
-        // overlap nothing. `DisjointBytes`'s forward-only cursor refuses it in the read.
         handle.push_entry(
             "c/1",
             vec![95],
@@ -188,7 +177,6 @@ fn test_push_entry_leaves_overlap_to_the_vendor() -> PyResult<()> {
             vec![10],
             vec![],
         )?;
-        // Starting where the last one ended is exactly what zarr produces.
         handle.push_entry(
             "c/1",
             vec![95],
@@ -213,7 +201,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
     Python::attach(|py| {
         let inner = 4u64;
         let cols = 3u64;
-        // Chunk 0: rows 1 and 1 (a duplicate) and 3. Chunk 2: row 9.
+        // Chunk 0: rows 1, 1 and 3. Chunk 2: row 9.
         let indices = PyArray1::from_slice(py, &[1i64, 1, 3, 9]);
         let items = crate::chunk_item::build_chunk_unit_items(
             "c/0/0",
@@ -242,8 +230,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
         assert_eq!(
             got,
             vec![
-                // rows 0..4 of the chunk, all 3 columns; output rows 2..5, all 3 columns.
-                // Rows 1, 1, 3 within the chunk are element offsets 3, 3, 9.
+                // Rows 1, 1, 3 of the chunk are element offsets 3, 3, 9.
                 (
                     vec![0, 0],
                     vec![4, 3],
@@ -252,7 +239,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
                     vec![3, 3, 9],
                     3
                 ),
-                // hi is min(lo + inner, extent), so the last chunk is short: rows 8..10.
+                // The last chunk is short: rows 8..10.
                 (vec![8, 0], vec![10, 3], vec![5, 0], vec![6, 3], vec![3], 3),
             ]
         );
@@ -260,8 +247,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
     })
 }
 
-/// A trailing selection strided within one index is refused: `gather` copies one contiguous
-/// run per coordinate, so a strided box would take whatever sat after its start.
+/// A trailing selection must be one run per index.
 #[test]
 fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
@@ -269,7 +255,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
     Python::initialize();
     Python::attach(|py| {
         let indices = PyArray1::from_slice(py, &[0i64, 1]);
-        // A narrower trailing axis alone is fine: 2 of 3 columns from 0 is `X[rows, 0:2]`.
+        // `X[rows, 0:2]` of 3 columns.
         let narrower = crate::chunk_item::build_chunk_unit_items(
             "c/0/0",
             vec![10, 3],
@@ -284,8 +270,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             narrower.is_ok(),
             "a contiguous column subset is served, not refused"
         );
-        // 2 of 4 rows by 5 of 10 columns is 2 runs of 5 at a stride of 10, not one range. A fused
-        // offset could not see this; the per-axis starts can.
+        // 2 of 4 by 5 of 10 is two runs of 5 per index.
         let strided = crate::chunk_item::build_chunk_unit_items(
             "c/0/0/0",
             vec![10, 4, 10],
@@ -297,7 +282,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             &[0, 0],
         );
         assert!(strided.is_err(), "a strided trailing box must be refused");
-        // A run that starts inside its own sub-row and walks off the end of it, likewise.
+        // A run that walks off the end of its own row.
         let wraps = crate::chunk_item::build_chunk_unit_items(
             "c/0/0/0",
             vec![10, 4, 10],
@@ -312,7 +297,6 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             wraps.is_err(),
             "a run leaving its own sub-row must be refused"
         );
-        // Differing arity is refused too: a 1-D chunk against a 2-D output.
         let ranks = crate::chunk_item::build_chunk_unit_items(
             "c/0",
             vec![10],
@@ -328,7 +312,6 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
     })
 }
 
-/// `gather` copies by coordinate, and refuses an out-of-range coord or a mismatched output.
 #[test]
 fn test_gather_copies_by_coordinate_and_refuses_the_rest() {
     let scratch: Vec<u8> = (0..12u8).collect(); // 6 elements of 2 bytes
@@ -337,46 +320,35 @@ fn test_gather_copies_by_coordinate_and_refuses_the_rest() {
     crate::utils::gather(&scratch, &[0, 2, 5], 1, &mut out, 2).expect("in bounds");
     assert_eq!(out, vec![0, 1, 4, 5, 10, 11]);
 
-    // A coordinate past the decoded buffer must not read adjacent elements.
     let mut out = vec![0u8; 2];
     assert!(crate::utils::gather(&scratch, &[6], 1, &mut out, 2).is_err());
 
-    // An output region that does not match the coordinate count would write short or over.
     let mut out = vec![0u8; 4];
     assert!(crate::utils::gather(&scratch, &[0, 1, 2], 1, &mut out, 2).is_err());
 }
 
-/// With a run length, one coordinate is a whole row, and the end of the run is what has to be in
-/// bounds, which a start-only check would miss.
 #[test]
 fn test_gather_copies_a_run_per_coordinate() {
     let scratch: Vec<u8> = (0..12u8).collect(); // 6 elements of 2 bytes, as 2 rows of 3
     let mut out = vec![0u8; 6];
 
-    // Row 1 of the chunk: coordinate 3 (element offset), 3 elements long.
+    // Row 1 of 2 rows of 3.
     crate::utils::gather(&scratch, &[3], 3, &mut out, 2).expect("in bounds");
     assert_eq!(out, vec![6, 7, 8, 9, 10, 11]);
 
-    // Both rows, in order.
     let mut out = vec![0u8; 12];
     crate::utils::gather(&scratch, &[0, 3], 3, &mut out, 2).expect("in bounds");
     assert_eq!(out, (0..12u8).collect::<Vec<_>>());
 
-    // A coordinate inside the buffer whose run walks off the end. The start alone is fine,
-    // which is exactly why the check is on the end.
+    // In bounds at the start, not at the end.
     let mut out = vec![0u8; 6];
     assert!(crate::utils::gather(&scratch, &[4], 3, &mut out, 2).is_err());
 
-    // A zero run length would make the output region match at every coordinate count.
     let mut out = vec![0u8; 0];
     assert!(crate::utils::gather(&scratch, &[0], 0, &mut out, 2).is_err());
 }
 
-/// `raw_runs` counts READS, not rows, and that distinction is the whole gate.
-///
-/// Written because getting it wrong is not a crash: counting rows makes the gate refuse the
-/// dense cases it should serve, and the read silently stays on the chunk path -- which reads
-/// as "the raw path did not pay" rather than as "the raw path was never taken".
+/// `raw_runs` counts reads, not rows.
 #[test]
 fn test_raw_runs_counts_reads_not_rows() {
     let run_len = 2u64;
@@ -384,28 +356,19 @@ fn test_raw_runs_counts_reads_not_rows() {
 
     assert_eq!(crate::read_decode::raw_runs(&[], run_len), 0);
     assert_eq!(crate::read_decode::raw_runs(&c(&[7]), run_len), 1);
-    // A whole 64-row chunk, consecutive: still ONE read, which is the point.
     let dense: Vec<u64> = (0..64).map(|r| r * run_len).collect();
     assert_eq!(crate::read_decode::raw_runs(&dense, run_len), 1);
-    // Every other row: 32 reads, and the gate should refuse it.
     let strided: Vec<u64> = (0..64).step_by(2).map(|r| r * run_len).collect();
     assert_eq!(crate::read_decode::raw_runs(&strided, run_len), 32);
-    // Two blocks.
     assert_eq!(
         crate::read_decode::raw_runs(&c(&[0, 1, 2, 10, 11]), run_len),
         2
     );
-    // A DUPLICATE steps by 0, so it breaks the run: the same row twice is two output
-    // pieces and cannot be served by one read.
+    // A duplicate breaks the run.
     assert_eq!(crate::read_decode::raw_runs(&c(&[3, 3, 4]), run_len), 2);
 }
 
-/// The raw path may only be taken when the stored bytes are already in this machine's order.
-///
-/// The `bytes` codec REVERSES a multi-byte element when the array's order is not the
-/// platform's. The chunk path goes through the codec and swaps; the raw path copies the
-/// stored bytes verbatim and does not. Same array, two answers, no error -- and big-endian
-/// is legal Zarr V3 that nothing else here refuses.
+/// The raw path copies stored bytes verbatim, so it needs them in this machine's order.
 #[test]
 fn test_raw_is_refused_for_a_foreign_byte_order() {
     let meta = |inner: &str| {
@@ -427,35 +390,25 @@ fn test_raw_is_refused_for_a_foreign_byte_order() {
         crate::inner_chunk_is_raw(&bytes_with("big")),
         cfg!(target_endian = "big")
     );
-    // No `endian` at all means little, the V3 default. Reading it as "no order" and admitting
-    // it everywhere would hand back byte-reversed elements on a big-endian host.
+    // No `endian` means little.
     assert_eq!(
         crate::inner_chunk_is_raw(&meta(r#"{"name":"bytes"}"#)),
         cfg!(target_endian = "little")
     );
-    // A codec beside the byte reinterpretation still declines, and one carrying no name
-    // cannot be skipped past to reach that conclusion.
     assert!(!crate::inner_chunk_is_raw(&meta(
         r#"{"name":"bytes"},{"name":"crc32c"}"#
     )));
     assert!(!crate::inner_chunk_is_raw(&meta(r#"{"configuration":{}}"#)));
 }
 
-/// A coordinate near the top of the range ENDS a run instead of starting the next one.
-///
-/// The three walks `coord_runs` replaced did not agree: two added unchecked, so
-/// `coord + run_len` wrapped in release -- and a wrapped sum that happens to equal the next
-/// coordinate reads as CONSECUTIVE, which merges two reads that share no bytes. The checked
-/// walk is the only behaviour this de-duplication changed, so it is the one thing pinned here.
+/// `coord + run_len` must not wrap into the next coordinate.
 #[test]
 fn test_coord_runs_do_not_wrap_at_the_top_of_the_range() {
     let run_len = 4u64;
-    // (u64::MAX - 1) + 4 wraps to 2. Unchecked, these two are one run.
     assert_eq!(
         crate::utils::coord_runs(&[u64::MAX - 1, 2], run_len).count(),
         2
     );
-    // The ordinary case still merges, and the empty one is still no runs at all.
     assert_eq!(crate::utils::coord_runs(&[0, 4, 8], run_len).count(), 1);
     assert_eq!(crate::utils::coord_runs(&[], run_len).count(), 0);
 }

@@ -8,7 +8,7 @@ ZARRS = {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}
 
 
 def open_strict(path):
-    """Open with no fallback, so a decline raises rather than returning right values slowly."""
+    """Open with no fallback, so a decline raises."""
     with zarr.config.set({**ZARRS, "codec_pipeline.strict": True}):
         return zarr.open_array(path, mode="r+")
 
@@ -84,8 +84,7 @@ def test_2d_slice_matches(divided_2d):
         np.array([0, 3, 4, 5, 17, 30]),
         np.arange(0, 32),
         np.array([7, 8]),
-        # Short and low: an inflated coordinate stride stays inside the decoded buffer here,
-        # so `gather`'s bounds check does not fire and the wrong rows come back quietly.
+        # Low rows, where a wrong stride would stay inside the decoded buffer.
         np.array([0, 1]),
     ],
     ids=["scattered", "every-row", "chunk-edge", "short-and-low"],

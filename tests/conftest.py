@@ -29,25 +29,17 @@ class ArrayRequest:
 
 @pytest.fixture
 def entries(monkeypatch) -> dict[str, int]:
-    """Counts of batches served by each Rust entry point.
+    """How many batches reached the Rust read path, rather than falling back to zarr-python."""
+    counts = {"handle": 0}
+    original = CodecPipelineImpl.retrieve_chunk_items_and_apply_index
 
-    Values alone cannot tell a served read from one that fell back to zarr-python and got the
-    same answer. "list" is the removed fused path: absent today, so its count stays at zero.
-    """
-    counts = {"handle": 0, "list": 0}
-    for name, key in (
-        ("retrieve_chunk_items_and_apply_index", "handle"),
-        ("retrieve_chunks_and_apply_index", "list"),
-    ):
-        original = getattr(CodecPipelineImpl, name, None)
-        if original is None:
-            continue
+    def wrapper(self, *args, **kwargs):
+        counts["handle"] += 1
+        return original(self, *args, **kwargs)
 
-        def wrapper(self, *args, _original=original, _key=key, **kwargs):
-            counts[_key] += 1
-            return _original(self, *args, **kwargs)
-
-        monkeypatch.setattr(CodecPipelineImpl, name, wrapper)
+    monkeypatch.setattr(
+        CodecPipelineImpl, "retrieve_chunk_items_and_apply_index", wrapper
+    )
     return counts
 
 
