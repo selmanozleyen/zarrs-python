@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import itertools
-import math
+import operator
 import os
 from dataclasses import dataclass
+from functools import reduce
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -43,17 +44,15 @@ class FillValueNoneError(Exception):
 
 
 def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
-    """Normalise the batch's array indices to int64 positions, lazily."""
+    """Normalise the batch's index arrays to int64 positions, lazily."""
 
     def cast(sel: SelectorTuple) -> SelectorTuple:
         if isinstance(sel, np.ndarray):
-            # A boolean mask is not an index array; its positions are what it means.
             if sel.dtype.kind == "b":
                 return np.flatnonzero(sel).astype(np.int64, copy=False)
             if sel.dtype.kind not in "iuf":
                 raise DiscontiguousArrayError(sel.dtype)
-            # Everything downstream assumes int64. Float is accepted only because uint64
-            # arrives as float64; checked before casting, since `astype` truncates in silence.
+            # uint64 indices arrive as float64.
             if sel.dtype.kind == "f" and not (
                 np.isfinite(sel).all()
                 and (sel == np.rint(sel)).all()
@@ -71,8 +70,9 @@ def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
     )
 
 
-# Not replaceable by `zarr.core.indexing.make_slice_selection`: upstream raises for any index
-# array of more than one element, where this turns a consecutive run into the slice it is.
+# This is a (mostly) copy of the function from zarr.core.indexing that fixes:
+#   DeprecationWarning: Conversion of an array with ndim > 0 to a scalar is deprecated
+# TODO: Upstream this fix
 def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
     ls: list[slice] = []
     for dim_selection in selection:
@@ -81,15 +81,13 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
         elif isinstance(dim_selection, np.ndarray):
             dim_selection = dim_selection.ravel()
             if len(dim_selection) == 0:
-                # `dim_selection[0]` is an `IndexError` here, and `IndexError` is not in
-                # `FALLBACK_TO_ZARR_PYTHON`: it would escape `read` rather than decline.
                 raise DiscontiguousArrayError(dim_selection)
             if len(dim_selection) == 1:
                 ls.append(
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                # Callers must normalise to int64 first: an unsigned diff wraps a decrease into +1.
+                # Signed, or an unsigned decrease wraps to a step of +1.
                 steps = dim_selection[1:] - dim_selection[:-1]
                 if (steps != 1).any() and (steps != 0).any():
                     raise DiscontiguousArrayError(steps)
@@ -110,7 +108,6 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
 def _as_selector_tuples(
     chunk_selection: SelectorTuple, out_selection: SelectorTuple
 ) -> tuple[tuple, tuple]:
-    """Both selections as tuples."""
     return (
         chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,),
         out_selection if isinstance(out_selection, tuple) else (out_selection,),
@@ -118,13 +115,10 @@ def _as_selector_tuples(
 
 
 def _is_sorted_integer_axis(indices: Any, out_axis_sel: Any) -> bool:
-    """Is this one sorted 1-D integer axis written to a contiguous output slice?"""
+    """Is this one non-decreasing 1-D integer axis written to a contiguous output slice?"""
     return (
         isinstance(indices, np.ndarray)
         and indices.ndim == 1
-        # Non-decreasing only. What reaches this test is `CoordinateIndexer` with
-        # `sel_sort is None`, which hands over a contiguous slice whose indices descend, and
-        # `out_start + i` would then put each element at the wrong output position.
         and not (indices[1:] < indices[:-1]).any()
         and isinstance(out_axis_sel, slice)
         and out_axis_sel.step in (None, 1)
@@ -132,7 +126,6 @@ def _is_sorted_integer_axis(indices: Any, out_axis_sel: Any) -> bool:
 
 
 def _output_run_matches(indices: np.ndarray, out_axis_sel: slice) -> bool:
-    """Does the output slice hold exactly one element per index."""
     start = out_axis_sel.start or 0
     return out_axis_sel.stop - start == indices.size
 
@@ -188,7 +181,7 @@ def resulting_shape_from_index(
 
 
 def prod_op(x: Iterable[int]) -> int:
-    return math.prod(x)
+    return reduce(operator.mul, x, 1)
 
 
 def get_shape_for_selector(
@@ -216,17 +209,13 @@ def get_implicit_fill_value(dtype: ZDType, fill_value: Any) -> Any:
 
 @dataclass(frozen=True)
 class RustChunkInfo:
-    # A ChunkItems handle when the batch is entirely chunk-unit; a list otherwise.
+    # A ChunkItems handle for a read, a list for a write.
     chunk_info_with_indices: list[ChunkItem] | ChunkItems
     write_empty_chunks: bool
 
 
 def _step1_span(sel: Any, extent: int) -> tuple[int, int] | None:
-    """A step-1 slice as (start, stop) within `extent`, or None if it is not one.
-
-    Rejects rather than clamps: a stop past the extent means the caller and this path disagree
-    about the array, and guessing which is right is how wrong data gets returned.
-    """
+    """A step-1 slice as (start, stop) within `extent`, or None if it is not one."""
     if not isinstance(sel, slice) or sel.step not in (None, 1):
         return None
     lo = sel.start or 0
@@ -236,44 +225,14 @@ def _step1_span(sel: Any, extent: int) -> tuple[int, int] | None:
     return lo, hi
 
 
-def _contiguous_offset(
-    starts: list[int], widths: list[int], extents: tuple[int, ...]
-) -> int | None:
-    """Element offset of a sub-box within one row, or None if that box is not contiguous.
-
-    Row-major, the box is one unbroken range exactly when every axis before the last partial one
-    selects a single element. Give a partial axis a wider axis ahead of it and the box takes
-    `widths[k]` elements, skips the rest of that axis, and takes them again: strided, and an
-    item's output is vended as one range, which cannot express that.
-
-    So `X[rows, a:b]` on a 2-D array is always contiguous (there is nothing before axis 1),
-    which is the case this exists for; `X[rows, a:b]` on a rank-3 array is not.
-    """
-    last_partial = -1
-    for axis, (width, extent) in enumerate(zip(widths, extents, strict=True)):
-        if width != extent:
-            last_partial = axis
-    if last_partial > 0 and any(width != 1 for width in widths[:last_partial]):
-        return None
-    offset = 0
-    stride = 1
-    for axis in reversed(range(len(widths))):
-        offset += starts[axis] * stride
-        stride *= extents[axis]
-    return offset
+def _is_one_run(widths: list[int], extents: tuple[int, ...]) -> bool:
+    """Is a sub-box one run in row-major order: every axis before the last partial one takes one element?"""
+    partial = [axis for axis, (w, e) in enumerate(zip(widths, extents, strict=True)) if w != e]
+    return not partial or all(w == 1 for w in widths[: partial[-1]])
 
 
 def _bands(lo: int, hi: int, inner: int, out_lo: int) -> list[tuple[int, int, int]]:
-    """(chunk_start, width, out_start) per inner chunk the range `lo:hi` crosses.
-
-    A shard may hold several inner chunks across a trailing axis, and the inner chunk is the
-    decode unit, so a selection straddling a boundary is not one read of a wide row, it is one
-    read per inner chunk. Splitting here rather than in Rust is deliberate: it is what both
-    previous attempts got wrong, and it is testable without a build.
-
-    Always advances (`(at // inner + 1) * inner > at` for any positive `inner`) so it cannot
-    loop. `inner <= 0` is refused by the caller before it gets here.
-    """
+    """(chunk_start, width, out_start) per inner chunk the range `lo:hi` crosses."""
     out, at = [], lo
     while at < hi:
         end = min((at // inner + 1) * inner, hi)
@@ -282,7 +241,7 @@ def _bands(lo: int, hi: int, inner: int, out_lo: int) -> list[tuple[int, int, in
     return out
 
 
-# Below this mean run length a span per run costs more FFI calls than one element walk.
+# Below this mean run length, one span per run costs more than naming the elements.
 _MIN_MEAN_SPAN = 64
 
 
@@ -298,26 +257,20 @@ def _index_runs(indices: np.ndarray) -> list[tuple[int, int]] | None:
 def _chunk_unit_args(
     entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
 ) -> list[tuple] | None:
-    """Args for `ChunkItems.push_entry`, one per item, or None if this entry is not that shape.
+    """`ChunkItems` push arguments for one entry, or None if it is not served.
 
-    Eligible: an integer axis at axis 0 (non-negative, non-decreasing, against a contiguous
-    output slice) with every axis after it taken whole or as a contiguous sub-box. One entry can
-    describe several items, since a trailing selection crossing an inner-chunk boundary is one
-    read per inner chunk and the items are the product of the per-axis bands. A band may not be
-    strided within one index, on either side, because an item's output is vended as one range.
-
-    `chunk_spec.shape` is the shard, so `inner_shape` is passed in separately.
+    Served: sorted non-negative indices or a step-1 slice on axis 0, and a step-1 slice on every
+    other axis that is one run per row. A slice crossing inner chunks on a trailing axis gives
+    one item per band.
     """
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
     if drop_axes or inner_shape is None:
         return None
-    # `_bands` divides by these. Metadata reaches here through its own parser, so a zero
-    # extent declines rather than raising ZeroDivisionError out of the description builder.
     if any(int(v) <= 0 for v in inner_shape):
         return None
     chunk_sel_raw, out_sel_raw = _as_selector_tuples(chunk_selection, out_selection)
-    # zarr drops a scalar axis from the output without saying so in `drop_axes`. Rebuilding it
-    # as an extent of one is exact, since such an axis contributes no stride.
+    # zarr drops a scalar axis from the output without saying so in `drop_axes`; put it back
+    # as an extent of one.
     scalars: dict[int, int] = {}
     for axis, sel in enumerate(chunk_sel_raw):
         if isinstance(sel, (int, np.integer)):
@@ -331,8 +284,7 @@ def _chunk_unit_args(
             and bool((sel == sel[0]).all())
         ):
             scalars[axis] = int(sel[0])
-    # Must stay an equality: it refuses a constant array whose axis the output kept, where an
-    # extent of one claims a single column against an output that has more.
+    # An equality, so a constant array on an axis the output kept is not rebuilt.
     if (
         scalars
         and len(chunk_sel_raw) == len(chunk_spec.shape)
@@ -349,33 +301,25 @@ def _chunk_unit_args(
         chunk_selection = tuple(r[0] for r in rebuilt)
         out_selection = tuple(r[1] for r in rebuilt)
         shape = tuple(r[2] for r in rebuilt)
-    # Not sharded: the chunk is the decode unit, and the grid checks below then compare it
-    # against itself, which is exactly right; there is no subdivision to get wrong.
+    # Not sharded: the chunk is the decode unit.
     if inner_shape == ():
         inner_shape = tuple(int(s) for s in chunk_spec.shape)
     chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
     rank = len(chunk_spec.shape)
     if not (rank == len(chunk_sel) == len(out_sel) == len(inner_shape) == len(shape)):
         return None
-    # The entry's own box per trailing axis, before it is cut into bands. Only the span gate
-    # below reads these; the items are described by `lanes`.
     widths: list[int] = []
-    # One list of bands per trailing axis. A shard holding several inner chunks across an axis
-    # turns one entry into one item per band, and the items are the product across axes.
+    # The bands per trailing axis; the items are their product.
     lanes: list[list[tuple[int, int, int]]] = []
     for axis in range(1, rank):
         span = _step1_span(chunk_sel[axis], chunk_spec.shape[axis])
         if span is None:
             return None
         lo, hi = span
-        # The output axis need not be whole, only a contiguous band as wide as the chunk
-        # selection: a two-shard-wide array gives every entry half the output width.
         out_span = _step1_span(out_sel[axis], shape[axis])
         if out_span is None or out_span[1] - out_span[0] != hi - lo:
             return None
         widths.append(int(hi - lo))
-        # The inner chunk is the decode unit, so a selection crossing one of its boundaries is
-        # one read per inner chunk rather than a wide read.
         lanes.append(_bands(int(lo), int(hi), int(inner_shape[axis]), int(out_span[0])))
     indices = chunk_sel[0]
     out_axis_sel = out_sel[0]
@@ -388,11 +332,7 @@ def _chunk_unit_args(
         span = _step1_span(indices, chunk_spec.shape[0])
         if span is None:
             return None
-        # Keep the run rather than `np.arange`-ing it: Rust needs a coordinate and a length
-        # instead of one u64 per element, and on a long read those indices are most of the
-        # description. The span form says "the whole trailing extent" on both sides and derives
-        # its row stride from the shard, so the width must be whole and the shard must hold one
-        # inner chunk per trailing axis.
+        # A span needs whole trailing axes; otherwise name the elements.
         if whole:
             out_span = _step1_span(out_axis_sel, shape[0])
             count = span[1] - span[0]
@@ -413,8 +353,6 @@ def _chunk_unit_args(
                         int(inner_shape[0]),
                     )
                 ]
-        # A sub-box on a trailing axis makes each index its own run, so the span form does
-        # not describe it and the elements are named after all.
         indices = np.arange(span[0], span[1], dtype=np.int64)
     if not _is_sorted_integer_axis(indices, out_axis_sel) or indices.size == 0:
         return None
@@ -424,8 +362,7 @@ def _chunk_unit_args(
     start = out_axis_sel.start or 0
     if not _output_run_matches(indices, out_axis_sel):
         return None
-    # A coordinate read of whole CSR rows is a few long runs per shard; as spans, Rust takes
-    # O(1) per run instead of walking every element.
+    # Long runs of consecutive indices, as a CSR row read gives, go as spans.
     if whole and (runs := _index_runs(indices)) is not None:
         return [
             (
@@ -442,21 +379,14 @@ def _chunk_unit_args(
         ]
 
     pushes = []
-    # One item per combination of bands across the trailing axes. Rank 1 has no lanes, so the
-    # product is a single empty tuple and that path is unchanged.
     for combo in itertools.product(*lanes):
         band_starts = [b[0] for b in combo]
         band_widths = [b[1] for b in combo]
         band_out = [b[2] for b in combo]
-        # Both one-run tests, per band: the output against the output extents, the chunk
-        # against the inner extents, since the buffer addressed is the inner chunk.
-        if _contiguous_offset(band_out, band_widths, tuple(shape[1:])) is None:
-            return None
-        # Gate only. Rust re-derives the offset from these same starts and rechecks the shape,
-        # because `push_entry` is reachable from Python with arbitrary arguments and a single
-        # fused offset is not a checkable thing.
-        within = [s % int(inner_shape[a + 1]) for a, s in enumerate(band_starts)]
-        if _contiguous_offset(within, band_widths, tuple(inner_shape[1:])) is None:
+        # One run per row in the output and in the inner chunk.
+        if not _is_one_run(band_widths, tuple(shape[1:])) or not _is_one_run(
+            band_widths, tuple(inner_shape[1:])
+        ):
             return None
         pushes.append(
             (
@@ -467,27 +397,11 @@ def _chunk_unit_args(
                 indices,
                 (int(start), *band_out),
                 (int(shape[0]), *band_widths),
-                # The whole inner chunk: every trailing stride Rust computes is a product of
-                # these, and the decoded buffer is the inner chunk, not the shard.
                 tuple(int(v) for v in inner_shape),
-                # Shard-relative: this is what steers `locate` to the right inner chunk.
-                # Rust reduces it into the inner chunk for the coordinate.
                 tuple(int(v) for v in band_starts),
             )
         )
     return pushes
-
-
-def chunk_info_for_write(
-    batch_info: BatchInfo,
-    drop_axes: tuple[int, ...],
-    shape: tuple[int, ...],
-) -> RustChunkInfo:
-    """Describe a write batch to Rust, one item per entry.
-
-    Never split: two items on one chunk key make the read-modify-writes race.
-    """
-    return _chunk_items(_as_int64_batch_info(batch_info), drop_axes, shape)
 
 
 def chunk_info_for_read(
@@ -496,45 +410,32 @@ def chunk_info_for_read(
     shape: tuple[int, ...],
     inner_chunk_shape: tuple[int, ...] | None,
 ) -> RustChunkInfo:
-    """Describe a read batch to Rust, grouped by decode unit where the selection allows.
-
-    One item per inner chunk if every entry is eligible; otherwise one box per run of
-    consecutive indices, falling back to one item per entry.
-    """
-    # A generator would be consumed by the eligibility test, and the ordinary route needs
-    # to read the same entries again if that test fails.
+    """A `ChunkItems` handle for a read batch, or `DiscontiguousArrayError` if one entry is not served."""
     entries = list(_as_int64_batch_info(batch_info))
-
-    # All or nothing: one ineligible entry sends the whole batch down the ordinary route.
     unit_args = [
         _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
         for entry in entries
     ]
     if unit_args and all(args is not None for args in unit_args):
         handle = ChunkItems()
-        # An entry straddling an inner-chunk boundary on a trailing axis describes one item
-        # per band, so this is a list of lists.
         for kind, *args in itertools.chain.from_iterable(unit_args):
-            # A span names a contiguous block; an entry names its elements. Both land in the
-            # same handle and are served by the same path: the difference is only how much had
-            # to be said to describe the read.
             if kind == "span":
                 handle.push_span(*args)
             else:
                 handle.push_entry(*args)
         return RustChunkInfo(handle, write_empty_chunks=True)
 
-    # Nothing else is served here: anything that did not produce a handle above declines to
-    # zarr-python, and `DiscontiguousArrayError` is what `pipeline.read` catches to do that.
     raise DiscontiguousArrayError("this selection is not served by the chunk-unit path")
 
 
-def _chunk_items(
-    batch_info: BatchInfo,
+def make_chunk_info_for_rust_with_indices(
+    batch_info: Iterable[
+        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
+    ],
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
 ) -> RustChunkInfo:
-    """One ChunkItem per batch entry."""
+    batch_info = _as_int64_batch_info(batch_info)
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True

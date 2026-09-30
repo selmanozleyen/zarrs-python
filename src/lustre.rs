@@ -1,6 +1,5 @@
-//! How many reads the Lustre pool a file lives on can take in flight from this client, found the
-//! way `available_parallelism` finds cores: read off the client's own files, with no `lctl`, `lfs`
-//! or liblustreapi. Anything missing or unexpected is `None`, and the caller keeps its default.
+//! How many reads the Lustre pool a file lives on can take in flight from this client, read off
+//! the client's `/proc` and `/sys` files. Anything missing or unexpected is `None`.
 
 use std::path::Path;
 
@@ -9,8 +8,7 @@ const LOV_MAGIC_V1: u32 = 0x0BD1_0BD0;
 const LOV_MAGIC_V3: u32 = 0x0BD3_0BD0;
 const LOV_MAGIC_COMP_V1: u32 = 0x0BD6_0BD0;
 
-/// The pool's OSTs times each one's `max_rpcs_in_flight`, clamped to [64, 1024]: past that many,
-/// further reads only queue in the client.
+/// The pool's OSTs times each one's `max_rpcs_in_flight`, clamped to [64, 1024].
 pub(crate) fn read_capacity(file: &Path) -> Option<usize> {
     let file = std::fs::canonicalize(file).ok()?;
     if !is_lustre(&file) {
@@ -85,8 +83,7 @@ fn fsname(mountinfo: &str, path: &Path) -> Option<String> {
         .map(|(_, fs)| fs)
 }
 
-/// The pool a layout names: `Some(None)` for none (all OSTs), `None` when it cannot be told --
-/// an unknown layout, or components that disagree.
+/// The pool a layout names: `Some(None)` for none (all OSTs), `None` when it cannot be told.
 fn pool(lov: &[u8]) -> Option<Option<String>> {
     let u32at = |at: usize| lov.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     match u32at(0)? {
@@ -114,7 +111,7 @@ fn lov_dir(fsname: &str) -> Option<std::path::PathBuf> {
         .map(|e| e.path())
 }
 
-/// Every OST of the filesystem, named `<fsname>-OSTxxxx` like the pool files name them.
+/// Every OST of the filesystem, named `<fsname>-OSTxxxx`.
 fn all_osts(fsname: &str) -> Option<Vec<String>> {
     let prefix = format!("{fsname}-OST");
     let osts: std::collections::BTreeSet<String> = std::fs::read_dir("/sys/fs/lustre/osc")
@@ -160,7 +157,6 @@ mod tests {
         b
     }
 
-    /// The three shapes seen on the HMGU client, and the ones that must fall back.
     #[test]
     fn pool_reads_plain_and_composite_layouts() {
         assert_eq!(pool(&v3("ddn_hdd")), Some(Some("ddn_hdd".into())));

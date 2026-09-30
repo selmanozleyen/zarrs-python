@@ -46,19 +46,8 @@ pub fn is_whole_chunk(item: &ChunkItem) -> bool {
         && item.chunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(&item.shape)
 }
 
-/// The maximal runs of CONSECUTIVE coordinates, as index ranges into `coords`.
-///
-/// `coords` is non-decreasing and a run is a stretch stepping by exactly `run_len`, so one run
-/// names one contiguous span: it starts `coords[r.start]` elements in and is `r.len() *
-/// run_len` elements long. A duplicate steps by 0, which breaks the run -- the same row twice
-/// is two output pieces and cannot be one span.
-///
-/// Written once because three callers want this same walk and had three copies of it: counting
-/// the reads a chunk becomes (`raw_runs`), emitting them (`raw_row_jobs`), and merging copies
-/// out of a decoded chunk (`gather_pieces`).
-///
-/// `coord_runs`, not `runs`: a run of COORDINATES is not `gather_runs`' run of elements
-/// inside one index's row, and this file needs both words in the same loop.
+/// Maximal runs of coordinates stepping by exactly `run_len`, as index ranges into `coords`.
+/// A duplicate breaks the run.
 pub(crate) fn coord_runs(coords: &[u64], run_len: u64) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut start = 0usize;
     std::iter::from_fn(move || {
@@ -66,7 +55,6 @@ pub(crate) fn coord_runs(coords: &[u64], run_len: u64) -> impl Iterator<Item = R
             return None;
         }
         let mut end = start + 1;
-        // Checked: a coordinate near u64::MAX must end the run, not wrap into the next one.
         while end < coords.len() && coords[end - 1].checked_add(run_len) == Some(coords[end]) {
             end += 1;
         }
@@ -95,7 +83,6 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
     /// Append `src`, spilling into later pieces as needed.
     pub(crate) fn write(&mut self, mut src: &[u8]) -> Result<(), String> {
         while !src.is_empty() {
-            // Skip pieces already filled, and any that are empty to begin with.
             while self.piece < self.pieces.len() && self.at == self.pieces[self.piece].len() {
                 self.piece += 1;
                 self.at = 0;
@@ -115,11 +102,8 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
         Ok(())
     }
 
-    /// Every byte of every piece was written. The caller's buffer is `np.empty`, so a piece
-    /// left short returns whatever was already in memory, as data.
+    /// Every byte of every piece was written.
     pub(crate) fn finished(&self) -> bool {
-        // Everything before `piece` was filled to its end by construction, so only the
-        // current piece and whatever follows it can be short.
         self.pieces
             .get(self.piece)
             .is_none_or(|piece| self.at == piece.len())
@@ -129,7 +113,6 @@ impl<'a, 'b> PieceWriter<'a, 'b> {
     }
 }
 
-/// Bytes in one index's run of elements. Refuses zero and overflow.
 fn run_bytes(run_len: u64, size: usize) -> Result<usize, String> {
     let Some(bytes) = usize::try_from(run_len)
         .ok()
@@ -155,13 +138,9 @@ pub(crate) fn gather(
         return Err("output region does not match the coordinate count".to_string());
     }
     for (n, &c) in coords.iter().enumerate() {
-        // Not because a coordinate can be that large today: unchecked, a large one wraps in
-        // release and lands back inside scratch, so `get` succeeds on the wrong element.
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {
             return Err(format!("coordinate {c} is too large to address"));
         };
-        // The end of the run is what has to be in bounds, not its start: a coordinate inside
-        // `scratch` whose run walks off the end would otherwise read past the decode.
         let Some(element) = src.checked_add(run).and_then(|end| scratch.get(src..end)) else {
             return Err(format!(
                 "coordinate {c} plus {run_len} elements is outside the {} decoded",
@@ -187,8 +166,7 @@ pub(crate) fn gather_pieces(
         return Err("output pieces do not match the coordinate count".to_string());
     }
     let mut writer = PieceWriter::new(pieces);
-    // Consecutive coordinates name one contiguous span and are copied as one. Pieces are
-    // written in order, so a merged span straddling two of them still lands correctly.
+    // A merged span may straddle two pieces; the writer spills it over.
     for r in coord_runs(coords, run_len) {
         let c = coords[r.start];
         let Some(src) = usize::try_from(c).ok().and_then(|c| c.checked_mul(size)) else {

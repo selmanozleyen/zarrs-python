@@ -1,5 +1,4 @@
-//! Where an innermost chunk lives inside its shard, however many levels of sharding are
-//! between them.
+//! Where an innermost chunk lives inside its shard, through any number of sharding levels.
 
 use std::sync::Arc;
 
@@ -20,25 +19,17 @@ struct Level {
     sharding_options: ShardingCodecOptions,
 }
 
-/// What the read path needs to know about a sharded array to fetch one innermost chunk at
-/// a time.
 pub(crate) struct ShardInfo {
-    /// Outermost first. Exactly one entry for a singly sharded array, which is the case the
-    /// hot path is tuned for: one iteration, one index, one cache lookup.
+    /// Outermost first; empty when not sharded.
     levels: Vec<Level>,
-    /// The innermost chunk shape, what a job sizes its scratch by. `None` when not sharded:
-    /// the decode unit is the chunk, which only an item knows.
+    /// The innermost chunk shape, `None` when not sharded.
     pub subchunk_shape: Option<ChunkShape>,
-    /// The codecs that decode an innermost chunk, bound to the data type and fill value. The
-    /// only chain that may hold other codecs; every chain above it must be exclusively sharded.
+    /// The codecs that decode an innermost chunk.
     pub inner_chain: Arc<CodecChainBound>,
 }
 
 impl ShardInfo {
-    /// Read off the array's bound codec chain, or `None` if this array is sharded in a way this
-    /// path refuses.
-    ///
-    /// A non-sharded array is accepted with no levels: its chunk is its own decode unit.
+    /// `None` if a sharding level has a codec beside it.
     pub fn from_codec_chain(chain: &Arc<CodecChainBound>) -> Option<Self> {
         let mut levels: Vec<Level> = Vec::new();
         let mut current = chain.clone();
@@ -75,12 +66,10 @@ impl ShardInfo {
         })
     }
 
-    /// How many levels of sharding this array has. One is the ordinary case.
     pub fn depth(&self) -> usize {
         self.levels.len()
     }
 
-    /// What the level at `depth` divides into — the shard shape for the level below it.
     pub fn subchunk_shape_at(&self, depth: usize) -> &ChunkShape {
         &self.levels[depth].subchunk_shape
     }

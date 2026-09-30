@@ -230,17 +230,13 @@ def test_a_column_slice_matches_zarr_python(
 
 def test_the_contiguity_rule() -> None:
     """One run only when every axis before the last partial one takes a single element."""
-    from zarrs.utils import _contiguous_offset
+    from zarrs.utils import _is_one_run
 
-    # One trailing axis: any sub-range of it is contiguous.
-    assert _contiguous_offset([8], [16], (48,)) == 8
-    assert _contiguous_offset([0], [48], (48,)) == 0
-    # Partial middle axis, last axis whole: still one run, offset in whole last-axis rows.
-    assert _contiguous_offset([2, 0], [3, 10], (5, 10)) == 20
-    # Partial last axis with a wider axis ahead of it: 5 blocks of 4, strided. Decline.
-    assert _contiguous_offset([0, 2], [5, 4], (5, 10)) is None
-    # The same partial last axis is fine once the axis ahead of it takes exactly one.
-    assert _contiguous_offset([3, 2], [1, 4], (5, 10)) == 32
+    assert _is_one_run([16], (48,))
+    assert _is_one_run([48], (48,))
+    assert _is_one_run([3, 10], (5, 10))
+    assert not _is_one_run([5, 4], (5, 10))
+    assert _is_one_run([1, 4], (5, 10))
 
 
 def test_full_width_matches_zarr_python(

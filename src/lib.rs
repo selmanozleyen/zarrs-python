@@ -43,27 +43,14 @@ use crate::concurrency::ChunkConcurrentLimitAndCodecOptions;
 use crate::store::StoreConfig;
 use crate::utils::{PyCodecErrExt, PyErrExt as _};
 
-// TODO: Use a OnceLock for store with get_or_try_init when stabilised?
-/// What `endian` in a `bytes` codec's configuration has to say for the stored bytes to be
-/// usable without conversion.
 const NATIVE_ENDIAN: &str = if cfg!(target_endian = "little") {
     "little"
 } else {
     "big"
 };
 
-/// Is an innermost chunk a plain byte tiling of its elements?
-///
-/// True only when the sharding codec's inner chain is exactly `bytes`: no filter, no
-/// compressor, nothing between an element and its bytes. Then a chunk's bytes are its
-/// elements in C order, the offset of any row inside it is arithmetic, and a row can be read
-/// WITHOUT reading the chunk around it.
-///
-/// Read off the metadata JSON the pipeline is constructed from, rather than taken as another
-/// constructor flag -- that argument list already carries three bools and nine parameters.
-///
-/// Conservative by construction: anything unrecognised, unparsable or nested returns false
-/// and the read takes the ordinary chunk path, which is always correct.
+/// Whether the sharding codec's inner chain is exactly `bytes` in native order, so a row's bytes
+/// can be read without decoding the chunk around it.
 fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
     let Ok(meta) = serde_json::from_str::<serde_json::Value>(array_metadata_json) else {
         return false;
@@ -80,19 +67,13 @@ fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
             .and_then(|c| c.get("codecs"))
             .and_then(|c| c.as_array());
         let Some(inner) = inner else { return false };
-        // Exactly the byte reinterpretation, and nothing beside it: a `crc32c` or a `blosc`
-        // here means the chunk cannot be entered part-way, which is the whole reason the
-        // chunk is the read unit. Matched as ONE codec rather than by collecting the names
-        // that parse, so a codec carrying no `name` cannot be skipped over silently.
         let [only] = inner.as_slice() else {
             return false;
         };
         if only.get("name").and_then(|n| n.as_str()) != Some("bytes") {
             return false;
         }
-        // And in this machine's byte order: the chunk path swaps a foreign-order element and
-        // the raw path, copying verbatim, does not. Same array, two answers, no error. Absent
-        // means little, which is the v3 default, not "no order".
+        // Absent means little, the v3 default.
         let endian = only
             .get("configuration")
             .and_then(|c| c.get("endian"))
@@ -102,14 +83,18 @@ fn inner_chunk_is_raw(array_metadata_json: &str) -> bool {
     false
 }
 
+// TODO: Use a OnceLock for store with get_or_try_init when stabilised?
 #[gen_stub_pyclass]
 #[pyclass]
 pub(crate) struct CodecPipelineImpl {
+    /// Read handle, deliberately the READ-ONLY type: `set`/`erase` are not in its interface,
+    /// so the only way to reach a write is `writable()`.
     pub(crate) readable_store: ReadableStorage,
-    /// Where a filesystem store lives, so the first read can ask what its storage takes in flight.
-    pub(crate) filesystem_root: Option<String>,
-    /// The same store, `None` when opened read-only, so a write has to go through `writable()`.
+    /// The writable handle -- `None` when zarr-python opened the store read-only. Same object
+    /// as `readable_store`; the read-only case simply never keeps a writable view of it.
     pub(crate) writable_store: Option<ReadableWritableListableStorage>,
+    /// Used by the first read to size the read pool from the storage.
+    pub(crate) filesystem_root: Option<String>,
     pub(crate) codec_chain: Arc<CodecChainBound>,
     pub(crate) codec_options: CodecOptions,
     pub(crate) chunk_concurrent_minimum: usize,
@@ -117,24 +102,18 @@ pub(crate) struct CodecPipelineImpl {
     pub(crate) num_threads: usize,
     pub(crate) fill_value: FillValue,
     pub(crate) data_type: DataType,
-    /// `None` means this array cannot take the chunk-unit path at all.
+    /// `None` if the read path does not serve this codec chain.
     pub(crate) shard: Option<Arc<shard_index::ShardInfo>>,
-    /// Kept for the life of the array: reading one is a full-latency round trip on the
-    /// calling thread. A shard that does not exist is remembered too.
     pub(crate) shard_indexes: Mutex<HashMap<StoreKey, Arc<ShardingPartialDecoder>>>,
-    /// The same below the outermost level, empty unless the array is nested-sharded.
     pub(crate) subshard_indexes: Mutex<HashMap<(StoreKey, Vec<u64>), Arc<ShardingPartialDecoder>>>,
-    /// True exactly when the store is read-only: one we can write through must not cache.
+    /// Only for a read-only store: a write moves the bytes an index addresses.
     pub(crate) cache_shard_indexes: bool,
-    /// Whether the caller named any of upstream's chunk-concurrency knobs. Kept because the
-    /// resolved values cannot say it: they default, so every read would look like a request.
+    /// Whether any of the chunk-concurrency options was set, which reads ignore.
     pub(crate) chunk_concurrency_asked: bool,
-    /// A plain byte tiling -- no filter, no compressor -- so a row's bytes are arithmetic.
     pub(crate) inner_chunk_is_raw: bool,
 }
 
 impl CodecPipelineImpl {
-    /// The array's element size in bytes; errors for a variable-length data type.
     fn element_size(&self) -> PyResult<usize> {
         self.data_type
             .fixed_size()
@@ -256,9 +235,6 @@ impl CodecPipelineImpl {
         array_object
     }
 
-    /// The buffer's pointer and length in bytes, shared by the three `nparray_to_*`
-    /// functions. The pointer is returned unread; each caller dereferences it in its own
-    /// `unsafe` block, where its safety argument belongs.
     fn nparray_bytes(
         value: &Bound<'_, PyUntypedArray>,
         element_size: usize,
@@ -305,10 +281,6 @@ impl CodecPipelineImpl {
         Ok(UnsafeCellSlice::new(output))
     }
 
-    /// Say once that a read does not spend the chunk-concurrency budget.
-    ///
-    /// Once per process, not per call: the condition is a property of how this pipeline was
-    /// built, so repeating it per read would be noise around a fact that cannot change.
     fn warn_read_ignores_chunk_concurrency(&self, py: Python<'_>) -> PyResult<()> {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !self.chunk_concurrency_asked
@@ -319,73 +291,17 @@ impl CodecPipelineImpl {
         py.import("warnings")?.call_method1(
             "warn",
             ("codec_pipeline.chunk_concurrent_minimum, chunk_concurrent_maximum and \
-              threading.max_workers bound a WRITE through this pipeline, not a read. A read runs \
-              on the two pools that codec_pipeline.read_workers and decode_workers size at the \
-              first read of the process.",),
+              threading.max_workers apply to writes only; reads use codec_pipeline.read_workers \
+              and decode_workers.",),
         )?;
         Ok(())
-    }
-
-    fn retrieve_items_and_apply_index(
-        &self,
-        py: Python,
-        chunk_descriptions: &[chunk_item::ChunkItem],
-        value: &Bound<'_, PyUntypedArray>,
-        config: read_decode::ReadConfig,
-    ) -> PyResult<()> {
-        // Guaranteed by `chunk_info_for_read`, the only route to a `ChunkItems` handle. Checked
-        // anyway: this is a pymethods boundary guarding an exclusive output slice.
-        if let Some(shard) = self.shard.as_ref() {
-            let element_size = self.element_size()?;
-            // An aliasing wrapper: no `&mut` is claimed over the whole buffer. `DisjointBytes`
-            // vends the pieces from it, one range each, so each becomes a checkable `&mut [u8]`.
-            let output = Self::nparray_to_unsafe_cell_slice(value, element_size)?;
-            let output_len = output.len();
-            // BEFORE `detach`, deliberately: `pools` locks, and the GIL is what keeps that
-            // lock from being held when another thread forks.
-            let pools = read_decode::pools(py, config)?;
-            // These are upstream's knobs and this path no longer spends them: the outer limit
-            // below is dropped and the codec target is overridden to 1, so a read is bounded by
-            // the two pools alone. Said out loud rather than accepted silently,
-            // because upstream honours them and a write through this same pipeline still does.
-            // Before `detach`: warning is Python work and the GIL is held here.
-            self.warn_read_ignores_chunk_concurrency(py)?;
-            py.detach(|| {
-                // `None` here means the item slice is empty. It must NOT short-circuit: the
-                // coverage check inside is the only thing stopping an `np.empty` buffer being
-                // returned as data, and an empty batch against a non-empty output is exactly
-                // the case it exists to refuse.
-                let codec_options = chunk_descriptions
-                    .get_chunk_concurrent_limit_and_codec_options(self)?
-                    .map_or_else(|| self.codec_options.clone(), |(_, o)| o);
-                self.retrieve_chunk_units(
-                    shard,
-                    chunk_descriptions,
-                    output,
-                    output_len,
-                    config,
-                    &pools,
-                    &codec_options,
-                )
-            })?;
-            return Ok(());
-        }
-        // Only one way to reach here now, and returning Ok would hand back `np.empty`.
-        Err(PyRuntimeError::new_err(format!(
-            "a batch of {} items could not be served: this array presents no sharding codec, \
-             so there is no decode unit to group by",
-            chunk_descriptions.len()
-        )))
     }
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl CodecPipelineImpl {
-    /// The innermost unit this array's codec chain decodes, or `None` to refuse the array.
-    ///
-    /// A shape is a sharded array's inner chunk; an empty shape means unsharded, so the chunk
-    /// is its own decode unit; `None` refuses the chain.
+    /// The inner chunk shape, empty if unsharded, or `None` if the read path does not serve it.
     fn inner_chunk_shape(&self) -> Option<Vec<u64>> {
         let shard = self.shard.as_ref()?;
         Some(
@@ -410,7 +326,6 @@ impl CodecPipelineImpl {
     ))]
     #[new]
     fn new(
-        py: Python<'_>,
         array_metadata: &str,
         mut store_config: StoreConfig,
         validate_checksums: bool,
@@ -430,27 +345,19 @@ impl CodecPipelineImpl {
             }
             ArrayMetadata::V3(v3) => Cow::Borrowed(v3),
         };
-        // Parsed here, as before, so an array with both bad codec metadata and a bad fill
-        // value still reports the codec. Only the binding has to wait for the data type.
         let codec_chain =
             CodecChain::from_metadata(&metadata_v3.codecs).map_py_err::<PyTypeError>()?;
         let codec_options = CodecOptions::default().with_validate_checksums(validate_checksums);
 
-        // Before the shadowing below turns these into resolved widths, which cannot say whether
-        // the caller named one: they all default.
         let chunk_concurrency_asked = chunk_concurrent_minimum.is_some()
             || chunk_concurrent_maximum.is_some()
             || num_threads.is_some();
         let chunk_concurrent_minimum =
-            chunk_concurrent_minimum.unwrap_or_else(|| global_config().chunk_concurrent_minimum());
-        // A budget wider than the pool schedules decodes with no thread to run them.
-        let width = rayon::current_num_threads();
-        let chunk_concurrent_maximum = chunk_concurrent_maximum.unwrap_or(width);
-        let num_threads = num_threads.unwrap_or(width);
+            chunk_concurrent_minimum.unwrap_or(global_config().chunk_concurrent_minimum());
+        let chunk_concurrent_maximum =
+            chunk_concurrent_maximum.unwrap_or(rayon::current_num_threads());
+        let num_threads = num_threads.unwrap_or(rayon::current_num_threads());
 
-        // Both default to the available parallelism: more readers than that is defensible (a
-        // blocked reader costs no CPU) but not a library's call to make unasked. Set
-        // independently, so a caller who wants reads oversubscribed can raise one alone.
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
         let writable_store = (!store_config.read_only).then(|| store.clone());
@@ -476,13 +383,9 @@ impl CodecPipelineImpl {
             })
             .map_py_err::<PyTypeError>()?;
 
-        // A codec chain is unbound until given a data type and fill value. Bound once here,
-        // since it is the same for every chunk this pipeline touches.
         let codec_chain = codec_chain
             .with_context(data_type.clone(), fill_value.clone())
             .map_py_err::<PyTypeError>()?;
-        // Read off the bound chain: it already holds the sharding codec with its inner and
-        // index chains bound, so nothing has to be re-derived from the metadata.
         let shard = shard_index::ShardInfo::from_codec_chain(&codec_chain).map(Arc::new);
 
         Ok(Self {
@@ -499,18 +402,13 @@ impl CodecPipelineImpl {
             shard,
             shard_indexes: Mutex::new(HashMap::new()),
             subshard_indexes: Mutex::new(HashMap::new()),
-            // Read before `writable_store` moves into the struct: a store this pipeline can
-            // write through must not remember a shard index, because a write moves the bytes
-            // that index addresses.
             cache_shard_indexes: writable_store.is_none(),
             writable_store,
             inner_chunk_is_raw: inner_chunk_is_raw(array_metadata),
         })
     }
 
-    /// The one read entry point. A selection this declines falls back to zarr-python; there is
-    /// no second Rust path.
-    #[pyo3(signature = (chunk_items, value, read_workers=None, decode_workers=None, raw_max_reads_per_chunk=None, strict=false))]
+    #[pyo3(signature = (chunk_items, value, read_workers=None, decode_workers=None, strict=false))]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,
@@ -518,28 +416,27 @@ impl CodecPipelineImpl {
         value: &Bound<'_, PyUntypedArray>,
         read_workers: Option<usize>,
         decode_workers: Option<usize>,
-        raw_max_reads_per_chunk: Option<usize>,
         strict: bool,
     ) -> PyResult<()> {
-        // Only the first read of the process sizes the pools, so only it looks at the storage: a
-        // later one without an explicit width takes the pool that exists rather than re-deriving
-        // a default that would then disagree with it.
+        let items = chunk_items.as_slice();
+        // Only the first read of the process sizes the pools, so only it looks at the storage.
         let read_workers = read_workers.filter(|n| *n > 0).or_else(|| {
             read_decode::pool_sizes().0.or_else(|| {
-                let (root, item) = (self.filesystem_root.as_ref()?, chunk_items.as_slice().first()?);
+                let (root, item) = (self.filesystem_root.as_ref()?, items.first()?);
                 lustre::read_capacity(&std::path::Path::new(root).join(item.key.as_str()))
             })
         });
-        // Read per call so a first call can size the pools; later calls are checked against them.
-        let config = read_decode::ReadConfig::from_call(
-            read_workers,
-            decode_workers,
-            raw_max_reads_per_chunk,
-            strict,
-        );
-        // The pools are fixed once built, so a width that differs from theirs is said out loud.
-        read_decode::check_workers_arrived(py, config)?;
-        self.retrieve_items_and_apply_index(py, chunk_items.as_slice(), value, config)
+        let config = read_decode::ReadConfig::from_call(read_workers, decode_workers, strict);
+        // Under the GIL: `pools` locks, and the GIL keeps that lock from being held across a fork.
+        let pools = read_decode::pools(py, config)?;
+        read_decode::check_workers_arrived(py, config, &pools)?;
+        self.warn_read_ignores_chunk_concurrency(py)?;
+        let shard = self.shard.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("this array's codec chain is not served by the read path")
+        })?;
+        let output = Self::nparray_to_unsafe_cell_slice(value, self.element_size()?)?;
+        let output_len = output.len();
+        py.detach(|| self.retrieve_chunk_units(shard, items, output, output_len, &pools))
     }
 
     fn store_chunks_with_indices(
@@ -576,30 +473,37 @@ impl CodecPipelineImpl {
         codec_options.set_store_empty_chunks(write_empty_chunks);
 
         py.detach(move || {
-            // The two inputs differ in how the bytes are obtained, not in what is done with
-            // them, so the store call is written once below rather than in each arm.
-            let store_chunk = |item: ChunkItem| {
-                let chunk_subset_bytes = match &input {
-                    InputValue::Array(input) => input
+            let store_chunk = |item: ChunkItem| match &input {
+                InputValue::Array(input) => {
+                    let chunk_subset_bytes = input
                         .extract_array_subset(
                             &item.subset,
                             bytemuck::must_cast_slice(&item.array_shape),
                             &self.data_type,
                         )
-                        .map_codec_err()?,
-                    InputValue::Constant(constant_value) => ArrayBytes::new_fill_value(
+                        .map_codec_err()?;
+                    self.store_chunk_subset_bytes(
+                        &item,
+                        &self.codec_chain,
+                        chunk_subset_bytes,
+                        &codec_options,
+                    )
+                }
+                InputValue::Constant(constant_value) => {
+                    let chunk_subset_bytes = ArrayBytes::new_fill_value(
                         &self.data_type,
                         item.chunk_subset.num_elements(),
                         constant_value,
                     )
-                    .map_py_err::<PyRuntimeError>()?,
-                };
-                self.store_chunk_subset_bytes(
-                    &item,
-                    &self.codec_chain,
-                    chunk_subset_bytes,
-                    &codec_options,
-                )
+                    .map_py_err::<PyRuntimeError>()?;
+
+                    self.store_chunk_subset_bytes(
+                        &item,
+                        &self.codec_chain,
+                        chunk_subset_bytes,
+                        &codec_options,
+                    )
+                }
             };
 
             iter_concurrent_limit!(
@@ -614,7 +518,7 @@ impl CodecPipelineImpl {
     }
 }
 
-/// `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
+/// `(call_hits, array_hits, builds)` for the shard index cache.
 #[gen_stub_pyfunction]
 #[pyfunction]
 fn shard_index_cache_stats() -> (u64, u64, u64) {
@@ -626,25 +530,7 @@ fn shard_index_cache_stats() -> (u64, u64, u64) {
     )
 }
 
-/// `(direct, via_scratch)` decode jobs since the run began.
-///
-/// Both produce the same bytes, so a predicate that never fires is invisible in values and
-/// would read as "the copy was not the cost" rather than "the path never ran".
-#[gen_stub_pyfunction]
-#[pyfunction]
-fn decode_path_stats() -> (u64, u64) {
-    use std::sync::atomic::Ordering;
-    (
-        read_decode::DIRECT_JOBS.load(Ordering::Relaxed),
-        read_decode::CHUNK_COPY_JOBS.load(Ordering::Relaxed),
-    )
-}
-
-/// `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
-/// inner chunks read and decoded.
-///
-/// Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
-/// the same values, so a gate that refuses everything passes every values test.
+/// `(raw, chunk)` read jobs: rows read as their own byte range, and whole inner chunks.
 #[gen_stub_pyfunction]
 #[pyfunction]
 fn raw_path_stats() -> (u64, u64) {
@@ -655,14 +541,13 @@ fn raw_path_stats() -> (u64, u64) {
     )
 }
 
-/// The sizes the two worker pools were built with, or `None` where one has not been built.
+/// The widths the read and decode pools were built with, `None` before the first read.
 #[gen_stub_pyfunction]
 #[pyfunction]
 fn pool_sizes() -> (Option<usize>, Option<usize>) {
     read_decode::pool_sizes()
 }
 
-/// Zero the counters, so one test's numbers are its own.
 #[gen_stub_pyfunction]
 #[pyfunction]
 fn reset_shard_index_cache_stats() {
@@ -672,6 +557,7 @@ fn reset_shard_index_cache_stats() {
     read_decode::INDEX_BUILDS.store(0, Ordering::Relaxed);
 }
 
+/// A Python module implemented in Rust.
 #[pymodule]
 pub mod _internal {
     #[pymodule_export]
@@ -683,8 +569,6 @@ pub mod _internal {
     use super::chunk_item::ChunkItem;
     #[pymodule_export]
     use super::chunk_item::ChunkItems;
-    #[pymodule_export]
-    use super::decode_path_stats;
     #[pymodule_export]
     use super::pool_sizes;
     #[pymodule_export]

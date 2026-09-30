@@ -12,7 +12,7 @@ extern "C" fn note_fork() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn generation() -> u64 {
+fn generation() -> u64 {
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| {
         #[cfg(unix)]
@@ -29,10 +29,9 @@ pub(crate) fn check() -> PyResult<()> {
         Ok(_) => Ok(()),
         Err(armed) if armed == now => Ok(()),
         Err(_) => Err(PyRuntimeError::new_err(
-            "zarrs was used in this process before it was forked, and its worker threads -- the \
-             read and decode pools, rayon's pool for writes, the tokio runtime for remote stores \
-             -- do not survive a fork. Start worker processes with the 'spawn' or 'forkserver' \
-             method instead.",
+            "zarrs was used in this process before it was forked, and its worker threads do not \
+             survive a fork. Start worker processes with the 'spawn' or 'forkserver' method \
+             instead.",
         )),
     }
 }

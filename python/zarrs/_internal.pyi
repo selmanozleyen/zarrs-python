@@ -16,21 +16,13 @@ class ChunkItem:
         chunk_shape: typing.Sequence[builtins.int],
         subset: typing.Sequence[slice],
         shape: typing.Sequence[builtins.int],
-    ) -> ChunkItem:
-        r"""
-        `coords` is always `None` here: it is not a parameter, so this constructor cannot build a
-        chunk-unit item. `ChunkItems::push_entry` builds those.
-        """
+    ) -> ChunkItem: ...
 
 @typing.final
 class ChunkItems:
     r"""
-    A batch of chunk items, built and held in Rust.
+    A batch of read items, built and held in Rust.
     """
-    def refuse_backwards(self, out_start: builtins.int) -> None:
-        r"""
-        Output must not step backwards: the pieces are vended forward-only.
-        """
     def __new__(cls) -> ChunkItems: ...
     def push_entry(
         self,
@@ -44,18 +36,9 @@ class ChunkItems:
         elem_starts: typing.Sequence[builtins.int] = [],
     ) -> None:
         r"""
-        Build one batch entry's items and append them.
+        Push one batch entry: sorted `indices` on axis 0 and a contiguous box on the others.
 
-        `indices` select along axis 0 and are checked here: non-negative, non-decreasing, and inside
-        the chunk extent. So is `out_start`: entries must be pushed in increasing order, and one
-        that would reuse output another entry already owns is refused.
-
-        Axes after the first are taken whole and must be the same extent in `chunk_shape` and in
-        `shape`, which is what makes one index one contiguous run.
-
-        One obligation this cannot check: `shape` must be the real extent of the output buffer,
-        since the output subset is bounded against it. A larger one describes bytes the buffer does
-        not have, and that produces wrong data rather than an error.
+        `shape` must be the output buffer's real extent; it is not checked.
         """
     def push_span(
         self,
@@ -85,19 +68,15 @@ class ChunkItems:
         trailing: typing.Sequence[builtins.int],
     ) -> None:
         r"""
-        Push whole rows of axis 0, back to back in the output, split at shard boundaries
-        here: per range, not per element. `shard_ids` ascends and names the shard of each key.
+        Push ranges of whole rows on axis 0, back to back in the output. `shard_ids` ascends and
+        names the shard of each key.
         """
 
 @typing.final
 class CodecPipelineImpl:
     def inner_chunk_shape(self) -> typing.Optional[builtins.list[builtins.int]]:
         r"""
-        The innermost unit this array's codec chain decodes, or `None` to refuse the array.
-
-        Three answers: a shape is the inner chunk of a sharded array; an empty shape means the
-        array is not sharded, so its chunk is its own decode unit; `None` means this chain
-        cannot be served at all.
+        The inner chunk shape, empty if unsharded, or `None` if the read path does not serve it.
         """
     def __new__(
         cls,
@@ -117,13 +96,8 @@ class CodecPipelineImpl:
         value: numpy.typing.NDArray[typing.Any],
         read_workers: typing.Optional[builtins.int] = None,
         decode_workers: typing.Optional[builtins.int] = None,
-        raw_max_reads_per_chunk: typing.Optional[builtins.int] = None,
         strict: builtins.bool = False,
-    ) -> None:
-        r"""
-        The one read entry point. A selection this declines falls back to zarr-python; there is
-        no second Rust path.
-        """
+    ) -> None: ...
     def store_chunks_with_indices(
         self,
         chunk_descriptions: typing.Sequence[ChunkItem],
@@ -133,24 +107,17 @@ class CodecPipelineImpl:
 
 def pool_sizes() -> tuple[typing.Optional[builtins.int], typing.Optional[builtins.int]]:
     r"""
-    The sizes the two worker pools were built with, or `None` where one has not been built.
+    The widths the read and decode pools were built with, `None` before the first read.
     """
 
 def raw_path_stats() -> tuple[builtins.int, builtins.int]:
     r"""
-    `(raw, chunk)` jobs since the run began: rows read as their own byte range, against whole
-    inner chunks read and decoded.
-
-    Exposed so a test can assert the raw path was TAKEN. Correctness cannot: both paths return
-    the same values, so a gate that refuses everything passes every values test.
+    `(raw, chunk)` read jobs: rows read as their own byte range, and whole inner chunks.
     """
 
-def reset_shard_index_cache_stats() -> None:
-    r"""
-    Zero the counters, so one test's numbers are its own.
-    """
+def reset_shard_index_cache_stats() -> None: ...
 
 def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
     r"""
-    `(call_hits, array_hits, builds)` for the shard index cache, since the run began.
+    `(call_hits, array_hits, builds)` for the shard index cache.
     """
