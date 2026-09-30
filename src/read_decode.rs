@@ -25,8 +25,7 @@ use zarrs::array::codec::api::ByteIntervalPartialDecoder;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 
 use crate::utils::{
-    PyCodecErrExt as _, PyErrExt as _, coord_runs, gather, gather_pieces, gather_runs,
-    key_partial_decoder,
+    PyCodecErrExt as _, PyErrExt as _, coord_runs, gather, gather_pieces, key_partial_decoder,
 };
 
 /// The per-array state a decode needs, shared by every job of a call.
@@ -459,7 +458,6 @@ fn carve<'a>(
                     // by construction rather than by the absence of a caller.
                     && ctx.raw_max_reads > 0
                     && pieces.len() == 1
-                    && item.grid.is_none()
                     && raw_runs(coords_of(item)?, item.run_len) <= ctx.raw_max_reads =>
             {
                 let piece = pieces.into_iter().next().expect("length checked");
@@ -475,7 +473,6 @@ fn carve<'a>(
             }
             Some(range) => {
                 let coords = coords_of(item)?;
-                let grid = item.grid.as_ref().map(|(starts, run)| (&starts[..], *run));
                 // Items in output order that read the same chunk sit next to each other (rows
                 // of one inner chunk that do not touch, as a strided draw gives): one read and
                 // one decode, gathered into each, instead of one of each per item.
@@ -487,7 +484,6 @@ fn carve<'a>(
                         out: pieces,
                         coords,
                         run_len: item.run_len,
-                        grid,
                     });
                     continue;
                 }
@@ -499,7 +495,6 @@ fn carve<'a>(
                     out: pieces,
                     coords,
                     run_len: item.run_len,
-                    grid,
                     shared: Vec::new(),
                     ctx,
                 });
@@ -580,7 +575,6 @@ fn raw_row_jobs<'a>(
             out: vec![run_out],
             coords: &[],
             run_len: item.run_len,
-            grid: None,
             shared: Vec::new(),
             ctx,
         });
@@ -913,9 +907,6 @@ struct Job<'a> {
     coords: &'a [u64],
     /// Elements per coordinate; 1 on the 1-D path. See `ChunkItem::run_len`.
     run_len: u64,
-    /// Where each run starts inside a coordinate's elements and how long it is, when the wanted
-    /// elements are not one span. `None` is a single contiguous run.
-    grid: Option<(&'a [u64], u64)>,
     /// Further items served by the same chunk: read and decoded once, gathered into each.
     shared: Vec<Part<'a>>,
     ctx: &'a JobContext,
@@ -926,7 +917,6 @@ struct Part<'a> {
     out: Vec<&'a mut [u8]>,
     coords: &'a [u64],
     run_len: u64,
-    grid: Option<(&'a [u64], u64)>,
 }
 
 /// Keep the first failure; later ones are usually consequences of it.
@@ -1033,7 +1023,6 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let whole_unit = job.shared.is_empty()
         && job.out.len() == 1
         && job.out[0].len() == needed
-        && job.grid.is_none()
         && job.coords.first() == Some(&0)
         && job.coords.len() as u64 * job.run_len == elements
         && coord_runs(job.coords, job.run_len).nth(1).is_none();
@@ -1096,12 +1085,10 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
             )
             .map_err(|e| e.to_string())?;
     }
-    let (coords, run_len, grid) = (job.coords, job.run_len, job.grid);
-    gather_part(scratch, &mut job.out, coords, run_len, grid, size)
+    gather_part(scratch, &mut job.out, job.coords, job.run_len, size)
         .map_err(|e| format!("{}: {e}", job.key))?;
     for part in &mut job.shared {
-        let (coords, run_len, grid) = (part.coords, part.run_len, part.grid);
-        gather_part(scratch, &mut part.out, coords, run_len, grid, size)
+        gather_part(scratch, &mut part.out, part.coords, part.run_len, size)
             .map_err(|e| format!("{}: {e}", job.key))?;
     }
     Ok(())
@@ -1113,22 +1100,10 @@ fn gather_part(
     out: &mut [&mut [u8]],
     coords: &[u64],
     run_len: u64,
-    grid: Option<(&[u64], u64)>,
     size: usize,
 ) -> Result<(), String> {
-    // One piece is the overwhelming case: `gather` writes into a single slice, one copy per
-    // coordinate, with its own bounds checks. Several pieces only happen when a shard divides
-    // a trailing axis, and `gather_pieces` merges consecutive coordinates because there a run
-    // can straddle two pieces.
     if let [piece] = out {
-        match grid {
-            Some((starts, run)) => gather_runs(scratch, coords, starts, run, piece, size),
-            None => gather(scratch, coords, run_len, piece, size),
-        }
-    } else if grid.is_some() {
-        // A grid takes the same sub-box out of every index, so its output is one range by
-        // construction. Reaching here means an item was built with both, which nothing does.
-        Err("a grid selection cannot also span several output pieces".to_string())
+        gather(scratch, coords, run_len, piece, size)
     } else {
         gather_pieces(scratch, coords, run_len, out, size)
     }
@@ -1152,7 +1127,6 @@ mod tests {
             coords: None,
             run_len: 1,
             claimed_inner: (0, 0),
-            grid: None,
         };
         // Strided: axis 1 takes 5 of 10 and axis 2 takes 5 of 10, so a row is not one run.
         let strided = item(&[0..2, 0..5, 0..5], &[6, 10, 10]);

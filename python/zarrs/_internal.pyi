@@ -88,34 +88,6 @@ class ChunkItems:
         Push whole rows of axis 0, back to back in the output, split at shard boundaries
         here: per range, not per element. `shard_ids` ascends and names the shard of each key.
         """
-    def push_grid(
-        self,
-        key: builtins.str,
-        chunk_shape: typing.Sequence[builtins.int],
-        shape: typing.Sequence[builtins.int],
-        indices: numpy.typing.NDArray[numpy.int64],
-        starts: numpy.typing.NDArray[numpy.uint64],
-        run: builtins.int,
-        out_start: builtins.int,
-        inner: builtins.int,
-    ) -> None:
-        r"""
-        Push a grid selection: the same columns taken from every selected index.
-        """
-    def push_points(
-        self,
-        key: builtins.str,
-        chunk_shape: typing.Sequence[builtins.int],
-        shape: typing.Sequence[builtins.int],
-        indices: numpy.typing.NDArray[numpy.int64],
-        offsets: numpy.typing.NDArray[numpy.uint64],
-        out_start: builtins.int,
-        inner: builtins.int,
-    ) -> None:
-        r"""
-        Push a point selection: one element per index, each naming its own offset inside that
-        index's elements.
-        """
 
 @typing.final
 class CodecPipelineImpl:

@@ -345,22 +345,6 @@ def test_a_contiguous_slice_takes_the_path(
     assert entries["list"] == 0
 
 
-def test_paired_points_take_the_path(
-    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
-) -> None:
-    """`X[rows, cols]`: one element per pair, and a flat result."""
-    path, values = full_width
-    rows = np.array([1, 3, 3, 9, 60, 61, 200])
-    cols = np.array([40, 0, 17, 5, 47, 2, 33])
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r")[rows, cols]
-
-    assert got.shape == (rows.size,), "a point selection is flat"
-    np.testing.assert_array_equal(got, values[rows, cols])
-    assert entries["handle"] > 0, "a point selection did not take the chunk-unit path"
-    assert entries["list"] == 0
-
-
 def test_a_single_column_takes_the_path(
     full_width: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
@@ -372,37 +356,6 @@ def test_a_single_column_takes_the_path(
 
     np.testing.assert_array_equal(got, values[rows, 5])
     assert entries["handle"] > 0, "a single column did not take the chunk-unit path"
-
-
-def test_points_match_zarr_python(full_width: tuple[Path, np.ndarray]) -> None:
-    """Byte for byte against the reference pipeline, on the same store."""
-    path, _ = full_width
-    rng = np.random.default_rng(0)
-    rows = np.sort(rng.choice(256, size=200, replace=True))
-    cols = rng.choice(48, size=200, replace=True)
-    with zarr.config.set(CHUNK_UNIT):
-        mine = zarr.open_array(path, mode="r")[rows, cols]
-    with zarr.config.set(
-        {"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}
-    ):
-        theirs = zarr.open_array(path, mode="r")[rows, cols]
-    np.testing.assert_array_equal(mine, theirs)
-
-
-def test_points_with_unsorted_rows_decline_and_are_still_right(
-    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
-) -> None:
-    """Descending rows would make the output positions step backwards. Decline, stay correct."""
-    path, values = full_width
-    rows = np.array([200, 3, 61, 9])
-    cols = np.array([1, 2, 3, 4])
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r")[rows, cols]
-
-    np.testing.assert_array_equal(got, values[rows, cols])
-    assert entries["handle"] == 0, (
-        "an unsorted point selection reached the chunk-unit path"
-    )
 
 
 @pytest.fixture(params=["1d", "2d"])
@@ -468,161 +421,6 @@ def test_an_unsharded_array_reads_unwritten_chunks_as_fill(
     assert entries["handle"] > 0, "an unsharded array did not take the chunk-unit path"
 
 
-def test_a_grid_selection_takes_the_path(
-    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
-) -> None:
-    """`oindex[rows, cols]`: the n x m grid, a gene panel across cells."""
-    path, values = full_width
-    rows = np.array([1, 3, 3, 9, 60, 61, 200])
-    cols = np.array([0, 5, 17, 17, 40])
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r").oindex[rows, cols]
-
-    assert got.shape == (rows.size, cols.size)
-    np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
-    assert entries["handle"] > 0, "a grid selection did not take the chunk-unit path"
-    assert entries["list"] == 0
-
-
-def test_a_whole_column_panel_takes_the_path(
-    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
-) -> None:
-    """`X[:, cols]`: every row, a panel of columns. The row axis is a slice here."""
-    path, values = full_width
-    cols = np.array([2, 7, 44])
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r").oindex[:, cols]
-
-    np.testing.assert_array_equal(got, values[:, cols])
-    assert entries["handle"] > 0, "a column panel did not take the chunk-unit path"
-
-
-def test_a_grid_matches_zarr_python(full_width: tuple[Path, np.ndarray]) -> None:
-    path, _ = full_width
-    rng = np.random.default_rng(0)
-    rows = np.sort(rng.choice(256, size=64, replace=False))
-    cols = np.sort(rng.choice(48, size=12, replace=True))
-    with zarr.config.set(CHUNK_UNIT):
-        mine = zarr.open_array(path, mode="r").oindex[rows, cols]
-    with zarr.config.set(
-        {"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}
-    ):
-        theirs = zarr.open_array(path, mode="r").oindex[rows, cols]
-    np.testing.assert_array_equal(mine, theirs)
-
-
-def test_a_grid_with_unsorted_columns_declines_and_is_still_right(
-    full_width: tuple[Path, np.ndarray], entries: dict[str, int]
-) -> None:
-    """Out-of-order columns make zarr hand over ndarray out-selections rather than slices."""
-    path, values = full_width
-    rows = np.array([1, 3, 9, 60])
-    cols = np.array([40, 0, 17, 5])
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r").oindex[rows, cols]
-
-    np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
-    assert entries["handle"] == 0, "an unsorted grid reached the chunk-unit path"
-
-
-@pytest.fixture
-def volume(tmp_path: Path) -> tuple[Path, np.ndarray]:
-    """A rank-3 array whose inner chunk spans both trailing axes whole."""
-    values = np.arange(256 * 8 * 16, dtype=np.float32).reshape(256, 8, 16)
-    path = tmp_path / "vol"
-    z = zarr.create_array(
-        path,
-        dtype=values.dtype,
-        shape=values.shape,
-        chunks=(8, 8, 16),
-        shards=(64, 8, 16),
-    )
-    z[:] = values
-    return path, values
-
-
-@pytest.mark.parametrize(
-    ("name", "sel"),
-    [
-        (
-            "grid on every axis",
-            (np.array([1, 3, 3, 9, 60]), np.array([1, 3, 6]), np.array([2, 9, 15])),
-        ),
-        # A span on one trailing axis and a scattered list on the other.
-        ("span and list", (np.array([1, 3, 9, 60]), slice(2, 5), np.array([0, 7, 15]))),
-        # One plane: the middle axis takes a single element and is dropped from the result.
-        ("dropped middle axis", (np.array([1, 3, 9, 60]), 3, slice(4, 12))),
-        # Every row, a couple of planes.
-        ("all rows", (slice(None), np.array([1, 5]), slice(None))),
-    ],
-)
-def test_rank_three_grids_take_the_path(
-    volume: tuple[Path, np.ndarray], entries: dict[str, int], name: str, sel
-) -> None:
-    """The grid generalises to rank N, whatever the number of axes."""
-    path, values = volume
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r").oindex[sel]
-    with zarr.config.set(
-        {"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}
-    ):
-        theirs = zarr.open_array(path, mode="r").oindex[sel]
-
-    np.testing.assert_array_equal(got, theirs)
-    assert entries["handle"] > 0, f"{name} did not take the chunk-unit path"
-    assert entries["list"] == 0
-
-
-def test_a_pure_slice_box_takes_the_path_as_runs(
-    volume: tuple[Path, np.ndarray], entries: dict[str, int]
-) -> None:
-    """A box of pure slices is served, because it is described as runs: `[rows, 2:5, 4:12]`."""
-    path, values = volume
-    rows = np.array([1, 3, 9, 60])
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r").oindex[rows, 2:5, 4:12]
-
-    np.testing.assert_array_equal(got, values[np.ix_(rows, range(2, 5), range(4, 12))])
-    assert entries["handle"] > 0, "a pure-slice box did not take the chunk-unit path"
-    assert entries["list"] == 0
-
-
-def test_the_run_decomposition() -> None:
-    """The runs a selection decomposes into, which a values-only test cannot see."""
-    from zarrs.utils import _as_contiguous
-
-    # A slice-shaped index array is recognised as contiguous; a scattered one is not.
-    assert _as_contiguous(np.array([4, 5, 6, 7])) == (4, 4)
-    assert _as_contiguous(np.array([4])) == (4, 1)
-    assert _as_contiguous(np.array([4, 6, 7])) is None
-    # Descending is not contiguous either, however tempting the endpoints look.
-    assert _as_contiguous(np.array([7, 6, 5, 4])) is None
-
-
-def test_rank_four_grid_takes_the_path(tmp_path: Path, entries: dict[str, int]) -> None:
-    """Nothing in the offset arithmetic knows the rank, so rank 4 is not a separate case."""
-    values = np.arange(64 * 4 * 6 * 5, dtype=np.float32).reshape(64, 4, 6, 5)
-    path = tmp_path / "hyper"
-    z = zarr.create_array(
-        path,
-        dtype=values.dtype,
-        shape=values.shape,
-        chunks=(8, 4, 6, 5),
-        shards=(32, 4, 6, 5),
-    )
-    z[:] = values
-    sel = (np.array([1, 3, 3, 40]), np.array([0, 3]), slice(1, 4), np.array([0, 2, 4]))
-    with zarr.config.set(CHUNK_UNIT):
-        got = zarr.open_array(path, mode="r").oindex[sel]
-    with zarr.config.set(
-        {"codec_pipeline.path": "zarr.core.codec_pipeline.BatchedCodecPipeline"}
-    ):
-        theirs = zarr.open_array(path, mode="r").oindex[sel]
-
-    np.testing.assert_array_equal(got, theirs)
-    assert entries["handle"] > 0, "a rank-4 grid did not take the chunk-unit path"
-
-
 @pytest.fixture
 def nested(tmp_path: Path) -> tuple[Path, np.ndarray]:
     """Two levels of sharding: 256-row shard -> 32-row subshard -> 8-row inner chunk."""
@@ -650,8 +448,6 @@ def nested(tmp_path: Path) -> tuple[Path, np.ndarray]:
     [
         ("whole rows", lambda a, r: a.oindex[r, :]),
         ("column sub-box", lambda a, r: a.oindex[r, 8:24]),
-        ("grid", lambda a, r: a.oindex[r, np.array([0, 5, 5, 17, 40])]),
-        ("paired points", lambda a, r: a[r, np.array([0, 5, 5, 17, 40, 44])]),
         ("contiguous slice", lambda a, r: a.oindex[10:200, :]),
     ],
 )

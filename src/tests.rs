@@ -51,7 +51,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
             &[7],
             &[100],
             &[inner],
-            crate::chunk_item::Offsets::Uniform(&[]),
+            &[],
         )?;
 
         let got: Vec<_> = items
@@ -87,7 +87,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 &[0],
                 &[100],
                 &[inner],
-                crate::chunk_item::Offsets::Uniform(&[])
+                &[]
             )
             .is_err()
         );
@@ -102,7 +102,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 &[0],
                 &[1],
                 &[inner],
-                crate::chunk_item::Offsets::Uniform(&[])
+                &[]
             )
             .is_err()
         );
@@ -223,7 +223,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
             &[2, 0],
             &[12, cols],
             &[inner, cols],
-            crate::chunk_item::Offsets::Uniform(&[0]),
+            &[0],
         )?;
 
         let got: Vec<_> = items
@@ -278,7 +278,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             &[0, 0],
             &[10, 2],
             &[4, 3],
-            crate::chunk_item::Offsets::Uniform(&[0]),
+            &[0],
         );
         assert!(
             narrower.is_ok(),
@@ -294,7 +294,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             &[0, 0, 0],
             &[10, 2, 5],
             &[4, 4, 10],
-            crate::chunk_item::Offsets::Uniform(&[0, 0]),
+            &[0, 0],
         );
         assert!(strided.is_err(), "a strided trailing box must be refused");
         // A run that starts inside its own sub-row and walks off the end of it, likewise.
@@ -306,7 +306,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             &[0, 0, 0],
             &[10, 1, 4],
             &[4, 4, 10],
-            crate::chunk_item::Offsets::Uniform(&[0, 8]),
+            &[0, 8],
         );
         assert!(
             wraps.is_err(),
@@ -321,7 +321,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             &[0, 0],
             &[10, 2],
             &[4],
-            crate::chunk_item::Offsets::Uniform(&[0]),
+            &[0],
         );
         assert!(ranks.is_err());
         Ok(())
@@ -370,110 +370,6 @@ fn test_gather_copies_a_run_per_coordinate() {
     // A zero run length would make the output region match at every coordinate count.
     let mut out = vec![0u8; 0];
     assert!(crate::utils::gather(&scratch, &[0], 0, &mut out, 2).is_err());
-}
-
-/// Arguments are whatever Python passed. Two must be refused: a point whose offset leaves its
-/// own index's elements, and an offset array of the wrong length.
-#[test]
-fn test_push_points_refuses_offsets_that_leave_their_row() -> PyResult<()> {
-    use numpy::{PyArray1, PyArrayMethods as _};
-
-    Python::initialize();
-    Python::attach(|py| {
-        let rows = PyArray1::from_slice(py, &[0i64, 1, 2]);
-        // A chunk row holds 48 elements, so 48 is one past the end of index 0's own.
-        let past = PyArray1::from_slice(py, &[0u64, 48, 2]);
-        let mut handle = crate::chunk_item::ChunkItems::new();
-        assert!(
-            handle
-                .push_points(
-                    "c/0/0",
-                    vec![64, 48],
-                    vec![3],
-                    rows.readonly(),
-                    past.readonly(),
-                    0,
-                    8
-                )
-                .is_err(),
-            "a point past its own row must be refused"
-        );
-
-        let short = PyArray1::from_slice(py, &[0u64, 1]);
-        let mut handle = crate::chunk_item::ChunkItems::new();
-        assert!(
-            handle
-                .push_points(
-                    "c/0/0",
-                    vec![64, 48],
-                    vec![3],
-                    rows.readonly(),
-                    short.readonly(),
-                    0,
-                    8
-                )
-                .is_err(),
-            "one offset per index, or the pairing is guesswork"
-        );
-
-        let ok = PyArray1::from_slice(py, &[0u64, 47, 2]);
-        let mut handle = crate::chunk_item::ChunkItems::new();
-        handle.push_points(
-            "c/0/0",
-            vec![64, 48],
-            vec![3],
-            rows.readonly(),
-            ok.readonly(),
-            0,
-            8,
-        )?;
-        Ok(())
-    })
-}
-
-/// A column past its own row would have `gather_runs` read the next row's element under this
-/// column's name, so it is refused here rather than trusted from the gate.
-#[test]
-fn test_push_grid_refuses_runs_outside_the_row() -> PyResult<()> {
-    use numpy::{PyArray1, PyArrayMethods as _};
-
-    Python::initialize();
-    Python::attach(|py| {
-        let rows = PyArray1::from_slice(py, &[0i64, 1, 2]);
-        // A chunk row holds 48 elements, so 48 is one past the last.
-        let past = PyArray1::from_slice(py, &[0u64, 48]);
-        let mut handle = crate::chunk_item::ChunkItems::new();
-        assert!(
-            handle
-                .push_grid(
-                    "c/0/0",
-                    vec![64, 48],
-                    vec![3, 2],
-                    rows.readonly(),
-                    past.readonly(),
-                    1,
-                    0,
-                    8
-                )
-                .is_err(),
-            "a run past the row must be refused"
-        );
-
-        // Repeats are legal and must be kept: a panel may ask for the same gene twice.
-        let repeated = PyArray1::from_slice(py, &[5u64, 5, 47]);
-        let mut handle = crate::chunk_item::ChunkItems::new();
-        handle.push_grid(
-            "c/0/0",
-            vec![64, 48],
-            vec![3, 3],
-            rows.readonly(),
-            repeated.readonly(),
-            1,
-            0,
-            8,
-        )?;
-        Ok(())
-    })
 }
 
 /// `raw_runs` counts READS, not rows, and that distinction is the whole gate.
