@@ -39,7 +39,44 @@ struct JobContext {
     may_be_absent: bool,
     /// The inner chunk when sharded, the chunk when not.
     decode_shape: Vec<NonZeroU64>,
+    /// Undecoded bytes the readers may hold ahead of the decoders.
+    read_ahead: ReadAhead,
 }
+
+/// Bytes read but not yet decoded, bounded so the read pool cannot run arbitrarily far ahead
+/// of the decode pool: a reader waits until its chunk fits. A chunk larger than the whole
+/// budget still goes, alone, so nothing waits forever.
+struct ReadAhead {
+    limit: usize,
+    held: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+impl ReadAhead {
+    fn new(limit: usize) -> Self {
+        Self { limit: limit.max(1), held: Mutex::new(0), freed: std::sync::Condvar::new() }
+    }
+
+    /// Wait for room for `want` bytes and hold them; returns what to give back.
+    fn acquire(&self, want: usize) -> usize {
+        let want = want.min(self.limit);
+        let mut held = self.held.lock().expect("read-ahead poisoned");
+        while *held > 0 && *held + want > self.limit {
+            held = self.freed.wait(held).expect("read-ahead poisoned");
+        }
+        *held += want;
+        want
+    }
+
+    fn release(&self, n: usize) {
+        *self.held.lock().expect("read-ahead poisoned") -= n;
+        self.freed.notify_all();
+    }
+}
+
+/// The default read-ahead: enough for the read pool to keep many small chunks in flight, few
+/// enough large ones that undecoded bytes stay a fraction of a typical output.
+pub(crate) const READ_AHEAD_BYTES: usize = 256 << 20;
 
 /// Shard and subshard decoders built during one call.
 #[derive(Default)]
@@ -57,6 +94,7 @@ impl CodecPipelineImpl {
         output: UnsafeCellSlice<'_, u8>,
         output_len: usize,
         pools: &(Arc<QueuePool>, Arc<QueuePool>),
+        read_ahead_bytes: usize,
     ) -> PyResult<()> {
         let element_size = self.element_size()?;
         let ctx = JobContext {
@@ -72,6 +110,7 @@ impl CodecPipelineImpl {
                 || items.first().map(|i| i.shape.clone()).unwrap_or_default(),
                 |shape| shape.to_vec(),
             ),
+            read_ahead: ReadAhead::new(read_ahead_bytes),
         };
 
         let located = self.locate_chunks(shard, items, &ctx)?;
@@ -896,6 +935,7 @@ pub(crate) fn check_workers_arrived(
 pub(crate) struct ReadConfig {
     pub(crate) read_workers: usize,
     pub(crate) decode_workers: usize,
+    pub(crate) read_ahead_bytes: usize,
     pub(crate) strict: bool,
 }
 
@@ -904,12 +944,14 @@ impl ReadConfig {
     pub(crate) fn from_call(
         read_workers: Option<usize>,
         decode_workers: Option<usize>,
+        read_ahead_bytes: Option<usize>,
         strict: bool,
     ) -> Self {
         let (read, decode) = default_widths(default_pool_size());
         Self {
             read_workers: read_workers.filter(|n| *n > 0).unwrap_or(read),
             decode_workers: decode_workers.filter(|n| *n > 0).unwrap_or(decode),
+            read_ahead_bytes: read_ahead_bytes.filter(|n| *n > 0).unwrap_or(READ_AHEAD_BYTES),
             strict,
         }
     }
@@ -958,9 +1000,26 @@ fn read_one<'env>(
     failure: &'env Mutex<Option<String>>,
     ctx: &'env JobContext,
 ) {
+    let held = ctx.read_ahead.acquire(expected_bytes(&job, ctx));
     match ctx.store.get_partial(&job.key, job.range) {
-        Ok(bytes) => spawn_decode(dec, b, job, bytes, failure),
-        Err(e) => record(failure, format!("read {} failed: {e}", job.key)),
+        Ok(bytes) => spawn_decode(dec, b, job, bytes, held, failure),
+        Err(e) => {
+            ctx.read_ahead.release(held);
+            record(failure, format!("read {} failed: {e}", job.key));
+        }
+    }
+}
+
+/// What a read will hold until decoded: its byte range, or the decoded size when the range is
+/// a whole unsharded chunk of unknown encoded length.
+fn expected_bytes(job: &Job<'_>, ctx: &JobContext) -> usize {
+    match job.range {
+        ByteRange::FromStart(_, Some(len)) => usize::try_from(len).unwrap_or(usize::MAX),
+        _ => ctx
+            .decode_shape
+            .iter()
+            .map(|d| usize::try_from(d.get()).unwrap_or(usize::MAX))
+            .fold(ctx.element_size, usize::saturating_mul),
     }
 }
 
@@ -970,6 +1029,7 @@ fn spawn_decode<'env>(
     b: &Batch,
     mut job: Job<'env>,
     bytes: MaybeBytes,
+    held: usize,
     failure: &'env Mutex<Option<String>>,
 ) {
     // Raw jobs too: a reader that copies inline stops issuing reads.
@@ -978,7 +1038,10 @@ fn spawn_decode<'env>(
         b.spawn(dec, move || {
             SCRATCH.with(|cell| {
                 let mut scratch = cell.borrow_mut();
-                if let Err(e) = decode_one(&mut job, bytes, &mut scratch) {
+                let ctx = job.ctx;
+                let result = decode_one(&mut job, bytes, &mut scratch);
+                ctx.read_ahead.release(held);
+                if let Err(e) = result {
                     record(failure, e);
                 }
             });
@@ -1226,6 +1289,32 @@ mod tests {
         assert!(ran.iter().all(|&r| r), "both decode workers are still there");
     }
 
+    /// A reader waits while its chunk does not fit, and one chunk larger than the budget goes
+    /// alone rather than never.
+    #[test]
+    fn read_ahead_holds_readers_back_until_bytes_are_decoded() {
+        let ahead = Arc::new(ReadAhead::new(10));
+        assert_eq!(ahead.acquire(6), 6);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let ahead = ahead.clone();
+            std::thread::spawn(move || {
+                let got = ahead.acquire(6);
+                tx.send(got).unwrap();
+            })
+        };
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            "6 more bytes do not fit beside 6 of 10"
+        );
+        ahead.release(6);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(6));
+        waiter.join().unwrap();
+        ahead.release(6);
+        assert_eq!(ahead.acquire(25), 10, "an oversized chunk holds the whole budget");
+        ahead.release(10);
+    }
+
     /// The defaults at the sizes they were measured on.
     #[test]
     fn default_widths_follow_the_measured_rule() {
@@ -1247,7 +1336,7 @@ mod tests {
     fn the_io_pool_is_wider_than_the_cpu_pool_and_both_report_what_they_built() {
         Python::initialize();
         Python::attach(|py| {
-            let config = ReadConfig::from_call(None, None, true);
+            let config = ReadConfig::from_call(None, None, None, true);
             let (io, cpu) = pools(py, config).expect("the pools must be buildable");
             assert_eq!(
                 (io.width(), cpu.width()),
@@ -1267,7 +1356,7 @@ mod tests {
             assert!(config.decode_workers <= cpu.width());
 
             // A later call naming a different width is answered by the pool that exists.
-            let narrower = ReadConfig::from_call(Some(1), Some(1), false);
+            let narrower = ReadConfig::from_call(Some(1), Some(1), None, false);
             let (io2, cpu2) = pools(py, narrower).expect("already built");
             assert_eq!(io2.width(), io.width());
             assert_eq!(cpu2.width(), cpu.width());

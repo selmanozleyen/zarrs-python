@@ -58,11 +58,12 @@ FALLBACK_TO_ZARR_PYTHON = (
 )
 
 
-def _read_config() -> tuple[int | None, int | None, bool]:
+def _read_config() -> tuple[int | None, int | None, bool, int | None]:
     return (
         config.get("codec_pipeline.read_workers", None),
         config.get("codec_pipeline.decode_workers", None),
         config.get("codec_pipeline.strict", False),
+        config.get("codec_pipeline.read_ahead_bytes", None),
     )
 
 
