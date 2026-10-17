@@ -451,9 +451,11 @@ def _chunk_unit_args(
     return pushes
 
 
-# ponytail: past this many items per entry the description costs more than zarr-python's read;
-# raise it if a real read lands here.
-_MAX_BOX_ITEMS = 1 << 16
+# ponytail: one read item per element of the run product, ~0.7 us each. Measured on one
+# 4096x4096 f32 shard with two scattered index arrays: Rust wins to 16,384 runs (28 vs 35 ms)
+# and loses from 36,864 (40 vs 35 ms). One item per inner chunk with an output offset per run
+# would remove the ceiling.
+_MAX_BOX_ITEMS = 1 << 14
 
 
 def _positions(sel: Any, extent: int) -> np.ndarray | None:
