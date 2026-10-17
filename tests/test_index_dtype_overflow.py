@@ -122,11 +122,13 @@ def test_an_all_false_mask_declines_rather_than_raising_IndexError() -> None:
 
 
 @pytest.mark.parametrize("dtype", UNSIGNED)
-def test_unsigned_descending_rows_are_refused(dtype: str, sharded) -> None:
-    """Rows 27 and 3 land in different shards, so each arrives alone and looks orderable."""
-    path, _ = sharded
-    with zarr.config.set(STRICT), pytest.raises(DiscontiguousArrayError):
-        zarr.open_array(path, mode="r")[np.array([27, 3], dtype=dtype), :]
+def test_unsigned_descending_rows_are_served(dtype: str, sharded) -> None:
+    """Rows 27 and 3 land in different shards; read in storage order, then put back."""
+    path, values = sharded
+    rows = np.array([27, 3], dtype=dtype)
+    with zarr.config.set(STRICT):
+        got = zarr.open_array(path, mode="r")[rows, :]
+    np.testing.assert_array_equal(got, values[rows.astype(np.intp), :])
 
 
 def test_sorted_selections_never_produce_a_negative_bound(sharded) -> None:

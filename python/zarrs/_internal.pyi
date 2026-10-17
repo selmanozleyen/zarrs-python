@@ -9,14 +9,7 @@ import zarr.abc.store
 
 @typing.final
 class ChunkItem:
-    def __new__(
-        cls,
-        key: builtins.str,
-        chunk_subset: typing.Sequence[slice],
-        chunk_shape: typing.Sequence[builtins.int],
-        subset: typing.Sequence[slice],
-        shape: typing.Sequence[builtins.int],
-    ) -> ChunkItem: ...
+    def __new__(cls, key: builtins.str, chunk_subset: typing.Sequence[slice], chunk_shape: typing.Sequence[builtins.int], subset: typing.Sequence[slice], shape: typing.Sequence[builtins.int]) -> ChunkItem: ...
 
 @typing.final
 class ChunkItems:
@@ -24,52 +17,15 @@ class ChunkItems:
     A batch of read items, built and held in Rust.
     """
     def __new__(cls) -> ChunkItems: ...
-    def push_entry(
-        self,
-        key: builtins.str,
-        chunk_shape: typing.Sequence[builtins.int],
-        shape: typing.Sequence[builtins.int],
-        indices: numpy.typing.NDArray[numpy.int64],
-        out_starts: typing.Sequence[builtins.int],
-        out_widths: typing.Sequence[builtins.int],
-        inner: typing.Sequence[builtins.int],
-        elem_starts: typing.Sequence[builtins.int] = [],
-    ) -> None:
-        r"""
-        Push one batch entry: sorted `indices` on axis 0 and a contiguous box on the others.
-
-        `shape` must be the output buffer's real extent; it is not checked.
-        """
-    def push_span(
-        self,
-        key: builtins.str,
-        chunk_shape: typing.Sequence[builtins.int],
-        shape: typing.Sequence[builtins.int],
-        first: builtins.int,
-        count: builtins.int,
-        out_start: builtins.int,
-        inner: builtins.int,
-    ) -> None:
-        r"""
-        Push a contiguous span of the split axis, without naming its elements.
-        """
     def __len__(self) -> builtins.int:
         r"""
         The number of read items pushed so far.
         """
-    def push_runs(
-        self,
-        keys: typing.Sequence[builtins.str],
-        shard_ids: typing.Sequence[numpy.typing.NDArray[numpy.int64]],
-        starts: typing.Sequence[numpy.typing.NDArray[numpy.int64]],
-        lengths: typing.Sequence[numpy.typing.NDArray[numpy.int64]],
-        shard_shape: typing.Sequence[builtins.int],
-        inner: typing.Sequence[builtins.int],
-    ) -> None:
+    def push_box(self, key: builtins.str, shard_shape: typing.Sequence[builtins.int], inner: typing.Sequence[builtins.int], out_shape: typing.Sequence[builtins.int], lo: typing.Sequence[numpy.typing.NDArray[numpy.int64]], len: typing.Sequence[numpy.typing.NDArray[numpy.int64]], out: typing.Sequence[numpy.typing.NDArray[numpy.int64]]) -> None:
         r"""
-        Push the product of runs on every axis, each axis's runs back to back in the output.
-        `shard_ids[k]` ascends and names the shards touched on axis `k`; `keys` are their
-        product in C order.
+        Push one shard's orthogonal selection: per axis, runs `lo[r]..lo[r] + len[r]` of the
+        shard, each written from output offset `out[r]` on. The runs need not be sorted or
+        adjacent, so an index array in any order is a run per index (or per consecutive group).
         """
 
 @typing.final
@@ -78,32 +34,9 @@ class CodecPipelineImpl:
         r"""
         The inner chunk shape, empty if unsharded, or `None` if the read path does not serve it.
         """
-    def __new__(
-        cls,
-        array_metadata: builtins.str,
-        store_config: zarr.abc.store.Store,
-        *,
-        validate_checksums: builtins.bool = False,
-        chunk_concurrent_minimum: typing.Optional[builtins.int] = None,
-        chunk_concurrent_maximum: typing.Optional[builtins.int] = None,
-        num_threads: typing.Optional[builtins.int] = None,
-        direct_io: builtins.bool = False,
-        file_handle_cache_size: builtins.int = 0,
-    ) -> CodecPipelineImpl: ...
-    def retrieve_chunk_items_and_apply_index(
-        self,
-        chunk_items: ChunkItems,
-        value: numpy.typing.NDArray[typing.Any],
-        read_workers: typing.Optional[builtins.int] = None,
-        decode_workers: typing.Optional[builtins.int] = None,
-        strict: builtins.bool = False,
-    ) -> None: ...
-    def store_chunks_with_indices(
-        self,
-        chunk_descriptions: typing.Sequence[ChunkItem],
-        value: numpy.typing.NDArray[typing.Any],
-        write_empty_chunks: builtins.bool,
-    ) -> None: ...
+    def __new__(cls, array_metadata: builtins.str, store_config: zarr.abc.store.Store, *, validate_checksums: builtins.bool = False, chunk_concurrent_minimum: typing.Optional[builtins.int] = None, chunk_concurrent_maximum: typing.Optional[builtins.int] = None, num_threads: typing.Optional[builtins.int] = None, direct_io: builtins.bool = False, file_handle_cache_size: builtins.int = 0) -> CodecPipelineImpl: ...
+    def retrieve_chunk_items_and_apply_index(self, chunk_items: ChunkItems, value: numpy.typing.NDArray[typing.Any], read_workers: typing.Optional[builtins.int] = None, decode_workers: typing.Optional[builtins.int] = None, strict: builtins.bool = False) -> None: ...
+    def store_chunks_with_indices(self, chunk_descriptions: typing.Sequence[ChunkItem], value: numpy.typing.NDArray[typing.Any], write_empty_chunks: builtins.bool) -> None: ...
 
 def pool_sizes() -> tuple[typing.Optional[builtins.int], typing.Optional[builtins.int]]:
     r"""
@@ -121,3 +54,4 @@ def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]
     r"""
     `(call_hits, array_hits, builds)` for the shard index cache.
     """
+
