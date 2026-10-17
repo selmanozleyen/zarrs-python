@@ -30,299 +30,6 @@ fn test_nparray_to_unsafe_cell_slice_empty() -> PyResult<()> {
     })
 }
 
-/// One item per inner chunk: coords relative to it, output runs contiguous and in order.
-#[test]
-fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
-    use numpy::{PyArray1, PyArrayMethods as _};
-
-    Python::initialize();
-    Python::attach(|py| {
-        let inner = 10u64;
-        // Chunk 0: 3, 3, 9. Chunk 2: 20, 27. Chunk 9: 94, the last index the extent allows.
-        let indices = PyArray1::from_slice(py, &[3i64, 3, 9, 20, 27, 94]);
-        let items = crate::chunk_item::build_chunk_unit_items(
-            "c/0",
-            vec![95],
-            vec![100],
-            indices.readonly(),
-            &[7],
-            &[100],
-            &[inner],
-            &[],
-            None,
-        )?;
-
-        let got: Vec<_> = items
-            .iter()
-            .map(|i| {
-                (
-                    i.chunk_subset.start()[0],
-                    i.chunk_subset.end_exc()[0],
-                    i.subset.start()[0],
-                    i.subset.end_exc()[0],
-                    i.coords.as_ref().unwrap().to_vec(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                (0, 10, 7, 10, vec![3, 3, 9]),
-                (20, 30, 10, 12, vec![0, 7]),
-                // The last chunk is short.
-                (90, 95, 12, 13, vec![4]),
-            ]
-        );
-
-        let bad = PyArray1::from_slice(py, &[-1i64]);
-        assert!(
-            crate::chunk_item::build_chunk_unit_items(
-                "c/0",
-                vec![95],
-                vec![100],
-                bad.readonly(),
-                &[0],
-                &[100],
-                &[inner],
-                &[], None
-            )
-            .is_err()
-        );
-        let over = PyArray1::from_slice(py, &[0i64, 1]);
-        assert!(
-            crate::chunk_item::build_chunk_unit_items(
-                "c/0",
-                vec![95],
-                vec![1],
-                over.readonly(),
-                &[0],
-                &[1],
-                &[inner],
-                &[], None
-            )
-            .is_err()
-        );
-        Ok(())
-    })
-}
-
-/// A selection spanning two shards is two entries, the second starting where the first ended.
-#[test]
-fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
-    use numpy::{PyArray1, PyArrayMethods as _};
-
-    Python::initialize();
-    Python::attach(|py| {
-        let mut handle = crate::chunk_item::ChunkItems::new();
-        let a = PyArray1::from_slice(py, &[3i64, 20]);
-        let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry(
-            "c/0",
-            vec![95],
-            vec![100],
-            a.readonly(),
-            vec![0],
-            vec![100],
-            vec![10],
-            vec![],
-            None,
-        )?;
-        handle.push_entry(
-            "c/1",
-            vec![95],
-            vec![100],
-            b.readonly(),
-            vec![2],
-            vec![100],
-            vec![10],
-            vec![],
-            None,
-        )?;
-
-        let got: Vec<_> = handle
-            .as_slice()
-            .iter()
-            .map(|i| (i.key.as_str(), i.subset.start()[0], i.subset.end_exc()[0]))
-            .collect();
-        assert_eq!(got, vec![("c/0", 0, 1), ("c/0", 1, 2), ("c/1", 2, 3)]);
-        Ok(())
-    })
-}
-
-/// `push_entry` accepts overlapping output; `DisjointBytes` refuses it when the read carves.
-#[test]
-fn test_push_entry_leaves_overlap_to_the_read() -> PyResult<()> {
-    use numpy::{PyArray1, PyArrayMethods as _};
-
-    Python::initialize();
-    Python::attach(|py| {
-        let mut handle = crate::chunk_item::ChunkItems::new();
-        let a = PyArray1::from_slice(py, &[3i64, 20]);
-        let b = PyArray1::from_slice(py, &[41i64]);
-        handle.push_entry(
-            "c/0",
-            vec![95],
-            vec![100],
-            a.readonly(),
-            vec![0],
-            vec![100],
-            vec![10],
-            vec![],
-            None,
-        )?;
-
-        handle.push_entry(
-            "c/1",
-            vec![95],
-            vec![100],
-            b.readonly(),
-            vec![1],
-            vec![100],
-            vec![10],
-            vec![],
-            None,
-        )?;
-        handle.push_entry(
-            "c/1",
-            vec![95],
-            vec![100],
-            b.readonly(),
-            vec![2],
-            vec![100],
-            vec![10],
-            vec![],
-            None,
-        )?;
-        assert_eq!(handle.as_slice().len(), 4);
-        Ok(())
-    })
-}
-
-/// The rank-2 case: the same grouping, with every column taken whole.
-#[test]
-fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
-    use numpy::{PyArray1, PyArrayMethods as _};
-
-    Python::initialize();
-    Python::attach(|py| {
-        let inner = 4u64;
-        let cols = 3u64;
-        // Chunk 0: rows 1, 1 and 3. Chunk 2: row 9.
-        let indices = PyArray1::from_slice(py, &[1i64, 1, 3, 9]);
-        let items = crate::chunk_item::build_chunk_unit_items(
-            "c/0/0",
-            vec![10, cols],
-            vec![12, cols],
-            indices.readonly(),
-            &[2, 0],
-            &[12, cols],
-            &[inner, cols],
-            &[0],
-            None,
-        )?;
-
-        let got: Vec<_> = items
-            .iter()
-            .map(|i| {
-                (
-                    i.chunk_subset.start().to_vec(),
-                    i.chunk_subset.end_exc(),
-                    i.subset.start().to_vec(),
-                    i.subset.end_exc(),
-                    i.coords.as_ref().unwrap().to_vec(),
-                    i.run_len,
-                )
-            })
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                // Rows 1, 1, 3 of the chunk are element offsets 3, 3, 9.
-                (
-                    vec![0, 0],
-                    vec![4, 3],
-                    vec![2, 0],
-                    vec![5, 3],
-                    vec![3, 3, 9],
-                    3
-                ),
-                // The last chunk is short: rows 8..10.
-                (vec![8, 0], vec![10, 3], vec![5, 0], vec![6, 3], vec![3], 3),
-            ]
-        );
-        Ok(())
-    })
-}
-
-/// A trailing selection must be one run per index.
-#[test]
-fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
-    use numpy::{PyArray1, PyArrayMethods as _};
-
-    Python::initialize();
-    Python::attach(|py| {
-        let indices = PyArray1::from_slice(py, &[0i64, 1]);
-        // `X[rows, 0:2]` of 3 columns.
-        let narrower = crate::chunk_item::build_chunk_unit_items(
-            "c/0/0",
-            vec![10, 3],
-            vec![10, 2],
-            indices.readonly(),
-            &[0, 0],
-            &[10, 2],
-            &[4, 3],
-            &[0],
-            None,
-        );
-        assert!(
-            narrower.is_ok(),
-            "a contiguous column subset is served, not refused"
-        );
-        // 2 of 4 by 5 of 10 is two runs of 5 per index.
-        let strided = crate::chunk_item::build_chunk_unit_items(
-            "c/0/0/0",
-            vec![10, 4, 10],
-            vec![10, 2, 5],
-            indices.readonly(),
-            &[0, 0, 0],
-            &[10, 2, 5],
-            &[4, 4, 10],
-            &[0, 0],
-            None,
-        );
-        assert!(strided.is_err(), "a strided trailing box must be refused");
-        // A run that walks off the end of its own row.
-        let wraps = crate::chunk_item::build_chunk_unit_items(
-            "c/0/0/0",
-            vec![10, 4, 10],
-            vec![10, 1, 4],
-            indices.readonly(),
-            &[0, 0, 0],
-            &[10, 1, 4],
-            &[4, 4, 10],
-            &[0, 8],
-            None,
-        );
-        assert!(
-            wraps.is_err(),
-            "a run leaving its own sub-row must be refused"
-        );
-        let ranks = crate::chunk_item::build_chunk_unit_items(
-            "c/0",
-            vec![10],
-            vec![10, 2],
-            indices.readonly(),
-            &[0, 0],
-            &[10, 2],
-            &[4],
-            &[0],
-            None,
-        );
-        assert!(ranks.is_err());
-        Ok(())
-    })
-}
-
 #[test]
 fn test_gather_copies_by_coordinate_and_refuses_the_rest() {
     let scratch: Vec<u8> = (0..12u8).collect(); // 6 elements of 2 bytes
@@ -424,24 +131,26 @@ fn test_coord_runs_do_not_wrap_at_the_top_of_the_range() {
     assert_eq!(crate::utils::coord_runs(&[], run_len).count(), 0);
 }
 
-/// Runs on two axes: one item per inner chunk a piece meets, its coords walking the box.
+/// A box on two axes: one item per inner chunk it meets, a coordinate and an output offset
+/// per run.
 #[test]
-fn test_push_runs_splits_every_axis_at_inner_chunks() -> PyResult<()> {
+fn test_push_box_splits_every_axis_at_inner_chunks() -> PyResult<()> {
     use numpy::{PyArray1, PyArrayMethods as _};
 
     Python::initialize();
     Python::attach(|py| {
         let a = |v: &[i64]| PyArray1::from_slice(py, v).readonly();
         let mut handle = crate::chunk_item::ChunkItems::new();
-        // Shards of 8 x 8 in inner chunks of 4 x 4: rows 2..6 cross a seam, columns 9..11 are
-        // in shard 1.
-        handle.push_runs(
-            vec!["c/0/1".to_string()],
-            vec![a(&[0]), a(&[1])],
-            vec![a(&[2]), a(&[9])],
-            vec![a(&[4]), a(&[2])],
+        // A shard of 8 x 8 in inner chunks of 4 x 4: rows 2..6 cross a seam, columns 1..3 do
+        // not; the output is 4 x 2.
+        handle.push_box(
+            "c/0/1",
             vec![8, 8],
             vec![4, 4],
+            vec![4, 2],
+            vec![a(&[2]), a(&[1])],
+            vec![a(&[4]), a(&[2])],
+            vec![a(&[0]), a(&[0])],
         )?;
         let got: Vec<_> = handle
             .as_slice()
@@ -450,8 +159,8 @@ fn test_push_runs_splits_every_axis_at_inner_chunks() -> PyResult<()> {
                 (
                     i.key.as_str(),
                     i.chunk_subset.start().to_vec(),
-                    i.subset.start().to_vec(),
                     i.coords.as_ref().unwrap().to_vec(),
+                    i.out_offsets.as_ref().unwrap().to_vec(),
                     i.run_len,
                 )
             })
@@ -459,8 +168,8 @@ fn test_push_runs_splits_every_axis_at_inner_chunks() -> PyResult<()> {
         assert_eq!(
             got,
             vec![
-                ("c/0/1", vec![2, 1], vec![0, 0], vec![9, 13], 2),
-                ("c/0/1", vec![4, 1], vec![2, 0], vec![1, 5], 2),
+                ("c/0/1", vec![0, 0], vec![9, 13], vec![0, 2], 2),
+                ("c/0/1", vec![4, 0], vec![1, 5], vec![4, 6], 2),
             ]
         );
         Ok(())
@@ -484,4 +193,48 @@ fn test_gather_pieces_copies_a_box() {
     let (a, b) = out.split_at_mut(4);
     crate::utils::gather_pieces(&scratch, &[4], 8, &mut [a, b], 1).expect("in bounds");
     assert_eq!(out, (4..12u8).collect::<Vec<_>>());
+}
+
+/// Whole trailing axes fold into the run: rows of a full-width box are one run each, and
+/// consecutive rows one run together.
+#[test]
+fn test_push_box_folds_whole_trailing_axes_into_the_run() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let a = |v: &[i64]| PyArray1::from_slice(py, v).readonly();
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        // A shard of 8 x 6 in inner chunks of 4 x 6: rows 1..3 and row 6, every column, out
+        // to a 3 x 6 output.
+        handle.push_box(
+            "c/0/0",
+            vec![8, 6],
+            vec![4, 6],
+            vec![3, 6],
+            vec![a(&[1, 6]), a(&[0])],
+            vec![a(&[2, 1]), a(&[6])],
+            vec![a(&[0, 2]), a(&[0])],
+        )?;
+        let got: Vec<_> = handle
+            .as_slice()
+            .iter()
+            .map(|i| {
+                (
+                    i.chunk_subset.start().to_vec(),
+                    i.coords.as_ref().unwrap().to_vec(),
+                    i.out_offsets.as_ref().unwrap().to_vec(),
+                    i.run_len,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (vec![0, 0], vec![6], vec![0], 12),
+                (vec![4, 0], vec![12], vec![12], 6),
+            ]
+        );
+        Ok(())
+    })
 }

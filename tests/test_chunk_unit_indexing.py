@@ -192,17 +192,6 @@ def test_a_column_slice_matches_zarr_python(
     np.testing.assert_array_equal(mine, theirs)
 
 
-def test_the_contiguity_rule() -> None:
-    """One run only when every axis before the last partial one takes a single element."""
-    from zarrs.utils import _is_one_run
-
-    assert _is_one_run([16], (48,))
-    assert _is_one_run([48], (48,))
-    assert _is_one_run([3, 10], (5, 10))
-    assert not _is_one_run([5, 4], (5, 10))
-    assert _is_one_run([1, 4], (5, 10))
-
-
 def test_full_width_matches_zarr_python(
     full_width: tuple[Path, np.ndarray],
 ) -> None:
@@ -494,105 +483,6 @@ def _wanted(entry, out_shape) -> list[tuple[int, int]]:
     ]
     assert len(src) == len(dst)
     return list(zip(src, dst))
-
-
-def _described(args) -> list[tuple[int, int]]:
-    """The same pairs, expanded the way Rust reads the description back."""
-    if args[0] == "span":
-        _, _key, chunk_shape, shape, first, count, out_start, _inner = args
-        row, out_row = prod(chunk_shape[1:]), prod(shape[1:])
-        return [
-            ((first + k) * row + j, (out_start + k) * out_row + j)
-            for k in range(count)
-            for j in range(row)
-        ]
-    _, _key, chunk_shape, shape, indices, out_starts, out_widths, _inner, starts, out_rows = args
-    assert out_rows is None, "these cases are sorted, so nothing is scattered"
-    row, out_row = prod(chunk_shape[1:]), prod(shape[1:])
-    src_offset = _fold(starts, chunk_shape[1:])
-    dst_offset = _fold(out_starts[1:], shape[1:])
-    run = prod(out_widths[1:])
-    return [
-        (
-            int(index) * row + src_offset + j,
-            (out_starts[0] + i) * out_row + dst_offset + j,
-        )
-        for i, index in enumerate(indices)
-        for j in range(run)
-    ]
-
-
-@pytest.mark.parametrize(
-    ("shard", "inner"),
-    [
-        ((4, 5), (4, 5)),
-        ((2, 3, 4), (2, 3, 4)),
-        # Two inner chunks across the shard, so a column range can cross into both.
-        ((4, 12), (4, 6)),
-        ((16, 12), (8, 6)),
-        ((4, 12, 4), (4, 6, 4)),
-        # An inner chunk that does not divide the shard, so the last band is short.
-        ((4, 12), (4, 5)),
-    ],
-    ids=[
-        "rank-2",
-        "rank-3",
-        "divided",
-        "divided-tall",
-        "divided-rank-3",
-        "ragged-inner",
-    ],
-)
-@pytest.mark.parametrize(
-    "rows",
-    [(0, 8), (1, 9), [0, 1, 3, 6], [5]],
-    ids=["slice", "unaligned-slice", "list", "one"],
-)
-def test_a_description_names_exactly_its_own_bytes(shard, inner, rows) -> None:
-    """Every column range over a shard grid, described and expanded back."""
-    import itertools
-
-    from zarrs.utils import _chunk_unit_args
-
-    width = shard[1] * 3
-    checked = 0
-    for lo, hi in itertools.combinations(range(width + 1), 2):
-        boxes = [(lo, hi), *[(0, shard[axis]) for axis in range(2, len(shard))]]
-        entries, out_shape = _batch(shard, rows, boxes)
-        pairs: list[tuple[int, int]] = []
-        for entry in entries:
-            pushes = _chunk_unit_args(entry, out_shape, (), tuple(inner))
-            if pushes is None:
-                break
-            said = [pair for args in pushes for pair in _described(args)]
-            assert sorted(said) == sorted(_wanted(entry, out_shape)), (
-                f"{[a[0] for a in pushes]} for {entry[0].path} names bytes the selection did "
-                f"not ask for: {entry[2]} -> {entry[3]} of {out_shape}"
-            )
-            pairs += said
-        else:
-            got = sorted(d for _, d in pairs)
-            assert got == list(range(prod(out_shape))), (
-                f"X[{rows}, {lo}:{hi}] of {shard}: the descriptions do not tile {out_shape}"
-            )
-            checked += 1
-    assert checked, "every column range declined; this asserted nothing"
-
-
-def test_a_strided_output_box_is_declined() -> None:
-    """A partial last axis behind a wider one is not one run per index, so it is declined."""
-    import types
-
-    from zarrs.utils import _chunk_unit_args
-
-    entry = (
-        types.SimpleNamespace(path="c/0/0/0"),
-        types.SimpleNamespace(shape=(4, 5, 10)),
-        (slice(0, 4), slice(0, 5), slice(0, 4)),
-        (slice(0, 4), slice(0, 5), slice(0, 4)),
-        False,
-    )
-    assert _chunk_unit_args(entry, (4, 5, 10), (), (4, 5, 10)) is None
 
 
 @pytest.mark.parametrize(

@@ -125,20 +125,31 @@ def array_metadata_to_codecs(metadata: ArrayMetadata) -> list[Codec]:
         return [v2_codec]
 
 
-def _shards_touched(
+def _runs_per_shard(
     starts: np.ndarray, lengths: np.ndarray, size: int
-) -> np.ndarray:
-    """The ascending ids of the shards of extent `size` that the runs touch."""
+) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """One axis's runs, back to back in the output, split per shard of extent `size`.
+
+    Shard id -> the shard-local `(lo, len, out)` of each run piece it holds, `out` the piece's
+    position along this axis of the output.
+    """
     keep = lengths > 0
     starts, lengths = starts[keep], lengths[keep]
+    out = np.concatenate(([0], np.cumsum(lengths)[:-1])).astype(np.int64)
     first, last = starts // size, (starts + lengths - 1) // size
-    ids = np.union1d(first, last)
-    if (wide := last - first > 1).any():
-        between = [
-            np.arange(f + 1, l) for f, l in zip(first[wide], last[wide], strict=True)
-        ]
-        ids = np.union1d(ids, np.concatenate(between))
-    return ids.astype(np.int64)
+    if (cross := first != last).any():
+        # Split a run at each shard boundary it crosses; rare when runs are short.
+        pieces = [(starts[~cross], lengths[~cross], out[~cross])]
+        for s, n, o, f, l in zip(starts[cross], lengths[cross], out[cross], first[cross], last[cross], strict=True):
+            bounds = np.r_[s, np.arange(f + 1, l + 1) * size, s + n]
+            pieces.append((bounds[:-1], np.diff(bounds), o + bounds[:-1] - s))
+        starts, lengths, out = (np.concatenate(c) for c in zip(*pieces, strict=True))
+        first = starts // size
+    by_shard = {}
+    for shard in np.unique(first).tolist():
+        at = first == shard
+        by_shard[shard] = (starts[at] - shard * size, lengths[at], out[at])
+    return by_shard
 
 
 @dataclass
@@ -315,14 +326,11 @@ class ZarrsCodecPipeline(CodecPipeline):
                 f"out must be a {dtype} array of shape {want}, not {out.dtype} {out.shape}"
             )
         shard_shape = [int(v) for v in grid.chunk_shape]
-        ids = [
-            _shards_touched(starts, lengths, size)
+        axes = [
+            _runs_per_shard(starts, lengths, size)
             for (starts, lengths), size in zip(runs, shard_shape, strict=True)
         ]
-        keys = [
-            (store_path / metadata.encode_chunk_key(c)).path
-            for c in itertools.product(*(i.tolist() for i in ids))
-        ]
+        inner_shape = list(inner or shard_shape)
         knobs = _read_config()
         impl = self.impl
 
@@ -330,14 +338,18 @@ class ZarrsCodecPipeline(CodecPipeline):
             if not out.size:
                 return
             handle = ChunkItems()
-            handle.push_runs(
-                keys,
-                ids,
-                [starts for starts, _ in runs],
-                [lengths for _, lengths in runs],
-                shard_shape,
-                list(inner or shard_shape),
-            )
+            # One box per shard touched: the product of each axis's runs in that shard.
+            for coords in itertools.product(*(sorted(a) for a in axes)):
+                pieces = [a[c] for a, c in zip(axes, coords, strict=True)]
+                handle.push_box(
+                    (store_path / metadata.encode_chunk_key(coords)).path,
+                    shard_shape,
+                    inner_shape,
+                    list(want),
+                    [p[0] for p in pieces],
+                    [p[1] for p in pieces],
+                    [p[2] for p in pieces],
+                )
             impl.retrieve_chunk_items_and_apply_index(handle, out, *knobs)
 
         return read
