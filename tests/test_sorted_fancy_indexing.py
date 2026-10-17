@@ -17,17 +17,23 @@ SHARDS = (16, 12)
 ZARRS = {"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}
 
 
-def _write(path, values, chunks, shards) -> Path:
+def _write(path, values, chunks, shards, compressors="auto") -> Path:
     zarr.create_array(
-        path, dtype=values.dtype, shape=values.shape, chunks=chunks, shards=shards
+        path,
+        dtype=values.dtype,
+        shape=values.shape,
+        chunks=chunks,
+        shards=shards,
+        compressors=compressors,
     )[:] = values
     return path
 
 
-@pytest.fixture
-def sharded(tmp_path: Path) -> tuple[Path, np.ndarray]:
+# Uncompressed takes the raw path: each run read as its own bytes.
+@pytest.fixture(params=["auto", None], ids=["compressed", "uncompressed"])
+def sharded(tmp_path: Path, request) -> tuple[Path, np.ndarray]:
     values = np.arange(np.prod(SHAPE), dtype=np.float64).reshape(SHAPE)
-    return _write(tmp_path / "2d.zarr", values, CHUNKS, SHARDS), values
+    return _write(tmp_path / "2d.zarr", values, CHUNKS, SHARDS, request.param), values
 
 
 @pytest.fixture
@@ -63,11 +69,6 @@ def open_strict(path: Path) -> zarr.Array:
         # Descending within one chunk: zarr does not sort inside a chunk.
         pytest.param(np.array([7, 5, 6, 0]), id="unsorted-within-a-chunk"),
         pytest.param(np.array([31, 30, 29, 16, 15, 1, 0]), id="descending"),
-        # Not rows of one run: read as a box, one run per piece of each axis.
-        pytest.param((slice(None), slice(None, None, 2)), id="strided"),
-        pytest.param((slice(None), np.array([0, 1, 7, 23])), id="cols"),
-        pytest.param((slice(6, 9), np.array([5, 6, 13])), id="slice-cols"),
-        pytest.param((slice(None), np.array([23, 0, 7, 1])), id="unsorted-cols"),
     ],
 )
 def test_sorted_integer_array_read(

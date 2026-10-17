@@ -1035,30 +1035,12 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
         && job.coords.first() == Some(&0)
         && job.coords.len() as u64 * job.run_len == elements
         && coord_runs(job.coords, job.run_len).nth(1).is_none();
+    let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
+    let whole = ArraySubset::new_with_shape(shape_u64.clone());
     if whole_unit {
-        let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
-        let slice = UnsafeCellSlice::new(&mut job.out[0][..]);
-        let mut view = unsafe {
-            // SAFETY: this view is the only writer to that piece, which `DisjointBytes` vended
-            // to this job alone and no other job can hold.
-            ArrayBytesFixedDisjointView::new(
-                slice,
-                size,
-                &shape_u64,
-                ArraySubset::new_with_shape(shape_u64.clone()),
-            )
-            .map_err(|e| e.to_string())?
-        };
-        return ctx
-            .shard
-            .inner_chain
-            .decode_into(
-                Cow::Borrowed(&bytes),
-                shape,
-                ArrayBytesDecodeIntoTarget::Fixed(&mut view),
-                &ctx.codec_options,
-            )
-            .map_err(|e| e.to_string());
+        let target = UnsafeCellSlice::new(&mut job.out[0][..]);
+        // SAFETY: `DisjointBytes` vended that piece to this job alone.
+        return unsafe { decode_into(&bytes, target, &shape_u64, whole, ctx) };
     }
     // Grow only: `decode_into` overwrites it.
     if scratch.len() < needed {
@@ -1066,29 +1048,8 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     }
     let scratch = &mut scratch[..needed];
 
-    let shape_u64: Vec<u64> = shape.iter().map(|s| s.get()).collect();
-    {
-        let slice = UnsafeCellSlice::new(&mut scratch[..]);
-        let mut view = unsafe {
-            // SAFETY: this view is the only writer to `scratch`, which this thread owns.
-            ArrayBytesFixedDisjointView::new(
-                slice,
-                size,
-                &shape_u64,
-                ArraySubset::new_with_shape(shape_u64.clone()),
-            )
-            .map_err(|e| e.to_string())?
-        };
-        ctx.shard
-            .inner_chain
-            .decode_into(
-                Cow::Borrowed(&bytes),
-                shape,
-                ArrayBytesDecodeIntoTarget::Fixed(&mut view),
-                &ctx.codec_options,
-            )
-            .map_err(|e| e.to_string())?;
-    }
+    // SAFETY: `scratch` is this thread's own.
+    unsafe { decode_into(&bytes, UnsafeCellSlice::new(&mut scratch[..]), &shape_u64, whole, ctx)? };
     gather_part(scratch, &mut job.out, job.coords, job.run_len, size)
         .map_err(|e| format!("{}: {e}", job.key))?;
     for part in &mut job.shared {
@@ -1105,12 +1066,27 @@ fn decode_into_box(
     item: &ChunkItem,
     ctx: &JobContext,
 ) -> Result<(), String> {
-    let out_box = item.out_box.as_ref().ok_or("a direct job needs an output box")?;
+    let out_box = item.out_box.clone().ok_or("a direct job needs an output box")?;
     let array_shape: Vec<u64> = item.array_shape.iter().map(|d| d.get()).collect();
+    // SAFETY: the box is this job's alone: either `DisjointBytes` vended every byte of it to
+    // this job, which dropped those pieces first, or `box_jobs` proved the boxes disjoint.
+    unsafe { decode_into(bytes, output, &array_shape, out_box, ctx) }
+}
+
+/// Decode one inner chunk into `subset` of an array of `array_shape` over `target`.
+///
+/// # Safety
+/// Nothing else may read or write the bytes of `subset` in `target` while this runs.
+unsafe fn decode_into(
+    bytes: &[u8],
+    target: UnsafeCellSlice<'_, u8>,
+    array_shape: &[u64],
+    subset: ArraySubset,
+    ctx: &JobContext,
+) -> Result<(), String> {
+    // SAFETY: passed on from the caller.
     let mut view = unsafe {
-        // SAFETY: the box is this job's alone: either `DisjointBytes` vended every byte of it to
-        // this job, which dropped those pieces first, or `box_jobs` proved the boxes disjoint.
-        ArrayBytesFixedDisjointView::new(output, ctx.element_size, &array_shape, out_box.clone())
+        ArrayBytesFixedDisjointView::new(target, ctx.element_size, array_shape, subset)
             .map_err(|e| e.to_string())?
     };
     ctx.shard

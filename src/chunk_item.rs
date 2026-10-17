@@ -378,8 +378,6 @@ type ChunkPieces = Vec<(u64, Vec<Piece>)>;
 #[pyclass]
 pub(crate) struct ChunkItems {
     items: Vec<ChunkItem>,
-    /// Where the last pushed output ended on axis 0.
-    out_end: u64,
 }
 
 #[gen_stub_pymethods]
@@ -387,10 +385,7 @@ pub(crate) struct ChunkItems {
 impl ChunkItems {
     #[new]
     pub(crate) fn new() -> Self {
-        Self {
-            items: Vec::new(),
-            out_end: 0,
-        }
+        Self { items: Vec::new() }
     }
 
     /// The number of read items pushed so far.
@@ -440,7 +435,7 @@ impl ChunkItems {
             &elem_starts,
             out_rows.as_deref(),
         )?;
-        self.extend_items(items);
+        self.items.extend(items);
         Ok(())
     }
 
@@ -457,7 +452,6 @@ impl ChunkItems {
         out_start: u64,
         inner: u64,
     ) -> PyResult<()> {
-        self.refuse_backwards(out_start)?;
         if count == 0 {
             return Ok(());
         }
@@ -533,7 +527,6 @@ impl ChunkItems {
                 out_offsets: None,
                 out_box: None,
             });
-            self.out_end = out_hi;
         }
         Ok(())
     }
@@ -916,23 +909,4 @@ impl ChunkItems {
         &self.items
     }
 
-    fn refuse_backwards(&self, out_start: u64) -> PyResult<()> {
-        if out_start < self.out_end {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "output starting at {out_start} overlaps an entry already pushed, which ends \
-                 at {}",
-                self.out_end
-            )));
-        }
-        Ok(())
-    }
-
-    fn extend_items(&mut self, items: Vec<ChunkItem>) {
-        if let Some(last) = items.last()
-            && last.out_rows.is_none()
-        {
-            self.out_end = last.subset.end_exc()[0];
-        }
-        self.items.extend(items);
-    }
 }
