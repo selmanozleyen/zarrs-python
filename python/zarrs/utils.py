@@ -451,13 +451,6 @@ def _chunk_unit_args(
     return pushes
 
 
-# ponytail: one read item per element of the run product, ~0.7 us each. Measured on one
-# 4096x4096 f32 shard with two scattered index arrays: Rust wins to 16,384 runs (28 vs 35 ms)
-# and loses from 36,864 (40 vs 35 ms). One item per inner chunk with an output offset per run
-# would remove the ceiling.
-_MAX_BOX_ITEMS = 1 << 14
-
-
 def _positions(sel: Any, extent: int) -> np.ndarray | None:
     """Every position one axis selector names, in order, or None if it is not an axis list."""
     if isinstance(sel, slice):
@@ -523,7 +516,9 @@ def _box_args(
         _axis_runs(c, o, n, m)
         for c, o, n, m in zip(chunk_sel, out_sel, chunk_shape, shape, strict=True)
     ]
-    if any(r is None for r in runs) or prod_op(len(r[0]) for r in runs) > _MAX_BOX_ITEMS:
+    # ponytail: the description is 16 bytes per run, so a read of one-element runs (a strided
+    # last axis) holds up to 4x a float32 output in coordinates while it runs.
+    if any(r is None for r in runs):
         return None
     lo, length, out = (list(column) for column in zip(*runs, strict=True))
     return [("box", byte_getter.path, chunk_shape, inner, tuple(shape), lo, length, out)]

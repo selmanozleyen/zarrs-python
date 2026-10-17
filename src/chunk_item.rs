@@ -46,6 +46,8 @@ pub(crate) struct ChunkItem {
     pub claimed_inner: (u64, u64),
     /// The output row on axis 0 of each coordinate, when they are not `subset`'s rows in order.
     pub out_rows: Option<Arc<[u64]>>,
+    /// The flat output element offset of each coordinate's run; `subset` is then unused.
+    pub out_offsets: Option<Arc<[u64]>>,
 }
 
 #[gen_stub_pymethods]
@@ -84,6 +86,7 @@ impl ChunkItem {
             run_len: 1,
             claimed_inner: (0, 0),
             out_rows: None,
+            out_offsets: None,
         })
     }
 }
@@ -353,11 +356,17 @@ pub(crate) fn build_chunk_unit_items(
             run_len,
             claimed_inner: (inner[0], row_stride),
             out_rows: rows.map(Into::into),
+            out_offsets: None,
         });
         a = b;
     }
     Ok(items)
 }
+
+/// `(shard-local lo, hi, output start)` of a run within one inner chunk.
+type Piece = (u64, u64, u64);
+/// One axis of a box: each inner chunk index touched, and its pieces.
+type ChunkPieces = Vec<(u64, Vec<Piece>)>;
 
 /// A batch of read items, built and held in Rust.
 #[gen_stub_pyclass]
@@ -516,6 +525,7 @@ impl ChunkItems {
                 run_len: rows * row_stride,
                 claimed_inner: (inner, row_stride),
                 out_rows: None,
+                out_offsets: None,
             });
             self.out_end = out_hi;
         }
@@ -635,37 +645,123 @@ impl ChunkItems {
             u64::try_from(v)
                 .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative run field {v}")))
         };
-        let mut axes: Vec<Vec<(usize, u64, u64, u64)>> = Vec::with_capacity(rank);
+        // Per axis, the pieces of each inner chunk touched: `(shard-local lo..hi, output start)`.
+        let mut axes: Vec<ChunkPieces> = Vec::with_capacity(rank);
         for k in 0..rank {
-            let (l, n, o) = (lo[k].as_array(), len[k].as_array(), out[k].as_array());
-            if l.len() != n.len() || l.len() != o.len() {
+            let (los, lens, outs) = (lo[k].as_array(), len[k].as_array(), out[k].as_array());
+            if los.len() != lens.len() || los.len() != outs.len() {
                 return Err(PyErr::new::<PyValueError, _>("one length and output per run"));
             }
             let (shard, split) = (shard_shape[k], inner[k]);
-            let mut pieces = Vec::new();
-            for ((l, n), o) in l.iter().zip(n.iter()).zip(o.iter()) {
-                let (mut s, n, o) = (u(*l)?, u(*n)?, u(*o)?);
-                let end = s.checked_add(n).filter(|end| *end <= shard).ok_or_else(|| {
+            let mut by_chunk: std::collections::BTreeMap<u64, Vec<Piece>> =
+                std::collections::BTreeMap::new();
+            for ((run_lo, run_len), run_out) in los.iter().zip(lens.iter()).zip(outs.iter()) {
+                let (mut at, count, to) = (u(*run_lo)?, u(*run_len)?, u(*run_out)?);
+                let end = at.checked_add(count).filter(|end| *end <= shard).ok_or_else(|| {
                     PyErr::new::<PyIndexError, _>(format!("a run on axis {k} is past the shard"))
                 })?;
-                if o.checked_add(n).is_none_or(|end| end > out_shape[k]) {
+                if to.checked_add(count).is_none_or(|end| end > out_shape[k]) {
                     return Err(PyErr::new::<PyIndexError, _>(format!(
                         "a run on axis {k} is past the output extent {}",
                         out_shape[k]
                     )));
                 }
-                let first = s;
+                let first = at;
                 // Split at inner chunk boundaries, so each piece is read from one inner chunk.
-                while s < end {
-                    let hi = ((s / split + 1) * split).min(end);
-                    pieces.push((0, s, hi, o + (s - first)));
-                    s = hi;
+                while at < end {
+                    let hi = ((at / split + 1) * split).min(end);
+                    by_chunk.entry(at / split).or_default().push((at, hi, to + (at - first)));
+                    at = hi;
                 }
             }
-            axes.push(pieces);
+            if by_chunk.is_empty() {
+                return Ok(());
+            }
+            axes.push(by_chunk.into_iter().collect());
         }
         let key = StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?;
-        self.push_product(&[key], &vec![1; rank], &axes, shard_shape, &inner, out_shape)
+        let strides = |shape: &[u64]| {
+            let mut strides = vec![1u64; shape.len()];
+            for k in (0..shape.len().saturating_sub(1)).rev() {
+                strides[k] = strides[k + 1] * shape[k + 1];
+            }
+            strides
+        };
+        let (in_strides, out_strides) = (strides(&inner), strides(&out_shape));
+        let num_elements = shard_shape.iter().product();
+        let claimed_inner = (inner[0], inner[1..].iter().product());
+        let array_shape = to_nonzero_u64_vec(out_shape)?;
+        let shape = to_nonzero_u64_vec(shard_shape.clone())?;
+        let last = rank - 1;
+        // One item per inner chunk and last-axis run length: every run in it is a coordinate,
+        // and each run says where in the output it goes.
+        let mut at = vec![0usize; rank];
+        loop {
+            let chunk: Vec<&(u64, Vec<Piece>)> = at.iter().zip(&axes).map(|(i, a)| &a[*i]).collect();
+            let origin: Vec<u64> = chunk.iter().zip(&inner).map(|((c, _), e)| c * e).collect();
+            // `(inner offset, output offset)` of each row: every element of the leading axes.
+            let mut rows = vec![(0u64, 0u64)];
+            for k in 0..last {
+                let mut next = Vec::new();
+                for &(io, oo) in &rows {
+                    for &(lo, hi, out) in &chunk[k].1 {
+                        for e in 0..hi - lo {
+                            next.push((
+                                io + (lo - origin[k] + e) * in_strides[k],
+                                oo + (out + e) * out_strides[k],
+                            ));
+                        }
+                    }
+                }
+                rows = next;
+            }
+            let mut by_len: std::collections::BTreeMap<u64, Vec<(u64, u64)>> =
+                std::collections::BTreeMap::new();
+            for &(lo, hi, out) in &chunk[last].1 {
+                by_len.entry(hi - lo).or_default().push((lo - origin[last], out));
+            }
+            let box_ranges: Vec<_> = origin
+                .iter()
+                .zip(&inner)
+                .zip(&shard_shape)
+                .map(|((o, e), s)| *o..(*o + *e).min(*s))
+                .collect();
+            for (run_len, runs) in by_len {
+                let mut coords = Vec::with_capacity(rows.len() * runs.len());
+                let mut offsets = Vec::with_capacity(rows.len() * runs.len());
+                for &(io, oo) in &rows {
+                    for &(l, o) in &runs {
+                        coords.push(io + l);
+                        offsets.push(oo + o);
+                    }
+                }
+                self.items.push(ChunkItem {
+                    key: key.clone(),
+                    chunk_subset: ArraySubset::new_with_ranges(&box_ranges),
+                    subset: ArraySubset::new_with_shape(vec![0; rank]),
+                    shape: shape.clone(),
+                    num_elements,
+                    array_shape: array_shape.clone(),
+                    coords: Some(coords.into()),
+                    run_len,
+                    claimed_inner,
+                    out_rows: None,
+                    out_offsets: Some(offsets.into()),
+                });
+            }
+            let mut k = rank;
+            loop {
+                if k == 0 {
+                    return Ok(());
+                }
+                k -= 1;
+                at[k] += 1;
+                if at[k] < axes[k].len() {
+                    break;
+                }
+                at[k] = 0;
+            }
+        }
     }
 }
 
@@ -718,6 +814,7 @@ impl ChunkItems {
                 run_len: runs.contiguous_elements(),
                 claimed_inner,
                 out_rows: None,
+                out_offsets: None,
             });
             let mut k = rank;
             loop {

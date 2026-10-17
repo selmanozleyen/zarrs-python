@@ -273,6 +273,28 @@ impl CodecPipelineImpl {
 /// The disjoint output pieces one item writes, in the order its coordinates fill them: offset
 /// order for a box, destination-row order for a scattered item.
 fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, usize)>> {
+    if let Some(offsets) = &item.out_offsets {
+        let too_large =
+            || PyRuntimeError::new_err(format!("{}: output offset too large", item.key));
+        let width = usize::try_from(item.run_len)
+            .ok()
+            .and_then(|r| r.checked_mul(element_size))
+            .ok_or_else(too_large)?;
+        // Runs that land back to back in the output share one piece; the gather fills pieces
+        // in coordinate order, so where one ends is where the next begins.
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for &at in offsets.iter() {
+            let at = usize::try_from(at)
+                .ok()
+                .and_then(|at| at.checked_mul(element_size))
+                .ok_or_else(too_large)?;
+            match pieces.last_mut() {
+                Some((start, len)) if *start + *len == at => *len += width,
+                _ => pieces.push((at, width)),
+            }
+        }
+        return Ok(pieces);
+    }
     let full: Vec<u64> = item.array_shape.iter().map(|d| d.get()).collect();
     let start = item.subset.start();
     let shape = item.subset.shape();
@@ -360,7 +382,14 @@ fn carve<'a>(
                 real_inner.1,
             )));
         }
-        if (coords.len() as u64).checked_mul(item.run_len) != Some(item.subset.num_elements()) {
+        let wanted = match &item.out_offsets {
+            Some(offsets) if offsets.len() == coords.len() => {
+                (offsets.len() as u64).checked_mul(item.run_len)
+            }
+            Some(_) => None,
+            None => Some(item.subset.num_elements()),
+        };
+        if (coords.len() as u64).checked_mul(item.run_len) != wanted {
             return Err(PyRuntimeError::new_err(format!(
                 "{} wants {} coordinates of {} elements but its output subset holds {}",
                 item.key,
@@ -597,6 +626,9 @@ fn coords_of(item: &ChunkItem) -> PyResult<&Arc<[u64]>> {
 
 /// Where an item's output starts, as a flat element offset. Orders jobs only.
 fn output_offset(item: &ChunkItem) -> u64 {
+    if let Some(offsets) = &item.out_offsets {
+        return offsets.iter().copied().min().unwrap_or(u64::MAX);
+    }
     let shape = bytemuck::must_cast_slice::<_, u64>(&item.array_shape);
     ravel_indices(item.subset.start(), shape).unwrap_or(u64::MAX)
 }
@@ -987,6 +1019,7 @@ mod tests {
             run_len: 1,
             claimed_inner: (0, 0),
             out_rows: None,
+            out_offsets: None,
         };
         let strided = item(&[0..2, 0..5, 0..5], &[6, 10, 10]);
         let pieces = output_pieces(&strided, 8).expect("a strided box");
