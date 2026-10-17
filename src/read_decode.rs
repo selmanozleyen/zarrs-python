@@ -281,9 +281,31 @@ fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, 
             item.key, item.subset
         )));
     }
-    let runs = item
-        .subset
-        .contiguous_linearised_indices(&full)
+    let Some(rows) = &item.out_rows else {
+        return box_pieces(item, &item.subset, &full, element_size);
+    };
+    // Scattered: the trailing box at each destination row, in coordinate order.
+    let mut row_shape = shape.to_vec();
+    row_shape[0] = 1;
+    let mut pieces = Vec::with_capacity(rows.len());
+    for &row in rows.iter() {
+        let mut row_start = start.to_vec();
+        row_start[0] = row;
+        let row_box = ArraySubset::new_with_start_shape(row_start, row_shape.clone())
+            .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", item.key)))?;
+        pieces.extend(box_pieces(item, &row_box, &full, element_size)?);
+    }
+    Ok(pieces)
+}
+
+fn box_pieces(
+    item: &ChunkItem,
+    subset: &ArraySubset,
+    full: &[u64],
+    element_size: usize,
+) -> PyResult<Vec<(usize, usize)>> {
+    let runs = subset
+        .contiguous_linearised_indices(full)
         .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", item.key)))?;
     let width = usize::try_from(runs.contiguous_elements())
         .ok()
@@ -350,13 +372,19 @@ fn carve<'a>(
     }
 
     // Pass 2: vend every piece of every item in ascending output order.
-    let mut vend: Vec<(usize, usize, usize)> = plan
+    let mut vend: Vec<(usize, usize, usize, usize)> = plan
         .iter()
-        .flat_map(|(i, pieces)| pieces.iter().map(move |&(at, len)| (at, len, *i)))
+        .flat_map(|(i, pieces)| {
+            pieces.iter().enumerate().map(move |(j, &(at, len))| (at, len, *i, j))
+        })
         .collect();
-    vend.sort_unstable_by_key(|&(at, _, _)| at);
-    let mut taken: Vec<Vec<&'a mut [u8]>> = (0..located.len()).map(|_| Vec::new()).collect();
-    for (at, len, i) in vend {
+    vend.sort_unstable_by_key(|&(at, _, _, _)| at);
+    // Slot `j` of item `i`: a scattered item's pieces are vended out of address order.
+    let mut slots: Vec<Vec<Option<&'a mut [u8]>>> = plan
+        .iter()
+        .map(|(_, pieces)| (0..pieces.len()).map(|_| None).collect())
+        .collect();
+    for (at, len, i, j) in vend {
         let Some(piece) = output.take(at, len) else {
             return Err(PyRuntimeError::new_err(format!(
                 "{} claims output bytes {at}..{}, which run backwards into a piece already \
@@ -365,8 +393,12 @@ fn carve<'a>(
                 at.saturating_add(len)
             )));
         };
-        taken[i].push(piece);
+        slots[i][j] = Some(piece);
     }
+    let mut taken: Vec<Vec<&'a mut [u8]>> = slots
+        .into_iter()
+        .map(|item| item.into_iter().map(|p| p.expect("every piece is vended or refused")).collect())
+        .collect();
 
     let mut jobs: Vec<Job<'a>> = Vec::with_capacity(located.len());
     let mut absent: Vec<&'a mut [u8]> = Vec::new();
@@ -382,14 +414,13 @@ fn carve<'a>(
             // A banded item has several pieces and takes the chunk path.
             Some(range)
                 if ctx.raw
-                    && pieces.len() == 1
+                    && (pieces.len() == 1 || item.out_rows.is_some())
                     && raw_runs(coords_of(item)?, item.run_len) <= RAW_MAX_READS =>
             {
-                let piece = pieces.into_iter().next().expect("length checked");
                 raw_row_jobs(
                     item,
                     *range,
-                    piece,
+                    pieces,
                     coords_of(item)?,
                     element_size,
                     ctx,
@@ -442,7 +473,7 @@ const RAW_MAX_READS: usize = 2;
 fn raw_row_jobs<'a>(
     item: &'a ChunkItem,
     range: ByteRange,
-    piece: &'a mut [u8],
+    pieces: Vec<&'a mut [u8]>,
     coords: &'a [u64],
     element_size: usize,
     ctx: &'a JobContext,
@@ -458,13 +489,26 @@ fn raw_row_jobs<'a>(
         .ok()
         .and_then(|r| r.checked_mul(element_size))
         .ok_or_else(|| PyRuntimeError::new_err(format!("{}: row too large", item.key)))?;
-    let mut rest = piece;
+    // One piece for the whole item, or one per row when scattered: take `span` bytes either way.
+    let mut rest: std::collections::VecDeque<&'a mut [u8]> = pieces.into();
     for run in coord_runs(coords, item.run_len) {
         let span = row_bytes
             .checked_mul(run.len())
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: run too large", item.key)))?;
-        let (run_out, tail) = rest.split_at_mut(span.min(rest.len()));
-        rest = tail;
+        let mut run_out = Vec::new();
+        let mut need = span;
+        while need > 0 {
+            let Some(piece) = rest.pop_front() else { break };
+            if piece.len() > need {
+                let (head, tail) = piece.split_at_mut(need);
+                rest.push_front(tail);
+                run_out.push(head);
+                need = 0;
+            } else {
+                need -= piece.len();
+                run_out.push(piece);
+            }
+        }
         let at = base
             .checked_add(coords[run.start] * element_size as u64)
             .ok_or_else(|| PyRuntimeError::new_err(format!("{}: offset overflow", item.key)))?;
@@ -472,7 +516,7 @@ fn raw_row_jobs<'a>(
             key: item.key.clone(),
             range: ByteRange::FromStart(at, Some(span as u64)),
             raw: true,
-            out: vec![run_out],
+            out: run_out,
             coords: &[],
             run_len: item.run_len,
             shared: Vec::new(),
@@ -484,7 +528,7 @@ fn raw_row_jobs<'a>(
         return Err(PyRuntimeError::new_err(format!(
             "{}: {} output bytes left after {} rows",
             item.key,
-            rest.len(),
+            rest.iter().map(|p| p.len()).sum::<usize>(),
             coords.len()
         )));
     }
@@ -939,6 +983,7 @@ mod tests {
             coords: None,
             run_len: 1,
             claimed_inner: (0, 0),
+            out_rows: None,
         };
         let strided = item(&[0..2, 0..5, 0..5], &[6, 10, 10]);
         let pieces = output_pieces(&strided, 8).expect("a strided box");

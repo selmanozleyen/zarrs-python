@@ -49,6 +49,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
             &[100],
             &[inner],
             &[],
+            None,
         )?;
 
         let got: Vec<_> = items
@@ -83,7 +84,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 &[0],
                 &[100],
                 &[inner],
-                &[]
+                &[], None
             )
             .is_err()
         );
@@ -97,7 +98,7 @@ fn test_chunk_unit_items_groups_by_inner_chunk() -> PyResult<()> {
                 &[0],
                 &[1],
                 &[inner],
-                &[]
+                &[], None
             )
             .is_err()
         );
@@ -124,6 +125,7 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
             vec![100],
             vec![10],
             vec![],
+            None,
         )?;
         handle.push_entry(
             "c/1",
@@ -134,6 +136,7 @@ fn test_chunk_items_handle_accumulates_across_entries() -> PyResult<()> {
             vec![100],
             vec![10],
             vec![],
+            None,
         )?;
 
         let got: Vec<_> = handle
@@ -165,6 +168,7 @@ fn test_push_entry_leaves_overlap_to_the_read() -> PyResult<()> {
             vec![100],
             vec![10],
             vec![],
+            None,
         )?;
 
         handle.push_entry(
@@ -176,6 +180,7 @@ fn test_push_entry_leaves_overlap_to_the_read() -> PyResult<()> {
             vec![100],
             vec![10],
             vec![],
+            None,
         )?;
         handle.push_entry(
             "c/1",
@@ -186,6 +191,7 @@ fn test_push_entry_leaves_overlap_to_the_read() -> PyResult<()> {
             vec![100],
             vec![10],
             vec![],
+            None,
         )?;
         assert_eq!(handle.as_slice().len(), 4);
         Ok(())
@@ -212,6 +218,7 @@ fn test_chunk_unit_items_rank_two_takes_columns_whole() -> PyResult<()> {
             &[12, cols],
             &[inner, cols],
             &[0],
+            None,
         )?;
 
         let got: Vec<_> = items
@@ -265,6 +272,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             &[10, 2],
             &[4, 3],
             &[0],
+            None,
         );
         assert!(
             narrower.is_ok(),
@@ -280,6 +288,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             &[10, 2, 5],
             &[4, 4, 10],
             &[0, 0],
+            None,
         );
         assert!(strided.is_err(), "a strided trailing box must be refused");
         // A run that walks off the end of its own row.
@@ -292,6 +301,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             &[10, 1, 4],
             &[4, 4, 10],
             &[0, 8],
+            None,
         );
         assert!(
             wraps.is_err(),
@@ -306,6 +316,7 @@ fn test_chunk_unit_items_refuses_mismatched_trailing_axes() -> PyResult<()> {
             &[10, 2],
             &[4],
             &[0],
+            None,
         );
         assert!(ranks.is_err());
         Ok(())

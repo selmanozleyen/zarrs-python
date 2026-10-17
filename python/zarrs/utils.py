@@ -270,6 +270,30 @@ def _chunk_unit_args(
         return None
     if any(int(v) <= 0 for v in inner_shape):
         return None
+    # zarr groups an unsorted index array by chunk but keeps the caller's order within it, as
+    # an output index array. Sort the chunk's indices; Rust writes each row to its output row.
+    out_rows = None
+    chunk_raw, out_raw = _as_selector_tuples(chunk_selection, out_selection)
+    if (
+        chunk_raw
+        and isinstance(chunk_raw[0], np.ndarray)
+        and chunk_raw[0].ndim == 1
+        and isinstance(out_raw[0], np.ndarray)
+        and out_raw[0].shape == chunk_raw[0].shape
+        and out_raw[0].dtype.kind in "iu"
+    ):
+        order = np.argsort(chunk_raw[0], kind="stable")
+        out_rows = out_raw[0][order].astype(np.int64, copy=False)
+        if isinstance(out_selection, np.ndarray):
+            # A coordinate read: every index array pairs element for element with the output.
+            chunk_selection = tuple(
+                s[order] if isinstance(s, np.ndarray) and s.shape == order.shape else s
+                for s in chunk_raw
+            )
+            out_selection = slice(0, order.size)
+        else:
+            chunk_selection = (chunk_raw[0][order], *chunk_raw[1:])
+            out_selection = (slice(0, order.size), *out_raw[1:])
     chunk_sel_raw, out_sel_raw = _as_selector_tuples(chunk_selection, out_selection)
     # zarr drops a scalar axis from the output without saying so in `drop_axes`; put it back
     # as an extent of one.
@@ -330,7 +354,7 @@ def _chunk_unit_args(
         and int(widths[axis - 1]) == int(shape[axis]) == int(chunk_spec.shape[axis])
         for axis in range(1, rank)
     )
-    if isinstance(indices, slice):
+    if isinstance(indices, slice) and out_rows is None:
         span = _step1_span(indices, chunk_spec.shape[0])
         if span is None:
             return None
@@ -365,7 +389,7 @@ def _chunk_unit_args(
     if not _output_run_matches(indices, out_axis_sel):
         return None
     # Long runs of consecutive indices, as a CSR row read gives, go as spans.
-    if whole and (runs := _index_runs(indices)) is not None:
+    if out_rows is None and whole and (runs := _index_runs(indices)) is not None:
         return [
             (
                 "span",
@@ -401,6 +425,7 @@ def _chunk_unit_args(
                 (int(shape[0]), *band_widths),
                 tuple(int(v) for v in inner_shape),
                 tuple(int(v) for v in band_starts),
+                out_rows,
             )
         )
     return pushes

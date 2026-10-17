@@ -54,6 +54,15 @@ def open_strict(path: Path) -> zarr.Array:
         pytest.param(np.arange(0, 32), id="every-row"),
         pytest.param(np.array([3, 3, 3]), id="all-repeats"),
         pytest.param(np.array([0, 0, 1, 2, 2]), id="repeats-either-side-of-a-run"),
+        # Unsorted: read in storage order, then scattered to the caller's order.
+        pytest.param(np.array([9, 2]), id="unsorted-rows-one-shard"),
+        pytest.param(np.array([30, 0, 17, 5, 4, 3]), id="unsorted-rows"),
+        pytest.param((np.array([20, 2, 3]), slice(4, 18)), id="unsorted-rows-slice"),
+        pytest.param((np.array([29, 4, 6, 5]), 7), id="unsorted-rows-int"),
+        pytest.param(np.array([3, 0, 3, 1]), id="unsorted-repeats"),
+        # Descending within one chunk: zarr keeps the caller's order inside a chunk.
+        pytest.param(np.array([7, 5, 6, 0]), id="unsorted-within-a-chunk"),
+        pytest.param(np.array([31, 30, 29, 16, 15, 1, 0]), id="descending"),
     ],
 )
 def test_sorted_integer_array_read(
@@ -75,7 +84,6 @@ def test_sorted_vindex_1d(sharded_1d: tuple[Path, np.ndarray]) -> None:
 @pytest.mark.parametrize(
     "index",
     [
-        pytest.param(np.array([9, 2]), id="unsorted-rows"),
         pytest.param((np.array([1, 3]), np.array([0, 2])), id="two-array-axes"),
         pytest.param((slice(None), slice(None, None, 2)), id="strided"),
         # A column index array is not a step-1 slice on the trailing axis.

@@ -536,7 +536,8 @@ def _described(args) -> list[tuple[int, int]]:
             for k in range(count)
             for j in range(row)
         ]
-    _, _key, chunk_shape, shape, indices, out_starts, out_widths, _inner, starts = args
+    _, _key, chunk_shape, shape, indices, out_starts, out_widths, _inner, starts, out_rows = args
+    assert out_rows is None, "these cases are sorted, so nothing is scattered"
     row, out_row = prod(chunk_shape[1:]), prod(shape[1:])
     src_offset = _fold(starts, chunk_shape[1:])
     dst_offset = _fold(out_starts[1:], shape[1:])
@@ -680,10 +681,8 @@ def test_a_kept_constant_column_axis_is_not_rebuilt(tmp_path: Path, cols) -> Non
     np.testing.assert_array_equal(got, values[np.ix_(rows, cols)])
 
 
-def test_a_bare_ndarray_selector_is_declined_not_mis_described(tmp_path: Path) -> None:
+def test_a_bare_ndarray_selector_is_served_not_mis_described(tmp_path: Path) -> None:
     """An out-of-order index on a rank-1 array arrives as a bare ndarray, not a tuple."""
-    from zarrs.utils import DiscontiguousArrayError
-
     values = np.arange(8, dtype=np.float32)
     path = tmp_path / "bare.zarr"
     zarr.create_array(path, dtype=values.dtype, shape=values.shape, chunks=(4,))[:] = (
@@ -694,11 +693,8 @@ def test_a_bare_ndarray_selector_is_declined_not_mis_described(tmp_path: Path) -
     with zarr.config.set(CHUNK_UNIT):
         np.testing.assert_array_equal(zarr.open_array(path, mode="r")[idx], values[idx])
 
-    with (
-        zarr.config.set({**CHUNK_UNIT, "codec_pipeline.strict": True}),
-        pytest.raises(DiscontiguousArrayError),
-    ):
-        zarr.open_array(path, mode="r")[idx]
+    with zarr.config.set({**CHUNK_UNIT, "codec_pipeline.strict": True}):
+        np.testing.assert_array_equal(zarr.open_array(path, mode="r")[idx], values[idx])
 
 
 def test_a_row_of_an_array_wider_than_one_shard(tmp_path: Path) -> None:

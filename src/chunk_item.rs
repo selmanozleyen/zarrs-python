@@ -44,6 +44,8 @@ pub(crate) struct ChunkItem {
     pub run_len: u64,
     /// `(axis-0 extent, row stride)` of the inner chunk `coords` were built against.
     pub claimed_inner: (u64, u64),
+    /// The output row on axis 0 of each coordinate, when they are not `subset`'s rows in order.
+    pub out_rows: Option<Arc<[u64]>>,
 }
 
 #[gen_stub_pymethods]
@@ -81,6 +83,7 @@ impl ChunkItem {
             coords: None,
             run_len: 1,
             claimed_inner: (0, 0),
+            out_rows: None,
         })
     }
 }
@@ -196,6 +199,8 @@ pub(crate) fn build_chunk_unit_items(
     inner: &[u64],
     // Shard-relative start of the band on each trailing axis.
     elem_starts: &[u64],
+    // The output row of each index, when they are not `out_starts[0]` onwards in order.
+    out_rows: Option<&[u64]>,
 ) -> PyResult<Vec<ChunkItem>> {
     if chunk_shape.is_empty() || inner.len() != chunk_shape.len() {
         return Err(PyErr::new::<PyValueError, _>(format!(
@@ -229,6 +234,14 @@ pub(crate) fn build_chunk_unit_items(
     let n = indices.len();
     if n == 0 {
         return Ok(Vec::new());
+    }
+    if let Some(rows) = out_rows
+        && rows.len() != n
+    {
+        return Err(PyErr::new::<PyValueError, _>(format!(
+            "one output row per index is needed: {} for {n} indices",
+            rows.len()
+        )));
     }
     let within: Vec<u64> = elem_starts
         .iter()
@@ -289,9 +302,21 @@ pub(crate) fn build_chunk_unit_items(
                 at(b - 1)?
             )));
         }
-        let out_lo = out_starts[0] + a as u64;
-        let out_hi = out_starts[0] + b as u64;
-        if out_hi > out_extent {
+        let rows = out_rows.map(|rows| &rows[a..b]);
+        // Scattered rows: `subset` keeps the count and an ordering key; the rows say where.
+        let out_lo = match rows {
+            Some(rows) => {
+                if let Some(&row) = rows.iter().find(|&&row| row >= out_extent) {
+                    return Err(PyErr::new::<PyIndexError, _>(format!(
+                        "output row {row} is past the output extent {out_extent}",
+                    )));
+                }
+                rows.iter().copied().min().unwrap_or(0)
+            }
+            None => out_starts[0] + a as u64,
+        };
+        let out_hi = out_lo + (b - a) as u64;
+        if rows.is_none() && out_hi > out_extent {
             return Err(PyErr::new::<PyIndexError, _>(format!(
                 "output subset {out_lo}..{out_hi} is past the output extent {out_extent}",
             )));
@@ -327,6 +352,7 @@ pub(crate) fn build_chunk_unit_items(
             ),
             run_len,
             claimed_inner: (inner[0], row_stride),
+            out_rows: rows.map(Into::into),
         });
         a = b;
     }
@@ -361,7 +387,8 @@ impl ChunkItems {
     /// Push one batch entry: sorted `indices` on axis 0 and a contiguous box on the others.
     ///
     /// `shape` must be the output buffer's real extent; it is not checked.
-    #[pyo3(signature = (key, chunk_shape, shape, indices, out_starts, out_widths, inner, elem_starts=Vec::new()))]
+    /// `out_rows`, if given, is the output row of each index; they need not be in order.
+    #[pyo3(signature = (key, chunk_shape, shape, indices, out_starts, out_widths, inner, elem_starts=Vec::new(), out_rows=None))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub(crate) fn push_entry(
         &mut self,
@@ -373,7 +400,20 @@ impl ChunkItems {
         out_widths: Vec<u64>,
         inner: Vec<u64>,
         elem_starts: Vec<u64>,
+        out_rows: Option<PyReadonlyArray1<'_, i64>>,
     ) -> PyResult<()> {
+        let out_rows = out_rows
+            .map(|rows| {
+                rows.as_array()
+                    .iter()
+                    .map(|&row| {
+                        u64::try_from(row).map_err(|_| {
+                            PyErr::new::<PyValueError, _>(format!("output row {row} is negative"))
+                        })
+                    })
+                    .collect::<PyResult<Vec<u64>>>()
+            })
+            .transpose()?;
         // Overlap is refused when the output is carved: bands of one entry share an axis-0 start.
         let items = build_chunk_unit_items(
             key,
@@ -384,6 +424,7 @@ impl ChunkItems {
             &out_widths,
             &inner,
             &elem_starts,
+            out_rows.as_deref(),
         )?;
         self.extend_items(items);
         Ok(())
@@ -474,6 +515,7 @@ impl ChunkItems {
                 coords: Some(vec![(span_lo - lo) * row_stride].into()),
                 run_len: rows * row_stride,
                 claimed_inner: (inner, row_stride),
+                out_rows: None,
             });
             self.out_end = out_hi;
         }
@@ -595,6 +637,7 @@ impl ChunkItems {
                 coords: Some(runs.iter().map(|(i, _)| i).collect()),
                 run_len: runs.contiguous_elements(),
                 claimed_inner,
+                out_rows: None,
             });
             let mut k = rank;
             loop {
@@ -629,7 +672,9 @@ impl ChunkItems {
     }
 
     fn extend_items(&mut self, items: Vec<ChunkItem>) {
-        if let Some(last) = items.last() {
+        if let Some(last) = items.last()
+            && last.out_rows.is_none()
+        {
             self.out_end = last.subset.end_exc()[0];
         }
         self.items.extend(items);
