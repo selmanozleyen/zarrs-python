@@ -498,11 +498,20 @@ def _box_args(
     list of runs, and the item is their product. A coordinate read is not orthogonal.
     """
     byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
-    if drop_axes or inner_shape is None or isinstance(out_selection, np.ndarray):
+    if inner_shape is None or not isinstance(out_selection, tuple):
         return None
-    chunk_selection, out_selection, shape = _restore_dropped_axes(
-        chunk_spec, chunk_selection, out_selection, shape
-    )
+    if drop_axes:
+        # A scalar on an orthogonal axis: zarr leaves the axis out of the output. Extent one
+        # does not move a byte, so put it back.
+        out_selection, shape = list(out_selection), list(shape)
+        for axis in sorted(drop_axes):
+            out_selection.insert(axis, slice(0, 1))
+            shape.insert(axis, 1)
+        out_selection, shape = tuple(out_selection), tuple(shape)
+    else:
+        chunk_selection, out_selection, shape = _restore_dropped_axes(
+            chunk_spec, chunk_selection, out_selection, shape
+        )
     chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
     chunk_shape = tuple(int(s) for s in chunk_spec.shape)
     inner = tuple(int(s) for s in inner_shape) or chunk_shape

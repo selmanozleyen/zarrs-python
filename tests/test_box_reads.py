@@ -79,3 +79,24 @@ def test_unsorted_rows_on_the_raw_path(tmp_path: Path, rows: list[int]) -> None:
     with zarr.config.set(STRICT):
         got = zarr.open_array(path, mode="r")[np.array(rows)]
     np.testing.assert_array_equal(got, values[rows])
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        pytest.param((np.array([1, 20, 9]), 3), id="rows-scalar"),
+        pytest.param((5, np.array([30, 2, 7])), id="scalar-cols"),
+        pytest.param((np.array([40, 3]), slice(2, 40, 5)), id="rows-strided"),
+    ],
+)
+def test_oindex_with_a_scalar_axis(tmp_path: Path, index: object) -> None:
+    """zarr reports the scalar's axis in `drop_axes`; the box puts it back as extent one."""
+    values = np.arange(64 * 48, dtype=np.float64).reshape(64, 48)
+    path = tmp_path / "scalar.zarr"
+    zarr.create_array(
+        path, dtype=values.dtype, shape=values.shape, chunks=(8, 6), shards=(16, 12)
+    )[:] = values
+    rows, cols = (np.arange(n)[i] for i, n in zip(index, values.shape, strict=True))
+    with zarr.config.set(STRICT):
+        got = zarr.open_array(path, mode="r").oindex[index]
+    np.testing.assert_array_equal(got, values[np.ix_(np.atleast_1d(rows), np.atleast_1d(cols))].reshape(got.shape))
