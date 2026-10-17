@@ -10,11 +10,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.27.1", features = ["abi3-py311"] }
-# The zarrs commit the run-selection builds pin, so a comparison against them differs only in
-# zarrs-python. Upstream zarrs main 2026-08-23 (c17fe374) plus three read-side direct_io fixes.
+# TODO: zarrs 0.24 from crates.io; drop this rev and the zarrs_storage patch below together.
 zarrs = { git = "https://github.com/selmanozleyen/zarrs", rev = "1e81e6b5ceb176b3d79f5d38510ac4debd7eb284", features = ["async", "zlib", "pcodec", "bz2"] }
 rayon_iter_concurrent_limit = "0.2.0"
 rayon = "1.10.0"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+libc = "0.2"
 # fix for https://stackoverflow.com/questions/76593417/package-openssl-was-not-found-in-the-pkg-config-search-path
 openssl = { version = "0.10", features = ["vendored"] }
 numpy = "0.27.0"

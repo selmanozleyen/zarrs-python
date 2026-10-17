@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypedDict
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, TypedDict
 from warnings import warn
 
 import numpy as np
@@ -14,7 +16,7 @@ from zarr.core.config import config
 from zarr.core.metadata import ArrayMetadata, ArrayV2Metadata, ArrayV3Metadata
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from typing import Self
 
     from zarr.abc.store import ByteGetter, ByteSetter, Store
@@ -23,12 +25,14 @@ if TYPE_CHECKING:
     from zarr.core.chunk_grids import ChunkGrid
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
+    from zarr.storage import StorePath
 
-from ._internal import CodecPipelineImpl
+from ._internal import ChunkItems, CodecPipelineImpl
 from .utils import (
     DiscontiguousArrayError,
     FillValueNoneError,
     UnsupportedVIndexingError,
+    chunk_info_for_read,
     make_chunk_info_for_rust_with_indices,
 )
 
@@ -39,6 +43,28 @@ class UnsupportedDataTypeError(Exception):
 
 class UnsupportedMetadataError(Exception):
     pass
+
+
+class UnsupportedRangeReadError(Exception):
+    pass
+
+
+FALLBACK_TO_ZARR_PYTHON = (
+    UnsupportedMetadataError,
+    DiscontiguousArrayError,
+    UnsupportedVIndexingError,
+    UnsupportedDataTypeError,
+    FillValueNoneError,
+)
+
+
+def _read_config() -> tuple[int | None, int | None, bool, int | None]:
+    return (
+        config.get("codec_pipeline.read_workers", None),
+        config.get("codec_pipeline.decode_workers", None),
+        config.get("codec_pipeline.strict", False),
+        config.get("codec_pipeline.read_ahead_bytes", None),
+    )
 
 
 def get_codec_pipeline_impl(
@@ -100,6 +126,22 @@ def array_metadata_to_codecs(metadata: ArrayMetadata) -> list[Codec]:
         return [v2_codec]
 
 
+def _shards_touched(
+    starts: np.ndarray, lengths: np.ndarray, size: int
+) -> np.ndarray:
+    """The ascending ids of the shards of extent `size` that the runs touch."""
+    keep = lengths > 0
+    starts, lengths = starts[keep], lengths[keep]
+    first, last = starts // size, (starts + lengths - 1) // size
+    ids = np.union1d(first, last)
+    if (wide := last - first > 1).any():
+        between = [
+            np.arange(f + 1, l) for f, l in zip(first[wide], last[wide], strict=True)
+        ]
+        ids = np.union1d(ids, np.concatenate(between))
+    return ids.astype(np.int64)
+
+
 @dataclass
 class ZarrsCodecPipeline(CodecPipeline):
     metadata: ArrayMetadata
@@ -135,6 +177,14 @@ class ZarrsCodecPipeline(CodecPipeline):
             impl=get_codec_pipeline_impl(array_metadata, store, strict=strict),
             python_impl=get_codec_pipeline_fallback(array_metadata, strict=strict),
         )
+
+    @cached_property
+    def _inner_chunk_shape(self) -> tuple[int, ...] | None:
+        """The inner chunk shape, `()` if unsharded, `None` if the read path does not serve it."""
+        if self.impl is None:
+            return None
+        shape = self.impl.inner_chunk_shape()
+        return None if shape is None else tuple(shape)
 
     @property
     def supports_partial_decode(self) -> bool:
@@ -182,16 +232,10 @@ class ZarrsCodecPipeline(CodecPipeline):
             if self.impl is None:
                 raise UnsupportedMetadataError()
             self._raise_error_on_unsupported_batch_dtype(batch_info)
-            chunks_desc = make_chunk_info_for_rust_with_indices(
-                batch_info, drop_axes, out.shape
+            chunks_desc = chunk_info_for_read(
+                batch_info, drop_axes, out.shape, self._inner_chunk_shape
             )
-        except (
-            UnsupportedMetadataError,
-            DiscontiguousArrayError,
-            UnsupportedVIndexingError,
-            UnsupportedDataTypeError,
-            FillValueNoneError,
-        ):
+        except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
             await self.python_impl.read(batch_info, out, drop_axes)
@@ -199,11 +243,106 @@ class ZarrsCodecPipeline(CodecPipeline):
         else:
             out: NDArrayLike = out.as_ndarray_like()
             await asyncio.to_thread(
-                self.impl.retrieve_chunks_and_apply_index,
+                self.impl.retrieve_chunk_items_and_apply_index,
                 chunks_desc.chunk_info_with_indices,
                 out,
+                *_read_config(),
             )
             return None
+
+    async def read_runs(
+        self,
+        store_path: StorePath,
+        metadata: ArrayMetadata,
+        runs: tuple[tuple[np.ndarray, np.ndarray], ...],
+        out: NDBuffer | np.ndarray,
+        **kwargs: Any,
+    ) -> None:
+        """Read the product of runs on every axis into `out`, or defer to zarr's default."""
+        buffer = out.as_ndarray_like() if hasattr(out, "as_ndarray_like") else out
+        try:
+            read = self.plan_runs(store_path, metadata, runs, buffer)
+        except UnsupportedRangeReadError:
+            await super().read_runs(store_path, metadata, runs, out, **kwargs)
+            return
+        await asyncio.to_thread(read)
+
+    def plan_runs(
+        self,
+        store_path: StorePath,
+        metadata: ArrayMetadata,
+        runs: tuple[tuple[np.ndarray, np.ndarray], ...],
+        out: np.ndarray,
+    ) -> Callable[[], None]:
+        """Check the read now and return a call that does it.
+
+        Raises `UnsupportedRangeReadError`, before anything is read, for an array not served.
+        """
+        inner = self._inner_chunk_shape
+        grid = getattr(metadata, "chunk_grid", None)
+        shape = tuple(int(v) for v in metadata.shape)
+        if (
+            self.impl is None
+            or inner is None
+            or not shape
+            or not hasattr(grid, "chunk_shape")
+        ):
+            raise UnsupportedRangeReadError(
+                "a chunked array with a regular grid is needed"
+            )
+        dtype = metadata.dtype.to_native_dtype()
+        if dtype.kind in {"V", "S", "U", "M", "m", "O", "T"} or not dtype.isnative:
+            raise UnsupportedRangeReadError(f"dtype {dtype} is not served")
+        if not out.flags.c_contiguous:
+            raise UnsupportedRangeReadError("out must be C contiguous")
+        if len(runs) != len(shape):
+            raise ValueError(
+                f"one (starts, lengths) pair per axis is needed: {len(runs)} for {len(shape)}"
+            )
+        runs = [
+            (np.asarray(s, dtype=np.int64), np.asarray(n, dtype=np.int64))
+            for s, n in runs
+        ]
+        for axis, ((starts, lengths), size) in enumerate(zip(runs, shape, strict=True)):
+            if starts.ndim != 1 or starts.shape != lengths.shape:
+                raise ValueError("starts and lengths must be 1-D and the same length")
+            if (lengths < 0).any() or (starts < 0).any() or (starts + lengths > size).any():
+                raise IndexError(
+                    f"a run falls outside axis {axis}, which has {size} elements"
+                )
+        want = tuple(int(lengths.sum()) for _, lengths in runs)
+        if out.shape != want or out.dtype != dtype:
+            raise ValueError(
+                f"out must be a {dtype} array of shape {want}, not {out.dtype} {out.shape}"
+            )
+        shard_shape = [int(v) for v in grid.chunk_shape]
+        ids = [
+            _shards_touched(starts, lengths, size)
+            for (starts, lengths), size in zip(runs, shard_shape, strict=True)
+        ]
+        keys = [
+            (store_path / metadata.encode_chunk_key(c)).path
+            for c in itertools.product(*(i.tolist() for i in ids))
+        ]
+        knobs = _read_config()
+        impl = self.impl
+
+        def read() -> None:
+            if not out.size:
+                return
+            handle = ChunkItems()
+            # One call for every shard: Rust splits the runs per shard and per inner chunk.
+            handle.push_runs(
+                keys,
+                ids,
+                [starts for starts, _ in runs],
+                [lengths for _, lengths in runs],
+                shard_shape,
+                list(inner or shard_shape),
+            )
+            impl.retrieve_chunk_items_and_apply_index(handle, out, *knobs)
+
+        return read
 
     async def write(
         self,
@@ -220,13 +359,7 @@ class ZarrsCodecPipeline(CodecPipeline):
             chunks_desc = make_chunk_info_for_rust_with_indices(
                 batch_info, drop_axes, value.shape
             )
-        except (
-            UnsupportedMetadataError,
-            DiscontiguousArrayError,
-            UnsupportedVIndexingError,
-            UnsupportedDataTypeError,
-            FillValueNoneError,
-        ):
+        except FALLBACK_TO_ZARR_PYTHON:
             if self.python_impl is None:
                 raise
             await self.python_impl.write(batch_info, value, drop_axes)
