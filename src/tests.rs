@@ -238,3 +238,49 @@ fn test_push_box_folds_whole_trailing_axes_into_the_run() -> PyResult<()> {
         Ok(())
     })
 }
+
+/// Runs over two shards in one call: each piece lands in its shard's key, at its place in
+/// the output, the shards' boxes built the way `push_box` builds one.
+#[test]
+fn test_push_runs_splits_runs_per_shard_in_one_call() -> PyResult<()> {
+    use numpy::{PyArray1, PyArrayMethods as _};
+
+    Python::initialize();
+    Python::attach(|py| {
+        let a = |v: &[i64]| PyArray1::from_slice(py, v).readonly();
+        let mut handle = crate::chunk_item::ChunkItems::new();
+        // Shards of 8 x 8 in inner chunks of 4 x 4. Rows 6..10 cross the shard seam at 8;
+        // columns 9..11 are in shard 1. Output is 4 x 2.
+        handle.push_runs(
+            vec!["c/0/1".to_string(), "c/1/1".to_string()],
+            vec![a(&[0, 1]), a(&[1])],
+            vec![a(&[6]), a(&[9])],
+            vec![a(&[4]), a(&[2])],
+            vec![8, 8],
+            vec![4, 4],
+        )?;
+        let got: Vec<_> = handle
+            .as_slice()
+            .iter()
+            .map(|i| {
+                (
+                    i.key.as_str(),
+                    i.chunk_subset.start().to_vec(),
+                    i.coords.as_ref().unwrap().to_vec(),
+                    i.out_offsets.as_ref().unwrap().to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                // Shard 0, inner chunk rows 4..8: rows 6, 7 at columns 1..3 -> output rows 0, 1.
+                ("c/0/1", vec![4, 0], vec![9, 13], vec![0, 2]),
+                // Shard 1, inner chunk rows 0..4: rows 0, 1 -> output rows 2, 3.
+                ("c/1/1", vec![0, 0], vec![1, 5], vec![4, 6]),
+            ]
+        );
+        Ok(())
+    })
+}
+

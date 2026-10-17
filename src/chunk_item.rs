@@ -192,36 +192,119 @@ impl ChunkItems {
             }
             axes.push(pieces);
         }
-        let layout = BoxLayout {
-            key: StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?,
-            in_strides: c_strides(&inner),
-            out_strides: c_strides(&out_shape),
-            num_elements: shard_shape.iter().product(),
-            claimed_inner: (inner[0], inner[1..].iter().product()),
-            array_shape: to_nonzero_u64_vec(out_shape)?,
-            shape: to_nonzero_u64_vec(shard_shape.clone())?,
-            shard_shape,
-            inner,
-        };
-        // An odometer over the inner chunks touched, last axis fastest.
+        let layout = BoxLayout::new(key, shard_shape, inner, out_shape)?;
+        self.push_shard(&layout, &axes.iter().collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// Push the product of runs on every axis, each axis's runs back to back in the output,
+    /// across every shard they touch, in one call. `shard_ids[k]` ascends and names the shards
+    /// touched on axis `k`; `keys` are their product in C order.
+    #[pyo3(signature = (keys, shard_ids, starts, lengths, shard_shape, inner))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn push_runs(
+        &mut self,
+        keys: Vec<String>,
+        shard_ids: Vec<PyReadonlyArray1<'_, i64>>,
+        starts: Vec<PyReadonlyArray1<'_, i64>>,
+        lengths: Vec<PyReadonlyArray1<'_, i64>>,
+        shard_shape: Vec<u64>,
+        inner: Vec<u64>,
+    ) -> PyResult<()> {
+        let rank = shard_shape.len();
+        if rank == 0 || [shard_ids.len(), starts.len(), lengths.len(), inner.len()] != [rank; 4] {
+            return Err(PyErr::new::<PyValueError, _>(
+                "one shard id array, run pair and inner extent per axis",
+            ));
+        }
+        if shard_shape.iter().chain(&inner).any(|d| *d == 0) {
+            return Err(PyErr::new::<PyValueError, _>(
+                "shard and inner extents must be non-zero",
+            ));
+        }
+        // Per axis: each shard touched (its position among `shard_ids`) and its inner pieces.
+        let mut axes: Vec<Vec<(usize, ChunkPieces)>> = Vec::with_capacity(rank);
+        let mut out_shape = Vec::with_capacity(rank);
+        for k in 0..rank {
+            let ids = shard_ids[k].as_slice().map_err(|_| {
+                PyErr::new::<PyValueError, _>("the shard id arrays must be contiguous")
+            })?;
+            let (s_arr, n_arr) = (starts[k].as_array(), lengths[k].as_array());
+            if s_arr.len() != n_arr.len() {
+                return Err(PyErr::new::<PyValueError, _>("one length per start"));
+            }
+            let shard = shard_shape[k];
+            let mut by_shard: std::collections::BTreeMap<u64, Vec<(u64, u64, u64)>> =
+                std::collections::BTreeMap::new();
+            let mut out = 0u64;
+            for (s, n) in s_arr.iter().zip(n_arr.iter()) {
+                let (mut at, n) = (non_negative(*s)?, non_negative(*n)?);
+                let end = at.checked_add(n).ok_or_else(|| {
+                    PyErr::new::<PyValueError, _>("a run is too long to address")
+                })?;
+                // Split at shard boundaries; each piece keeps its place in the output.
+                while at < end {
+                    let id = at / shard;
+                    let hi = ((id + 1) * shard).min(end);
+                    by_shard.entry(id).or_default().push((at - id * shard, hi - at, out));
+                    (out, at) = (out + hi - at, hi);
+                }
+            }
+            out_shape.push(out);
+            let mut per_shard = Vec::with_capacity(by_shard.len());
+            for (id, runs) in by_shard {
+                let pos = i64::try_from(id)
+                    .ok()
+                    .and_then(|id| ids.binary_search(&id).ok())
+                    .ok_or_else(|| {
+                        PyErr::new::<PyIndexError, _>(format!(
+                            "no key given for shard {id} of axis {k}"
+                        ))
+                    })?;
+                per_shard.push((pos, split_runs(k, runs, shard, inner[k], u64::MAX)?));
+            }
+            axes.push(per_shard);
+        }
+        let id_counts: Vec<usize> = shard_ids.iter().map(|ids| ids.as_array().len()).collect();
+        if keys.len() != id_counts.iter().product::<usize>() {
+            return Err(PyErr::new::<PyValueError, _>(
+                "one key per shard in the product of the shard ids",
+            ));
+        }
+        if axes.iter().any(Vec::is_empty) {
+            return Ok(());
+        }
+        // An odometer over the shards touched; each is one box of the selection.
         let mut at = vec![0usize; rank];
         loop {
-            let chunk: Vec<&(u64, Vec<Piece>)> = at.iter().zip(&axes).map(|(i, a)| &a[*i]).collect();
-            self.push_inner_chunk(&layout, &chunk);
-            let mut k = rank;
-            loop {
-                if k == 0 {
-                    return Ok(());
-                }
-                k -= 1;
-                at[k] += 1;
-                if at[k] < axes[k].len() {
-                    break;
-                }
-                at[k] = 0;
+            let shard: Vec<&(usize, ChunkPieces)> =
+                at.iter().zip(&axes).map(|(i, a)| &a[*i]).collect();
+            let key = shard.iter().zip(&id_counts).fold(0, |acc, ((p, _), c)| acc * c + p);
+            let layout =
+                BoxLayout::new(&keys[key], shard_shape.clone(), inner.clone(), out_shape.clone())?;
+            let pieces: Vec<&ChunkPieces> = shard.iter().map(|(_, p)| p).collect();
+            self.push_shard(&layout, &pieces);
+            if !advance(&mut at, &axes.iter().map(Vec::len).collect::<Vec<_>>()) {
+                return Ok(());
             }
         }
     }
+}
+
+/// Step an odometer over `lens` (last axis fastest); false once it has wrapped.
+fn advance(at: &mut [usize], lens: &[usize]) -> bool {
+    for k in (0..at.len()).rev() {
+        at[k] += 1;
+        if at[k] < lens[k] {
+            return true;
+        }
+        at[k] = 0;
+    }
+    false
+}
+
+fn non_negative(v: i64) -> PyResult<u64> {
+    u64::try_from(v).map_err(|_| PyErr::new::<PyValueError, _>(format!("negative run field {v}")))
 }
 
 /// What every item of one `push_box` call shares.
@@ -237,6 +320,22 @@ struct BoxLayout {
     shape: Vec<NonZeroU64>,
 }
 
+impl BoxLayout {
+    fn new(key: &str, shard_shape: Vec<u64>, inner: Vec<u64>, out_shape: Vec<u64>) -> PyResult<Self> {
+        Ok(Self {
+            key: StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?,
+            in_strides: c_strides(&inner),
+            out_strides: c_strides(&out_shape),
+            num_elements: shard_shape.iter().product(),
+            claimed_inner: (inner[0], inner[1..].iter().product()),
+            array_shape: to_nonzero_u64_vec(out_shape)?,
+            shape: to_nonzero_u64_vec(shard_shape.clone())?,
+            shard_shape,
+            inner,
+        })
+    }
+}
+
 /// C-order element strides of `shape`.
 fn c_strides(shape: &[u64]) -> Vec<u64> {
     let mut strides = vec![1u64; shape.len()];
@@ -246,8 +345,7 @@ fn c_strides(shape: &[u64]) -> Vec<u64> {
     strides
 }
 
-/// One axis's runs `(lo, len, out)`, checked against the shard and the output, and split at
-/// inner chunk boundaries: each inner chunk touched, in order, with its pieces.
+/// One axis's runs from numpy `(lo, len, out)` arrays; see `split_runs`.
 fn split_axis_runs(
     axis: usize,
     (lo, len, out): (
@@ -263,14 +361,27 @@ fn split_axis_runs(
     if los.len() != lens.len() || los.len() != outs.len() {
         return Err(PyErr::new::<PyValueError, _>("one length and output per run"));
     }
-    let u = |v: i64| {
-        u64::try_from(v)
-            .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative run field {v}")))
-    };
+    let runs = los
+        .iter()
+        .zip(lens.iter())
+        .zip(outs.iter())
+        .map(|((l, n), o)| Ok((non_negative(*l)?, non_negative(*n)?, non_negative(*o)?)))
+        .collect::<PyResult<Vec<_>>>()?;
+    split_runs(axis, runs, shard, split, out_extent)
+}
+
+/// One axis's shard-local runs `(lo, len, out)`, checked against the shard and the output, and
+/// split at inner chunk boundaries: each inner chunk touched, in order, with its pieces.
+fn split_runs(
+    axis: usize,
+    runs: Vec<(u64, u64, u64)>,
+    shard: u64,
+    split: u64,
+    out_extent: u64,
+) -> PyResult<ChunkPieces> {
     let mut by_chunk: std::collections::BTreeMap<u64, Vec<Piece>> =
         std::collections::BTreeMap::new();
-    for ((run_lo, run_len), run_out) in los.iter().zip(lens.iter()).zip(outs.iter()) {
-        let (mut at, count, to) = (u(*run_lo)?, u(*run_len)?, u(*run_out)?);
+    for (mut at, count, to) in runs {
         let end = at.checked_add(count).filter(|end| *end <= shard).ok_or_else(|| {
             PyErr::new::<PyIndexError, _>(format!("a run on axis {axis} is past the shard"))
         })?;
@@ -290,6 +401,20 @@ fn split_axis_runs(
 }
 
 impl ChunkItems {
+    /// Every inner chunk of one shard's box: the product of each axis's chunks touched.
+    fn push_shard(&mut self, layout: &BoxLayout, axes: &[&ChunkPieces]) {
+        let lens: Vec<usize> = axes.iter().map(|a| a.len()).collect();
+        let mut at = vec![0usize; axes.len()];
+        loop {
+            let chunk: Vec<&(u64, Vec<Piece>)> =
+                at.iter().zip(axes).map(|(i, a)| &a[*i]).collect();
+            self.push_inner_chunk(layout, &chunk);
+            if !advance(&mut at, &lens) {
+                return;
+            }
+        }
+    }
+
     /// The items of one inner chunk of a box: one per last-axis run length, whose coordinates
     /// are every run of that length in the chunk and whose `out_offsets` say where each lands.
     fn push_inner_chunk(&mut self, layout: &BoxLayout, chunk: &[&(u64, Vec<Piece>)]) {

@@ -27,6 +27,12 @@ class ChunkItems:
         shard, each written from output offset `out[r]` on. The runs need not be sorted or
         adjacent, so an index array in any order is a run per index (or per consecutive group).
         """
+    def push_runs(self, keys: typing.Sequence[builtins.str], shard_ids: typing.Sequence[numpy.typing.NDArray[numpy.int64]], starts: typing.Sequence[numpy.typing.NDArray[numpy.int64]], lengths: typing.Sequence[numpy.typing.NDArray[numpy.int64]], shard_shape: typing.Sequence[builtins.int], inner: typing.Sequence[builtins.int]) -> None:
+        r"""
+        Push the product of runs on every axis, each axis's runs back to back in the output,
+        across every shard they touch, in one call. `shard_ids[k]` ascends and names the shards
+        touched on axis `k`; `keys` are their product in C order.
+        """
 
 @typing.final
 class CodecPipelineImpl:
