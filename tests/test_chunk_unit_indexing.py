@@ -76,7 +76,7 @@ def test_selection_matches_and_takes_the_handle(
         pytest.param(slice(0, 4 * CHUNK, 3), id="strided slice"),
     ],
 )
-def test_ineligible_selections_decline_and_are_still_right(
+def test_rows_out_of_order_or_strided_take_the_handle(
     array: tuple[Path, np.ndarray], entries: dict[str, int], selection
 ) -> None:
     path, truth = array
@@ -85,7 +85,7 @@ def test_ineligible_selections_decline_and_are_still_right(
         got = zarr.open_array(path, mode="r")[selection]
 
     np.testing.assert_array_equal(got, truth[selection])
-    assert entries["handle"] == 0
+    assert entries["handle"] > 0
 
 
 @pytest.mark.parametrize(
@@ -194,17 +194,17 @@ def test_a_partial_column_slice_takes_the_path(
     )
 
 
-def test_a_strided_column_slice_still_falls_back(
+def test_a_strided_column_slice_is_read_as_a_box(
     full_width: tuple[Path, np.ndarray], entries: dict[str, int]
 ) -> None:
-    """Step 2 is not one run per row."""
+    """Step 2 is not one run per row, so each element is its own run of the box."""
     path, values = full_width
     rows = np.array([1, 3, 9, 200])
     with zarr.config.set(CHUNK_UNIT):
         got = zarr.open_array(path, mode="r")[rows, 8:24:2]
 
     np.testing.assert_array_equal(got, values[rows, 8:24:2])
-    assert entries["handle"] == 0, "a strided column slice reached the chunk-unit path"
+    assert entries["handle"] > 0, "a strided column slice fell back to zarr-python"
 
 
 def test_a_column_slice_matches_zarr_python(

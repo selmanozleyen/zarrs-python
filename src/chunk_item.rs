@@ -598,13 +598,93 @@ impl ChunkItems {
                 "one key per shard in the product of the shard ids",
             ));
         }
-        if axes.iter().any(Vec::is_empty) {
-            return Ok(());
-        }
         let keys = keys
             .into_iter()
             .map(|k| StoreKey::new(k).map_py_err::<PyValueError>())
             .collect::<PyResult<Vec<_>>>()?;
+        self.push_product(&keys, &id_counts, &axes, shard_shape, &inner, out_shape)
+    }
+
+    /// Push one shard's orthogonal selection: per axis, runs `lo[r]..lo[r] + len[r]` of the
+    /// shard, each written from output offset `out[r]` on. The runs need not be sorted or
+    /// adjacent, so an index array in any order is a run per index (or per consecutive group).
+    #[pyo3(signature = (key, shard_shape, inner, out_shape, lo, len, out))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    pub(crate) fn push_box(
+        &mut self,
+        key: &str,
+        shard_shape: Vec<u64>,
+        inner: Vec<u64>,
+        out_shape: Vec<u64>,
+        lo: Vec<PyReadonlyArray1<'_, i64>>,
+        len: Vec<PyReadonlyArray1<'_, i64>>,
+        out: Vec<PyReadonlyArray1<'_, i64>>,
+    ) -> PyResult<()> {
+        let rank = shard_shape.len();
+        if rank == 0 || [inner.len(), out_shape.len(), lo.len(), len.len(), out.len()] != [rank; 5] {
+            return Err(PyErr::new::<PyValueError, _>(
+                "one inner extent, output extent and run triple per axis",
+            ));
+        }
+        if shard_shape.iter().chain(&inner).any(|d| *d == 0) {
+            return Err(PyErr::new::<PyValueError, _>(
+                "shard and inner extents must be non-zero",
+            ));
+        }
+        let u = |v: i64| {
+            u64::try_from(v)
+                .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative run field {v}")))
+        };
+        let mut axes: Vec<Vec<(usize, u64, u64, u64)>> = Vec::with_capacity(rank);
+        for k in 0..rank {
+            let (l, n, o) = (lo[k].as_array(), len[k].as_array(), out[k].as_array());
+            if l.len() != n.len() || l.len() != o.len() {
+                return Err(PyErr::new::<PyValueError, _>("one length and output per run"));
+            }
+            let (shard, split) = (shard_shape[k], inner[k]);
+            let mut pieces = Vec::new();
+            for ((l, n), o) in l.iter().zip(n.iter()).zip(o.iter()) {
+                let (mut s, n, o) = (u(*l)?, u(*n)?, u(*o)?);
+                let end = s.checked_add(n).filter(|end| *end <= shard).ok_or_else(|| {
+                    PyErr::new::<PyIndexError, _>(format!("a run on axis {k} is past the shard"))
+                })?;
+                if o.checked_add(n).is_none_or(|end| end > out_shape[k]) {
+                    return Err(PyErr::new::<PyIndexError, _>(format!(
+                        "a run on axis {k} is past the output extent {}",
+                        out_shape[k]
+                    )));
+                }
+                let first = s;
+                // Split at inner chunk boundaries, so each piece is read from one inner chunk.
+                while s < end {
+                    let hi = ((s / split + 1) * split).min(end);
+                    pieces.push((0, s, hi, o + (s - first)));
+                    s = hi;
+                }
+            }
+            axes.push(pieces);
+        }
+        let key = StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?;
+        self.push_product(&[key], &vec![1; rank], &axes, shard_shape, &inner, out_shape)
+    }
+}
+
+impl ChunkItems {
+    /// One item per element of the product of per-axis pieces `(shard position, shard-local
+    /// lo..hi, output start)`, each within one inner chunk.
+    fn push_product(
+        &mut self,
+        keys: &[StoreKey],
+        id_counts: &[usize],
+        axes: &[Vec<(usize, u64, u64, u64)>],
+        shard_shape: Vec<u64>,
+        inner: &[u64],
+        out_shape: Vec<u64>,
+    ) -> PyResult<()> {
+        let rank = shard_shape.len();
+        if axes.iter().any(Vec::is_empty) {
+            return Ok(());
+        }
         let num_elements = shard_shape.iter().product();
         let claimed_inner = (inner[0], inner[1..].iter().product());
         let array_shape = to_nonzero_u64_vec(out_shape)?;
@@ -612,18 +692,18 @@ impl ChunkItems {
         // An odometer over the product, last axis fastest, so items come in output order.
         let mut at = vec![0usize; rank];
         loop {
-            let pieces: Vec<_> = at.iter().zip(&axes).map(|(i, a)| a[*i]).collect();
+            let pieces: Vec<_> = at.iter().zip(axes).map(|(i, a)| a[*i]).collect();
             let key = pieces
                 .iter()
-                .zip(&id_counts)
+                .zip(id_counts)
                 .fold(0, |acc, (p, count)| acc * count + p.0);
             let within = ArraySubset::new_with_start_shape(
-                pieces.iter().zip(&inner).map(|p| p.0.1 % p.1).collect(),
+                pieces.iter().zip(inner).map(|p| p.0.1 % p.1).collect(),
                 pieces.iter().map(|p| p.2 - p.1).collect(),
             )
             .map_py_err::<PyValueError>()?;
             let runs = within
-                .contiguous_linearised_indices(&inner)
+                .contiguous_linearised_indices(inner)
                 .map_py_err::<PyValueError>()?;
             let chunk_ranges: Vec<_> = pieces.iter().map(|p| p.1..p.2).collect();
             let out_ranges: Vec<_> = pieces.iter().map(|p| p.3..p.3 + p.2 - p.1).collect();

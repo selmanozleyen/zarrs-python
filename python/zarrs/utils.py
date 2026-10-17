@@ -256,44 +256,8 @@ def _index_runs(indices: np.ndarray) -> list[tuple[int, int]] | None:
     return list(zip(edges[:-1], edges[1:]))
 
 
-def _chunk_unit_args(
-    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
-) -> list[tuple] | None:
-    """`ChunkItems` push arguments for one entry, or None if it is not served.
-
-    Served: sorted non-negative indices or a step-1 slice on axis 0, and a step-1 slice on every
-    other axis that is one run per row. A slice crossing inner chunks on a trailing axis gives
-    one item per band.
-    """
-    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
-    if drop_axes or inner_shape is None:
-        return None
-    if any(int(v) <= 0 for v in inner_shape):
-        return None
-    # zarr groups an unsorted index array by chunk but keeps the caller's order within it, as
-    # an output index array. Sort the chunk's indices; Rust writes each row to its output row.
-    out_rows = None
-    chunk_raw, out_raw = _as_selector_tuples(chunk_selection, out_selection)
-    if (
-        chunk_raw
-        and isinstance(chunk_raw[0], np.ndarray)
-        and chunk_raw[0].ndim == 1
-        and isinstance(out_raw[0], np.ndarray)
-        and out_raw[0].shape == chunk_raw[0].shape
-        and out_raw[0].dtype.kind in "iu"
-    ):
-        order = np.argsort(chunk_raw[0], kind="stable")
-        out_rows = out_raw[0][order].astype(np.int64, copy=False)
-        if isinstance(out_selection, np.ndarray):
-            # A coordinate read: every index array pairs element for element with the output.
-            chunk_selection = tuple(
-                s[order] if isinstance(s, np.ndarray) and s.shape == order.shape else s
-                for s in chunk_raw
-            )
-            out_selection = slice(0, order.size)
-        else:
-            chunk_selection = (chunk_raw[0][order], *chunk_raw[1:])
-            out_selection = (slice(0, order.size), *out_raw[1:])
+def _restore_dropped_axes(chunk_spec, chunk_selection, out_selection, shape):
+    """The selections and output shape with every axis a scalar dropped put back as extent one."""
     chunk_sel_raw, out_sel_raw = _as_selector_tuples(chunk_selection, out_selection)
     # zarr drops a scalar axis from the output without saying so in `drop_axes`; put it back
     # as an extent of one.
@@ -327,6 +291,62 @@ def _chunk_unit_args(
         chunk_selection = tuple(r[0] for r in rebuilt)
         out_selection = tuple(r[1] for r in rebuilt)
         shape = tuple(r[2] for r in rebuilt)
+    return chunk_selection, out_selection, shape
+
+
+def _chunk_unit_args(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> list[tuple] | None:
+    """`ChunkItems` push arguments for one entry, or None if it is not served.
+
+    Served: non-negative indices in any order or a step-1 slice on axis 0, and a step-1 slice on
+    every other axis that is one run per row. A slice crossing inner chunks on a trailing axis
+    gives one item per band. Anything else is left to `_box_args`.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if drop_axes or inner_shape is None:
+        return None
+    if any(int(v) <= 0 for v in inner_shape):
+        return None
+    # zarr groups an unsorted index array by chunk without sorting within it, and gives the
+    # output positions as an index array (or, for points sharing one chunk, as a slice). Sort
+    # the chunk's indices; Rust writes each row to its output row.
+    out_rows = None
+    chunk_raw, out_raw = _as_selector_tuples(chunk_selection, out_selection)
+    # A coordinate read's output selector is bare; an orthogonal read's is a tuple.
+    coordinate = not isinstance(out_selection, tuple)
+    indices = chunk_raw[0] if chunk_raw else None
+    out_axis = out_raw[0] if out_raw else None
+    if (
+        isinstance(indices, np.ndarray)
+        and indices.ndim == 1
+        and isinstance(out_axis, slice)
+        and out_axis.step in (None, 1)
+        and (indices[1:] < indices[:-1]).any()
+    ):
+        out_axis = np.arange(out_axis.start or 0, out_axis.stop, dtype=np.int64)
+    if (
+        isinstance(indices, np.ndarray)
+        and indices.ndim == 1
+        and isinstance(out_axis, np.ndarray)
+        and out_axis.shape == indices.shape
+        and out_axis.dtype.kind in "iu"
+    ):
+        order = np.argsort(indices, kind="stable")
+        out_rows = out_axis[order].astype(np.int64, copy=False)
+        if coordinate:
+            # A coordinate read: every index array pairs element for element with the output.
+            chunk_selection = tuple(
+                s[order] if isinstance(s, np.ndarray) and s.shape == order.shape else s
+                for s in chunk_raw
+            )
+            out_selection = slice(0, order.size)
+        else:
+            chunk_selection = (chunk_raw[0][order], *chunk_raw[1:])
+            out_selection = (slice(0, order.size), *out_raw[1:])
+    chunk_selection, out_selection, shape = _restore_dropped_axes(
+        chunk_spec, chunk_selection, out_selection, shape
+    )
     # Not sharded: the chunk is the decode unit.
     if inner_shape == ():
         inner_shape = tuple(int(s) for s in chunk_spec.shape)
@@ -354,7 +374,7 @@ def _chunk_unit_args(
         and int(widths[axis - 1]) == int(shape[axis]) == int(chunk_spec.shape[axis])
         for axis in range(1, rank)
     )
-    if isinstance(indices, slice) and out_rows is None:
+    if isinstance(indices, slice):
         span = _step1_span(indices, chunk_spec.shape[0])
         if span is None:
             return None
@@ -431,6 +451,73 @@ def _chunk_unit_args(
     return pushes
 
 
+# ponytail: past this many items per entry the description costs more than zarr-python's read;
+# raise it if a real read lands here.
+_MAX_BOX_ITEMS = 1 << 16
+
+
+def _positions(sel: Any, extent: int) -> np.ndarray | None:
+    """Every position one axis selector names, in order, or None if it is not an axis list."""
+    if isinstance(sel, slice):
+        return np.arange(*sel.indices(extent), dtype=np.int64)
+    if isinstance(sel, (int, np.integer)):
+        return np.array([int(sel)], dtype=np.int64)
+    # zarr broadcasts orthogonal index arrays against each other: at most one axis is long.
+    if (
+        isinstance(sel, np.ndarray)
+        and sel.dtype.kind in "iu"
+        and sum(d > 1 for d in sel.shape) <= 1
+    ):
+        return sel.reshape(-1).astype(np.int64, copy=False)
+    return None
+
+
+def _axis_runs(sel: Any, out: Any, extent: int, out_extent: int) -> tuple | None:
+    """`(lo, len, out)` arrays of the runs one axis reads and where each lands, or None."""
+    if isinstance(sel, slice) and isinstance(out, slice):
+        lo, hi, step = sel.indices(extent)
+        out_lo, out_hi, out_step = out.indices(out_extent)
+        if step == out_step == 1:
+            if hi - lo != out_hi - out_lo or hi <= lo:
+                return None
+            return (np.array([lo]), np.array([hi - lo]), np.array([out_lo]))
+    idx, pos = _positions(sel, extent), _positions(out, out_extent)
+    if idx is None or pos is None or idx.size != pos.size or idx.size == 0:
+        return None
+    # A run continues while both the read and the write step by one.
+    heads = np.flatnonzero(np.r_[True, (np.diff(idx) != 1) | (np.diff(pos) != 1)])
+    return idx[heads], np.diff(np.r_[heads, idx.size]), pos[heads]
+
+
+def _box_args(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> list[tuple] | None:
+    """`ChunkItems.push_box` arguments for one orthogonal entry, or None if it is not served.
+
+    Any mix of step-1 or strided slices, scalars and index arrays in any order: each axis is a
+    list of runs, and the item is their product. A coordinate read is not orthogonal.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if drop_axes or inner_shape is None or isinstance(out_selection, np.ndarray):
+        return None
+    chunk_selection, out_selection, shape = _restore_dropped_axes(
+        chunk_spec, chunk_selection, out_selection, shape
+    )
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
+    chunk_shape = tuple(int(s) for s in chunk_spec.shape)
+    inner = tuple(int(s) for s in inner_shape) or chunk_shape
+    if not (len(chunk_shape) == len(chunk_sel) == len(out_sel) == len(shape) == len(inner)):
+        return None
+    runs = [
+        _axis_runs(c, o, n, m)
+        for c, o, n, m in zip(chunk_sel, out_sel, chunk_shape, shape, strict=True)
+    ]
+    if any(r is None for r in runs) or prod_op(len(r[0]) for r in runs) > _MAX_BOX_ITEMS:
+        return None
+    lo, length, out = (list(column) for column in zip(*runs, strict=True))
+    return [("box", byte_getter.path, chunk_shape, inner, tuple(shape), lo, length, out)]
+
+
 def chunk_info_for_read(
     batch_info: BatchInfo,
     drop_axes: tuple[int, ...],
@@ -441,6 +528,7 @@ def chunk_info_for_read(
     entries = list(_as_int64_batch_info(batch_info))
     unit_args = [
         _chunk_unit_args(entry, shape, drop_axes, inner_chunk_shape)
+        or _box_args(entry, shape, drop_axes, inner_chunk_shape)
         for entry in entries
     ]
     if unit_args and all(args is not None for args in unit_args):
@@ -448,6 +536,8 @@ def chunk_info_for_read(
         for kind, *args in itertools.chain.from_iterable(unit_args):
             if kind == "span":
                 handle.push_span(*args)
+            elif kind == "box":
+                handle.push_box(*args)
             else:
                 handle.push_entry(*args)
         return RustChunkInfo(handle, write_empty_chunks=True)

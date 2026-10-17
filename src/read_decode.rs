@@ -270,7 +270,8 @@ impl CodecPipelineImpl {
     }
 }
 
-/// Split the output into the disjoint piece each located chunk writes, in offset order.
+/// The disjoint output pieces one item writes, in the order its coordinates fill them: offset
+/// order for a box, destination-row order for a scattered item.
 fn output_pieces(item: &ChunkItem, element_size: usize) -> PyResult<Vec<(usize, usize)>> {
     let full: Vec<u64> = item.array_shape.iter().map(|d| d.get()).collect();
     let start = item.subset.start();
@@ -410,12 +411,9 @@ fn carve<'a>(
         let (item, range) = &located[i];
         let pieces = std::mem::take(&mut taken[i]);
         match range {
-            // Uncompressed: read each run of rows as its own byte range, if that is few reads.
-            // A banded item has several pieces and takes the chunk path.
+            // Uncompressed: read each run as its own byte range, if that is few reads.
             Some(range)
-                if ctx.raw
-                    && (pieces.len() == 1 || item.out_rows.is_some())
-                    && raw_runs(coords_of(item)?, item.run_len) <= RAW_MAX_READS =>
+                if ctx.raw && raw_runs(coords_of(item)?, item.run_len) <= RAW_MAX_READS =>
             {
                 raw_row_jobs(
                     item,
@@ -498,7 +496,12 @@ fn raw_row_jobs<'a>(
         let mut run_out = Vec::new();
         let mut need = span;
         while need > 0 {
-            let Some(piece) = rest.pop_front() else { break };
+            let Some(piece) = rest.pop_front() else {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{}: the output pieces run out {need} bytes short of row run {run:?}",
+                    item.key
+                )));
+            };
             if piece.len() > need {
                 let (head, tail) = piece.split_at_mut(need);
                 rest.push_front(tail);

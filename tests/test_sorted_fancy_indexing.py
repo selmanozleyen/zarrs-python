@@ -60,9 +60,14 @@ def open_strict(path: Path) -> zarr.Array:
         pytest.param((np.array([20, 2, 3]), slice(4, 18)), id="unsorted-rows-slice"),
         pytest.param((np.array([29, 4, 6, 5]), 7), id="unsorted-rows-int"),
         pytest.param(np.array([3, 0, 3, 1]), id="unsorted-repeats"),
-        # Descending within one chunk: zarr keeps the caller's order inside a chunk.
+        # Descending within one chunk: zarr does not sort inside a chunk.
         pytest.param(np.array([7, 5, 6, 0]), id="unsorted-within-a-chunk"),
         pytest.param(np.array([31, 30, 29, 16, 15, 1, 0]), id="descending"),
+        # Not rows of one run: read as a box, one run per piece of each axis.
+        pytest.param((slice(None), slice(None, None, 2)), id="strided"),
+        pytest.param((slice(None), np.array([0, 1, 7, 23])), id="cols"),
+        pytest.param((slice(6, 9), np.array([5, 6, 13])), id="slice-cols"),
+        pytest.param((slice(None), np.array([23, 0, 7, 1])), id="unsorted-cols"),
     ],
 )
 def test_sorted_integer_array_read(
@@ -84,11 +89,8 @@ def test_sorted_vindex_1d(sharded_1d: tuple[Path, np.ndarray]) -> None:
 @pytest.mark.parametrize(
     "index",
     [
+        # Points, not a box: each pair of indices names one element.
         pytest.param((np.array([1, 3]), np.array([0, 2])), id="two-array-axes"),
-        pytest.param((slice(None), slice(None, None, 2)), id="strided"),
-        # A column index array is not a step-1 slice on the trailing axis.
-        pytest.param((slice(None), np.array([0, 1, 7, 23])), id="cols"),
-        pytest.param((slice(6, 9), np.array([5, 6, 13])), id="slice-cols"),
     ],
 )
 def test_unsupported_raises_strictly_but_falls_back_correctly(
@@ -119,11 +121,22 @@ def test_contiguous_output_does_not_imply_sorted_input(
     """`CoordinateIndexer` sorts only when the chunk-raveled order is wrong: 7 and 3 share one."""
     path, expected = sharded_1d
     index = np.array([7, 3])
-    with pytest.raises((DiscontiguousArrayError, UnsupportedVIndexingError)):
-        open_strict(path).vindex[index]
-    with zarr.config.set(ZARRS):
-        got = zarr.open_array(path, mode="r").vindex[index]
-    np.testing.assert_array_equal(got, expected[index])
+    np.testing.assert_array_equal(open_strict(path).vindex[index], expected[index])
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        pytest.param((np.array([20, 2, 9]), np.array([3, 3, 3])), id="across-shards"),
+        # One chunk: zarr hands an output slice with the indices still unsorted.
+        pytest.param((np.array([7, 3, 5]), np.array([2, 2, 2])), id="within-a-chunk"),
+    ],
+)
+def test_unsorted_rows_of_one_column_by_vindex(
+    sharded: tuple[Path, np.ndarray], index: object
+) -> None:
+    path, expected = sharded
+    np.testing.assert_array_equal(open_strict(path).vindex[index], expected[index])
 
 
 @pytest.mark.parametrize(
