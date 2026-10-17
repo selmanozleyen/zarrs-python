@@ -48,6 +48,9 @@ pub(crate) struct ChunkItem {
     pub out_rows: Option<Arc<[u64]>>,
     /// The flat output element offset of each coordinate's run; `subset` is then unused.
     pub out_offsets: Option<Arc<[u64]>>,
+    /// When the item is one whole inner chunk landing as one box of the output, that box:
+    /// the chunk can be decoded straight into it.
+    pub out_box: Option<ArraySubset>,
 }
 
 #[gen_stub_pymethods]
@@ -87,6 +90,7 @@ impl ChunkItem {
             claimed_inner: (0, 0),
             out_rows: None,
             out_offsets: None,
+            out_box: None,
         })
     }
 }
@@ -357,6 +361,7 @@ pub(crate) fn build_chunk_unit_items(
             claimed_inner: (inner[0], row_stride),
             out_rows: rows.map(Into::into),
             out_offsets: None,
+            out_box: None,
         });
         a = b;
     }
@@ -526,6 +531,7 @@ impl ChunkItems {
                 claimed_inner: (inner, row_stride),
                 out_rows: None,
                 out_offsets: None,
+                out_box: None,
             });
             self.out_end = out_hi;
         }
@@ -758,6 +764,39 @@ impl ChunkItems {
     fn push_inner_chunk(&mut self, layout: &BoxLayout, chunk: &[&(u64, Vec<Piece>)]) {
         let last = chunk.len() - 1;
         let origin: Vec<u64> = chunk.iter().zip(&layout.inner).map(|((c, _), e)| c * e).collect();
+        let inner_box: Vec<_> = origin
+            .iter()
+            .zip(&layout.inner)
+            .zip(&layout.shard_shape)
+            .map(|((o, e), s)| *o..(*o + *e).min(*s))
+            .collect();
+        // One piece spanning the whole inner chunk on every axis: the chunk lands as one box,
+        // so it is one run of the whole chunk, written over that box in C order.
+        let whole = chunk.iter().zip(&origin).zip(&layout.inner).all(|(((_, pieces), o), e)| {
+            matches!(pieces.as_slice(), [(lo, hi, _)] if *lo == *o && *hi == *o + *e)
+        });
+        if whole {
+            let out_box = ArraySubset::new_with_start_shape(
+                chunk.iter().map(|(_, pieces)| pieces[0].2).collect(),
+                layout.inner.clone(),
+            )
+            .expect("one start and one extent per axis");
+            self.items.push(ChunkItem {
+                key: layout.key.clone(),
+                chunk_subset: ArraySubset::new_with_ranges(&inner_box),
+                subset: out_box.clone(),
+                shape: layout.shape.clone(),
+                num_elements: layout.num_elements,
+                array_shape: layout.array_shape.clone(),
+                coords: Some(vec![0].into()),
+                run_len: layout.inner.iter().product(),
+                claimed_inner: layout.claimed_inner,
+                out_rows: None,
+                out_offsets: None,
+                out_box: Some(out_box),
+            });
+            return;
+        }
         // `(inner offset, output offset)` of each row: every element of the leading axes.
         let mut rows = vec![(0u64, 0u64)];
         for k in 0..last {
@@ -779,12 +818,6 @@ impl ChunkItems {
         for &(lo, hi, out) in &chunk[last].1 {
             by_len.entry(hi - lo).or_default().push((lo - origin[last], out));
         }
-        let inner_box: Vec<_> = origin
-            .iter()
-            .zip(&layout.inner)
-            .zip(&layout.shard_shape)
-            .map(|((o, e), s)| *o..(*o + *e).min(*s))
-            .collect();
         for (run_len, runs) in by_len {
             let mut coords = Vec::with_capacity(rows.len() * runs.len());
             let mut offsets = Vec::with_capacity(rows.len() * runs.len());
@@ -806,6 +839,7 @@ impl ChunkItems {
                 claimed_inner: layout.claimed_inner,
                 out_rows: None,
                 out_offsets: Some(offsets.into()),
+                out_box: None,
             });
         }
     }
@@ -859,6 +893,7 @@ impl ChunkItems {
                 claimed_inner,
                 out_rows: None,
                 out_offsets: None,
+                out_box: None,
             });
             let mut k = rank;
             loop {

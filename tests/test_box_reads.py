@@ -100,3 +100,20 @@ def test_oindex_with_a_scalar_axis(tmp_path: Path, index: object) -> None:
     with zarr.config.set(STRICT):
         got = zarr.open_array(path, mode="r").oindex[index]
     np.testing.assert_array_equal(got, values[np.ix_(np.atleast_1d(rows), np.atleast_1d(cols))].reshape(got.shape))
+
+
+@pytest.mark.parametrize("compressed", [True, False], ids=["compressed", "uncompressed"])
+@pytest.mark.parametrize("shards", [None, (16, 12, 10)], ids=["unsharded", "sharded"])
+def test_whole_chunks_never_written_read_as_fill(tmp_path: Path, compressed, shards) -> None:
+    """A whole-array read decodes each chunk into its box; a chunk never written is fill."""
+    shape, chunks = (32, 24, 20), (8, 6, 5)
+    path = tmp_path / "partial.zarr"
+    z = zarr.create_array(
+        path, dtype="f8", shape=shape, chunks=chunks, shards=shards, fill_value=-1.5,
+        compressors="auto" if compressed else None,
+    )
+    values = np.full(shape, -1.5)
+    values[:16, 6:18, :] = np.arange(16 * 12 * 20, dtype="f8").reshape(16, 12, 20)
+    z[:16, 6:18, :] = values[:16, 6:18, :]
+    with zarr.config.set(STRICT):
+        np.testing.assert_array_equal(zarr.open_array(path, mode="r")[:], values)

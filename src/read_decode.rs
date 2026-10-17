@@ -76,16 +76,21 @@ impl CodecPipelineImpl {
 
         let located = self.locate_chunks(shard, items, &ctx)?;
 
-        let output = DisjointBytes::new(output, output_len);
-        let (jobs, absent) = carve(&output, &located, element_size, &ctx)?;
-        // The output is `np.empty`, so a byte no job owns would be returned uninitialised.
-        if output.covered() != output_len {
-            return Err(PyRuntimeError::new_err(format!(
-                "the batch covers {} of {output_len} output bytes; the rest would be returned \
-                 uninitialised",
-                output.covered()
-            )));
-        }
+        let disjoint = DisjointBytes::new(output, output_len);
+        let (jobs, absent) = if let Some(jobs) = box_jobs(&located, output, output_len, &ctx)? {
+            (jobs, Vec::new())
+        } else {
+            let (jobs, absent) = carve(&disjoint, &located, element_size, &ctx)?;
+            // The output is `np.empty`, so a byte no job owns would be returned uninitialised.
+            if disjoint.covered() != output_len {
+                return Err(PyRuntimeError::new_err(format!(
+                    "the batch covers {} of {output_len} output bytes; the rest would be \
+                     returned uninitialised",
+                    disjoint.covered()
+                )));
+            }
+            (jobs, absent)
+        };
 
         for piece in absent {
             fill(piece, &self.fill_value, element_size).map_py_err::<PyRuntimeError>()?;
@@ -442,7 +447,9 @@ fn carve<'a>(
         match range {
             // Uncompressed: read each run as its own byte range, if that is few reads.
             Some(range)
-                if ctx.raw && raw_runs(coords_of(item)?, item.run_len) <= RAW_MAX_READS =>
+                if ctx.raw
+                    && item.out_box.is_none()
+                    && raw_runs(coords_of(item)?, item.run_len) <= RAW_MAX_READS =>
             {
                 raw_row_jobs(
                     item,
@@ -477,12 +484,101 @@ fn carve<'a>(
                     run_len: item.run_len,
                     shared: Vec::new(),
                     ctx,
+                    direct: item.out_box.as_ref().map(|_| (output.slice, *item)),
                 });
             }
             None => absent.extend(pieces),
         }
     }
     Ok((jobs, absent))
+}
+
+/// When every item is one whole inner chunk landing as one box of the output, a job per box
+/// with no pieces: the boxes are proved inside the output, pairwise disjoint and covering it,
+/// box by box, instead of handing out every row. `None` if any item is not such a box.
+fn box_jobs<'a>(
+    located: &[(&'a ChunkItem, Option<ByteRange>)],
+    output: UnsafeCellSlice<'a, u8>,
+    output_len: usize,
+    ctx: &'a JobContext,
+) -> PyResult<Option<Vec<Job<'a>>>> {
+    let Some((first, _)) = located.first() else {
+        return Ok(None);
+    };
+    if located.iter().any(|(item, _)| item.out_box.is_none()) {
+        return Ok(None);
+    }
+    let bad = |message: String| PyRuntimeError::new_err(message);
+    let shape: Vec<u64> = first.array_shape.iter().map(|d| d.get()).collect();
+    let mut boxes: Vec<(Vec<u64>, Vec<u64>)> = Vec::with_capacity(located.len());
+    let mut total = 0u64;
+    for (item, _) in located {
+        let out_box = item.out_box.as_ref().expect("checked above");
+        let end = out_box.end_exc();
+        if item.array_shape != first.array_shape
+            || end.len() != shape.len()
+            || end.iter().zip(&shape).any(|(e, s)| e > s)
+        {
+            return Err(bad(format!("{}: output box {out_box} is outside {shape:?}", item.key)));
+        }
+        total += out_box.num_elements();
+        boxes.push((out_box.start().to_vec(), end));
+    }
+    if usize::try_from(total).ok().and_then(|t| t.checked_mul(ctx.element_size)) != Some(output_len)
+    {
+        return Err(bad(format!(
+            "the boxes hold {total} elements, the output {output_len} bytes"
+        )));
+    }
+    // Disjoint, by a sweep along axis 0: only boxes still open there can overlap the next.
+    let mut order: Vec<usize> = (0..boxes.len()).collect();
+    order.sort_unstable_by_key(|&i| boxes[i].0[0]);
+    let mut open: Vec<usize> = Vec::new();
+    for &i in &order {
+        open.retain(|&j| boxes[j].1[0] > boxes[i].0[0]);
+        if let Some(&j) = open.iter().find(|&&j| {
+            (0..shape.len()).all(|k| boxes[i].0[k] < boxes[j].1[k] && boxes[j].0[k] < boxes[i].1[k])
+        }) {
+            return Err(bad(format!(
+                "{} and {} write overlapping output boxes",
+                located[i].0.key, located[j].0.key
+            )));
+        }
+        open.push(i);
+    }
+    // Disjoint, inside, and as many elements as the output: every byte is written exactly once.
+    let mut jobs = Vec::with_capacity(located.len());
+    order.sort_by_key(|&i| output_offset(located[i].0));
+    for i in order {
+        let (item, range) = &located[i];
+        match range {
+            Some(range) => jobs.push(Job {
+                key: item.key.clone(),
+                range: *range,
+                raw: false,
+                out: Vec::new(),
+                coords: coords_of(item)?,
+                run_len: item.run_len,
+                shared: Vec::new(),
+                ctx,
+                direct: Some((output, *item)),
+            }),
+            None => fill_box(output, item, ctx).map_py_err::<PyRuntimeError>()?,
+        }
+    }
+    Ok(Some(jobs))
+}
+
+/// Write the fill value over one item's output box.
+fn fill_box(output: UnsafeCellSlice<'_, u8>, item: &ChunkItem, ctx: &JobContext) -> Result<(), String> {
+    let out_box = item.out_box.as_ref().ok_or("filling a box needs an output box")?;
+    let array_shape: Vec<u64> = item.array_shape.iter().map(|d| d.get()).collect();
+    let mut view = unsafe {
+        // SAFETY: as for `decode_into_box`: the box is this job's alone.
+        ArrayBytesFixedDisjointView::new(output, ctx.element_size, &array_shape, out_box.clone())
+            .map_err(|e| e.to_string())?
+    };
+    view.fill(ctx.fill_value.as_ne_bytes()).map_err(|e| e.to_string())
 }
 
 pub(crate) static RAW_JOBS: AtomicU64 = AtomicU64::new(0);
@@ -553,6 +649,7 @@ fn raw_row_jobs<'a>(
             run_len: item.run_len,
             shared: Vec::new(),
             ctx,
+            direct: None,
         });
         RAW_JOBS.fetch_add(1, Ordering::Relaxed);
     }
@@ -824,6 +921,8 @@ struct Job<'a> {
     /// Further items gathered from the same decoded chunk.
     shared: Vec<Part<'a>>,
     ctx: &'a JobContext,
+    /// The whole output and the box this job's chunk fills in it, when it fills one.
+    direct: Option<(UnsafeCellSlice<'a, u8>, &'a ChunkItem)>,
 }
 
 struct Part<'a> {
@@ -886,6 +985,12 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let ctx = job.ctx;
     let size = ctx.element_size;
     let Some(bytes) = bytes else {
+        if let (Some((output, item)), true) = (job.direct, job.out.is_empty()) {
+            if ctx.may_be_absent {
+                return fill_box(output, item, ctx);
+            }
+            return Err(format!("{} vanished between index and read", job.key));
+        }
         if ctx.may_be_absent {
             let parts = job.shared.iter_mut().flat_map(|p| p.out.iter_mut());
             for piece in job.out.iter_mut().chain(parts) {
@@ -917,6 +1022,12 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     let elements: u64 = shape.iter().map(|s| s.get()).product();
     let needed = usize::try_from(elements).map_err(|e| e.to_string())? * size;
 
+    // The item is the whole decode unit, landing as one box of the output: decode into it.
+    if let (Some((output, item)), true) = (job.direct, job.shared.is_empty()) {
+        // The pieces name exactly the box's bytes; drop them so nothing else refers to those.
+        job.out.clear();
+        return decode_into_box(&bytes, output, item, ctx);
+    }
     // The item wants the whole decode unit: decode straight into the output.
     let whole_unit = job.shared.is_empty()
         && job.out.len() == 1
@@ -987,6 +1098,32 @@ fn decode_one(job: &mut Job<'_>, bytes: MaybeBytes, scratch: &mut Vec<u8>) -> Re
     Ok(())
 }
 
+/// Decode one whole inner chunk straight into its box of the output.
+fn decode_into_box(
+    bytes: &[u8],
+    output: UnsafeCellSlice<'_, u8>,
+    item: &ChunkItem,
+    ctx: &JobContext,
+) -> Result<(), String> {
+    let out_box = item.out_box.as_ref().ok_or("a direct job needs an output box")?;
+    let array_shape: Vec<u64> = item.array_shape.iter().map(|d| d.get()).collect();
+    let mut view = unsafe {
+        // SAFETY: the box is this job's alone: either `DisjointBytes` vended every byte of it to
+        // this job, which dropped those pieces first, or `box_jobs` proved the boxes disjoint.
+        ArrayBytesFixedDisjointView::new(output, ctx.element_size, &array_shape, out_box.clone())
+            .map_err(|e| e.to_string())?
+    };
+    ctx.shard
+        .inner_chain
+        .decode_into(
+            Cow::Borrowed(bytes),
+            &ctx.decode_shape,
+            ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+            &ctx.codec_options,
+        )
+        .map_err(|e| e.to_string())
+}
+
 /// Gather what one item wants out of a decoded chunk into its output pieces.
 fn gather_part(
     scratch: &[u8],
@@ -1020,6 +1157,7 @@ mod tests {
             claimed_inner: (0, 0),
             out_rows: None,
             out_offsets: None,
+            out_box: None,
         };
         let strided = item(&[0..2, 0..5, 0..5], &[6, 10, 10]);
         let pieces = output_pieces(&strided, 8).expect("a strided box");
