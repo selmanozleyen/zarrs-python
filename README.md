@@ -53,7 +53,8 @@ The `ZarrsCodecPipeline` specific options are:
   - Cached handles are invalidated on writes through this pipeline, but not on modification from anywhere else — and `zarr-python` itself is such a writer, since `resize`, `delete_dir` and metadata writes go through its own store. A cached handle can then still read a chunk file that has been deleted. Only enable this while nothing is modifying the array.
   - The cache is per `Array` object, not per process, so compare `file_handle_cache_size` times the number of open arrays against `ulimit -n`. See [here](https://docs.rs/zarrs_filesystem/latest/zarrs_filesystem/struct.FilesystemStoreOptions.html#method.file_handle_cache_size) for more info.
 - `codec_pipeline.read_workers` / `codec_pipeline.decode_workers`: the sizes of the thread pools a read fetches and decodes on.
-  - `read_workers` defaults to the number of CPUs, but at least 64. On Lustre it defaults to what the storage pool of the first chunk read can take in flight from this client (its OSTs times `max_rpcs_in_flight`, between 64 and 1024). `decode_workers` defaults to the number of CPUs up to 16, and half of them beyond that.
+  - `read_workers` defaults to the number of CPUs, but at least 64; storage that rewards more reads in flight (a parallel file system with many targets) may want more. `decode_workers` defaults to the number of CPUs up to 16, and half of them beyond that.
+- `codec_pipeline.read_ahead_bytes`: how many read but not yet decoded bytes a read may hold, default 256 MiB. Readers wait for room, so a wide read pool keeps many small chunks in flight without holding as many large ones.
   - Both pools are built by the first read of the process and never resized. A later read asking for other widths warns, or raises if `strict` is set.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
@@ -75,6 +76,7 @@ zarr.config.set({
         "file_handle_cache_size": 0,
         "read_workers": None,
         "decode_workers": None,
+        "read_ahead_bytes": None,
         "direct_io": False,
         "strict": False,
     },

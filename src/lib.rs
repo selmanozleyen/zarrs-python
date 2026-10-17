@@ -30,7 +30,6 @@ use zarrs::storage::{ReadableStorage, ReadableWritableListableStorage, StoreKey}
 mod chunk_item;
 mod concurrency;
 mod fork;
-mod lustre;
 mod read_decode;
 mod runtime;
 mod shard_index;
@@ -94,7 +93,6 @@ pub(crate) struct CodecPipelineImpl {
     /// as `readable_store`; the read-only case simply never keeps a writable view of it.
     pub(crate) writable_store: Option<ReadableWritableListableStorage>,
     /// Used by the first read to size the read pool from the storage.
-    pub(crate) filesystem_root: Option<String>,
     pub(crate) codec_chain: Arc<CodecChainBound>,
     pub(crate) codec_options: CodecOptions,
     pub(crate) chunk_concurrent_minimum: usize,
@@ -361,10 +359,6 @@ impl CodecPipelineImpl {
         let store: ReadableWritableListableStorage =
             (&store_config).try_into().map_py_err::<PyTypeError>()?;
         let writable_store = (!store_config.read_only).then(|| store.clone());
-        let filesystem_root = match &store_config.kind {
-            store::StoreKind::Filesystem(config) => Some(config.root.clone()),
-            _ => None,
-        };
         let readable_store: ReadableStorage = store.readable();
 
         let data_type =
@@ -390,7 +384,6 @@ impl CodecPipelineImpl {
 
         Ok(Self {
             readable_store,
-            filesystem_root,
             codec_chain,
             codec_options,
             chunk_concurrency_asked,
@@ -408,7 +401,8 @@ impl CodecPipelineImpl {
         })
     }
 
-    #[pyo3(signature = (chunk_items, value, read_workers=None, decode_workers=None, strict=false))]
+    #[pyo3(signature = (chunk_items, value, read_workers=None, decode_workers=None, strict=false, read_ahead_bytes=None))]
+    #[allow(clippy::too_many_arguments)]
     fn retrieve_chunk_items_and_apply_index(
         &self,
         py: Python,
@@ -417,16 +411,15 @@ impl CodecPipelineImpl {
         read_workers: Option<usize>,
         decode_workers: Option<usize>,
         strict: bool,
+        read_ahead_bytes: Option<usize>,
     ) -> PyResult<()> {
         let items = chunk_items.as_slice();
-        // Only the first read of the process sizes the pools, so only it looks at the storage.
-        let read_workers = read_workers.filter(|n| *n > 0).or_else(|| {
-            read_decode::pool_sizes().0.or_else(|| {
-                let (root, item) = (self.filesystem_root.as_ref()?, items.first()?);
-                lustre::read_capacity(&std::path::Path::new(root).join(item.key.as_str()))
-            })
-        });
-        let config = read_decode::ReadConfig::from_call(read_workers, decode_workers, strict);
+        let config = read_decode::ReadConfig::from_call(
+            read_workers,
+            decode_workers,
+            read_ahead_bytes,
+            strict,
+        );
         // Under the GIL: `pools` locks, and the GIL keeps that lock from being held across a fork.
         let pools = read_decode::pools(py, config)?;
         read_decode::check_workers_arrived(py, config, &pools)?;
@@ -436,7 +429,9 @@ impl CodecPipelineImpl {
         })?;
         let output = Self::nparray_to_unsafe_cell_slice(value, self.element_size()?)?;
         let output_len = output.len();
-        py.detach(|| self.retrieve_chunk_units(shard, items, output, output_len, &pools))
+        py.detach(|| {
+            self.retrieve_chunk_units(shard, items, output, output_len, &pools, config.read_ahead_bytes)
+        })
     }
 
     fn store_chunks_with_indices(
