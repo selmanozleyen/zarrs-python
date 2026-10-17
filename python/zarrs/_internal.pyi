@@ -2,44 +2,56 @@
 # ruff: noqa: E501, F401
 
 import builtins
-import typing
-
+import numpy
 import numpy.typing
+import typing
 import zarr.abc.store
 
 @typing.final
 class ChunkItem:
-    def __new__(
-        cls,
-        key: builtins.str,
-        chunk_subset: typing.Sequence[slice],
-        chunk_shape: typing.Sequence[builtins.int],
-        subset: typing.Sequence[slice],
-        shape: typing.Sequence[builtins.int],
-    ) -> ChunkItem: ...
+    def __new__(cls, key: builtins.str, chunk_subset: typing.Sequence[slice], chunk_shape: typing.Sequence[builtins.int], subset: typing.Sequence[slice], shape: typing.Sequence[builtins.int]) -> ChunkItem: ...
+
+@typing.final
+class ChunkItems:
+    r"""
+    A batch of read items, built and held in Rust.
+    """
+    def __new__(cls) -> ChunkItems: ...
+    def __len__(self) -> builtins.int:
+        r"""
+        The number of read items pushed so far.
+        """
+    def push_box(self, key: builtins.str, shard_shape: typing.Sequence[builtins.int], inner: typing.Sequence[builtins.int], out_shape: typing.Sequence[builtins.int], lo: typing.Sequence[numpy.typing.NDArray[numpy.int64]], len: typing.Sequence[numpy.typing.NDArray[numpy.int64]], out: typing.Sequence[numpy.typing.NDArray[numpy.int64]]) -> None:
+        r"""
+        Push one shard's orthogonal selection: per axis, runs `lo[r]..lo[r] + len[r]` of the
+        shard, each written from output offset `out[r]` on. The runs need not be sorted or
+        adjacent, so an index array in any order is a run per index (or per consecutive group).
+        """
 
 @typing.final
 class CodecPipelineImpl:
-    def __new__(
-        cls,
-        array_metadata: builtins.str,
-        store_config: zarr.abc.store.Store,
-        *,
-        validate_checksums: builtins.bool = False,
-        chunk_concurrent_minimum: builtins.int | None = None,
-        chunk_concurrent_maximum: builtins.int | None = None,
-        num_threads: builtins.int | None = None,
-        direct_io: builtins.bool = False,
-        file_handle_cache_size: builtins.int = 0,
-    ) -> CodecPipelineImpl: ...
-    def retrieve_chunks_and_apply_index(
-        self,
-        chunk_descriptions: typing.Sequence[ChunkItem],
-        value: numpy.typing.NDArray[typing.Any],
-    ) -> None: ...
-    def store_chunks_with_indices(
-        self,
-        chunk_descriptions: typing.Sequence[ChunkItem],
-        value: numpy.typing.NDArray[typing.Any],
-        write_empty_chunks: builtins.bool,
-    ) -> None: ...
+    def inner_chunk_shape(self) -> typing.Optional[builtins.list[builtins.int]]:
+        r"""
+        The inner chunk shape, empty if unsharded, or `None` if the read path does not serve it.
+        """
+    def __new__(cls, array_metadata: builtins.str, store_config: zarr.abc.store.Store, *, validate_checksums: builtins.bool = False, chunk_concurrent_minimum: typing.Optional[builtins.int] = None, chunk_concurrent_maximum: typing.Optional[builtins.int] = None, num_threads: typing.Optional[builtins.int] = None, direct_io: builtins.bool = False, file_handle_cache_size: builtins.int = 0) -> CodecPipelineImpl: ...
+    def retrieve_chunk_items_and_apply_index(self, chunk_items: ChunkItems, value: numpy.typing.NDArray[typing.Any], read_workers: typing.Optional[builtins.int] = None, decode_workers: typing.Optional[builtins.int] = None, strict: builtins.bool = False, read_ahead_bytes: typing.Optional[builtins.int] = None) -> None: ...
+    def store_chunks_with_indices(self, chunk_descriptions: typing.Sequence[ChunkItem], value: numpy.typing.NDArray[typing.Any], write_empty_chunks: builtins.bool) -> None: ...
+
+def pool_sizes() -> tuple[typing.Optional[builtins.int], typing.Optional[builtins.int]]:
+    r"""
+    The widths the read and decode pools were built with, `None` before the first read.
+    """
+
+def raw_path_stats() -> tuple[builtins.int, builtins.int]:
+    r"""
+    `(raw, chunk)` read jobs: rows read as their own byte range, and whole inner chunks.
+    """
+
+def reset_shard_index_cache_stats() -> None: ...
+
+def shard_index_cache_stats() -> tuple[builtins.int, builtins.int, builtins.int]:
+    r"""
+    `(call_hits, array_hits, builds)` for the shard index cache.
+    """
+

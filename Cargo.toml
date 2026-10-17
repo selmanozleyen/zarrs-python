@@ -10,9 +10,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.27.1", features = ["abi3-py311"] }
-zarrs = { version = "0.23.6", features = ["async", "zlib", "pcodec", "bz2"] }
+# TODO: zarrs 0.24 from crates.io; drop this rev and the zarrs_storage patch below together.
+zarrs = { git = "https://github.com/selmanozleyen/zarrs", rev = "1e81e6b5ceb176b3d79f5d38510ac4debd7eb284", features = ["async", "zlib", "pcodec", "bz2"] }
 rayon_iter_concurrent_limit = "0.2.0"
 rayon = "1.10.0"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+libc = "0.2"
 # fix for https://stackoverflow.com/questions/76593417/package-openssl-was-not-found-in-the-pkg-config-search-path
 openssl = { version = "0.10", features = ["vendored"] }
 numpy = "0.27.0"
@@ -29,3 +33,7 @@ zarrs_object_store = "0.5.0" # object_store 0.12
 
 [profile.release]
 lto = true
+
+# zarrs_opendal and zarrs_object_store use zarrs_storage from crates.io; point it at the same rev.
+[patch.crates-io]
+zarrs_storage = { git = "https://github.com/selmanozleyen/zarrs", rev = "1e81e6b5ceb176b3d79f5d38510ac4debd7eb284" }
