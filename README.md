@@ -36,15 +36,15 @@ A `NotImplementedError` will be raised if a store is not supported.
 `ZarrsCodecPipeline` options are exposed through `zarr.config`.
 
 Standard `zarr.config` options control some functionality (see the defaults in the [config.py](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py) of `zarr-python`):
-- `threading.max_workers`: the maximum number of threads used internally by the `ZarrsCodecPipeline` on the Rust side.
+- `threading.max_workers`: the maximum number of threads used internally by the `ZarrsCodecPipeline` on the Rust side for writes. Reads use `codec_pipeline.read_workers` and `decode_workers`.
   - Defaults to the number of threads in the global `rayon` thread pool if set to `None`, which is [typically the number of logical CPUs](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
 - `array.write_empty_chunks`: whether or not to store empty chunks.
   - Defaults to false if `None`. Note that checking for emptiness has some overhead, see [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#store-empty-chunks) for more info.
 
 The `ZarrsCodecPipeline` specific options are:
-- `codec_pipeline.chunk_concurrent_maximum`: the maximum number of chunks stored/retrieved concurrently.
+- `codec_pipeline.chunk_concurrent_maximum`: the maximum number of chunks stored concurrently.
   - Defaults to the number of logical CPUs if `None`. It is constrained by `threading.max_workers` as well.
-- `codec_pipeline.chunk_concurrent_minimum`: the minimum number of chunks retrieved/stored concurrently when balancing chunk/codec concurrency.
+- `codec_pipeline.chunk_concurrent_minimum`: the minimum number of chunks stored concurrently when balancing chunk/codec concurrency.
   - Defaults to 4 if `None`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#chunk-concurrent-minimum) for more info.
 - `codec_pipeline.validate_checksums`: enable checksum validation (e.g. with the CRC32C codec).
   - Defaults to `True`. See [here](https://docs.rs/zarrs/latest/zarrs/config/struct.Config.html#validate-checksums) for more info.
@@ -52,10 +52,16 @@ The `ZarrsCodecPipeline` specific options are:
   - Defaults to `0` (disabled). Only applies to filesystem stores, and has no effect when `direct_io` is enabled.
   - Cached handles are invalidated on writes through this pipeline, but not on modification from anywhere else — and `zarr-python` itself is such a writer, since `resize`, `delete_dir` and metadata writes go through its own store. A cached handle can then still read a chunk file that has been deleted. Only enable this while nothing is modifying the array.
   - The cache is per `Array` object, not per process, so compare `file_handle_cache_size` times the number of open arrays against `ulimit -n`. See [here](https://docs.rs/zarrs_filesystem/latest/zarrs_filesystem/struct.FilesystemStoreOptions.html#method.file_handle_cache_size) for more info.
+- `codec_pipeline.read_workers` / `codec_pipeline.decode_workers`: the sizes of the thread pools a read fetches and decodes on.
+  - `read_workers` defaults to the number of CPUs, but at least 64; storage that rewards more reads in flight (a parallel file system with many targets) may want more. `decode_workers` defaults to the number of CPUs up to 16, and half of them beyond that.
+- `codec_pipeline.read_ahead_bytes`: how many read but not yet decoded bytes a read may hold, default 256 MiB. Readers wait for room, so a wide read pool keeps many small chunks in flight without holding as many large ones.
+  - Both pools are built by the first read of the process and never resized. A later read asking for other widths warns, or raises if `strict` is set.
 - `codec_pipeline.direct_io`: enable `O_DIRECT` read/write, needs support from the operating system (currently only Linux) and file system.
   - Defaults to `False`.
 - `codec_pipeline.strict`: raise exceptions for unsupported operations instead of falling back to the default codec pipeline of `zarr-python`.
   - Defaults to `False`.
+
+A read of a sharded array caches each shard's index for that read, or for the life of the array if it was opened with `mode="r"`. As with `file_handle_cache_size`, this assumes nothing else modifies the array.
 
 For example:
 ```python
@@ -68,6 +74,9 @@ zarr.config.set({
         "chunk_concurrent_maximum": None,
         "chunk_concurrent_minimum": 4,
         "file_handle_cache_size": 0,
+        "read_workers": None,
+        "decode_workers": None,
+        "read_ahead_bytes": None,
         "direct_io": False,
         "strict": False,
     },
@@ -92,6 +101,10 @@ Chunk concurrency is typically favored because:
 - it is advantageous to retrieve/store multiple chunks concurrently, especially with high latency stores.
 
 `zarrs-python` will often favor codec concurrency with sharded arrays, as they are well suited to codec concurrency.
+
+## Multiprocessing
+
+Use the `spawn` or `forkserver` start method. A process that has used `zarrs-python` raises a `RuntimeError` on reads and writes in a child it forks, since the worker threads do not survive the fork.
 
 ## Supported Indexing Methods
 

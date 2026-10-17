@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import operator
 import os
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from zarr.core.indexing import is_integer
 
-from zarrs._internal import ChunkItem
+from zarrs._internal import ChunkItem, ChunkItems
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -19,6 +20,10 @@ if TYPE_CHECKING:
     from zarr.core.array_spec import ArraySpec
     from zarr.core.indexing import SelectorTuple
     from zarr.dtype import ZDType
+
+    BatchInfo = Iterable[
+        tuple[ByteGetter | ByteSetter, ArraySpec, SelectorTuple, SelectorTuple, bool]
+    ]
 
 
 # adapted from https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
@@ -38,6 +43,33 @@ class FillValueNoneError(Exception):
     pass
 
 
+def _as_int64_batch_info(batch_info: BatchInfo) -> BatchInfo:
+    """Normalise the batch's index arrays to int64 positions, lazily."""
+
+    def cast(sel: SelectorTuple) -> SelectorTuple:
+        if isinstance(sel, np.ndarray):
+            if sel.dtype.kind == "b":
+                return np.flatnonzero(sel).astype(np.int64, copy=False)
+            if sel.dtype.kind not in "iuf":
+                raise DiscontiguousArrayError(sel.dtype)
+            # uint64 indices arrive as float64.
+            if sel.dtype.kind == "f" and not (
+                np.isfinite(sel).all()
+                and (sel == np.rint(sel)).all()
+                and (np.abs(sel) < 2.0**63).all()
+            ):
+                raise DiscontiguousArrayError(sel.dtype)
+            return sel.astype(np.int64, copy=False)
+        if isinstance(sel, tuple) and any(isinstance(s, np.ndarray) for s in sel):
+            return tuple(map(cast, sel))
+        return sel
+
+    return (
+        (byte_getter, chunk_spec, cast(chunk_sel), cast(out_sel), is_complete)
+        for byte_getter, chunk_spec, chunk_sel, out_sel, is_complete in batch_info
+    )
+
+
 # This is a (mostly) copy of the function from zarr.core.indexing that fixes:
 #   DeprecationWarning: Conversion of an array with ndim > 0 to a scalar is deprecated
 # TODO: Upstream this fix
@@ -48,15 +80,18 @@ def make_slice_selection(selection: tuple[np.ndarray | float]) -> list[slice]:
             ls.append(slice(int(dim_selection), int(dim_selection) + 1, 1))
         elif isinstance(dim_selection, np.ndarray):
             dim_selection = dim_selection.ravel()
+            if len(dim_selection) == 0:
+                raise DiscontiguousArrayError(dim_selection)
             if len(dim_selection) == 1:
                 ls.append(
                     slice(int(dim_selection.item()), int(dim_selection.item()) + 1, 1)
                 )
             else:
-                diff = np.diff(dim_selection)
-                if (diff != 1).any() and (diff != 0).any():
-                    raise DiscontiguousArrayError(diff)
-                ls.append(slice(dim_selection[0], dim_selection[-1] + 1, 1))
+                # Signed, or an unsigned decrease wraps to a step of +1.
+                steps = dim_selection[1:] - dim_selection[:-1]
+                if (steps != 1).any() and (steps != 0).any():
+                    raise DiscontiguousArrayError(steps)
+                ls.append(slice(int(dim_selection[0]), int(dim_selection[-1]) + 1, 1))
         else:
             ls.append(dim_selection)
     return ls
@@ -68,6 +103,15 @@ def selector_tuple_to_slice_selection(selector_tuple: SelectorTuple) -> list[sli
     if all(isinstance(s, slice) for s in selector_tuple):
         return list(selector_tuple)
     return make_slice_selection(selector_tuple)
+
+
+def _as_selector_tuples(
+    chunk_selection: SelectorTuple, out_selection: SelectorTuple
+) -> tuple[tuple, tuple]:
+    return (
+        chunk_selection if isinstance(chunk_selection, tuple) else (chunk_selection,),
+        out_selection if isinstance(out_selection, tuple) else (out_selection,),
+    )
 
 
 def resulting_shape_from_index(
@@ -149,8 +193,142 @@ def get_implicit_fill_value(dtype: ZDType, fill_value: Any) -> Any:
 
 @dataclass(frozen=True)
 class RustChunkInfo:
-    chunk_info_with_indices: list[ChunkItem]
+    # A ChunkItems handle for a read, a list for a write.
+    chunk_info_with_indices: list[ChunkItem] | ChunkItems
     write_empty_chunks: bool
+
+
+def _restore_dropped_axes(chunk_spec, chunk_selection, out_selection, shape):
+    """The selections and output shape with every axis a scalar dropped put back as extent one."""
+    chunk_sel_raw, out_sel_raw = _as_selector_tuples(chunk_selection, out_selection)
+    # zarr drops a scalar axis from the output without saying so in `drop_axes`; put it back
+    # as an extent of one.
+    scalars: dict[int, int] = {}
+    for axis, sel in enumerate(chunk_sel_raw):
+        if isinstance(sel, (int, np.integer)):
+            scalars[axis] = int(sel)
+        elif (
+            axis > 0
+            and isinstance(sel, np.ndarray)
+            and sel.ndim == 1
+            and sel.size > 0
+            and np.issubdtype(sel.dtype, np.integer)
+            and bool((sel == sel[0]).all())
+        ):
+            scalars[axis] = int(sel[0])
+    # An equality, so a constant array on an axis the output kept is not rebuilt.
+    if (
+        scalars
+        and len(chunk_sel_raw) == len(chunk_spec.shape)
+        and len(out_sel_raw) == len(shape) == len(chunk_spec.shape) - len(scalars)
+    ):
+        kept_out = iter(out_sel_raw)
+        kept_extent = iter(shape)
+        rebuilt = [
+            (slice(scalars[axis], scalars[axis] + 1), slice(0, 1), 1)
+            if axis in scalars
+            else (sel, next(kept_out), next(kept_extent))
+            for axis, sel in enumerate(chunk_sel_raw)
+        ]
+        chunk_selection = tuple(r[0] for r in rebuilt)
+        out_selection = tuple(r[1] for r in rebuilt)
+        shape = tuple(r[2] for r in rebuilt)
+    return chunk_selection, out_selection, shape
+
+
+def _positions(sel: Any, extent: int) -> np.ndarray | None:
+    """Every position one axis selector names, in order, or None if it is not an axis list."""
+    if isinstance(sel, slice):
+        return np.arange(*sel.indices(extent), dtype=np.int64)
+    if isinstance(sel, (int, np.integer)):
+        return np.array([int(sel)], dtype=np.int64)
+    # zarr broadcasts orthogonal index arrays against each other: at most one axis is long.
+    if (
+        isinstance(sel, np.ndarray)
+        and sel.dtype.kind in "iu"
+        and sum(d > 1 for d in sel.shape) <= 1
+    ):
+        return sel.reshape(-1).astype(np.int64, copy=False)
+    return None
+
+
+def _axis_runs(sel: Any, out: Any, extent: int, out_extent: int) -> tuple | None:
+    """`(lo, len, out)` arrays of the runs one axis reads and where each lands, or None."""
+    if isinstance(sel, slice) and isinstance(out, slice):
+        lo, hi, step = sel.indices(extent)
+        out_lo, out_hi, out_step = out.indices(out_extent)
+        if step == out_step == 1:
+            if hi - lo != out_hi - out_lo or hi <= lo:
+                return None
+            return (np.array([lo]), np.array([hi - lo]), np.array([out_lo]))
+    idx, pos = _positions(sel, extent), _positions(out, out_extent)
+    if idx is None or pos is None or idx.size != pos.size or idx.size == 0:
+        return None
+    # A run continues while both the read and the write step by one.
+    heads = np.flatnonzero(np.r_[True, (np.diff(idx) != 1) | (np.diff(pos) != 1)])
+    return idx[heads], np.diff(np.r_[heads, idx.size]), pos[heads]
+
+
+def _box_args(
+    entry, shape: tuple[int, ...], drop_axes: tuple[int, ...], inner_shape
+) -> list[tuple] | None:
+    """`ChunkItems.push_box` arguments for one orthogonal entry, or None if it is not served.
+
+    Any mix of step-1 or strided slices, scalars and index arrays in any order: each axis is a
+    list of runs, and the item is their product. A coordinate read of points is not served.
+    """
+    byte_getter, chunk_spec, chunk_selection, out_selection, _ = entry
+    if inner_shape is None:
+        return None
+    if drop_axes:
+        # A scalar on an orthogonal axis: zarr leaves the axis out of the output. Extent one
+        # does not move a byte, so put it back.
+        out_selection, shape = list(out_selection), list(shape)
+        for axis in sorted(drop_axes):
+            out_selection.insert(axis, slice(0, 1))
+            shape.insert(axis, 1)
+        out_selection, shape = tuple(out_selection), tuple(shape)
+    else:
+        # A coordinate read whose other index arrays are constant is one array and scalars;
+        # with two varying arrays it is points, and the ranks below no longer match.
+        chunk_selection, out_selection, shape = _restore_dropped_axes(
+            chunk_spec, chunk_selection, out_selection, shape
+        )
+    chunk_sel, out_sel = _as_selector_tuples(chunk_selection, out_selection)
+    chunk_shape = tuple(int(s) for s in chunk_spec.shape)
+    inner = tuple(int(s) for s in inner_shape) or chunk_shape
+    if not (len(chunk_shape) == len(chunk_sel) == len(out_sel) == len(shape) == len(inner)):
+        return None
+    runs = [
+        _axis_runs(c, o, n, m)
+        for c, o, n, m in zip(chunk_sel, out_sel, chunk_shape, shape, strict=True)
+    ]
+    # ponytail: the description is 16 bytes per run, so a read of one-element runs (a strided
+    # last axis) holds up to 4x a float32 output in coordinates while it runs.
+    if any(r is None for r in runs):
+        return None
+    lo, length, out = (list(column) for column in zip(*runs, strict=True))
+    return [("box", byte_getter.path, chunk_shape, inner, tuple(shape), lo, length, out)]
+
+
+def chunk_info_for_read(
+    batch_info: BatchInfo,
+    drop_axes: tuple[int, ...],
+    shape: tuple[int, ...],
+    inner_chunk_shape: tuple[int, ...] | None,
+) -> RustChunkInfo:
+    """A `ChunkItems` handle for a read batch; raises if any entry is not served."""
+    entries = list(_as_int64_batch_info(batch_info))
+    unit_args = [
+        _box_args(entry, shape, drop_axes, inner_chunk_shape) for entry in entries
+    ]
+    if unit_args and all(args is not None for args in unit_args):
+        handle = ChunkItems()
+        for _, *args in itertools.chain.from_iterable(unit_args):
+            handle.push_box(*args)
+        return RustChunkInfo(handle, write_empty_chunks=True)
+
+    raise DiscontiguousArrayError("this selection is not served by the chunk-unit path")
 
 
 def make_chunk_info_for_rust_with_indices(
@@ -160,6 +338,7 @@ def make_chunk_info_for_rust_with_indices(
     drop_axes: tuple[int, ...],
     shape: tuple[int, ...],
 ) -> RustChunkInfo:
+    batch_info = _as_int64_batch_info(batch_info)
     is_constant = shape == ()
     chunk_info_with_indices: list[ChunkItem] = []
     write_empty_chunks: bool = True
