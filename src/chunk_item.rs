@@ -641,114 +641,36 @@ impl ChunkItems {
                 "shard and inner extents must be non-zero",
             ));
         }
-        let u = |v: i64| {
-            u64::try_from(v)
-                .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative run field {v}")))
-        };
-        // Per axis, the pieces of each inner chunk touched: `(shard-local lo..hi, output start)`.
         let mut axes: Vec<ChunkPieces> = Vec::with_capacity(rank);
         for k in 0..rank {
-            let (los, lens, outs) = (lo[k].as_array(), len[k].as_array(), out[k].as_array());
-            if los.len() != lens.len() || los.len() != outs.len() {
-                return Err(PyErr::new::<PyValueError, _>("one length and output per run"));
-            }
-            let (shard, split) = (shard_shape[k], inner[k]);
-            let mut by_chunk: std::collections::BTreeMap<u64, Vec<Piece>> =
-                std::collections::BTreeMap::new();
-            for ((run_lo, run_len), run_out) in los.iter().zip(lens.iter()).zip(outs.iter()) {
-                let (mut at, count, to) = (u(*run_lo)?, u(*run_len)?, u(*run_out)?);
-                let end = at.checked_add(count).filter(|end| *end <= shard).ok_or_else(|| {
-                    PyErr::new::<PyIndexError, _>(format!("a run on axis {k} is past the shard"))
-                })?;
-                if to.checked_add(count).is_none_or(|end| end > out_shape[k]) {
-                    return Err(PyErr::new::<PyIndexError, _>(format!(
-                        "a run on axis {k} is past the output extent {}",
-                        out_shape[k]
-                    )));
-                }
-                let first = at;
-                // Split at inner chunk boundaries, so each piece is read from one inner chunk.
-                while at < end {
-                    let hi = ((at / split + 1) * split).min(end);
-                    by_chunk.entry(at / split).or_default().push((at, hi, to + (at - first)));
-                    at = hi;
-                }
-            }
-            if by_chunk.is_empty() {
+            let pieces = split_axis_runs(
+                k,
+                (&lo[k], &len[k], &out[k]),
+                shard_shape[k],
+                inner[k],
+                out_shape[k],
+            )?;
+            if pieces.is_empty() {
                 return Ok(());
             }
-            axes.push(by_chunk.into_iter().collect());
+            axes.push(pieces);
         }
-        let key = StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?;
-        let strides = |shape: &[u64]| {
-            let mut strides = vec![1u64; shape.len()];
-            for k in (0..shape.len().saturating_sub(1)).rev() {
-                strides[k] = strides[k + 1] * shape[k + 1];
-            }
-            strides
+        let layout = BoxLayout {
+            key: StoreKey::new(key.to_string()).map_py_err::<PyValueError>()?,
+            in_strides: c_strides(&inner),
+            out_strides: c_strides(&out_shape),
+            num_elements: shard_shape.iter().product(),
+            claimed_inner: (inner[0], inner[1..].iter().product()),
+            array_shape: to_nonzero_u64_vec(out_shape)?,
+            shape: to_nonzero_u64_vec(shard_shape.clone())?,
+            shard_shape,
+            inner,
         };
-        let (in_strides, out_strides) = (strides(&inner), strides(&out_shape));
-        let num_elements = shard_shape.iter().product();
-        let claimed_inner = (inner[0], inner[1..].iter().product());
-        let array_shape = to_nonzero_u64_vec(out_shape)?;
-        let shape = to_nonzero_u64_vec(shard_shape.clone())?;
-        let last = rank - 1;
-        // One item per inner chunk and last-axis run length: every run in it is a coordinate,
-        // and each run says where in the output it goes.
+        // An odometer over the inner chunks touched, last axis fastest.
         let mut at = vec![0usize; rank];
         loop {
             let chunk: Vec<&(u64, Vec<Piece>)> = at.iter().zip(&axes).map(|(i, a)| &a[*i]).collect();
-            let origin: Vec<u64> = chunk.iter().zip(&inner).map(|((c, _), e)| c * e).collect();
-            // `(inner offset, output offset)` of each row: every element of the leading axes.
-            let mut rows = vec![(0u64, 0u64)];
-            for k in 0..last {
-                let mut next = Vec::new();
-                for &(io, oo) in &rows {
-                    for &(lo, hi, out) in &chunk[k].1 {
-                        for e in 0..hi - lo {
-                            next.push((
-                                io + (lo - origin[k] + e) * in_strides[k],
-                                oo + (out + e) * out_strides[k],
-                            ));
-                        }
-                    }
-                }
-                rows = next;
-            }
-            let mut by_len: std::collections::BTreeMap<u64, Vec<(u64, u64)>> =
-                std::collections::BTreeMap::new();
-            for &(lo, hi, out) in &chunk[last].1 {
-                by_len.entry(hi - lo).or_default().push((lo - origin[last], out));
-            }
-            let box_ranges: Vec<_> = origin
-                .iter()
-                .zip(&inner)
-                .zip(&shard_shape)
-                .map(|((o, e), s)| *o..(*o + *e).min(*s))
-                .collect();
-            for (run_len, runs) in by_len {
-                let mut coords = Vec::with_capacity(rows.len() * runs.len());
-                let mut offsets = Vec::with_capacity(rows.len() * runs.len());
-                for &(io, oo) in &rows {
-                    for &(l, o) in &runs {
-                        coords.push(io + l);
-                        offsets.push(oo + o);
-                    }
-                }
-                self.items.push(ChunkItem {
-                    key: key.clone(),
-                    chunk_subset: ArraySubset::new_with_ranges(&box_ranges),
-                    subset: ArraySubset::new_with_shape(vec![0; rank]),
-                    shape: shape.clone(),
-                    num_elements,
-                    array_shape: array_shape.clone(),
-                    coords: Some(coords.into()),
-                    run_len,
-                    claimed_inner,
-                    out_rows: None,
-                    out_offsets: Some(offsets.into()),
-                });
-            }
+            self.push_inner_chunk(&layout, &chunk);
             let mut k = rank;
             loop {
                 if k == 0 {
@@ -765,7 +687,129 @@ impl ChunkItems {
     }
 }
 
+/// What every item of one `push_box` call shares.
+struct BoxLayout {
+    key: StoreKey,
+    shard_shape: Vec<u64>,
+    inner: Vec<u64>,
+    in_strides: Vec<u64>,
+    out_strides: Vec<u64>,
+    num_elements: u64,
+    claimed_inner: (u64, u64),
+    array_shape: Vec<NonZeroU64>,
+    shape: Vec<NonZeroU64>,
+}
+
+/// C-order element strides of `shape`.
+fn c_strides(shape: &[u64]) -> Vec<u64> {
+    let mut strides = vec![1u64; shape.len()];
+    for k in (0..shape.len().saturating_sub(1)).rev() {
+        strides[k] = strides[k + 1] * shape[k + 1];
+    }
+    strides
+}
+
+/// One axis's runs `(lo, len, out)`, checked against the shard and the output, and split at
+/// inner chunk boundaries: each inner chunk touched, in order, with its pieces.
+fn split_axis_runs(
+    axis: usize,
+    (lo, len, out): (
+        &PyReadonlyArray1<'_, i64>,
+        &PyReadonlyArray1<'_, i64>,
+        &PyReadonlyArray1<'_, i64>,
+    ),
+    shard: u64,
+    split: u64,
+    out_extent: u64,
+) -> PyResult<ChunkPieces> {
+    let (los, lens, outs) = (lo.as_array(), len.as_array(), out.as_array());
+    if los.len() != lens.len() || los.len() != outs.len() {
+        return Err(PyErr::new::<PyValueError, _>("one length and output per run"));
+    }
+    let u = |v: i64| {
+        u64::try_from(v)
+            .map_err(|_| PyErr::new::<PyValueError, _>(format!("negative run field {v}")))
+    };
+    let mut by_chunk: std::collections::BTreeMap<u64, Vec<Piece>> =
+        std::collections::BTreeMap::new();
+    for ((run_lo, run_len), run_out) in los.iter().zip(lens.iter()).zip(outs.iter()) {
+        let (mut at, count, to) = (u(*run_lo)?, u(*run_len)?, u(*run_out)?);
+        let end = at.checked_add(count).filter(|end| *end <= shard).ok_or_else(|| {
+            PyErr::new::<PyIndexError, _>(format!("a run on axis {axis} is past the shard"))
+        })?;
+        if to.checked_add(count).is_none_or(|end| end > out_extent) {
+            return Err(PyErr::new::<PyIndexError, _>(format!(
+                "a run on axis {axis} is past the output extent {out_extent}"
+            )));
+        }
+        let first = at;
+        while at < end {
+            let hi = ((at / split + 1) * split).min(end);
+            by_chunk.entry(at / split).or_default().push((at, hi, to + (at - first)));
+            at = hi;
+        }
+    }
+    Ok(by_chunk.into_iter().collect())
+}
+
 impl ChunkItems {
+    /// The items of one inner chunk of a box: one per last-axis run length, whose coordinates
+    /// are every run of that length in the chunk and whose `out_offsets` say where each lands.
+    fn push_inner_chunk(&mut self, layout: &BoxLayout, chunk: &[&(u64, Vec<Piece>)]) {
+        let last = chunk.len() - 1;
+        let origin: Vec<u64> = chunk.iter().zip(&layout.inner).map(|((c, _), e)| c * e).collect();
+        // `(inner offset, output offset)` of each row: every element of the leading axes.
+        let mut rows = vec![(0u64, 0u64)];
+        for k in 0..last {
+            let mut next = Vec::new();
+            for &(io, oo) in &rows {
+                for &(lo, hi, out) in &chunk[k].1 {
+                    for e in 0..hi - lo {
+                        next.push((
+                            io + (lo - origin[k] + e) * layout.in_strides[k],
+                            oo + (out + e) * layout.out_strides[k],
+                        ));
+                    }
+                }
+            }
+            rows = next;
+        }
+        let mut by_len: std::collections::BTreeMap<u64, Vec<(u64, u64)>> =
+            std::collections::BTreeMap::new();
+        for &(lo, hi, out) in &chunk[last].1 {
+            by_len.entry(hi - lo).or_default().push((lo - origin[last], out));
+        }
+        let inner_box: Vec<_> = origin
+            .iter()
+            .zip(&layout.inner)
+            .zip(&layout.shard_shape)
+            .map(|((o, e), s)| *o..(*o + *e).min(*s))
+            .collect();
+        for (run_len, runs) in by_len {
+            let mut coords = Vec::with_capacity(rows.len() * runs.len());
+            let mut offsets = Vec::with_capacity(rows.len() * runs.len());
+            for &(io, oo) in &rows {
+                for &(lo, out) in &runs {
+                    coords.push(io + lo);
+                    offsets.push(oo + out);
+                }
+            }
+            self.items.push(ChunkItem {
+                key: layout.key.clone(),
+                chunk_subset: ArraySubset::new_with_ranges(&inner_box),
+                subset: ArraySubset::new_with_shape(vec![0; chunk.len()]),
+                shape: layout.shape.clone(),
+                num_elements: layout.num_elements,
+                array_shape: layout.array_shape.clone(),
+                coords: Some(coords.into()),
+                run_len,
+                claimed_inner: layout.claimed_inner,
+                out_rows: None,
+                out_offsets: Some(offsets.into()),
+            });
+        }
+    }
+
     /// One item per element of the product of per-axis pieces `(shard position, shard-local
     /// lo..hi, output start)`, each within one inner chunk.
     fn push_product(
