@@ -20,7 +20,7 @@ use utils::is_whole_chunk;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingPartialDecoder;
 use zarrs::array::{
     ArrayBytes, ArrayMetadata, ArrayToBytesCodecTraits, CodecChain, CodecChainBound, CodecOptions,
-    DataType, FillValue, update_array_bytes,
+    CodecSpecificOptions, DataType, FillValue, update_array_bytes,
 };
 use zarrs::config::global_config;
 use zarrs::convert::array_metadata_v2_to_v3;
@@ -166,12 +166,11 @@ impl CodecPipelineImpl {
         } else {
             let value_encoded = codec_chain
                 .encode(value_decoded, &item.shape, codec_options)
-                .map(Cow::into_owned)
                 .map_codec_err()?;
 
             // Store the encoded chunk
             store
-                .set(&item.key, value_encoded.into())
+                .set(&item.key, value_encoded)
                 .map_py_err::<PyRuntimeError>()
         }
     }
@@ -378,7 +377,7 @@ impl CodecPipelineImpl {
             .map_py_err::<PyTypeError>()?;
 
         let codec_chain = codec_chain
-            .with_context(data_type.clone(), fill_value.clone())
+            .with_context(data_type.clone(), fill_value.clone(), &CodecSpecificOptions::default())
             .map_py_err::<PyTypeError>()?;
         let shard = shard_index::ShardInfo::from_codec_chain(&codec_chain).map(Arc::new);
 

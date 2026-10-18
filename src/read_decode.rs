@@ -1,5 +1,4 @@
 //! Reading and decoding the innermost chunks of one call, concurrently.
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -12,7 +11,7 @@ use pyo3::{PyResult, Python};
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
     ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset, ArrayToBytesCodecTraits,
-    CodecOptions, FillValue, ravel_indices,
+    CodecOptions, CowBytes, FillValue, ravel_indices,
 };
 use zarrs::storage::byte_range::ByteRange;
 use zarrs::storage::{MaybeBytes, ReadableStorage, StoreKey};
@@ -1164,7 +1163,7 @@ unsafe fn decode_into(
     ctx.shard
         .inner_chain
         .decode_into(
-            Cow::Borrowed(bytes),
+            CowBytes::from(bytes),
             &ctx.decode_shape,
             ArrayBytesDecodeIntoTarget::Fixed(&mut view),
             &ctx.codec_options,

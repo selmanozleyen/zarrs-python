@@ -10,8 +10,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.27.1", features = ["abi3-py311"] }
-# TODO: zarrs 0.24 from crates.io; drop this rev and the zarrs_storage patch below together.
-zarrs = { git = "https://github.com/selmanozleyen/zarrs", rev = "1e81e6b5ceb176b3d79f5d38510ac4debd7eb284", features = ["async", "zlib", "pcodec", "bz2"] }
+# BENCHMARK-ONLY BUILD: zarrs perf/direct_b2b_decode (main 2026-10-04 + 6 commits); no HTTP or
+# obstore stores, whose adapters need zarrs_storage 0.4.
+zarrs = { git = "https://github.com/zarrs/zarrs", rev = "2a9a113cca3c828ebf2796102db021f72eac0c8c", features = ["async", "zlib", "pcodec", "bz2"] }
 rayon_iter_concurrent_limit = "0.2.0"
 rayon = "1.10.0"
 crossbeam-channel = "0.5"
@@ -23,17 +24,9 @@ numpy = "0.27.0"
 unsafe_cell_slice = "0.2.0"
 serde_json = "1.0.128"
 pyo3-stub-gen = "0.17.1"
-opendal = { version = "0.55.0", features = ["services-http"] }
 tokio = { version = "1.41.1", features = ["rt-multi-thread"] }
-zarrs_opendal = "0.10.0"
 itertools = "0.14.0"
 bytemuck = { version = "1.24.0", features = ["must_cast"] }
-pyo3-object_store = "0.7.0" # object_store 0.12
-zarrs_object_store = "0.5.0" # object_store 0.12
 
 [profile.release]
 lto = true
-
-# zarrs_opendal and zarrs_object_store use zarrs_storage from crates.io; point it at the same rev.
-[patch.crates-io]
-zarrs_storage = { git = "https://github.com/selmanozleyen/zarrs", rev = "1e81e6b5ceb176b3d79f5d38510ac4debd7eb284" }

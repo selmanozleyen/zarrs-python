@@ -1,25 +1,16 @@
-use std::{collections::HashMap, sync::Arc};
 
-use opendal::Builder;
+
 use pyo3::{
-    Borrowed, Bound, FromPyObject, PyAny, PyErr, PyResult,
-    exceptions::{PyNotImplementedError, PyValueError},
+    Borrowed, FromPyObject, PyAny, PyErr, PyResult,
+    exceptions::PyNotImplementedError,
     types::{PyAnyMethods, PyStringMethods, PyTypeMethods},
 };
-use pyo3_object_store::PyExternalObjectStore;
-use zarrs::storage::{
-    ReadableWritableListableStorage, storage_adapter::async_to_sync::AsyncToSyncStorageAdapter,
-};
+use zarrs::storage::ReadableWritableListableStorage;
 
-use crate::{runtime::tokio_block_on, utils::PyErrExt};
 
 mod filesystem;
-mod http;
-mod obstore;
 
 pub use self::filesystem::FilesystemStoreConfig;
-pub use self::http::HttpStoreConfig;
-pub use self::obstore::ObStoreConfig;
 
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -34,8 +25,6 @@ pub struct StoreConfig {
 #[derive(Debug, Clone)]
 pub enum StoreKind {
     Filesystem(FilesystemStoreConfig),
-    Http(HttpStoreConfig),
-    ObStore(ObStoreConfig),
     // TODO: Add support for more stores
 }
 
@@ -50,30 +39,10 @@ impl<'py> FromPyObject<'_, 'py> for StoreConfig {
                 let root: String = store.getattr("root")?.call_method0("__str__")?.extract()?;
                 StoreKind::Filesystem(FilesystemStoreConfig::new(root))
             }
-            "FsspecStore" => {
-                let fs = store.getattr("fs")?;
-                let fs_name = fs.get_type().name()?;
-                let fs_name = fs_name.to_str()?;
-                let path: String = store.getattr("path")?.extract()?;
-                let storage_options: HashMap<String, Bound<'py, PyAny>> =
-                    fs.getattr("storage_options")?.extract()?;
-                match fs_name {
-                    "HTTPFileSystem" => {
-                        StoreKind::Http(HttpStoreConfig::new(&path, &storage_options)?)
-                    }
-                    _ => {
-                        return Err(PyErr::new::<PyNotImplementedError, _>(format!(
-                            "zarrs-python does not support {fs_name} (FsspecStore) stores"
-                        )));
-                    }
-                }
-            }
-            "ObjectStore" => {
-                let underlying_store = store.getattr("store")?;
-                let external_object_store: PyExternalObjectStore = underlying_store.extract()?;
-                let object_store: Arc<dyn zarrs_object_store::object_store::ObjectStore> =
-                    external_object_store.into_dyn();
-                StoreKind::ObStore(ObStoreConfig::new(object_store))
+            "FsspecStore" | "ObjectStore" => {
+                return Err(PyErr::new::<PyNotImplementedError, _>(format!(
+                    "{name} stores are not in this benchmark build"
+                )));
             }
             _ => {
                 return Err(PyErr::new::<PyNotImplementedError, _>(format!(
@@ -92,16 +61,12 @@ impl StoreConfig {
     pub fn direct_io(&mut self, flag: bool) {
         match &mut self.kind {
             StoreKind::Filesystem(config) => config.direct_io(flag),
-            StoreKind::Http(_config) => (),
-            StoreKind::ObStore(_config) => (),
         }
     }
 
     pub fn file_handle_cache_size(&mut self, size: usize) {
         match &mut self.kind {
             StoreKind::Filesystem(config) => config.file_handle_cache_size(size),
-            StoreKind::Http(_config) => (),
-            StoreKind::ObStore(_config) => (),
         }
     }
 }
@@ -118,19 +83,7 @@ impl TryFrom<&StoreConfig> for ReadableWritableListableStorage {
     fn try_from(value: &StoreConfig) -> Result<Self, Self::Error> {
         match &value.kind {
             StoreKind::Filesystem(config) => config.try_into(),
-            StoreKind::Http(config) => config.try_into(),
-            StoreKind::ObStore(config) => config.try_into(),
         }
     }
 }
 
-fn opendal_builder_to_sync_store<B: Builder>(
-    builder: B,
-) -> PyResult<ReadableWritableListableStorage> {
-    let operator = opendal::Operator::new(builder)
-        .map_py_err::<PyValueError>()?
-        .finish();
-    let store = Arc::new(zarrs_opendal::AsyncOpendalStore::new(operator));
-    let store = Arc::new(AsyncToSyncStorageAdapter::new(store, tokio_block_on()));
-    Ok(store)
-}
