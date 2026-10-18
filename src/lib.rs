@@ -21,7 +21,8 @@ use utils::is_whole_chunk;
 use zarrs::array::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArrayMetadata,
     ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, CodecChain, CodecOptions, DataType,
-    BytesPartialDecoderTraits, CodecChainBound, FillValue, copy_fill_value_into,
+    BytesPartialDecoderTraits, CodecChainBound, CodecSpecificOptions, CowBytes, FillValue,
+    copy_fill_value_into,
     update_array_bytes,
 };
 use zarrs::config::global_config;
@@ -108,12 +109,11 @@ impl CodecPipelineImpl {
         } else {
             let value_encoded = codec_chain
                 .encode(value_decoded, &item.shape, codec_options)
-                .map(Cow::into_owned)
                 .map_codec_err()?;
 
             // Store the encoded chunk
             store
-                .set(&item.key, value_encoded.into())
+                .set(&item.key, value_encoded)
                 .map_py_err::<PyRuntimeError>()
         }
     }
@@ -278,7 +278,7 @@ impl CodecPipelineImpl {
             .map_py_err::<PyTypeError>()?;
         // zarrs 0.24: a codec chain is bound to its data type and fill value once.
         let codec_chain = codec_chain
-            .with_context(data_type.clone(), fill_value.clone())
+            .with_context(data_type.clone(), fill_value.clone(), &CodecSpecificOptions::default())
             .map_py_err::<PyTypeError>()?;
 
         Ok(Self {
@@ -369,7 +369,7 @@ impl CodecPipelineImpl {
                         // Decode the encoded data into the output buffer
                         let chunk_encoded: Vec<u8> = chunk_encoded.into();
                         self.codec_chain.decode_into(
-                            Cow::Owned(chunk_encoded),
+                            CowBytes::from(chunk_encoded),
                             &item.shape,
                             target,
                             &codec_options,
